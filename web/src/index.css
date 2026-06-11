@@ -1,0 +1,39 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
+}
+
+html {
+  font-size: 14px;
+}
+
+body {
+  @apply bg-slate-900 text-slate-200 font-sans antialiased;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-slate-700 rounded;
+}
+
+/* Theme-matched checkbox — native widgets ignore the dark palette */
+input[type='checkbox'].tlg-check {
+  @apply h-3.5 w-3.5 cursor-pointer appearance-none rounded border border-slate-600 bg-slate-900 align-middle transition-colors;
+}
+input[type='checkbox'].tlg-check:hover {
+  @apply border-slate-400;
+}
+input[type='checkbox'].tlg-check:focus-visible {
+  @apply outline-none ring-2 ring-blue-500/50;
+}
+input[type='checkbox'].tlg-check:checked {
+  @apply border-blue-500 bg-blue-500;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg viewBox='0 0 16 16' fill='white' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M12.207 4.793a1 1 0 0 1 0 1.414l-5 5a1 1 0 0 1-1.414 0l-2-2a1 1 0 0 1 1.414-1.414L6.5 9.086l4.293-4.293a1 1 0 0 1 1.414 0z'/%3E%3C/svg%3E");
+  background-size: 100% 100%;
+  background-position: center;
+  background-repeat: no-repeat;
+}

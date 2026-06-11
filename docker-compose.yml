@@ -1,0 +1,14 @@
+services:
+  ipam:
+    build: .
+    volumes:
+      - ipam-data:/data
+    environment:
+      - API_KEY=${API_KEY:?set API_KEY in .env}
+      - DB_PATH=/data/ipam.db
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+volumes:
+  ipam-data:
