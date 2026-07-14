@@ -82,3 +82,20 @@ async def test_update_and_delete_frees_ip(client):
     assert res.status_code == 204
     # the freed IP can be reused
     await make_host(client, subnet["id"], "10.0.0.9")
+
+
+async def test_required_host_update_fields_reject_explicit_null(client):
+    subnet = await _subnet(client)
+    host = await make_host(client, subnet["id"], "10.0.0.5")
+    for field in ("ip", "device_type", "status"):
+        res = await client.put(f"/api/v1/hosts/{host['id']}", json={field: None})
+        assert res.status_code == 422, (field, res.text)
+        assert res.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+async def test_empty_host_update_rejected(client):
+    subnet = await _subnet(client)
+    host = await make_host(client, subnet["id"], "10.0.0.5")
+    res = await client.put(f"/api/v1/hosts/{host['id']}", json={})
+    assert res.status_code == 422
+    assert "At least one host field" in res.json()["error"]["message"]

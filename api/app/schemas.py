@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .ipnet import normalise_domain, normalise_mac, parse_ip
 
 HostStatus = Literal["active", "reserved", "dhcp", "offline"]
+HostClearField = Literal["hostname", "domain", "mac", "owner", "notes", "last_seen"]
 
 
 # --- Device types ---
@@ -19,6 +20,13 @@ class DeviceTypeCreate(BaseModel):
 class DeviceTypeUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=40)
     icon: str | None = Field(default=None, min_length=1, max_length=40)
+
+    @field_validator("name", "icon")
+    @classmethod
+    def _required_fields_cannot_be_null(cls, v):
+        if v is None:
+            raise ValueError("must not be null")
+        return v
 
 
 class DeviceTypeOut(BaseModel):
@@ -43,6 +51,13 @@ class SectionUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
     description: str | None = None
     colour: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
+
+    @field_validator("name")
+    @classmethod
+    def _required_fields_cannot_be_null(cls, v):
+        if v is None:
+            raise ValueError("must not be null")
+        return v
 
 
 class SectionOut(BaseModel):
@@ -98,6 +113,13 @@ class SubnetUpdate(_SubnetFields):
     section_id: str | None = None
     cidr: str | None = None
     name: str | None = Field(default=None, min_length=1, max_length=120)
+
+    @field_validator("section_id", "cidr", "name")
+    @classmethod
+    def _required_fields_cannot_be_null(cls, v):
+        if v is None:
+            raise ValueError("must not be null")
+        return v
 
 
 class ReservedRangeCreate(BaseModel):
@@ -177,6 +199,13 @@ class HostUpdate(_HostFields):
     ip: str | None = None
     device_type: str | None = Field(default=None, max_length=40)
     status: HostStatus | None = None
+
+    @field_validator("ip", "device_type", "status")
+    @classmethod
+    def _required_fields_cannot_be_null(cls, v):
+        if v is None:
+            raise ValueError("must not be null")
+        return v
 
 
 class HostOut(BaseModel):

@@ -122,6 +122,8 @@ async def update_host(
     host = await get_host(session, host_id)
     before = changes.snapshot(host)
     data = payload.model_dump(exclude_unset=True)
+    if not data:
+        raise validation_error("At least one host field must be provided")
     if data.get("device_type") is None:
         data.pop("device_type", None)
     else:

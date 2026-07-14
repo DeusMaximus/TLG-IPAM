@@ -29,6 +29,13 @@ async def test_update(client):
     assert res.json()["data"]["name"] == section["name"]
 
 
+async def test_required_section_update_fields_reject_explicit_null(client):
+    section = await make_section(client)
+    res = await client.put(f"/api/v1/sections/{section['id']}", json={"name": None})
+    assert res.status_code == 422
+    assert res.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
 async def test_delete_refused_with_subnets(client):
     section = await make_section(client)
     await make_subnet(client, section["id"])

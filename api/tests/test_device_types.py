@@ -87,6 +87,14 @@ async def test_fallback_cannot_be_renamed(client):
     assert res.json()["data"]["icon"] == "box"
 
 
+async def test_required_device_type_update_fields_reject_explicit_null(client):
+    server = await _type_by_name(client, "server")
+    for field in ("name", "icon"):
+        res = await client.put(f"/api/v1/device-types/{server['id']}", json={field: None})
+        assert res.status_code == 422, (field, res.text)
+        assert res.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
 async def test_bulk_import_validates_types_per_row(client):
     subnet = await _subnet(client)
     res = await client.post(

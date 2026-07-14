@@ -2,7 +2,15 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..errors import conflict, not_found, validation_error
-from ..ipnet import excluded_ints, iter_free, parse_cidr, parse_ip, usable_bounds
+from ..ipnet import (
+    exclusion_intervals,
+    interval_size,
+    iter_free,
+    merge_intervals,
+    parse_cidr,
+    parse_ip,
+    usable_bounds,
+)
 from ..models import Host, ReservedRange, Subnet
 from ..schemas import ReservedRangeCreate, ReservedRangeOut, SubnetCreate, SubnetOut, SubnetUpdate
 from . import changes
@@ -45,8 +53,11 @@ async def subnet_stats(session: AsyncSession, subnet: Subnet) -> dict:
     usable = last - first + 1
     allocated = await _allocated_ints(session, subnet.id)
     reserved = await reserved_ranges(session, subnet.id)
-    excluded = {i for i in excluded_ints(subnet, reserved) if first <= i <= last}
-    free = (usable - len(excluded)) - len(allocated - excluded)
+    excluded = exclusion_intervals(subnet, reserved)
+    blocked = merge_intervals(
+        [*excluded, *((ip, ip) for ip in allocated)], lower=first, upper=last
+    )
+    free = usable - interval_size(blocked)
     return {"used": len(allocated), "usable": usable, "free": free}
 
 
@@ -147,15 +158,29 @@ async def update_subnet(
         await get_section(session, data["section_id"])
     net = await _validate_subnet(session, **merged, exclude_id=subnet.id)
     if merged["cidr"] != subnet.cidr:
-        outside = await session.scalar(
+        first, last = usable_bounds(net)
+        outside_hosts = await session.scalar(
             select(func.count(Host.id)).where(
                 Host.subnet_id == subnet.id,
-                (Host.ip_int < int(net.network_address)) | (Host.ip_int > int(net.broadcast_address)),
+                (Host.ip_int < first) | (Host.ip_int > last),
             )
         )
-        if outside:
+        if outside_hosts:
             raise validation_error(
-                f"Cannot change CIDR to {merged['cidr']}: {outside} existing host(s) would fall outside it"
+                f"Cannot change CIDR to {merged['cidr']}: "
+                f"{outside_hosts} existing host(s) would not be assignable in it"
+            )
+        outside_ranges = await session.scalar(
+            select(func.count(ReservedRange.id)).where(
+                ReservedRange.subnet_id == subnet.id,
+                (ReservedRange.start_int < int(net.network_address))
+                | (ReservedRange.end_int > int(net.broadcast_address)),
+            )
+        )
+        if outside_ranges:
+            raise validation_error(
+                f"Cannot change CIDR to {merged['cidr']}: "
+                f"{outside_ranges} reserved range(s) would fall outside it"
             )
     before = changes.snapshot(subnet)
     for field, value in data.items():

@@ -29,6 +29,10 @@ async def test_all_tools_registered():
         assert {t.name for t in tools} == EXPECTED_TOOLS
         # descriptions are Claude's documentation — they must exist
         assert all(t.description for t in tools)
+        update_host = next(t for t in tools if t.name == "update_host")
+        clear_fields = update_host.inputSchema["properties"]["clear_fields"]
+        allowed = clear_fields["anyOf"][0]["items"]["enum"]
+        assert set(allowed) == {"hostname", "domain", "mac", "owner", "notes", "last_seen"}
 
 
 async def test_mcp_end_to_end(client):
@@ -71,3 +75,52 @@ async def test_mcp_errors_are_meaningful(client):
         )
         assert result.is_error
         assert "not within" in result.content[0].text
+
+
+async def test_mcp_update_host_can_clear_nullable_fields(client):
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"], domain="home.arpa")
+    host = (
+        await client.post(
+            "/api/v1/hosts",
+            json={
+                "subnet_id": subnet["id"],
+                "ip": "10.0.0.10",
+                "hostname": "server",
+                "domain": "override.example.com",
+                "notes": "remove me",
+            },
+        )
+    ).json()["data"]
+
+    async with Client(mcp) as mcp_client:
+        updated = (
+            await mcp_client.call_tool(
+                "update_host",
+                {"host_id": host["id"], "clear_fields": ["domain", "notes"]},
+            )
+        ).data["host"]
+
+    assert updated["domain"] is None
+    assert updated["notes"] is None
+    assert updated["fqdn"] == "server.home.arpa"
+
+
+async def test_mcp_update_host_rejects_conflicting_set_and_clear(client):
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"])
+    host = (
+        await client.post(
+            "/api/v1/hosts", json={"subnet_id": subnet["id"], "ip": "10.0.0.10"}
+        )
+    ).json()["data"]
+
+    async with Client(mcp) as mcp_client:
+        result = await mcp_client.call_tool(
+            "update_host",
+            {"host_id": host["id"], "notes": "keep", "clear_fields": ["notes"]},
+            raise_on_error=False,
+        )
+
+    assert result.is_error
+    assert "cannot be both set and cleared" in result.content[0].text

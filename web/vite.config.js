@@ -10,4 +10,8 @@ export default defineConfig({
       '/health': 'http://localhost:8080',
     },
   },
+  test: {
+    environment: 'jsdom',
+    setupFiles: './src/test/setup.js',
+  },
 })

@@ -16,6 +16,7 @@ from .errors import ApiError
 from .schemas import (
     AllocateRequest,
     ChangeOut,
+    HostClearField,
     HostCreate,
     HostUpdate,
     ReservedRangeCreate,
@@ -280,11 +281,14 @@ async def update_host(
     status: str | None = None,
     owner: str | None = None,
     notes: str | None = None,
+    clear_fields: list[HostClearField] | None = None,
 ) -> dict:
     """Update fields on an existing host record. Only the provided fields are changed.
     domain sets a per-host domain-suffix override (the subnet default applies when no
     override is set). device_type: any name from list_device_types (defaults: server|vm|lxc|network|iot|desktop|laptop|phone|other).
-    status: active|reserved|dhcp|offline."""
+    status: active|reserved|dhcp|offline. To clear nullable values, pass their names in
+    clear_fields; for example, clear_fields=["domain", "notes"] removes the domain
+    override and notes. A field cannot be both set and cleared in the same call."""
     provided = {
         k: v
         for k, v in {
@@ -299,6 +303,10 @@ async def update_host(
         }.items()
         if v is not None
     }
+    for field in clear_fields or []:
+        if field in provided:
+            raise ToolError(f"{field} cannot be both set and cleared")
+        provided[field] = None
     payload = HostUpdate(**provided)
     async with SessionLocal() as session:
         host = await hosts_svc.update_host(session, host_id, payload, source="mcp")

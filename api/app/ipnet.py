@@ -66,31 +66,77 @@ def total_usable(net: ipaddress.IPv4Network) -> int:
     return last - first + 1
 
 
-def excluded_ints(subnet, reserved_ranges=()) -> set[int]:
-    """Addresses that are usable but never auto-allocatable: the gateway, the DHCP
-    pool, and any reserved ranges."""
-    excluded: set[int] = set()
+def merge_intervals(
+    intervals: list[tuple[int, int]], *, lower: int, upper: int
+) -> list[tuple[int, int]]:
+    """Clip and merge inclusive integer intervals within the supplied bounds."""
+    clipped = sorted(
+        (max(start, lower), min(end, upper))
+        for start, end in intervals
+        if end >= lower and start <= upper
+    )
+    merged: list[tuple[int, int]] = []
+    for start, end in clipped:
+        if not merged or start > merged[-1][1] + 1:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+
+def exclusion_intervals(subnet, reserved_ranges=()) -> list[tuple[int, int]]:
+    """Merged usable-address intervals excluded from automatic allocation."""
+    net = parse_cidr(subnet.cidr)
+    first, last = usable_bounds(net)
+    intervals: list[tuple[int, int]] = []
     if subnet.gateway:
-        excluded.add(int(ipaddress.IPv4Address(subnet.gateway)))
+        gateway = int(ipaddress.IPv4Address(subnet.gateway))
+        intervals.append((gateway, gateway))
     if subnet.dhcp_start and subnet.dhcp_end:
         start = int(ipaddress.IPv4Address(subnet.dhcp_start))
         end = int(ipaddress.IPv4Address(subnet.dhcp_end))
-        excluded.update(range(start, end + 1))
+        intervals.append((start, end))
     for block in reserved_ranges:
-        excluded.update(range(block.start_int, block.end_int + 1))
-    return excluded
+        intervals.append((block.start_int, block.end_int))
+    return merge_intervals(intervals, lower=first, upper=last)
+
+
+def interval_size(intervals: list[tuple[int, int]]) -> int:
+    return sum(end - start + 1 for start, end in intervals)
+
+
+def in_intervals(value: int, intervals: list[tuple[int, int]]) -> bool:
+    for start, end in intervals:
+        if value < start:
+            return False
+        if value <= end:
+            return True
+    return False
 
 
 def iter_free(subnet, allocated: set[int], reserved_ranges=(), limit: int | None = None) -> list[str]:
     """Free IPs in ascending order: usable, not gateway/DHCP-pool/reserved, not allocated."""
     net = parse_cidr(subnet.cidr)
     first, last = usable_bounds(net)
-    excluded = excluded_ints(subnet, reserved_ranges)
+    blocked = merge_intervals(
+        [*exclusion_intervals(subnet, reserved_ranges), *((ip, ip) for ip in allocated)],
+        lower=first,
+        upper=last,
+    )
     free: list[str] = []
-    for ip_int in range(first, last + 1):
-        if ip_int in allocated or ip_int in excluded:
-            continue
-        free.append(str(ipaddress.IPv4Address(ip_int)))
-        if limit is not None and len(free) >= limit:
-            break
+
+    def append_gap(start: int, end: int) -> bool:
+        for ip_int in range(start, end + 1):
+            free.append(str(ipaddress.IPv4Address(ip_int)))
+            if limit is not None and len(free) >= limit:
+                return True
+        return False
+
+    cursor = first
+    for start, end in blocked:
+        if cursor < start and append_gap(cursor, start - 1):
+            return free
+        cursor = max(cursor, end + 1)
+    if cursor <= last:
+        append_gap(cursor, last)
     return free

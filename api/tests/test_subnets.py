@@ -94,6 +94,50 @@ async def test_cidr_change_rejected_if_hosts_fall_outside(client):
     assert res.status_code == 200
 
 
+async def test_cidr_change_rejected_if_host_becomes_network_or_broadcast(client):
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"], "10.0.0.0/23")
+    await make_host(client, subnet["id"], "10.0.1.0")
+
+    res = await client.put(f"/api/v1/subnets/{subnet['id']}", json={"cidr": "10.0.1.0/24"})
+
+    assert res.status_code == 422
+    assert "would not be assignable" in res.json()["error"]["message"]
+
+
+async def test_cidr_change_preserves_31_and_32_host_semantics(client):
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"], "10.0.0.0/30")
+    await make_host(client, subnet["id"], "10.0.0.1")
+
+    assert (
+        await client.put(f"/api/v1/subnets/{subnet['id']}", json={"cidr": "10.0.0.0/31"})
+    ).status_code == 200
+
+
+async def test_cidr_change_rejected_if_reserved_range_falls_outside(client):
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"], "10.0.0.0/23")
+    await client.post(
+        f"/api/v1/subnets/{subnet['id']}/reserved",
+        json={"start_ip": "10.0.0.10", "end_ip": "10.0.0.20"},
+    )
+
+    res = await client.put(f"/api/v1/subnets/{subnet['id']}", json={"cidr": "10.0.1.0/24"})
+
+    assert res.status_code == 422
+    assert "reserved range(s) would fall outside" in res.json()["error"]["message"]
+
+
+async def test_required_subnet_update_fields_reject_explicit_null(client):
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"])
+    for field in ("section_id", "cidr", "name"):
+        res = await client.put(f"/api/v1/subnets/{subnet['id']}", json={field: None})
+        assert res.status_code == 422, (field, res.text)
+        assert res.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
 async def test_delete_refused_with_hosts(client):
     section = await make_section(client)
     subnet = await make_subnet(client, section["id"])

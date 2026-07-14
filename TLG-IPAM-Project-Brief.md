@@ -146,7 +146,7 @@ Append-only record of every write. Because Claude can write to this system via M
 | `action` | enum: `create` \| `update` \| `delete` |
 | `summary` | str — human-readable one-liner, e.g. `host pbs-01 created at 10.10.20.45` |
 | `before` / `after` | JSON snapshots, nullable |
-| `source` | enum: `ui` \| `api` \| `mcp` — derived from request path/client |
+| `source` | enum: `ui` \| `api` \| `mcp` — MCP is server-assigned; REST uses the advisory `X-TLG-Client: ui` hint, so `ui` versus `api` is a UX label rather than trusted provenance |
 
 ### 3.7 Validation constraints
 
@@ -156,6 +156,8 @@ Append-only record of every write. Because Claude can write to this system via M
 - No duplicate IPs within a subnet — enforced by `UNIQUE(subnet_id, ip)` in the database, not just the API layer.
 - `dhcp_start`/`dhcp_end` must both be set or both null, both within the CIDR, start ≤ end.
 - Reserved ranges must be within the subnet CIDR, start ≤ end.
+- Changing a subnet CIDR must preserve every child invariant: existing hosts must remain assignable (including network/broadcast rules), and reserved ranges must remain within the new CIDR.
+- Update requests may omit fields they do not change. Explicit `null` is accepted only for nullable fields; required fields return `422 VALIDATION_ERROR` rather than reaching a database constraint.
 - Domain suffixes normalised to lowercase, leading/trailing dots stripped, charset-validated.
 - MAC addresses normalised to lowercase with colons on write.
 - VLAN IDs 1–4094 only.
@@ -202,7 +204,7 @@ All endpoints except `GET /health` require this header. Return `401` if missing,
 | `DELETE /api/v1/subnets/{id}/reserved/{range_id}` | Remove a reserved range. |
 | `GET  /api/v1/changes` | Recent changes, newest first. Filters: `?entity_type=` `?limit=`. |
 | `GET/POST /api/v1/device-types` + `PUT/DELETE /api/v1/device-types/{id}` | Device type CRUD with host counts. Rename cascades to hosts; delete refused while in use or for `other`. |
-| `GET  /api/v1/backup` | Download the SQLite database file (powers the Settings backup button). |
+| `GET  /api/v1/backup` | Download a consistent temporary snapshot made with SQLite's online backup API (powers the Settings backup button). |
 
 ### 4.3 Standard response shapes
 
@@ -227,6 +229,8 @@ An IP is **free** iff all of the following hold:
 Manual host creation (`POST /hosts`) only rejects the network/broadcast addresses — placing a host at the gateway, inside the DHCP pool, or inside a reserved range is deliberate and allowed.
 
 `next-free` allocates the lowest free IP and creates the host record in a single transaction. The `UNIQUE(subnet_id, ip)` constraint is the backstop against races.
+
+Gateway, DHCP, reserved-range, and allocated-address exclusions are represented as clipped, merged integer intervals. Utilisation counts interval lengths, and free-IP iteration skips blocked spans rather than materialising every address in a range.
 
 ---
 
@@ -268,13 +272,13 @@ Tool descriptions are the documentation Claude reads at runtime — write them w
 | `list_device_types` | List defined device types with usage counts — the valid `device_type` values for host writes. |
 | `list_subnets` | List subnets, optionally filtered by section. Returns CIDR, VLAN ID, name, and utilisation (used/total) in one call. |
 | `get_subnet` | Full detail for a subnet: VLAN tag, gateway, DNS servers, DHCP pool, utilisation, and free-IP count — one call, no follow-ups needed. |
-| `get_free_ips` | Return unallocated IPs in a subnet (respects gateway/DHCP-pool/broadcast exclusions). Use before allocating to check availability or find a specific address. |
+| `get_free_ips` | Return unallocated IPs in a subnet (respects gateway, DHCP-pool, reserved-range, and network/broadcast exclusions). Use before allocating to check availability or find a specific address. |
 | `list_hosts` | Search and filter host records across the network. Free-text search (hostname, IP, MAC) plus filtering by subnet or status. |
 | `get_host` | Full detail for a specific host record including MAC, device type, owner, and last seen. |
-| `create_host` | Register a new host at a specific IP address. Validates that the IP falls within the target subnet, is not reserved, and is not already allocated. |
+| `create_host` | Register a new host at a specific IP address. Validates that it is assignable within the target subnet and not already allocated. Manual placement at the gateway or inside DHCP/reserved ranges is allowed. |
 | `bulk_create_hosts` | Create many hosts in one subnet in a single call (e.g. importing devices from a UniFi export). Per-record results; duplicates skipped, bad records errored, batch never aborts. One audit entry. |
 | `allocate_next_ip` | Allocate the next available IP in a subnet and create a host record in one step. Use when the caller does not need a specific IP address. |
-| `update_host` | Update hostname, domain override, MAC address, status, device type, owner, or notes for an existing host record. |
+| `update_host` | Update hostname, domain override, MAC address, status, device type, owner, or notes for an existing host record. Pass nullable field names in `clear_fields` to clear them; clearing a domain override restores subnet-domain inheritance. |
 | `delete_host` | Remove a host record, freeing the IP address for future allocation. |
 | `bulk_delete_hosts` | Delete many hosts by ID in one call (cleanup workflows). Returns deleted count + not-found IDs. |
 | `add_reserved_range` | Reserve a block of IPs in a subnet so automatic allocation skips it (manual creation inside it stays allowed). |
@@ -347,7 +351,7 @@ Clean, data-dense, dark-mode-first. Reference aesthetic: linear.app sidebar dens
 - **CSV import modal** — on the subnet view; file picker or paste, header-mapped columns, per-row results shown after import (same bulk endpoint as MCP)
 - **Settings** — API key display (masked), device type management (add/rename/re-icon/delete with a curated icon picker), SQLite backup download, app version
 
-No separate login page — access control is handled at the reverse proxy / Cloudflare Access layer.
+When no API key is stored in the browser, the SPA shows an in-app API-key connection gate. The key is stored only in that browser. A reverse proxy / Cloudflare Access layer may provide an additional outer access-control boundary.
 
 ---
 
@@ -359,27 +363,31 @@ tlg-ipam/
 ├── Dockerfile               # multi-stage: node builds web/dist, python runs API + serves it
 ├── api/
 │   ├── requirements.txt
-│   ├── tests/                # pytest — validation + allocation logic
+│   ├── tests/                # pytest — API, MCP, validation, allocation, and backup coverage
 │   └── app/
 │       ├── main.py           # FastAPI app + static SPA serving + MCP mount
 │       ├── config.py         # env vars (pydantic-settings)
 │       ├── database.py       # SQLAlchemy async engine + session
-│       ├── models.py         # ORM models (Section, Subnet, Host, Change)
+│       ├── models.py         # ORM models (Section, Subnet, ReservedRange, Host, DeviceType, Change)
 │       ├── schemas.py        # Pydantic request/response schemas
 │       ├── auth.py           # API key dependency + /mcp ASGI middleware
 │       ├── mcp_server.py     # FastMCP tools (thin wrappers over services)
 │       ├── services/         # business logic — single source of truth
+│       │   ├── backups.py    # consistent SQLite online-backup snapshots
 │       │   ├── sections.py
 │       │   ├── subnets.py    # incl. free-IP + next-free allocation logic
 │       │   ├── hosts.py
+│       │   ├── device_types.py
 │       │   └── changes.py    # audit log writes + reads
 │       └── routers/
 │           ├── sections.py
 │           ├── subnets.py
 │           ├── hosts.py
+│           ├── device_types.py
 │           └── changes.py
 └── web/
     ├── package.json
+    ├── eslint.config.js
     ├── vite.config.js
     └── src/
         ├── main.jsx
@@ -401,17 +409,17 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 | 3 | API: `schemas.py` — all Pydantic request/response models |
 | 4 | API: `auth.py` dependency + health endpoint. Verify API key auth works end-to-end. |
 | 5 | API: services + routers — sections (full CRUD, change-logged) |
-| 6 | API: services + routers — subnets: CRUD + `/free` + `next-free` allocation logic incl. reserved-space exclusions |
-| 7 | API: services + routers — hosts: CRUD + search (`?q=`); changes router |
-| 8 | Tests: pytest for validation + allocation edge cases (gateway/DHCP-pool skipping, /31, duplicate IPs, overlap rule) |
-| 9 | MCP: `mcp_server.py` — all 11 tools wrapping services, mounted at `/mcp` with auth |
+| 6 | API: services + routers — subnets: CRUD + `/free` + `next-free` allocation logic incl. interval-based reserved-space exclusions |
+| 7 | API: services + routers — hosts: CRUD + search (`?q=`); reserved ranges, device types, changes, and snapshot backup |
+| 8 | Tests: pytest for validation + allocation edge cases (gateway/DHCP skipping, large exclusions, /31, duplicate IPs, overlap and CIDR-change invariants) |
+| 9 | MCP: `mcp_server.py` — all 16 curated tools wrapping services, mounted at `/mcp` with auth |
 | 10 | **Test MCP with `mcp-remote` locally before touching the frontend** |
 | 11 | Frontend: scaffold Vite + Tailwind + React Router, `api/` fetch layer |
 | 12 | Frontend: Sidebar with section/subnet tree |
-| 13 | Frontend: Subnet view + host table |
+| 13 | Frontend: Subnet view + sortable host table, virtualised above 200 rows |
 | 14 | Frontend: Host drawer (view + edit + delete) |
 | 15 | Frontend: Allocate modal + Dashboard (stats + activity feed) |
-| 16 | Polish: empty states, error toasts, loading skeletons, dark mode QA |
+| 16 | Quality gate and polish: ESLint, Vitest component coverage, CI, empty states, error toasts, loading skeletons, dark mode QA |
 
 ---
 
@@ -442,10 +450,11 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 - Overlapping CIDRs rejected within a section, allowed across sections.
 - Search returns results across hostname, IP, and MAC.
 - Subnet utilisation is accurate (allocated / total usable addresses).
-- Every write (UI, API, or MCP) appears in the change log with the correct source.
+- Every write appears in the change log. MCP provenance is authoritative; UI/API attribution is advisory because REST clients share one API key and can set `X-TLG-Client`.
 
 ### Testing
-- pytest suite covers CIDR/IP validation, the overlap rule, and next-free allocation edge cases (gateway/DHCP skipping, /31, full subnet, duplicate IP rejection).
+- pytest covers CIDR/IP validation, CIDR child invariants, explicit-null updates, the overlap rule, interval maths, consistent backups, MCP clearing, and next-free allocation edge cases.
+- ESLint, Vitest component tests, and the production frontend build run in CI alongside pytest.
 
 ### MCP integration
 - Claude Desktop connects via `mcp-remote` and lists all available tools.
@@ -457,12 +466,13 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 - `docker compose up --build` produces a running stack with no manual steps.
 - All data persists across container restarts (named volume).
 - API key changeable via env var without rebuild.
-- Settings page exposes SQLite backup download.
+- Settings exposes a SQLite backup download created through the online backup API rather than streaming the active database file.
 
 ### UI quality
 - Dark mode correct — no hardcoded colours bleeding through.
 - Works at 1280px and 1920px wide.
 - Empty states present on all list views.
+- Host IP sorting is numeric and keyboard accessible; inventories above 200 rows use windowed rendering.
 - No console errors in production build.
 
 ---

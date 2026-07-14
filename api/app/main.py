@@ -5,6 +5,8 @@ from fastapi import Depends, FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .auth import APIKeyASGIMiddleware, require_api_key
@@ -13,6 +15,7 @@ from .database import SessionLocal, init_models
 from .errors import ApiError
 from .mcp_server import mcp
 from .routers import changes, device_types, hosts, sections, subnets
+from .services.backups import create_snapshot
 from .services.device_types import seed_defaults
 
 mcp_app = mcp.http_app(path="/")
@@ -78,10 +81,13 @@ async def health():
 
 @app.get("/api/v1/backup", dependencies=[Depends(require_api_key)])
 async def backup():
-    db_file = Path(settings.db_path)
-    if not db_file.is_file():
-        raise ApiError("NOT_FOUND", "Database file not found", 404)
-    return FileResponse(db_file, filename="ipam.db", media_type="application/octet-stream")
+    snapshot = await run_in_threadpool(create_snapshot, settings.db_path)
+    return FileResponse(
+        snapshot,
+        filename="ipam.db",
+        media_type="application/octet-stream",
+        background=BackgroundTask(snapshot.unlink, missing_ok=True),
+    )
 
 
 for router in (sections.router, subnets.router, hosts.router, changes.router, device_types.router):
