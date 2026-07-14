@@ -2,6 +2,7 @@
 
 import sqlite3
 import tempfile
+from contextlib import closing
 from pathlib import Path
 
 from ..errors import ApiError
@@ -21,7 +22,12 @@ def create_snapshot(db_path: str) -> Path:
     snapshot_path = Path(handle.name)
     handle.close()
     try:
-        with sqlite3.connect(source_path) as source, sqlite3.connect(snapshot_path) as target:
+        # sqlite3's connection context manager only wraps a transaction; closing()
+        # is what actually releases the file handles.
+        with (
+            closing(sqlite3.connect(source_path)) as source,
+            closing(sqlite3.connect(snapshot_path)) as target,
+        ):
             source.backup(target)
     except Exception:
         snapshot_path.unlink(missing_ok=True)

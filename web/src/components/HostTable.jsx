@@ -5,8 +5,9 @@ import StatusBadge from './StatusBadge'
 
 const VIRTUALIZE_ABOVE = 200
 
+// ip_int is the API's numeric sort key — string comparison would mis-sort IPv6
 function compareIp(left, right) {
-  return left.localeCompare(right, undefined, { numeric: true })
+  return left.ip_int - right.ip_int
 }
 
 export default function HostTable({
@@ -24,7 +25,7 @@ export default function HostTable({
   const sortedHosts = useMemo(
     () =>
       [...hosts].sort((left, right) => {
-        const result = compareIp(left.ip, right.ip)
+        const result = compareIp(left, right)
         return sortDirection === 'asc' ? result : -result
       }),
     [hosts, sortDirection],
@@ -71,6 +72,7 @@ export default function HostTable({
         <div role="rowgroup" className="sticky top-0 z-10 bg-slate-900">
           <div
             role="row"
+            aria-rowindex={1}
             className="grid items-center border-b border-slate-700 text-slate-500"
             style={gridStyle}
           >
@@ -116,8 +118,17 @@ export default function HostTable({
                 ref={virtualized ? rowVirtualizer.measureElement : undefined}
                 data-index={virtualized ? virtualRow.index : undefined}
                 role="row"
+                aria-rowindex={virtualRow.index + 2}
+                tabIndex={onRowClick ? 0 : undefined}
                 onClick={() => onRowClick?.(host)}
-                className="grid w-full cursor-pointer items-center border-b border-slate-800 hover:bg-slate-800/60"
+                onKeyDown={(event) => {
+                  if (event.target !== event.currentTarget) return
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault()
+                    onRowClick?.(host)
+                  }
+                }}
+                className="grid w-full cursor-pointer items-center border-b border-slate-800 hover:bg-slate-800/60 focus-visible:bg-slate-800/60 focus-visible:outline-none"
                 style={
                   virtualized
                     ? {

@@ -105,15 +105,6 @@ def interval_size(intervals: list[tuple[int, int]]) -> int:
     return sum(end - start + 1 for start, end in intervals)
 
 
-def in_intervals(value: int, intervals: list[tuple[int, int]]) -> bool:
-    for start, end in intervals:
-        if value < start:
-            return False
-        if value <= end:
-            return True
-    return False
-
-
 def iter_free(subnet, allocated: set[int], reserved_ranges=(), limit: int | None = None) -> list[str]:
     """Free IPs in ascending order: usable, not gateway/DHCP-pool/reserved, not allocated."""
     net = parse_cidr(subnet.cidr)

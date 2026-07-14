@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from app.ipnet import exclusion_intervals, in_intervals, interval_size, iter_free
+from app.ipnet import exclusion_intervals, interval_size, iter_free
 
 
 def test_large_exclusions_are_merged_without_address_expansion():
@@ -19,8 +19,6 @@ def test_large_exclusions_are_merged_without_address_expansion():
 
     assert intervals == [(167772161, 184549373)]
     assert interval_size(intervals) == 16_777_213
-    assert in_intervals(167772170, intervals)
-    assert not in_intervals(184549374, intervals)
     assert iter_free(subnet, set(), reserved, limit=2) == ["10.255.255.254"]
 
 

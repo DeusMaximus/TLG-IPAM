@@ -111,6 +111,7 @@ A single IP assignment within a Subnet.
 | `id` | UUID, primary key |
 | `subnet_id` | FK → Subnet |
 | `ip` | str — must be within parent subnet CIDR |
+| `ip_int` | int — integer form of `ip`, kept for range queries and returned in API responses as the numeric sort key so clients never parse address strings |
 | `hostname` | str, nullable |
 | `domain` | str, nullable — per-host domain-suffix override; null inherits the subnet's `domain`. API responses include a computed `fqdn` (hostname + effective domain). |
 | `mac` | str, nullable — stored normalised (lowercase colon-separated) |

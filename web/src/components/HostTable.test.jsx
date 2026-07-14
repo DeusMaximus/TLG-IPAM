@@ -8,6 +8,7 @@ vi.mock('./DeviceIcon', () => ({ default: ({ type }) => <span>{type}</span> }))
 const host = (id, ip) => ({
   id: String(id),
   ip,
+  ip_int: ip.split('.').reduce((total, octet) => total * 256 + Number(octet), 0),
   hostname: `host-${id}`,
   fqdn: null,
   mac: null,
@@ -33,6 +34,22 @@ describe('HostTable', () => {
     rows = screen.getAllByRole('row')
     expect(within(rows[1]).getByText('10.0.0.10')).toBeInTheDocument()
     expect(screen.getByRole('columnheader', { name: /IP/ })).toHaveAttribute('aria-sort', 'descending')
+  })
+
+  it('activates rows with the keyboard', async () => {
+    const user = userEvent.setup()
+    const onRowClick = vi.fn()
+    const rowHost = host(1, '10.0.0.1')
+    render(<HostTable hosts={[rowHost]} onRowClick={onRowClick} />)
+
+    const row = screen.getAllByRole('row')[1]
+    expect(row).toHaveAttribute('aria-rowindex', '2')
+    row.focus()
+    await user.keyboard('{Enter}')
+    await user.keyboard(' ')
+
+    expect(onRowClick).toHaveBeenCalledTimes(2)
+    expect(onRowClick).toHaveBeenCalledWith(rowHost)
   })
 
   it('only enables virtualization above 200 rows', () => {

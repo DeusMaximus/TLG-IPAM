@@ -214,6 +214,8 @@ class HostOut(BaseModel):
     id: str
     subnet_id: str
     ip: str
+    # integer form of ip — the numeric sort key, so clients never parse address strings
+    ip_int: int
     hostname: str | None
     domain: str | None
     # computed: hostname + effective domain (host override, else subnet default)
