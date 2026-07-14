@@ -1,6 +1,6 @@
 # TLG-IPAM
 
-Homelab IPAM: FastAPI + SQLite backend, React SPA, and an MCP server at `/mcp` so Codex can query/update it. The full specification — data model, endpoints, MCP tool inventory, UI spec, acceptance criteria — lives in `TLG-IPAM-Project-Brief.md`. **Keep the brief in sync when behaviour changes**; it is the source of truth, not documentation theatre.
+Homelab IPAM: FastAPI + SQLite backend, React SPA, and an MCP server at `/mcp` so AI assistants (Claude, ChatGPT, or any other MCP client) can query/update it. The full specification — data model, endpoints, MCP tool inventory, UI spec, acceptance criteria — lives in `TLG-IPAM-Project-Brief.md`. **Keep the brief in sync when behaviour changes**; it is the source of truth, not documentation theatre.
 
 ## Commands
 
@@ -22,7 +22,7 @@ docker compose up --build
 
 - **All business logic lives in `api/app/services/`.** REST routers (`api/app/routers/`) and MCP tools (`api/app/mcp_server.py`) are thin wrappers over the same service functions. Never put validation or logic in a router or tool.
 - **Every write is audit-logged** via `services/changes.record()` with the correct `source` (`ui`/`api`/`mcp`). A write path without a change-log entry is a bug.
-- **MCP tools are hand-curated**, never auto-generated from OpenAPI. When adding or changing one: the docstring is Codex's runtime documentation (write it for tool selection), update `EXPECTED_TOOLS` in `api/tests/test_mcp.py`, and update the tool table in the brief. MCP may only mutate hosts and reserved ranges — subnet/section deletion stays UI-only by design.
+- **MCP tools are hand-curated**, never auto-generated from OpenAPI. When adding or changing one: the docstring is the connected assistant's runtime documentation (write it for tool selection), update `EXPECTED_TOOLS` in `api/tests/test_mcp.py`, and update the tool table in the brief. MCP may only mutate hosts and reserved ranges — subnet/section deletion stays UI-only by design.
 - **Schema changes are additive only** — new nullable columns or new tables. `database._add_missing_columns` auto-migrates existing databases on startup; there is no migration framework, so never rename/drop columns or add non-nullable ones without a default.
 - **Response shapes**: `{"data": ...}` on success, `{"error": {"code", "message"}}` on failure. Domain errors raise `ApiError` (`api/app/errors.py`); never return bare HTTPExceptions from services.
 - **IP maths goes through `api/app/ipnet.py`** and Python's `ipaddress`. No string parsing, no `/24` assumptions — the codebase is deliberately IPv6-ready even though v1 is IPv4-only.
@@ -31,6 +31,6 @@ docker compose up --build
 
 ## Gotchas
 
-- `/mcp` must work **without** a trailing slash (`MCPPathRewriteMiddleware` in `main.py`) — `mcp-remote` and Codex Desktop request the bare path, and the SPA catch-all would otherwise swallow it. `test_mcp_reachable_without_trailing_slash` guards this.
-- Codex Desktop snapshots the MCP tool list at connect time — after server restarts that change tools, fully restart Codex Desktop (Cmd+Q).
+- `/mcp` must work **without** a trailing slash (`MCPPathRewriteMiddleware` in `main.py`) — `mcp-remote` and most MCP clients request the bare path, and the SPA catch-all would otherwise swallow it. `test_mcp_reachable_without_trailing_slash` guards this.
+- Some MCP clients (Claude Desktop, for one) snapshot the tool list at connect time — after server restarts that change tools, fully restart the client app (Cmd+Q, not just closing the window).
 - The repo uses placeholder domains (`home.arpa`, `example.com`) in code, docs, and tests. Do not introduce the user's real domains.

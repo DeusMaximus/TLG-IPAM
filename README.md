@@ -1,13 +1,13 @@
 # TLG-IPAM
 
-A clean, modern, homelab-first IP address manager — faster than phpIPAM, simpler than Netbox, and built from day one to be driven by Claude through MCP.
+A clean, modern, homelab-first IP address manager — faster than phpIPAM, simpler than Netbox, and built from day one to be driven by AI assistants through MCP.
 
 - **Web UI** — dark-mode-first React SPA: section/subnet sidebar tree, host tables, slide-over editing, one-click "allocate next free IP"
 - **REST API** — FastAPI with API-key auth, OpenAPI docs at `/api/v1/docs`
-- **MCP server** — 16 hand-curated tools at `/mcp` (Streamable HTTP) so Claude Desktop can query and update your IPAM
+- **MCP server** — 16 hand-curated tools at `/mcp` (Streamable HTTP) so your AI assistant can query and update your IPAM
 - **Custom device types** — define your own types with icons in Settings (seeded with sensible defaults); renames cascade to hosts
-- **Bulk operations** — CSV import in the UI and `bulk_create_hosts`/`bulk_delete_hosts` MCP tools (paste a UniFi export at Claude); per-record results, partial failures never abort the batch. Multi-select delete in the host table, and force-delete for a whole subnet with confirmation.
-- **Audit log** — every write (UI, API, or MCP) is recorded with before/after snapshots, so you can always review what Claude changed
+- **Bulk operations** — CSV import in the UI and `bulk_create_hosts`/`bulk_delete_hosts` MCP tools (paste a UniFi export at your assistant); per-record results, partial failures never abort the batch. Multi-select delete in the host table, and force-delete for a whole subnet with confirmation.
+- **Audit log** — every write (UI, API, or MCP) is recorded with before/after snapshots, so you can always review what your assistant changed
 - **Zero ops** — single container, SQLite in a volume, backup = download one file
 
 See [TLG-IPAM-Project-Brief.md](TLG-IPAM-Project-Brief.md) for the full specification.
@@ -21,7 +21,11 @@ docker compose up --build
 
 Open http://localhost:8080, paste your API key, done.
 
-## Connect Claude Desktop
+## Connect an AI assistant
+
+The MCP server at `/mcp` speaks Streamable HTTP with API-key auth, so any MCP-capable client can use it. Claude Desktop setup is documented below; instructions for other clients (ChatGPT, Codex CLI, …) coming soon.
+
+### Claude Desktop
 
 Claude Desktop's native connectors want OAuth, so API-key auth goes through `mcp-remote`. Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
@@ -38,7 +42,7 @@ Claude Desktop's native connectors want OAuth, so API-key auth goes through `mcp
 }
 ```
 
-with `TLG_IPAM_KEY` set in your environment. Then ask Claude things like:
+with `TLG_IPAM_KEY` set in your environment. Then ask your assistant things like:
 
 > *"What IPs are free in the services VLAN?"*
 > *"Register the new PBS container at 10.10.20.45."*
