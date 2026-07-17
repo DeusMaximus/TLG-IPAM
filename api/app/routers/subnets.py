@@ -24,7 +24,7 @@ async def list_subnets(
     section_id: str | None = None, session: AsyncSession = Depends(get_session)
 ):
     subnets = await svc.list_subnets(session, section_id)
-    data = [await _out(session, subnet) for subnet in subnets]
+    data = await svc.subnets_out(session, subnets)
     return {"data": data, "total": len(data)}
 
 

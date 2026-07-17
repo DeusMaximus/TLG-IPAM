@@ -9,9 +9,13 @@ SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 
 @event.listens_for(engine.sync_engine, "connect")
-def _enable_foreign_keys(dbapi_connection, _record):
+def _configure_connection(dbapi_connection, _record):
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")
+    # WAL + busy_timeout so concurrent UI/API/MCP writes queue instead of
+    # failing with "database is locked".
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA busy_timeout=5000")
     cursor.close()
 
 

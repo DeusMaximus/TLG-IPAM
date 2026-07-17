@@ -60,7 +60,7 @@ async def list_hosts(
     if q:
         pattern = f"%{q}%"
         query = query.where(
-            or_(Host.hostname.ilike(pattern), Host.ip.like(pattern), Host.mac.like(pattern))
+            or_(Host.hostname.ilike(pattern), Host.ip.ilike(pattern), Host.mac.ilike(pattern))
         )
     return list((await session.scalars(query)).all())
 
@@ -271,30 +271,50 @@ async def bulk_delete(session: AsyncSession, host_ids: list[str], source: str) -
     return {"deleted": len(hosts), "not_found": not_found}
 
 
+_ALLOCATE_ATTEMPTS = 5
+
+
 async def allocate_next(
     session: AsyncSession, subnet_id: str, payload: AllocateRequest, source: str
 ) -> Host:
-    subnet = await get_subnet(session, subnet_id)
-    allocated = await _allocated_ints(session, subnet_id)
-    reserved = await reserved_ranges(session, subnet_id)
-    candidates = iter_free(subnet, allocated, reserved, limit=1)
-    if not candidates:
-        raise conflict(f"No free IPs available in subnet {subnet.name} ({subnet.cidr})")
-    ip = candidates[0]
-    addr = ip_in_subnet(ip, subnet.cidr)
     data = payload.model_dump()
     data["device_type"] = await device_types_svc.resolve(session, data["device_type"])
-    host = Host(subnet_id=subnet_id, ip=ip, ip_int=int(addr), **data)
-    session.add(host)
-    await _flush_host(session, host)
-    changes.record(
-        session,
-        entity_type="host",
-        entity_id=host.id,
-        action="create",
-        summary=f"host {_label(host)} allocated next free IP {ip} in {subnet.name}",
-        source=source,
-        after=changes.snapshot(host),
+    # A concurrent writer can claim the chosen IP between the free-list read and
+    # the insert; on that unique-constraint failure, re-read and roll to the next
+    # free IP instead of surfacing a conflict.
+    for _ in range(_ALLOCATE_ATTEMPTS):
+        subnet = await get_subnet(session, subnet_id)
+        allocated = await _allocated_ints(session, subnet_id)
+        reserved = await reserved_ranges(session, subnet_id)
+        candidates = iter_free(subnet, allocated, reserved, limit=1)
+        if not candidates:
+            raise conflict(f"No free IPs available in subnet {subnet.name} ({subnet.cidr})")
+        ip = candidates[0]
+        addr = ip_in_subnet(ip, subnet.cidr)
+        host = Host(subnet_id=subnet_id, ip=ip, ip_int=int(addr), **data)
+        session.add(host)
+        summary = f"host {_label(host)} allocated next free IP {ip} in {subnet.name}"
+        try:
+            await session.flush()
+        except IntegrityError:
+            await session.rollback()
+            continue
+        changes.record(
+            session,
+            entity_type="host",
+            entity_id=host.id,
+            action="create",
+            summary=summary,
+            source=source,
+            after=changes.snapshot(host),
+        )
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            continue
+        return host
+    raise conflict(
+        f"Could not allocate a free IP in subnet {subnet_id}: "
+        f"lost the race to a concurrent allocation {_ALLOCATE_ATTEMPTS} times"
     )
-    await _commit_host(session, host)
-    return host

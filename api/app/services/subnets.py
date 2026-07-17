@@ -44,15 +44,13 @@ async def reserved_ranges(session: AsyncSession, subnet_id: str) -> list[Reserve
     return list((await session.scalars(query)).all())
 
 
-async def subnet_stats(session: AsyncSession, subnet: Subnet) -> dict:
+def _stats(subnet: Subnet, allocated: set[int], reserved: list[ReservedRange]) -> dict:
     """used = host records; usable = addresses excl. network/broadcast;
     free = allocatable right now (usable minus gateway, DHCP pool, reserved
     ranges, and allocated)."""
     net = parse_cidr(subnet.cidr)
     first, last = usable_bounds(net)
     usable = last - first + 1
-    allocated = await _allocated_ints(session, subnet.id)
-    reserved = await reserved_ranges(session, subnet.id)
     excluded = exclusion_intervals(subnet, reserved)
     blocked = merge_intervals(
         [*excluded, *((ip, ip) for ip in allocated)], lower=first, upper=last
@@ -61,20 +59,65 @@ async def subnet_stats(session: AsyncSession, subnet: Subnet) -> dict:
     return {"used": len(allocated), "usable": usable, "free": free}
 
 
-async def subnet_out(session: AsyncSession, subnet: Subnet) -> dict:
-    """Serialised subnet with utilisation stats and reserved ranges — the shape
-    shared by the REST API and MCP tools."""
-    stats = await subnet_stats(session, subnet)
-    reserved = [
-        ReservedRangeOut.model_validate(r).model_dump()
-        for r in await reserved_ranges(session, subnet.id)
-    ]
+async def subnet_stats(session: AsyncSession, subnet: Subnet) -> dict:
+    allocated = await _allocated_ints(session, subnet.id)
+    reserved = await reserved_ranges(session, subnet.id)
+    return _stats(subnet, allocated, reserved)
+
+
+async def _grouped_allocated(session: AsyncSession, subnet_ids: list[str]) -> dict[str, set[int]]:
+    rows = await session.execute(
+        select(Host.subnet_id, Host.ip_int).where(Host.subnet_id.in_(subnet_ids))
+    )
+    grouped: dict[str, set[int]] = {}
+    for subnet_id, ip_int in rows.all():
+        grouped.setdefault(subnet_id, set()).add(ip_int)
+    return grouped
+
+
+async def _grouped_reserved(
+    session: AsyncSession, subnet_ids: list[str]
+) -> dict[str, list[ReservedRange]]:
+    rows = await session.scalars(
+        select(ReservedRange)
+        .where(ReservedRange.subnet_id.in_(subnet_ids))
+        .order_by(ReservedRange.start_int)
+    )
+    grouped: dict[str, list[ReservedRange]] = {}
+    for block in rows:
+        grouped.setdefault(block.subnet_id, []).append(block)
+    return grouped
+
+
+def _subnet_dict(subnet: Subnet, stats: dict, reserved: list[ReservedRange]) -> dict:
     # build from columns, not the ORM object: the reserved_ranges relationship would
     # otherwise lazy-load (not allowed under the async session)
     columns = {c.name: getattr(subnet, c.name) for c in subnet.__table__.columns}
+    ranges = [ReservedRangeOut.model_validate(r).model_dump() for r in reserved]
     return SubnetOut.model_validate(
-        {**columns, **stats, "reserved_ranges": reserved}
+        {**columns, **stats, "reserved_ranges": ranges}
     ).model_dump(mode="json")
+
+
+async def subnets_out(session: AsyncSession, subnets: list[Subnet]) -> list[dict]:
+    """Serialised subnets with utilisation stats and reserved ranges — the shape
+    shared by the REST API and MCP tools. Batches the per-subnet host and
+    reserved-range lookups into two queries regardless of subnet count."""
+    ids = [s.id for s in subnets]
+    allocated = await _grouped_allocated(session, ids) if ids else {}
+    reserved = await _grouped_reserved(session, ids) if ids else {}
+    return [
+        _subnet_dict(
+            s,
+            _stats(s, allocated.get(s.id, set()), reserved.get(s.id, [])),
+            reserved.get(s.id, []),
+        )
+        for s in subnets
+    ]
+
+
+async def subnet_out(session: AsyncSession, subnet: Subnet) -> dict:
+    return (await subnets_out(session, [subnet]))[0]
 
 
 async def free_ips(session: AsyncSession, subnet_id: str, limit: int = 100) -> list[str]:

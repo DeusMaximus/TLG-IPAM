@@ -229,7 +229,7 @@ An IP is **free** iff all of the following hold:
 
 Manual host creation (`POST /hosts`) only rejects the network/broadcast addresses — placing a host at the gateway, inside the DHCP pool, or inside a reserved range is deliberate and allowed.
 
-`next-free` allocates the lowest free IP and creates the host record in a single transaction. The `UNIQUE(subnet_id, ip)` constraint is the backstop against races.
+`next-free` allocates the lowest free IP and creates the host record in a single transaction. The `UNIQUE(subnet_id, ip)` constraint is the backstop against races: if a concurrent writer claims the chosen IP first, allocation re-reads the free list and rolls to the next candidate (up to 5 attempts) rather than surfacing a conflict.
 
 Gateway, DHCP, reserved-range, and allocated-address exclusions are represented as clipped, merged integer intervals. Utilisation counts interval lengths, and free-IP iteration skips blocked spans rather than materialising every address in a range.
 
@@ -428,7 +428,7 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 
 | Decision | Rationale |
 |---|---|
-| SQLite not Postgres | Zero ops overhead. A homelab IPAM will never have concurrent write contention. Backup = copy one file. |
+| SQLite not Postgres | Zero ops overhead. A homelab IPAM will never have sustained write contention. Backup = copy one file. Connections run with `journal_mode=WAL` and `busy_timeout=5000` so the occasional simultaneous UI/MCP write queues instead of raising "database is locked". |
 | FastAPI not Flask | Native async, automatic OpenAPI schema generation, Pydantic validation built in. |
 | FastMCP with curated tools, not OpenAPI auto-generation | Hand-written tools have better names, parameters, and denormalised answers — materially better Claude ergonomics. Shared `services/` layer eliminates the drift risk that auto-generation was meant to solve. FastMCP is the actively-maintained de facto standard. |
 | Streamable HTTP not stdio | Works with mcp-remote for Claude Desktop. Also compatible with any future MCP client without modification. |

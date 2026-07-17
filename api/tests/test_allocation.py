@@ -68,3 +68,30 @@ async def test_hostname_required_for_allocation(client):
     subnet = await make_subnet(client, section["id"])
     res = await client.post(f"/api/v1/subnets/{subnet['id']}/next-free", json={})
     assert res.status_code == 422
+
+
+async def test_allocation_retries_past_racing_writer(client, monkeypatch):
+    """If another writer claims the chosen IP between the free-list read and the
+    insert, allocation rolls to the next free IP instead of raising a conflict."""
+    from app.services import hosts as hosts_svc
+
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"], "10.0.0.0/29")
+    await make_host(client, subnet["id"], "10.0.0.1")
+
+    real = hosts_svc._allocated_ints
+    calls = {"count": 0}
+
+    async def stale_then_real(session, subnet_id):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return set()  # stale read: hides 10.0.0.1, simulating a lost race
+        return await real(session, subnet_id)
+
+    monkeypatch.setattr(hosts_svc, "_allocated_ints", stale_then_real)
+    res = await client.post(
+        f"/api/v1/subnets/{subnet['id']}/next-free", json={"hostname": "raced"}
+    )
+    assert res.status_code == 201, res.text
+    assert res.json()["data"]["ip"] == "10.0.0.2"
+    assert calls["count"] >= 2

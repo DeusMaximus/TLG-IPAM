@@ -59,6 +59,9 @@ async def test_search_and_filters(client):
     by_mac = (await client.get("/api/v1/hosts?q=dd:ee")).json()
     assert by_mac["total"] == 1
 
+    by_mac_upper = (await client.get("/api/v1/hosts?q=DD:EE")).json()
+    assert by_mac_upper["total"] == 1
+
     offline = (await client.get("/api/v1/hosts?status=offline")).json()
     assert offline["total"] == 1 and offline["data"][0]["status"] == "offline"
 

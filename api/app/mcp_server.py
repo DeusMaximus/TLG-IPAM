@@ -129,7 +129,7 @@ async def list_subnets(section_id: str | None = None) -> dict:
     utilisation (used/usable/free) for every subnet in one call."""
     async with SessionLocal() as session:
         subnets = await subnets_svc.list_subnets(session, section_id)
-        return {"subnets": [await _subnet(session, s) for s in subnets]}
+        return {"subnets": await subnets_svc.subnets_out(session, subnets)}
 
 
 @ipam_tool
@@ -243,7 +243,7 @@ async def bulk_create_hosts(subnet_id: str, hosts: list[dict]) -> dict:
     """Create many host records in one subnet in a single call — use this instead of
     repeated create_host calls when importing or registering several devices at once
     (max 1000 per call). Each item is an object with: ip (required), hostname, domain,
-    mac, device_type (server|vm|lxc|network|iot|laptop|phone|other), status
+    mac, device_type (server|vm|lxc|network|iot|desktop|laptop|phone|other), status
     (active|reserved|dhcp|offline), owner, notes. Records succeed or fail
     individually: duplicates are skipped and invalid records report an error without
     aborting the batch. Returns created/skipped/error counts and a per-record result

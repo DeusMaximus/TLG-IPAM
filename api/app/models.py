@@ -89,7 +89,7 @@ class Host(Base):
     # domain suffix override; null inherits the subnet's default domain
     domain: Mapped[str | None] = mapped_column(String(253))
     mac: Mapped[str | None] = mapped_column(String(17))
-    device_type: Mapped[str] = mapped_column(String(16), default="other")
+    device_type: Mapped[str] = mapped_column(String(40), default="other")
     status: Mapped[str] = mapped_column(String(16), default="active")
     owner: Mapped[str | None] = mapped_column(String(120))
     notes: Mapped[str | None] = mapped_column(Text)
