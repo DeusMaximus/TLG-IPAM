@@ -27,6 +27,19 @@ Template:
 
 ---
 
+## 2026-11-13 — Claude Code (Opus 5.5) — #7: changes.actor in the audit log (PR #47)
+- **Done:** [PR #47](https://github.com/DeusMaximus/TLG-IPAM/pull/47) closes #7, head `ad466b1`. CI green (backend, frontend, locks). Codex: no findings on `ad466b1`. Greptile: 5/5, no findings on `ad466b1`. Automatic reviews only; no briefed round owed. Merge is the owner's.
+  - `Change.actor` (`String(80)`, nullable); `changes.record(..., actor=None)`; `ChangeOut.actor`, so `GET /api/v1/changes` and the `list_changes` tool return it (docstring updated). None of the 17 `record()` call sites passes it: every write records null.
+  - `database.init_models(target=engine)` takes an optional engine so a test runs the real start-up path on its own file. `_add_missing_columns` adds the column unchanged.
+  - UI: the dashboard activity row is now `web/src/components/ActivityItem.jsx`; it shows `actor` after the source badge when set.
+  - Brief §3.6 `actor` row, MCP tool table, dashboard UI line. `AGENTS.md` audit-log invariant: `actor` is null for the owner key; a name a client or agent declares goes in `actor`, never in `summary` (spec §4.3).
+  - Tests: backend 101 → 104 (`test_changes.py`: migration from `main`'s frozen schema `api/tests/data/schema_before_actor.sql`; actor returned by REST and MCP; every REST write route and MCP write tool records null, 27 rows). Frontend 3 → 5 (`ActivityItem.test.jsx`). Each test was seen failing with the code broken. Checked by hand: this branch's uvicorn on a database made by `main`'s code: column added, old rows null over REST and over HTTP MCP with a bearer key.
+  - **Merged:** `ada7db1`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #7 closed. The orchestrator repeated the old-database check with a database made by `main`'s code. No follow-up issues filed. Live state after the merge: #45 is open as [PR #48](https://github.com/DeusMaximus/TLG-IPAM/pull/48), head `ce9b9f9`, automatic reviews clean, with a GPT-6.1 Sol briefed round running. #8 was started next, in its own thread. #46 and #43 wait behind #8: each edits the brief.
+- **Decisions:** no spec change; `ChangeOut.actor` has no default; the migration test uses a frozen `sqlite3 .schema` of `main` at `20f0c53`, not the current models. Full list under Deliberate calls in the PR.
+- **State:** schema change, additive only (one nullable column). Nothing half-finished. #45 (`test_auth.py` only) is in flight separately and does not overlap. The local venv must be Python 3.13 to match CI: a plain `python3` here is 3.15 and shows a beartype warning.
+- **Waiting on the owner:** merge PR #47.
+- **Next:** #8 (agent tokens; first writer of a non-null `actor`, `agent:<name>`; owes a briefed round). #26 writes `grant:<client name>`; #29 sanitises the client name before it reaches `actor`. #43 and #46 wait on brief edits; #25 (`owner`) is unblocked.
+
 ## 2026-11-13 — Claude Code (Opus 5.5) — #6: bearer auth on /mcp through FastMCP (PR #44)
 - **Done:** [PR #44](https://github.com/DeusMaximus/TLG-IPAM/pull/44) closes #6, head `6c65d78`. CI green (backend, frontend, locks). Codex: no findings on `6c65d78`. Greptile: still pending when the session ended, nothing posted. Briefed round not started; brief at `.dev/6/review-brief-1.md` in the #6 worktree (gitignored). Merge is the owner's.
   - `auth.py`: `is_owner_key()` (`hmac.compare_digest` on UTF-8 bytes) is the only owner-key check. `OwnerKeyVerifier(TokenVerifier)` grants `ipam:read` + `ipam:write`. `APIKeyASGIMiddleware` deleted.
@@ -85,18 +98,3 @@ Template:
 - **State:** nothing half-finished; the PR is ready to merge. A venv built on Python 3.15 still shows one beartype `DeprecationWarning` (`AsyncKeyValue`, FastMCP dependency tree). It does not appear on 3.13, which CI uses, and was left alone as a dependency matter. The pytest `rm_rf` warning did not appear in the concurrent runs.
 - **Waiting on the owner:** merge PR #38.
 - **Next:** #4 (docs, in flight) and #36 (CI lock check, in flight); then M1: #6, #7, #8. #36 may want a Python 3.15 look if the beartype warning matters later.
-
-## 2026-11-13 — Claude Code (Fable 5.2) — orchestration rules merged (PR #37); ready for an orchestrator thread
-
-- **Done:** [PR #37](https://github.com/DeusMaximus/TLG-IPAM/pull/37) merged as `bffd5b9`. `.agents/orchestration.md` now holds the loop for handing issues to worker sessions, the model roster, the worker brief, the verify checklist, the refusal hand-over, and the list of things to ask the owner first. `AGENTS.md` → Workflow points at it.
-- **Decisions** (owner, 2026-11-13):
-  - Roster: Fable 5.2 orchestrates; Opus 5.5 on high is the default implementer; Sonnet 5.5 takes mechanical issues; GPT-6.1 Sol through Codex runs every briefed review round. Details and the optional seats are in the roster table.
-  - A safety refusal on legitimate work is handed to the owner with a self-contained file; the owner continues by hand with a model no session here can start.
-  - One hand-off entry per issue, committed by the orchestrator after the merge.
-- **State:**
-  - `main` at `bffd5b9`. Backend suite 80 passed on the locked dependencies (FastMCP 4.1.8). The only warning is pytest-asyncio's (#35).
-  - Open in M0: #4, #5 (`owner`), #35, #36 (`stretch`). M1 (#6, #7, #8) has not started.
-  - The refusal section of `.agents/orchestration.md` was added after the automatic reviews ran and was not re-reviewed.
-  - This entry made six, so the oldest entry moved to `.agents/handoff/2026-11.md`: the first rotation.
-- **Waiting on the owner:** start the orchestrator thread when ready. Later: #5 (redeploy and a deliberate restore), #25 (client-compatibility spike), the real-VLAN check in #14, registry permissions for #24, #32 (acceptance run).
-- **Next:** an orchestrator starting from `.agents/orchestration.md` picks up #4 and #35, which touch different files and can run side by side. Then M1 in order: #6, #7, #8; #6 and #8 owe a briefed review round.
