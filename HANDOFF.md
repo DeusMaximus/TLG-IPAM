@@ -38,7 +38,8 @@ Template:
   - ARP scanning is an active request/reply sweep. The kernel neighbour table is not read.
   - Scan scope: the DHCP pool is not scanned unless enabled per subnet; reserved ranges are scanned unless excluded per range; exclusion is absolute and not configurable over MCP.
   - M2 is split: M2a (ingest, observations, scope, findings, container agent with a hand-made token) and M2b (enrolment, guided install, systemd installer).
-  - Process: one issue, one branch, one PR; merge needs green CI and a GO from a reviewer in a different model family; the owner merges.
+  - Process: one issue, one branch, one PR; merge needs green CI and every automatic review finding (Codex, Greptile) answered; PRs touching authentication, tokens, OAuth, agent ingest, or packet-sending code also need a briefed round with a GO; the owner merges.
+  - PR #1's automatic reviews found three gaps in the spec, fixed in the same PR: forward-DNS results had no storage, the systemd agent could not read its own token file, and a job with no liveness method could mark every address dead.
 - **State:**
   - No application code has changed. Backend suite: 80 passed on the local venv (FastMCP 3.4.2), and 80 passed on a fresh install (FastMCP 4.1.8, MCP SDK 2.3.0) with one deprecation warning in `tests/test_mcp.py`.
   - `api/requirements.txt` is still unpinned, so a fresh `docker build` installs FastMCP 4.x today. Pinning is M0.

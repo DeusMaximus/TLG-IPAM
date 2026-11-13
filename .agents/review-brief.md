@@ -1,6 +1,6 @@
 # Briefing an external reviewer
 
-A review round starts from a brief. The agent opening the PR fills the `‹slots›` in the template below and saves the result as `.dev/<issue>/review-brief-<round>.md` (gitignored). The reviewer is then started with one line: *"Follow the review brief at `<absolute path>`"*. A few lines in chat say what the round asks; the whole brief is not pasted into chat.
+Every PR gets the automatic reviews (Codex and Greptile comment on the diff when it opens). A **briefed round** is the heavier check, owed by the PRs `AGENTS.md` → Workflow names: the reviewer checks out the head, runs the suites, breaks the code to see the tests go red, and lists the contract on its own before reading the author's tests. A briefed round starts from a brief. The agent opening the PR fills the `‹slots›` in the template below and saves the result as `.dev/<issue>/review-brief-<round>.md` (gitignored). The reviewer is then started with one line: *"Follow the review brief at `<absolute path>`"*. A few lines in chat say what the round asks; the whole brief is not pasted into chat.
 
 **The PR body is the payload; the brief is the envelope.** The brief points at sections of the PR body by heading, so the PR thread stays the one record a second round reads. That works only if the body has the sections.
 
