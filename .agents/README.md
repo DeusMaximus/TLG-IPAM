@@ -2,6 +2,7 @@
 
 What agents, and the people working with them, need *between* sessions. It lives here rather than in the always-loaded `AGENTS.md` so it costs context only when read.
 
+- `orchestration.md` — the loop for the session that hands issues to worker sessions: which model for which seat, the worker brief, what to verify before a PR is called ready, and where to stop for the owner. Read it when you are orchestrating.
 - `review-brief.md` — the PR-body shape and the fill-in template for briefing an external reviewer. Read it when opening a PR or asking for a briefed review round.
 - `handoff/YYYY-MM.md` — archived `HANDOFF.md` entries, verbatim, newest first, one file per month. `HANDOFF.md` in the repo root keeps the five most recent; its header has the rotation rule and the grep recipe. Grep an archive; do not read one whole.
 
