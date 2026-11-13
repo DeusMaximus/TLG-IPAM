@@ -27,6 +27,24 @@ Template:
 
 ---
 
+## 2026-11-13 — Claude Code (Sonnet 5.5) — #3: dependencies locked, FastMCP 4 pinned (PR #34)
+
+- **Done:** [PR #34](https://github.com/DeusMaximus/TLG-IPAM/pull/34) closes #3, head `85e96f8`. CI green. Codex: no findings. Greptile: 5/5, no findings. Merge is the owner's.
+  - `api/requirements.in` / `requirements-dev.in` hold the direct dependencies (`fastmcp>=4.1,<5`). `requirements.txt` / `requirements-dev.txt` are now generated locks: `uv pip compile --universal --python-version 3.12 --generate-hashes`, 71 and 78 pins. They resolve FastMCP 4.1.8, MCP SDK 2.3.0, FastAPI 0.162.5. The dev lock is constrained to the runtime lock.
+  - The Dockerfile and CI install with `pip install --require-hashes`. `api/tests/test_mcp.py` reads `input_schema`, so the FastMCP deprecation warning is gone.
+  - `AGENTS.md` has the new setup command and a "Dependency lock" section with the regenerate commands. README and the brief are updated.
+- **Decisions:**
+  - uv, not pip-compile, because `--universal` gives one lock for the 3.12 image, 3.13 CI, and any dev machine. Only `pip` is needed to install it; `uv` is needed only to regenerate.
+  - The lock file names are unchanged and `--no-header` is used, so the locks hold no local paths. Recompiling reproduces them byte for byte.
+- **State:**
+  - Backend suite: 80 passed on Python 3.12 and 3.13 from fresh venvs. Frontend lint, tests and build pass. No schema change.
+  - The image built on `python:3.12-slim` matches the lock. The container started, `/health` returned 200, and `/mcp` returned 401 without a key.
+  - pytest-asyncio 1.5.0 prints a `PytestDeprecationWarning` at configure time about `asyncio_default_fixture_loop_scope` (unset). It is not a FastMCP warning, and `pytest.ini` is untouched. It is worth its own small issue.
+  - There is no CI check that the locks match the `.in` files. Install-time `--require-hashes` catches a hand-edited lock.
+  - Not tried: installs on Python 3.14 / 3.15.
+- **Waiting on the owner:** merge PR #34. Reinstall the long-lived venv with the new setup command; it is still on FastMCP 3.4.2.
+- **Next:** #4, then M1 (#6, #7, #8). From now on, dependency changes go through the `.in` files and a regenerated lock, never a hand-edited lock.
+
 ## 2026-11-13 — Claude Code (Fable 5.2) — #2 merged (PR #33); parallel test sessions are safe
 
 - **Done:** [PR #33](https://github.com/DeusMaximus/TLG-IPAM/pull/33) merged as `98b844e`, closing #2. Each pytest session now has its own database directory, removed at session end. Codex and Greptile reviewed it with no findings.
