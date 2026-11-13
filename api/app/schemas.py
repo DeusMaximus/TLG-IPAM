@@ -268,3 +268,80 @@ class ChangeOut(BaseModel):
     after: dict | None
     source: str
     actor: str | None
+
+
+# --- Agents ---
+
+# `agent:<name>` is the audit actor for an agent's own writes (spec §4.3) and must fit
+# `changes.actor` (80 characters), so names stop at 80 - len("agent:").
+AGENT_NAME_MAX = 74
+AgentState = Literal["pending", "active", "disabled"]
+
+
+def _agent_name(v: str) -> str:
+    v = v.strip()
+    if not v:
+        raise ValueError("must not be empty")
+    if len(v) > AGENT_NAME_MAX:
+        raise ValueError(f"must be at most {AGENT_NAME_MAX} characters")
+    if not v.isprintable():
+        raise ValueError("must contain printable characters only")
+    return v
+
+
+class AgentCreate(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def _valid_name(cls, v):
+        return _agent_name(v)
+
+
+class AgentUpdate(BaseModel):
+    name: str | None = None
+    enabled: bool | None = None
+
+    @field_validator("name", "enabled")
+    @classmethod
+    def _required_fields_cannot_be_null(cls, v, info):
+        if v is None:
+            raise ValueError("must not be null")
+        return _agent_name(v) if info.field_name == "name" else v
+
+
+class TokenOut(BaseModel):
+    """A token as listed: never the token itself or its hash."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    kind: str
+    token_prefix: str
+    created_at: datetime
+    last_used_at: datetime | None
+    expires_at: datetime | None
+    used_at: datetime | None
+    revoked_at: datetime | None
+
+
+class AgentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    state: AgentState
+    version: str | None
+    platform: str | None
+    hostname: str | None
+    interfaces: list | None
+    last_checkin_at: datetime | None
+    last_error: str | None
+    created_at: datetime
+    tokens: list[TokenOut]
+
+
+class AgentCreated(AgentOut):
+    """The create response, the only one that carries the plain token."""
+
+    token: str

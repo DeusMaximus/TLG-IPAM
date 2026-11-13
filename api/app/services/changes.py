@@ -5,8 +5,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import Change
 
-# internal columns kept out of audit snapshots
-_SNAPSHOT_EXCLUDE = {"ip_int", "start_int", "end_int"}
+# internal columns kept out of audit snapshots; the audit log is readable over MCP,
+# so a token's hash never goes in it
+_SNAPSHOT_EXCLUDE = {"ip_int", "start_int", "end_int", "name_key", "token_hash"}
 
 
 def snapshot(obj) -> dict:

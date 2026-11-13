@@ -55,7 +55,8 @@ volumes:
 | Path | Purpose |
 |---|---|
 | `/` | React SPA (static files + SPA fallback, served by FastAPI) |
-| `/api/v1/...` | REST API |
+| `/api/v1/...` | REST API (owner key) |
+| `/api/v1/agent/...` | Agent-facing REST API (agent token; §4.1). No route is served here yet: check-in and results arrive with v0.2 M2a |
 | `/mcp` | Streamable HTTP MCP endpoint |
 | `/api/v1/docs` | OpenAPI / Swagger (FastAPI auto-generated) |
 
@@ -144,9 +145,9 @@ Append-only record of every write. Because Claude can write to this system via M
 |---|---|
 | `id` | UUID, primary key |
 | `ts` | datetime, auto |
-| `entity_type` | enum: `section` \| `subnet` \| `host` |
+| `entity_type` | enum: `section` \| `subnet` \| `host` \| `device_type` \| `agent` \| `token` |
 | `entity_id` | UUID of the affected record |
-| `action` | enum: `create` \| `update` \| `delete` |
+| `action` | enum: `create` \| `update` \| `delete` \| `revoke` (`revoke` is for tokens only) |
 | `summary` | str — human-readable one-liner, e.g. `host pbs-01 created at 10.10.20.45` |
 | `before` / `after` | JSON snapshots, nullable |
 | `source` | enum: `ui` \| `api` \| `mcp` — MCP is server-assigned; REST uses the advisory `X-TLG-Client: ui` hint, so `ui` versus `api` is a UX label rather than trusted provenance |
@@ -167,6 +168,38 @@ Append-only record of every write. Because Claude can write to this system via M
 - VLAN IDs 1–4094 only.
 - Deleting a section requires no child subnets. Deleting a subnet requires no hosts, unless `force=true` is passed (cascades to hosts and reserved ranges; the UI requires explicit confirmation).
 
+### 3.8 Agent
+
+A scan agent (v0.2 spec §5.4). The owner creates it over REST; check-in, scanning and the Agents page arrive with v0.2 M2a.
+
+| Field | Type / notes |
+|---|---|
+| `id` | UUID, primary key |
+| `name` | str. 1–74 printable characters, trimmed: `agent:<name>` is the audit `actor` for the agent's own writes and must fit `changes.actor` (80). Unique case-insensitively (`409`) |
+| `name_key` | str, unique — `name.casefold()`, so the database itself refuses two names that differ only in case, even from racing requests. Internal: not returned, not in audit snapshots |
+| `state` | enum: `pending` (has never held an agent token; enrolment, v0.2 M2b) \| `active` \| `disabled`. An agent created over REST gets its token at once, so it starts `active` |
+| `version`, `platform`, `hostname`, `interfaces`, `last_checkin_at`, `last_error` | nullable; reported by the agent at check-in (M2a). Null until then |
+| `created_at` | datetime, auto |
+
+Rules: disabling an agent refuses its token without revoking it, and enabling it accepts the token again. Deleting an agent revokes its unrevoked tokens (each logged as a `token` `revoke`), then deletes the agent and its token rows.
+
+### 3.9 Token
+
+A credential bound to an agent (v0.2 spec §4.2). An agent token is `tlga_` followed by 43 URL-safe random characters (256 bits).
+
+| Field | Type / notes |
+|---|---|
+| `id` | UUID, primary key |
+| `kind` | enum: `agent` \| `enrol`. The `enrol` kind exists in the schema; nothing issues one until v0.2 M2b |
+| `agent_id` | FK → Agent |
+| `token_hash` | SHA-256 of the token, hex, unique. Never returned and never in an audit snapshot |
+| `token_prefix` | the first 13 characters (`tlga_` + 8), for display |
+| `created_at`, `last_used_at` | `last_used_at` is set each time the token authenticates |
+| `expires_at`, `used_at` | enrolment tokens only; null for agent tokens |
+| `revoked_at` | datetime, nullable |
+
+Rules: the plain token appears in exactly one response, the one that creates it; it cannot be recovered afterwards. An agent holds at most one unrevoked `agent` token, enforced by a partial unique index. Token create and revoke are audit-logged with `entity_type="token"`; agent and token writes are owner writes, so `actor` is null.
+
 ---
 
 ## 4. REST API
@@ -179,7 +212,9 @@ Single static API key passed as a header:
 X-API-Key: <value from API_KEY env var>
 ```
 
-All endpoints except `GET /health` require this header. Return `401` if missing, `403` if wrong. The key is compared in constant time (`hmac.compare_digest`, in `auth.is_owner_key`). Key is set at container start — no key rotation UI needed in v1. REST does not accept the key as a bearer, and `/mcp` does not accept `X-API-Key` (§5.1).
+All endpoints except `GET /health` and the agent-facing `/api/v1/agent/*` require this header. Return `401` if missing, `403` if wrong. The key is compared in constant time (`hmac.compare_digest`, in `auth.is_owner_key`). Key is set at container start — no key rotation UI needed in v1. REST does not accept the key as a bearer, and `/mcp` does not accept `X-API-Key` (§5.1).
+
+Agent-facing routes, `/api/v1/agent/*`, take an agent token instead (§3.9), as `Authorization: Bearer tlga_…`, through the `auth.require_agent` dependency and nothing else. It accepts only an unrevoked `agent` token of an `active` agent and records `last_used_at`. The token is found by the SHA-256 of the presented value, so the stored secret is never compared. Refusals use the REST error shape: `401 UNAUTHORIZED` when no bearer is sent (including `X-API-Key` alone), `403 FORBIDDEN` "Invalid agent token" for any bearer that is not a usable agent token — the owner key, an unknown, revoked or `enrol` token, or the token of a disabled or deleted agent. The owner routes refuse an agent token (`403` as `X-API-Key`, `401` as a bearer), and so does `/mcp` (`401 invalid_token`). No route is mounted under `/api/v1/agent/` yet; check-in and results arrive with v0.2 M2a.
 
 ### 4.2 Endpoints
 
@@ -207,6 +242,12 @@ All endpoints except `GET /health` require this header. Return `401` if missing,
 | `POST /api/v1/subnets/{id}/reserved` | Add a reserved range. Reserved ranges are embedded in subnet GET responses. |
 | `DELETE /api/v1/subnets/{id}/reserved/{range_id}` | Remove a reserved range. |
 | `GET  /api/v1/changes` | Recent changes, newest first. Filters: `?entity_type=` `?limit=`. |
+| `GET  /api/v1/agents` | List agents, by name, each with its tokens (prefix and timestamps only, newest first). |
+| `POST /api/v1/agents` | Create an agent (`{name}`) with its agent token. `201`; the response carries the plain token as `data.token`, the only response that ever does. Duplicate name (case-insensitive): `409`. |
+| `GET  /api/v1/agents/{id}` | Detail, with its tokens. |
+| `PUT  /api/v1/agents/{id}` | Update `name` and/or `enabled` (`false` → `disabled`; `true` → `active`, or `pending` for an agent that has never held an agent token). A request that changes nothing writes no change-log entry. |
+| `POST /api/v1/agents/{id}/revoke` | Revoke every unrevoked token of the agent; the agent is kept. `409` if it has none. |
+| `DELETE /api/v1/agents/{id}` | Revoke its tokens, then delete the agent and its tokens. |
 | `GET/POST /api/v1/device-types` + `PUT/DELETE /api/v1/device-types/{id}` | Device type CRUD with host counts. Rename cascades to hosts; delete refused while in use or for `other`. |
 | `GET  /api/v1/backup` | Download a consistent temporary snapshot made with SQLite's online backup API (powers the Settings backup button). `docs/backup-and-restore.md` documents the scheduled pull from another host and the restore. |
 
@@ -382,9 +423,9 @@ tlg-ipam/
 │       ├── main.py           # FastAPI app + static SPA serving + MCP mount
 │       ├── config.py         # env vars (pydantic-settings)
 │       ├── database.py       # SQLAlchemy async engine + session
-│       ├── models.py         # ORM models (Section, Subnet, ReservedRange, Host, DeviceType, Change)
+│       ├── models.py         # ORM models (Section, Subnet, ReservedRange, Host, DeviceType, Change, Agent, Token)
 │       ├── schemas.py        # Pydantic request/response schemas
-│       ├── auth.py           # owner-key check: REST dependency + /mcp bearer verifier
+│       ├── auth.py           # owner-key check (REST dependency + /mcp bearer verifier); agent-token dependency
 │       ├── mcp_server.py     # FastMCP tools (thin wrappers over services)
 │       ├── services/         # business logic — single source of truth
 │       │   ├── backups.py    # consistent SQLite online-backup snapshots
@@ -392,12 +433,14 @@ tlg-ipam/
 │       │   ├── subnets.py    # incl. free-IP + next-free allocation logic
 │       │   ├── hosts.py
 │       │   ├── device_types.py
+│       │   ├── agents.py     # agents, agent tokens (hashed), agent-token authentication
 │       │   └── changes.py    # audit log writes + reads
 │       └── routers/
 │           ├── sections.py
 │           ├── subnets.py
 │           ├── hosts.py
 │           ├── device_types.py
+│           ├── agents.py     # owner CRUD on /api/v1/agents
 │           └── changes.py
 └── web/
     ├── package.json
@@ -466,6 +509,8 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 - Search returns results across hostname, IP, and MAC.
 - Subnet utilisation is accurate (allocated / total usable addresses).
 - Every write appears in the change log. MCP provenance is authoritative; UI/API attribution is advisory because REST clients share one API key and can set `X-TLG-Client`.
+- An agent's `tlga_…` token appears in exactly one response, the create response, and is stored only as its SHA-256 and display prefix. Its create and revoke each have a change-log entry.
+- The owner key is refused on agent routes; an agent token is refused on owner routes and on `/mcp`. A revoked token, and the token of a disabled agent, are refused.
 
 ### Testing
 - pytest covers CIDR/IP validation, CIDR child invariants, explicit-null updates, the overlap rule, interval maths, consistent backups, MCP clearing, and next-free allocation edge cases.
