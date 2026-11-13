@@ -478,4 +478,4 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 
 ---
 
-*TLG-IPAM Project Brief · Built for Claude Fable · tlgnet.org*
+*TLG-IPAM Project Brief · Built for Claude Fable*

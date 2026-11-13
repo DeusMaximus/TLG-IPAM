@@ -2,6 +2,21 @@
 
 Homelab IPAM: FastAPI + SQLite backend, React SPA, and an MCP server at `/mcp` so AI assistants (Claude, ChatGPT, or any other MCP client) can query/update it. The full specification — data model, endpoints, MCP tool inventory, UI spec, acceptance criteria — lives in `TLG-IPAM-Project-Brief.md`. **Keep the brief in sync when behaviour changes**; it is the source of truth, not documentation theatre.
 
+## Workflow
+
+v0.2 (scan agents, remote MCP) is specified in `docs/v0.2-spec.md` and tracked as GitHub milestones M0–M3. The spec is the contract for work that has not shipped; the brief describes what `main` does.
+
+- **Session start:** read the newest entry in `HANDOFF.md`. It holds live state: what is merged, in flight, broken, or waiting on the owner.
+- **One issue, one branch, one PR.** Branch `<issue>-<slug>` from `main`. The PR closes the issue and carries in the same diff: the tests, the brief update for the behaviour it ships, and the `AGENTS.md` line for any invariant it adds or changes.
+- **Green before the PR opens:** the commands CI runs (`.github/workflows/ci.yml`), locally.
+- **The PR body is the record.** It opens with the authoring agent, model, and head sha, then **What**, **Deliberate calls**, **Tests**. `.agents/review-brief.md` holds the body shape; read it when opening a PR.
+- **Merge needs green CI and every automatic review finding answered.** Codex and Greptile review each PR when it opens: fix each finding or reply on its thread with the reason it stands. The owner merges.
+- **A briefed review round as well** for a PR that touches authentication, tokens, OAuth, agent ingest, or code that sends packets. It needs a GO from a reviewer in a different model family from the author; `.agents/review-brief.md` is how the round is briefed.
+- **When the spec is wrong** (the code or a spike shows it), change `docs/v0.2-spec.md` in the same PR and list the change under Deliberate calls.
+- **Session end:** add a `HANDOFF.md` entry using the template in its header. Hand-off entries commit straight to `main`, so the next session sees them without waiting on a PR.
+
+`.agents/README.md` indexes the process material that is not needed on every turn.
+
 ## Commands
 
 ```sh
