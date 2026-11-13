@@ -40,14 +40,22 @@ stamp=$(date -u +%Y%m%dT%H%M%SZ)
 partial="$DIR/.ipam-$stamp.db.partial"
 trap 'rm -f "$partial"' EXIT
 
-# --fail turns an HTTP error (a wrong key, a 500) into a non-zero exit and no file.
-curl --fail --silent --show-error --max-time 120 \
-  --header @"$HEADER_FILE" --output "$partial" "$URL/api/v1/backup"
+fail() { echo "tlg-ipam-backup: $*" >&2; exit 1; }
 
-# A truncated or non-database response must never become a "backup". immutable=1 opens
-# the file read-only without creating -wal/-shm files beside it (the snapshot is in WAL mode).
+# Only a plain 200 counts. curl does not follow redirects here, so a login redirect or a
+# proxy error page cannot pass for a snapshot.
+code=$(curl --silent --show-error --max-time 120 --header @"$HEADER_FILE" \
+  --output "$partial" --write-out '%{http_code}' "$URL/api/v1/backup")
+[ "$code" = "200" ] || fail "HTTP $code from $URL/api/v1/backup"
+
+# A truncated, empty or foreign file must never become a "backup". immutable=1 opens the
+# file read-only without creating -wal/-shm files beside it (the snapshot is in WAL mode).
+[ -s "$partial" ] || fail "the response was empty"
 result=$(sqlite3 "file:$partial?immutable=1" 'PRAGMA integrity_check')
-[ "$result" = "ok" ] || { echo "integrity_check failed: $result" >&2; exit 1; }
+[ "$result" = "ok" ] || fail "integrity_check said: $result"
+tables=$(sqlite3 "file:$partial?immutable=1" \
+  "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('sections','subnets','hosts')")
+[ "$tables" = "3" ] || fail "the file is a database, but not a TLG-IPAM one"
 
 mv "$partial" "$DIR/ipam-$stamp.db"
 echo "wrote $DIR/ipam-$stamp.db"
@@ -108,15 +116,18 @@ journalctl -u tlg-ipam-backup.service           # what the last run said
 
 ### Schedule it: cron
 
-If you prefer cron, one line in the `backup` user's crontab (`sudo -u backup crontab -e`):
+If you prefer cron, put this in the `backup` user's crontab (`sudo -u backup crontab -e`):
 
 ```cron
-30 2 * * * /usr/local/bin/tlg-ipam-backup >>/var/backups/tlg-ipam/backup.log 2>&1
+MAILTO=you@example.com
+30 2 * * * /usr/local/bin/tlg-ipam-backup >/dev/null
 ```
+
+Cron mails whatever a job prints, not its exit status. The script prints its success line on stdout and every failure on stderr, so discarding stdout leaves a mail on failure and silence on success. Do not redirect stderr to a log file as well, or nothing will be mailed. This needs a working local mail setup on the host; if you have none, use the systemd timer instead.
 
 ### Know when it stops working
 
-A backup job that fails silently is the usual way to find out you have no backups. Either alert on a failed run (systemd: `OnFailure=` on the service; cron: a `MAILTO=` line), or look now and then at the newest file's date: `ls -1 /var/backups/tlg-ipam/ipam-*.db | sort | tail -1`.
+A backup job that fails silently is the usual way to find out you have no backups. Either alert on a failed run (systemd: `OnFailure=` on the service; cron: the `MAILTO=` line above), or look now and then at the newest file's date: `ls -1 /var/backups/tlg-ipam/ipam-*.db | sort | tail -1`.
 
 ### A second copy
 
@@ -128,36 +139,92 @@ A restore replaces the database with a snapshot. Anything written after the snap
 
 The one rule behind the steps: **stop the app, remove the old database's `-wal` and `-shm` files with it, then copy the snapshot in.** A leftover `ipam.db-wal` from the old database, applied to the restored file, corrupts it.
 
-Run these on the machine that runs the container (`ipam-host`), from the directory that holds `docker-compose.yml` and `.env`. `SNAP` is the snapshot you chose; if the pull host is a different machine, copy it over first (`scp backup-host:/var/backups/tlg-ipam/ipam-20261113T023000Z.db .`).
+Run this on the machine that runs the container (`ipam-host`), from the directory that holds `docker-compose.yml` and `.env`. If the pull host is a different machine, copy the snapshot over first (`scp backup-host:/var/backups/tlg-ipam/ipam-20261113T023000Z.db .`). It needs `sqlite3` there too.
+
+It is a script, not a block to paste, so that `set -eu` stops it at the first failed check: a bad snapshot is refused before the app is stopped, and nothing is moved until the snapshot has passed. Save it as `tlg-ipam-restore`:
 
 ```sh
-SNAP="$PWD/ipam-20261113T023000Z.db"
+#!/bin/sh
+# Usage: ./tlg-ipam-restore restore <snapshot.db>
+#        ./tlg-ipam-restore undo <before-restore-directory-name>
+set -eu
 
-# 1. Check the snapshot. It must print "ok".
-sqlite3 "file:$SNAP?immutable=1" 'PRAGMA integrity_check'
+mode="${1:-}"
+arg="${2:-}"
+[ -n "$arg" ] || { sed -n '2,3p' "$0" >&2; exit 2; }
+fail() { echo "tlg-ipam-restore: $*" >&2; exit 1; }
 
-# 2. Stop the app, so nothing writes while the file is replaced.
-docker compose stop ipam
+check_up() {
+  docker compose up -d ipam
+  # The retry covers the second or two the app takes to start.
+  curl -fsS --retry 10 --retry-delay 1 --retry-all-errors http://localhost:8080/health
+  echo
+}
 
-# 3. Move the current database aside, then copy the snapshot in.
-docker compose run --rm --no-deps -v "$SNAP:/restore/ipam.db:ro" --entrypoint sh ipam -c '
-  set -eu
-  cd /data
-  aside="before-restore-$(date -u +%Y%m%dT%H%M%SZ)"
-  mkdir "$aside"
-  for f in ipam.db ipam.db-wal ipam.db-shm; do
-    [ -e "$f" ] && mv "$f" "$aside/"
-  done
-  cp /restore/ipam.db /data/ipam.db
-  ls -l /data "/data/$aside"
-'
+case "$mode" in
+restore)
+  [ -s "$arg" ] || fail "not found, or empty: $arg"
+  snap="$(cd "$(dirname "$arg")" && pwd)/$(basename "$arg")"
 
-# 4. Start the app and check it.
-docker compose up -d ipam
-curl -fsS --retry 10 --retry-delay 1 --retry-all-errors http://localhost:8080/health
+  # 1. The snapshot must pass before anything is touched.
+  result=$(sqlite3 "file:$snap?immutable=1" 'PRAGMA integrity_check')
+  [ "$result" = "ok" ] || fail "integrity_check said: $result"
+
+  # 2. Stop the app, so nothing writes while the file is replaced.
+  docker compose stop ipam
+
+  # 3. Move the current database (and its -wal and -shm) aside, then copy the snapshot in.
+  docker compose run --rm --no-deps -v "$snap:/restore/ipam.db:ro" --entrypoint sh ipam -c '
+    set -eu
+    cd /data
+    aside="before-restore-$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir "$aside"
+    for f in ipam.db ipam.db-wal ipam.db-shm; do
+      if [ -e "$f" ]; then mv "$f" "$aside/"; fi
+    done
+    cp /restore/ipam.db /data/ipam.db
+    echo "the replaced database is in /data/$aside"
+  '
+
+  # 4. Start the app and check it answers.
+  check_up
+  ;;
+
+undo)
+  case "$arg" in
+    */* | *..*) fail "give the directory name only, e.g. before-restore-20261113T044806Z" ;;
+    before-restore-[0-9]*) ;;
+    *) fail "not a before-restore directory name: $arg" ;;
+  esac
+  # Look for the saved database before stopping anything.
+  docker compose run --rm --no-deps --entrypoint test ipam -f "/data/$arg/ipam.db" ||
+    fail "no $arg/ipam.db in the volume; nothing changed"
+  docker compose stop ipam
+  docker compose run --rm --no-deps --entrypoint sh ipam -c '
+    set -eu
+    cd /data
+    aside="$1"
+    # Check the saved database is there before the current one is removed.
+    [ -f "$aside/ipam.db" ] || { echo "no $aside/ipam.db in the volume; nothing changed" >&2; exit 1; }
+    rm -f ipam.db ipam.db-wal ipam.db-shm
+    mv "$aside"/ipam.db* .
+    rmdir "$aside"
+  ' sh "$arg"
+  check_up
+  ;;
+
+*)
+  fail "first argument must be restore or undo"
+  ;;
+esac
 ```
 
-The retry covers the second or two the app takes to start; without it the first request can get an empty reply.
+```sh
+chmod +x tlg-ipam-restore
+./tlg-ipam-restore restore ipam-20261113T023000Z.db
+```
+
+If the script fails before it stops the app, nothing has changed. If it fails after that, the app is down: read the error and fix the cause. The old database is either still in place or in the `before-restore-` directory, and running the script again is safe.
 
 Then look at the data: open the web UI, or compare a count from the API with what you expect, for example the number of subnets:
 
@@ -165,22 +232,7 @@ Then look at the data: open the web UI, or compare a count from the API with wha
 curl -fsS -H "X-API-Key: $API_KEY" http://localhost:8080/api/v1/subnets | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["data"]), "subnets")'
 ```
 
-The database that was replaced is in `/data/before-restore-<timestamp>/` inside the volume (all of `ipam.db`, `ipam.db-wal` and `ipam.db-shm` that existed). To undo the restore, put them back (use the directory name step 3 printed):
-
-```sh
-docker compose stop ipam
-docker compose run --rm --no-deps --entrypoint sh ipam -c '
-  set -eu
-  cd /data
-  aside=before-restore-20261113T044806Z
-  rm -f ipam.db ipam.db-wal ipam.db-shm
-  mv "$aside"/ipam.db* .
-  rmdir "$aside"
-'
-docker compose up -d ipam
-```
-
-When you are sure about the restore, delete that directory with `docker compose run --rm --no-deps --entrypoint rm ipam -r /data/before-restore-20261113T044806Z`.
+The database that was replaced is in `/data/before-restore-<timestamp>/` inside the volume (all of `ipam.db`, `ipam.db-wal` and `ipam.db-shm` that existed); the script printed the name. To undo the restore, run `./tlg-ipam-restore undo before-restore-<timestamp>`. When you are sure about the restore, delete that directory with `docker compose run --rm --no-deps --entrypoint rm ipam -r /data/before-restore-<timestamp>`.
 
 Notes:
 
