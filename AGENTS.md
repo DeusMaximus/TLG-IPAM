@@ -13,7 +13,8 @@ v0.2 (scan agents, remote MCP) is specified in `docs/v0.2-spec.md` and tracked a
 - **Merge needs green CI and every automatic review finding answered.** Codex and Greptile review each PR when it opens: fix each finding or reply on its thread with the reason it stands. The owner merges.
 - **A briefed review round as well** for a PR that touches authentication, tokens, OAuth, agent ingest, or code that sends packets. It needs a GO from a reviewer in a different model family from the author; `.agents/review-brief.md` is how the round is briefed.
 - **When the spec is wrong** (the code or a spike shows it), change `docs/v0.2-spec.md` in the same PR and list the change under Deliberate calls.
-- **Session end:** add a `HANDOFF.md` entry using the template in its header. Hand-off entries commit straight to `main`, so the next session sees them without waiting on a PR.
+- **Session end:** add a `HANDOFF.md` entry using the template in its header. Hand-off entries commit straight to `main`, so the next session sees them without waiting on a PR. A session working in a worktree ends its final message with its entry, and the orchestrator commits it.
+- **Orchestrating** (handing issues to other sessions and checking their results): read `.agents/orchestration.md` first.
 
 `.agents/README.md` indexes the process material that is not needed on every turn.
 
