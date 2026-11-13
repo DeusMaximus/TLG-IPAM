@@ -27,6 +27,21 @@ Template:
 
 ---
 
+## 2026-11-13 — Claude Code (Fable 5.2) — orchestration rules merged (PR #37); ready for an orchestrator thread
+
+- **Done:** [PR #37](https://github.com/DeusMaximus/TLG-IPAM/pull/37) merged as `bffd5b9`. `.agents/orchestration.md` now holds the loop for handing issues to worker sessions, the model roster, the worker brief, the verify checklist, the refusal hand-over, and the list of things to ask the owner first. `AGENTS.md` → Workflow points at it.
+- **Decisions** (owner, 2026-11-13):
+  - Roster: Fable 5.2 orchestrates; Opus 5.5 on high is the default implementer; Sonnet 5.5 takes mechanical issues; GPT-6.1 Sol through Codex runs every briefed review round. Details and the optional seats are in the roster table.
+  - A safety refusal on legitimate work is handed to the owner with a self-contained file; the owner continues by hand with a model no session here can start.
+  - One hand-off entry per issue, committed by the orchestrator after the merge.
+- **State:**
+  - `main` at `bffd5b9`. Backend suite 80 passed on the locked dependencies (FastMCP 4.1.8). The only warning is pytest-asyncio's (#35).
+  - Open in M0: #4, #5 (`owner`), #35, #36 (`stretch`). M1 (#6, #7, #8) has not started.
+  - The refusal section of `.agents/orchestration.md` was added after the automatic reviews ran and was not re-reviewed.
+  - This entry made six, so the oldest entry moved to `.agents/handoff/2026-11.md`: the first rotation.
+- **Waiting on the owner:** start the orchestrator thread when ready. Later: #5 (redeploy and a deliberate restore), #25 (client-compatibility spike), the real-VLAN check in #14, registry permissions for #24, #32 (acceptance run).
+- **Next:** an orchestrator starting from `.agents/orchestration.md` picks up #4 and #35, which touch different files and can run side by side. Then M1 in order: #6, #7, #8; #6 and #8 owe a briefed review round.
+
 ## 2026-11-13 — Claude Code (Fable 5.2) — #3 merged (PR #34); follow-ups #35 and #36 filed
 
 - **Done:**
@@ -87,24 +102,3 @@ Template:
   - `api/requirements.txt` is still unpinned (#3).
 - **Waiting on the owner:** merge PR #33. Later: #5 (redeploy and a deliberate restore), #25 (client-compatibility spike: real web-client accounts and a public URL), the real-VLAN check in #14, registry permissions for #24, #32 (acceptance run).
 - **Next:** #3 (lock dependencies, pin FastMCP 4), then #4, then M1 in order: #6, #7, #8. After M1, M2a (#9 onwards) and M3 (#25 onwards) can run side by side; inside M2a the agent package (#13) can be built beside ingest (#11) once check-in (#10) is merged.
-
-## 2026-11-13 — Claude Code (Fable 5.2) — v0.2 spec accepted; process skeleton added
-
-- **Done:**
-  - `docs/v0.2-spec.md`: the v0.2 spec (scan agents, remote MCP), accepted at draft 5 after a review against the code. It is the contract for unshipped work; the brief stays the description of `main`.
-  - Process skeleton: this file, the Workflow section in `AGENTS.md`, `.agents/README.md`, `.agents/review-brief.md`, `.dev/` gitignored.
-  - Brief: a real domain removed from the footer.
-- **Decisions** (all recorded in the spec's §9):
-  - Linking a remote MCP client uses a one-time code from the private UI. There is no `OWNER_PASSWORD`.
-  - ARP scanning is an active request/reply sweep. The kernel neighbour table is not read.
-  - Scan scope: the DHCP pool is not scanned unless enabled per subnet; reserved ranges are scanned unless excluded per range; exclusion is absolute and not configurable over MCP.
-  - M2 is split: M2a (ingest, observations, scope, findings, container agent with a hand-made token) and M2b (enrolment, guided install, systemd installer).
-  - Process: one issue, one branch, one PR; merge needs green CI and every automatic review finding (Codex, Greptile) answered; PRs touching authentication, tokens, OAuth, agent ingest, or packet-sending code also need a briefed round with a GO; the owner merges.
-  - PR #1's automatic reviews found three gaps in the spec, fixed in the same PR: forward-DNS results had no storage, the systemd agent could not read its own token file, and a job with no liveness method could mark every address dead.
-- **State:**
-  - No application code has changed. Backend suite: 80 passed on the local venv (FastMCP 3.4.2), and 80 passed on a fresh install (FastMCP 4.1.8, MCP SDK 2.3.0) with one deprecation warning in `tests/test_mcp.py`.
-  - `api/requirements.txt` is still unpinned, so a fresh `docker build` installs FastMCP 4.x today. Pinning is M0.
-  - `api/tests/conftest.py` points every pytest session at one fixed temp database. Two sessions on one machine at the same time corrupt each other. Run one at a time until the M0 issue that gives each session its own database lands; it is the first thing to do before agents work in parallel.
-  - Milestones and issues are not filed yet.
-- **Waiting on the owner:** approval of the milestone and issue list; later, the M0 redeploy and deliberate restore test, the M3 client-compatibility spike (needs real web-client accounts and a public URL), and installing agents on the VLANs.
-- **Next:** file milestones M0, M1, M2a, M2b, M3 and their issues once approved. Then M0 and M1 serially (they chain through `auth.py`, `main.py`, `mcp_server.py`, `models.py`). After M1, M2a and M3 can run side by side, and inside M2a the `agent/` package can be built against the §5.7 protocol in parallel with server ingest.
