@@ -21,6 +21,48 @@ jobs:
       - run: python -m pip install --require-hashes -r requirements-dev.txt
       - run: python -m pytest
 
+  # The locks are generated from the .in files (AGENTS.md → "Dependency lock").
+  # Recompiling in place keeps every pin, and its hashes, that still satisfies
+  # the .in files, so a newer upstream release leaves this green; only a .in
+  # change that the committed lock does not reflect makes the output differ.
+  locks:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          # The resolver version is pinned so a uv release cannot change the
+          # output by itself. AGENTS.md names the same version; bump both together.
+          version: '0.13.6'
+          enable-cache: false
+      - name: Locks match requirements.in / requirements-dev.in
+        run: |
+          # The regenerate commands, verbatim from AGENTS.md → "Dependency lock".
+          cmds=(
+            "uv pip compile requirements.in --universal --python-version 3.12 --generate-hashes --no-header -o requirements.txt"
+            "uv pip compile requirements-dev.in --universal --python-version 3.12 --generate-hashes --no-header -c requirements.txt -o requirements-dev.txt"
+          )
+          for c in "${cmds[@]}"; do
+            if ! grep -qxF -- "$c" ../AGENTS.md; then
+              echo "::error file=AGENTS.md::AGENTS.md → \"Dependency lock\" no longer lists this command; keep it and the locks job in .github/workflows/ci.yml in step: $c"
+              exit 1
+            fi
+          done
+          fail() {
+            echo "::error::$1 Regenerate both locks from api/ with uv 0.13.6 and commit them with the .in change:%0A  ${cmds[0]}%0A  ${cmds[1]}"
+            printf '\n%s\nRegenerate both locks from api/ with uv 0.13.6 and commit them with the .in change:\n' "$1"
+            printf '  %s\n' "${cmds[@]}"
+            exit 1
+          }
+          for c in "${cmds[@]}"; do
+            $c >/dev/null || fail "uv could not compile the locks from the .in files."
+          done
+          git diff --exit-code -- requirements.txt requirements-dev.txt \
+            || fail "api/requirements.txt or api/requirements-dev.txt does not match its .in file (diff above)."
+
   frontend:
     runs-on: ubuntu-latest
     defaults:

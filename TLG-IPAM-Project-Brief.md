@@ -456,7 +456,7 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 
 ### Testing
 - pytest covers CIDR/IP validation, CIDR child invariants, explicit-null updates, the overlap rule, interval maths, consistent backups, MCP clearing, and next-free allocation edge cases.
-- ESLint, Vitest component tests, and the production frontend build run in CI alongside pytest.
+- ESLint, Vitest component tests, and the production frontend build run in CI alongside pytest, with a check that the dependency locks match their `.in` files.
 
 ### MCP integration
 - Claude Desktop connects via `mcp-remote` and lists all available tools.

@@ -46,6 +46,8 @@ uv pip compile requirements-dev.in --universal --python-version 3.12 --generate-
 
 Commit the `.in` and lock changes together. The `-c requirements.txt` constraint keeps shared packages at the same version in production and in tests.
 
+Use uv **0.13.6**, the version CI pins. `uvx uv@0.13.6 pip compile …` runs it without changing the uv you have installed. The `locks` job in CI runs these two commands, verbatim, in a fresh checkout and fails if either lock changes. Because recompiling keeps every pin, and its hashes, that still satisfies the `.in` files, a newer upstream release does not make the job fail. Only a `.in` change committed without regenerating does that. When you change these commands, change the `locks` job's copy in `.github/workflows/ci.yml` too. The job fails if `AGENTS.md` no longer lists its commands word for word.
+
 ## Architecture invariants
 
 - **All business logic lives in `api/app/services/`.** REST routers (`api/app/routers/`) and MCP tools (`api/app/mcp_server.py`) are thin wrappers over the same service functions. Never put validation or logic in a router or tool.
