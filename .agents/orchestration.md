@@ -9,7 +9,7 @@ The orchestrator writes briefs and checks results. Application code is written b
 Run these in order for each issue. Each step ends when its last line is true.
 
 1. **Pick.** Read the newest `HANDOFF.md` entry and the open issues in the earliest unfinished milestone. An issue is **ready** when every issue in its "Depends on" line is closed and it does not carry the `owner` label. Done when you can name the ready issues.
-2. **Decide what runs together.** Up to three ready issues at once, and only when their Scope sections name different files. Two issues that both edit `models.py`, `main.py`, `mcp_server.py`, the brief, or `AGENTS.md` run one after the other. Done when each issue you will start has no file in common with another in flight.
+2. **Decide what runs together.** Up to three ready issues at once, and only when their Scope sections name different code files. Two issues that both edit `models.py`, `main.py`, or `mcp_server.py` run one after the other. Two issues may both edit the brief, the README, or `AGENTS.md` when they touch different sections: tell each worker which sections the other owns, and the PR that merges second rebases. Done when each issue you will start has no code file in common with another in flight, and no docs section.
 3. **Choose the model** from the roster below. Done when each issue has a seat.
 4. **Launch.** One standalone thread per issue, in its own worktree cut from `origin/main`, on branch `<issue>-<slug>`, with the brief below. Done when the thread reports a run in progress.
 5. **Wait** for the worker's final message. The worker answers its own review findings; the PR is its work until it hands back. Done when the final message has the PR URL, head sha, review states, and a hand-off entry.

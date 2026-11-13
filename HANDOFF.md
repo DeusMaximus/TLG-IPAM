@@ -27,6 +27,39 @@ Template:
 
 ---
 
+## 2026-11-13 — Claude Code (Fable 5.2) — orchestrator session: M0 and M1 critical path merged; nothing in flight
+
+- **Done:** eight issues taken from ready to merged through `.agents/orchestration.md`, one worker thread each: #4 (PR #42), #35 (#38), #36 (#41), #6 (#44), #7 (#47), #45 (#48), #8 (#49). Each has its own entry below or in `.agents/handoff/2026-11.md`. Follow-ups filed on the owner's go-ahead: #43, #45, #46, #50, #51. A note for the implementer is on #10.
+- **Decisions** (owner, 2026-11-13):
+  - Two issues may now run together when they edit different sections of the brief, the README or `AGENTS.md`; code files still run one after the other (`.agents/orchestration.md`, step 2). Untried: the next wave is its first use.
+  - The automatic reviews do not run again after a fix commit. Comment `@codex review`; the owner retriggers Greptile (`.agents/orchestration.md` → "Verifying a result").
+- **State:**
+  - `main` at `d735977` plus this entry. Backend suite 186 passed on Python 3.13, no warnings. No open PRs, no worker running.
+  - Open in M0: #43, #5 (`owner`). Open in M1: #46 (`briefed-review`; must land before M3), #50 (`stretch`). M2a: #9 is ready; #51 is ready. M2b: #21 is ready. M3: #25 (`owner`) is ready.
+  - Things the loop does not say yet, learned this session:
+    - A worker thread cannot always subscribe to its PR, and then stops before Greptile finishes. The briefs for #7, #45 and #8 told the worker to wait on the PR's checks from the shell, and that worked.
+    - Nothing wakes the orchestrator when a worker thread finishes. It was woken by watching the PR, or by the briefed review completing.
+    - A briefed reviewer started as a delegated task gets a worktree cut from `main`. Each brief told it to check out the PR head detached; see `.dev/<issue>/review-brief-1.md` in the main checkout for the four used.
+    - A PR that merges while another is open leaves the open one's test count behind. Re-measure the suite on the PR merged with `main`.
+  - Worker worktrees and local branches from this session are still on disk under the T3 worktrees folder. Nothing in them is unmerged.
+- **Waiting on the owner:** #5 (redeploy and a deliberate restore; the procedure is `docs/backup-and-restore.md`). #25 (client-compatibility spike). Later: the real-VLAN check in #14, registry permissions for #24, #32.
+- **Next:** a wave of three, under the relaxed rule: #9 (scan targets; Opus 5.5), #46 (the `API_KEY` guard; Opus 5.5 and a GPT-6.1 Sol round) and #43 (`--workers 1`; Sonnet 5.5). Then #10, which owes a test of `require_agent` on the real router. #50 and #51 fit beside any wave that leaves `test_auth.py` and `services/agents.py` alone.
+
+## 2026-11-13 — Claude Code (Opus 5.5) — #8: agents and agent tokens (PR #49)
+- **Done:** [PR #49](https://github.com/DeusMaximus/TLG-IPAM/pull/49) closes #8, head `f03216f`. CI green on `36bbc62` and `f03216f`. Codex: one P2 on `36bbc62` (case-insensitive name race), fixed in `f03216f` and answered; no findings on `f03216f`. Greptile: 4/5 on `36bbc62` with one P1 (same race), fixed and answered; not yet re-run on `f03216f`. Briefed round owed (`briefed-review`), not started. Merge is the owner's.
+  - Tables `agents` (with internal `name_key = name.casefold()`, `UNIQUE`) and `tokens` (additive). Partial unique index `uq_tokens_live_agent_token`: one unrevoked `agent` token per agent.
+  - `services/agents.py`: create (agent + `tlga_` token, shown once, stored as SHA-256 + 13-char prefix), rename, enable/disable, revoke (all live tokens; 409 if none), delete (revokes first, then cascades token rows), `authenticate` (hash lookup; unrevoked `agent` kind, `active` agent; sets `last_used_at`), `actor_for` → `agent:<name>` (unused until #10).
+  - `auth.require_agent` for `/api/v1/agent/*`: 401 no bearer, 403 "Invalid agent token" for everything else, owner key included. No route mounted there yet; tests use a probe app.
+  - Owner REST `/api/v1/agents` (GET, POST, GET/PUT/DELETE `{id}`, POST `{id}/revoke`) behind `require_api_key`.
+  - Audit: `agent` create/update/delete; `token` create/revoke; `token_hash` and `name_key` in `_SNAPSHOT_EXCLUDE`. All owner writes: `actor` null.
+  - Brief §2.3, §3.6, new §3.8/§3.9, §4.1, §4.2, §7, §10. `AGENTS.md`: agent-token invariant, and spec §7.2 invariant 2 on the MCP bullet. Spec §4.2, §5.4, §5.7 edited.
+  - Tests: backend 104 → 153 (`api/tests/test_agents.py`; frozen schema `api/tests/data/schema_before_agents.sql` from `main` at `1dd7bd4`). `test_auth.py` untouched. Each guard was broken in a scratch copy and its test went red.
+  - **Merged:** `d735977`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #8 closed. Before the merge, Greptile re-reviewed `f03216f` after the owner's retrigger (5/5, finding fixed), and the briefed round by GPT-6.1 Sol returned GO on that head with two P3s, posted on the PR. Follow-up filed from the P3s: #51 (`briefed-review`, M2a). A comment on #10 carries what that issue owes. With #48 also on `main`, the suite is 186.
+- **Decisions:** names 1–74 printable characters, unique case-insensitively in the database; created agents start `active`; `pending` = never held an agent token; disable ≠ revoke; 403, not RFC 6750 401, for a bad agent bearer; `last_used_at` not audit-logged; no token-rotation route (re-enrol is #21). Full list under Deliberate calls in the PR.
+- **State:** schema change, additive only. No dependency change. #48 (#45, `test_auth.py`) still open; no overlap expected, rebase if it merges first. Seen, not changed: create responses carry `+00:00` timestamps and read-backs from SQLite do not (same for hosts on `main`).
+- **Waiting on the owner:** retrigger Greptile on `f03216f`; start the briefed round (reviewer outside the Claude family); merge PR #49.
+- **Next:** #10 (check-in, results, leasing): mount its router with `require_agent` alone, use `agents_svc.actor_for` for `agent:<name>`, test that the real router lacks `require_api_key`, and note that `authenticate` returns the agent without `tokens` loaded. #9: scan targets set `agent_id` to null on agent delete (hook point in `delete_agent`). #21 issues `enrol` tokens into the same table.
+
 ## 2026-11-13 — Claude Code (Opus 5.5) — #45: harden the owner-key auth tests (PR #48)
 - **Done:** [PR #48](https://github.com/DeusMaximus/TLG-IPAM/pull/48) closes #45, head `ce9b9f9`. CI green (backend, frontend, locks). Codex: no findings. Greptile: 5/5, no findings. Briefed round not started; brief at `.dev/45/review-brief-1.md` in the #45 worktree (gitignored). Merge is the owner's.
   - Only `api/tests/test_auth.py` changes (26 → 59 tests; suite 101 → 134). Nothing under `api/app/`, brief or `AGENTS.md`.
@@ -66,40 +99,3 @@ Template:
   - Seen, not changed (same on `main`): with the SPA served, `/.well-known/oauth-*` answer `index.html` 200, which M3 (#26) must take over. With `API_KEY=""`, an empty bearer authenticates on `/mcp`, as an empty `X-API-Key` does on `main`; compose's `${API_KEY:?}` blocks that. Possible follow-up issue.
 - **Waiting on the owner:** start the briefed round (different model family from Opus); after Greptile posts, every finding gets answered; merge PR #44. Decide whether to file the empty-`API_KEY` guard.
 - **Next:** #7 (`changes.actor`) and #8 (agent tokens; `/api/v1/agent/*` bearer auth; owes a briefed round). #8 should reuse `is_owner_key`'s constant-time pattern and change `test_rest_does_not_accept_bearer` deliberately if agent bearer auth goes on REST paths.
-
-## 2026-11-13 — Claude Code (Sonnet 5.5) — #4: scheduled backup pull and restore procedure (PR #42)
-- **Done:** [PR #42](https://github.com/DeusMaximus/TLG-IPAM/pull/42) closes #4, head `21b7bba`. CI green. Codex: no findings (on `16303b1`). Greptile: three P2s, all fixed and answered; no re-review of `21b7bba` had arrived. CodeRabbit skips this repo (under 10 stars). Merge is the owner's. Docs and one `AGENTS.md` line only; no application code, endpoint or schema change.
-  - `docs/backup-and-restore.md` (new):
-    - **Pull:** a scheduled pull of `GET /api/v1/backup` from another host. A POSIX sh script writes dated `ipam-<UTC stamp>.db` files and keeps the newest N. Before saving or pruning it requires HTTP 200 (redirects not followed), a non-empty file, `integrity_check = ok` and the `sections`/`subnets`/`hosts` tables. Systemd timer and cron variants; cron mails stderr only.
-    - **Restore:** `tlg-ipam-restore restore <snapshot>` and `undo <dir>`, one `set -eu` script. It refuses a bad snapshot before stopping the app, and checks the saved database exists before removing the current one.
-  - README ("Backups and restore", "One worker"), the brief (§2.2 one-worker paragraph, §4.2 pointer, §9 row, two §10 lines) and an `AGENTS.md` invariant line for the single worker.
-  - Measured on a local `docker compose` instance, from the doc's own code blocks. Pull, restore, undo and cleanup all worked. An empty 302, an empty 200, a foreign database and a wrong key were each rejected with no file left. A missing, empty and corrupt snapshot were each refused with the app still up. Output is in the PR body.
-  - **Merged:** `59acad5`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #4 closed. Before the merge, Codex and Greptile both re-reviewed `21b7bba` with no findings (Greptile 5/5), and the orchestrator re-ran pull, restore and undo at that head. Follow-up filed: #43 (pin `--workers 1` in the Dockerfile, M0). Live state after the merge: #35 and #36 are merged (entries below), so M0 has only #43 and #5 (`owner`, now unblocked) left. #6 was started next, in its own thread, with Opus 5.5.
-- **Decisions:**
-  - The restore moves the old `ipam.db`, `-wal` and `-shm` into `/data/before-restore-<stamp>/` instead of overwriting. After a normal stop the data was in a 168 KB `-wal` beside a 4 KB `ipam.db`.
-  - Retention keeps the newest N files, not an age window, and runs only after a successful pull.
-  - The integrity check opens the snapshot with `?immutable=1`. The snapshot is in WAL mode, and a plain open left `-wal`/`-shm` litter.
-  - The one-worker reasons are the ones true on `main`: stateful MCP sessions (from the code, not reproduced), SQLite's single writer, and uncoordinated per-process startup (measured: two workers on a fresh database sometimes fail with `database is locked`). The spec's M3 linking-state reason is not stated in the brief or README, which describe `main`.
-  - Not done: `--workers 1` in the Dockerfile `CMD`. `WEB_CONCURRENCY` would override the default, which is why the docs name it.
-  - Orchestrator, with the owner (2026-11-13): the automatic reviews do not re-run after a fix commit. `.agents/orchestration.md` → "Verifying a result" now says how to retrigger them.
-- **State:** backend suite 80 passed; frontend lint, 3 tests and build pass. Not run: the systemd timer, the cron line including the mail itself, a pull from another host over a real network.
-- **Waiting on the owner:** merge PR #42. #5 (redeploy and a deliberate restore on the deployed instance) is the owner's; its restore step is `docs/backup-and-restore.md`. Decide whether to pin `--workers 1` in the Dockerfile.
-- **Next:** #35 and #36 are independent of this. M1 follows: #6, #7, #8; #6 and #8 owe a briefed review round. #6 will edit the MCP auth parts of the README and the brief, which this PR left alone.
-
-## 2026-11-13 — Claude Code (Opus 5.5) — #36: CI checks the locks match their .in files (PR #41)
-
-- **Done:** [PR #41](https://github.com/DeusMaximus/TLG-IPAM/pull/41) closes #36, head `a317b81`. CI green. Codex: no findings. Greptile: 5/5, no findings. Merge is the owner's.
-  - New `locks` job in `.github/workflows/ci.yml`. It installs uv 0.13.6 (`astral-sh/setup-uv@v10.3.3`, no cache), runs the two `AGENTS.md` → "Dependency lock" commands in place in `api/`, and fails on any `git diff` of either lock. The failure shows the diff and an annotation naming both regenerate commands and the uv version. It also fails if `AGENTS.md` stops listing those commands word for word.
-  - `AGENTS.md` → "Dependency lock" names uv 0.13.6 (`uvx uv@0.13.6 pip compile …`) and what the job checks. One brief line (Acceptance → Testing) mentions the check.
-  - **Merged:** `bb15e69`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #36 closed. #35 merged just before it as `8a0c89e` (entry below). Live state after both: #4 is open as [PR #42](https://github.com/DeusMaximus/TLG-IPAM/pull/42), head `21b7bba`; three Greptile findings are fixed and answered, and the new head waits on a Codex re-review (requested) and a Greptile retrigger (the owner's). No follow-up issues filed.
-- **Decisions:**
-  - The check recompiles in place instead of resolving afresh. uv keeps every pin, and its hashes, that still satisfies the `.in` files, even a yanked one. That is what keeps the check green when upstream releases. Measured, not assumed.
-  - No path filter: the job runs on every PR and push and takes about 7s.
-  - uv 0.13.6 is the newest release older than two weeks. uv 0.9.30, 0.13.6 and 0.13.8 all reproduce the committed locks byte for byte.
-- **State:**
-  - Backend 80 passed (the pytest-asyncio warning, #35). Frontend lint, tests and build pass. No schema change; no application code touched.
-  - Throwaway drafts #39 and #40 showed the red and green cases on real CI. Both are closed and their branches deleted.
-  - Not reproduced: a pinned version deleted from PyPI would fail the job on unrelated PRs, as `--require-hashes` installs would.
-  - The check accepts a `.in` change that the current pins already satisfy, and a hash removed from a lock by hand. Both are by design and listed in the PR.
-- **Waiting on the owner:** merge PR #41. Bumping uv means changing `ci.yml` and `AGENTS.md` together. Later items are unchanged: #5, #25, the real-VLAN check in #14, registry permissions for #24, #32.
-- **Next:** M0 has #4 and #35 in flight, plus #5 (`owner`). Then M1 in order: #6, #7, #8; #6 and #8 owe a briefed review round.
