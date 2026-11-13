@@ -27,6 +27,20 @@ Template:
 
 ---
 
+## 2026-11-13 — Claude Code (Opus 5.5) — #6: bearer auth on /mcp through FastMCP (PR #44)
+- **Done:** [PR #44](https://github.com/DeusMaximus/TLG-IPAM/pull/44) closes #6, head `6c65d78`. CI green (backend, frontend, locks). Codex: no findings on `6c65d78`. Greptile: still pending when the session ended, nothing posted. Briefed round not started; brief at `.dev/6/review-brief-1.md` in the #6 worktree (gitignored). Merge is the owner's.
+  - `auth.py`: `is_owner_key()` (`hmac.compare_digest` on UTF-8 bytes) is the only owner-key check. `OwnerKeyVerifier(TokenVerifier)` grants `ipam:read` + `ipam:write`. `APIKeyASGIMiddleware` deleted.
+  - `mcp_server.py`: `FastMCP(..., auth=OwnerKeyVerifier())`. `main.py` mounts `mcp_app` unwrapped; `MCPPathRewriteMiddleware` unchanged.
+  - `/mcp` with no bearer (including `X-API-Key` only): 401, empty body, `WWW-Authenticate: Bearer`. Wrong bearer: 401 `invalid_token` (RFC 6750 JSON). REST unchanged: 401 missing, 403 wrong, no bearer accepted.
+  - README and brief (§4.1, §5.1 with a 401 table, §5.3, layout, §10): `mcp-remote` sends `--header "Authorization: Bearer ${TLG_IPAM_KEY}"`. `AGENTS.md`: one invariant line (owner key only via `is_owner_key`; `/mcp` auth is FastMCP's `auth=`; its 401s are the one response-shape exception).
+  - `test_auth.py`: 5 → 26 tests (suite 80 → 101). A real FastMCP HTTP client runs through the whole app on both paths. Measured on a running server with curl and `mcp-remote@0.15.2` (macOS), also with the SPA catch-all live.
+  - **Merged:** `86dd8db`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #6 closed. Before the merge, Greptile finished on `6c65d78` with no findings (5/5), and the briefed round by GPT-6.1 Sol returned GO on that head with two P3s, posted on the PR. The orchestrator used its own brief (`.dev/6/review-brief-1.md` in the main checkout), not the worker's. Follow-ups filed from the P3s: #45 (harden the auth tests) and #46 (refuse an empty or placeholder `API_KEY` at startup; `briefed-review`; must land before M3 exposes `/mcp`). Live state after the merge: #7 and #45 were started next, in their own threads. #43, #46 and #8 wait: each edits the brief. #25 (`owner`) is unblocked.
+- **Decisions:** FastMCP's 401 shape kept, not wrapped in the REST envelope. No `required_scopes` yet (M3, #28, adds per-tool scope checks). `client_id="owner"`. `auth=` on the `FastMCP` constructor, so in-process `Client(mcp)` tests skip it. Full list under Deliberate calls in the PR.
+- **State:** nothing half-finished; no schema or dependency change. The PR is not linked to a T3 thread (the link tool needs a thread id this session did not have).
+  - Seen, not changed (same on `main`): with the SPA served, `/.well-known/oauth-*` answer `index.html` 200, which M3 (#26) must take over. With `API_KEY=""`, an empty bearer authenticates on `/mcp`, as an empty `X-API-Key` does on `main`; compose's `${API_KEY:?}` blocks that. Possible follow-up issue.
+- **Waiting on the owner:** start the briefed round (different model family from Opus); after Greptile posts, every finding gets answered; merge PR #44. Decide whether to file the empty-`API_KEY` guard.
+- **Next:** #7 (`changes.actor`) and #8 (agent tokens; `/api/v1/agent/*` bearer auth; owes a briefed round). #8 should reuse `is_owner_key`'s constant-time pattern and change `test_rest_does_not_accept_bearer` deliberately if agent bearer auth goes on REST paths.
+
 ## 2026-11-13 — Claude Code (Sonnet 5.5) — #4: scheduled backup pull and restore procedure (PR #42)
 - **Done:** [PR #42](https://github.com/DeusMaximus/TLG-IPAM/pull/42) closes #4, head `21b7bba`. CI green. Codex: no findings (on `16303b1`). Greptile: three P2s, all fixed and answered; no re-review of `21b7bba` had arrived. CodeRabbit skips this repo (under 10 stars). Merge is the owner's. Docs and one `AGENTS.md` line only; no application code, endpoint or schema change.
   - `docs/backup-and-restore.md` (new):
@@ -86,18 +100,3 @@ Template:
   - This entry made six, so the oldest entry moved to `.agents/handoff/2026-11.md`: the first rotation.
 - **Waiting on the owner:** start the orchestrator thread when ready. Later: #5 (redeploy and a deliberate restore), #25 (client-compatibility spike), the real-VLAN check in #14, registry permissions for #24, #32 (acceptance run).
 - **Next:** an orchestrator starting from `.agents/orchestration.md` picks up #4 and #35, which touch different files and can run side by side. Then M1 in order: #6, #7, #8; #6 and #8 owe a briefed review round.
-
-## 2026-11-13 — Claude Code (Fable 5.2) — #3 merged (PR #34); follow-ups #35 and #36 filed
-
-- **Done:**
-  - [PR #34](https://github.com/DeusMaximus/TLG-IPAM/pull/34) merged as `9620504`, closing #3. `main` now installs from hashed locks and runs FastMCP 4.1.8 with MCP SDK 2.3.0.
-  - Filed #35 (set pytest-asyncio's fixture loop scope; the suite prints a deprecation warning at configure time until then) and #36 (`stretch`: CI check that the locks match their `.in` files). Both are in M0.
-- **Decisions:**
-  - #3 was done by a standalone session in its own worktree, started from the issue, `AGENTS.md`, and this log. It worked without further briefing, so that is the pattern for the next issues.
-  - A session in a worktree cannot commit to `main`. It ends its final message with its hand-off entry, and the coordinating session commits it. This is not in `AGENTS.md` yet.
-- **State:**
-  - `main` at `9620504`: backend suite 80 passed in a venv rebuilt from the lock on Python 3.13. The only warning is the pytest-asyncio one (#35).
-  - Dependency changes go through `api/requirements.in` / `requirements-dev.in` and a regenerated lock (`AGENTS.md` → "Dependency lock").
-  - No application code has changed yet beyond the one-line test fix in #3.
-- **Waiting on the owner:** nothing blocks the next issue. Later: #5 (redeploy and a deliberate restore), #25 (client-compatibility spike), the real-VLAN check in #14, registry permissions for #24, #32 (acceptance run).
-- **Next:** #4 (scheduled backup and restore procedure) and #35 are independent and can run side by side. Then M1 in order: #6, #7, #8; #6 and #8 owe a briefed review round.
