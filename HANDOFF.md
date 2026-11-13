@@ -27,6 +27,32 @@ Template:
 
 ---
 
+## 2026-11-13 — Claude Code (Opus 5.5) — #36: CI checks the locks match their .in files (PR #41)
+
+- **Done:** [PR #41](https://github.com/DeusMaximus/TLG-IPAM/pull/41) closes #36, head `a317b81`. CI green. Codex: no findings. Greptile: 5/5, no findings. Merge is the owner's.
+  - New `locks` job in `.github/workflows/ci.yml`. It installs uv 0.13.6 (`astral-sh/setup-uv@v10.3.3`, no cache), runs the two `AGENTS.md` → "Dependency lock" commands in place in `api/`, and fails on any `git diff` of either lock. The failure shows the diff and an annotation naming both regenerate commands and the uv version. It also fails if `AGENTS.md` stops listing those commands word for word.
+  - `AGENTS.md` → "Dependency lock" names uv 0.13.6 (`uvx uv@0.13.6 pip compile …`) and what the job checks. One brief line (Acceptance → Testing) mentions the check.
+  - **Merged:** `bb15e69`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #36 closed. #35 merged just before it as `8a0c89e` (entry below). Live state after both: #4 is open as [PR #42](https://github.com/DeusMaximus/TLG-IPAM/pull/42), head `21b7bba`; three Greptile findings are fixed and answered, and the new head waits on a Codex re-review (requested) and a Greptile retrigger (the owner's). No follow-up issues filed.
+- **Decisions:**
+  - The check recompiles in place instead of resolving afresh. uv keeps every pin, and its hashes, that still satisfies the `.in` files, even a yanked one. That is what keeps the check green when upstream releases. Measured, not assumed.
+  - No path filter: the job runs on every PR and push and takes about 7s.
+  - uv 0.13.6 is the newest release older than two weeks. uv 0.9.30, 0.13.6 and 0.13.8 all reproduce the committed locks byte for byte.
+- **State:**
+  - Backend 80 passed (the pytest-asyncio warning, #35). Frontend lint, tests and build pass. No schema change; no application code touched.
+  - Throwaway drafts #39 and #40 showed the red and green cases on real CI. Both are closed and their branches deleted.
+  - Not reproduced: a pinned version deleted from PyPI would fail the job on unrelated PRs, as `--require-hashes` installs would.
+  - The check accepts a `.in` change that the current pins already satisfy, and a hash removed from a lock by hand. Both are by design and listed in the PR.
+- **Waiting on the owner:** merge PR #41. Bumping uv means changing `ci.yml` and `AGENTS.md` together. Later items are unchanged: #5, #25, the real-VLAN check in #14, registry permissions for #24, #32.
+- **Next:** M0 has #4 and #35 in flight, plus #5 (`owner`). Then M1 in order: #6, #7, #8; #6 and #8 owe a briefed review round.
+
+## 2026-11-13 — Claude Code (Sonnet 5.5) — #35: fixture loop scope set (PR #38)
+- **Done:** [PR #38](https://github.com/DeusMaximus/TLG-IPAM/pull/38), head `bf0a0fe`, adds `asyncio_default_fixture_loop_scope = function` to `api/pytest.ini`. It is the only file changed. On Python 3.13 the pytest-asyncio deprecation warning is gone and the warning summary is empty. Three concurrent sessions each gave 80 passed. CI green (4/4); Codex and Greptile finished with no findings.
+  - **Merged:** `8a0c89e`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #35 closed. No follow-up issues filed. The orchestrator's own three concurrent sessions all passed, and one printed the pytest `rm_rf` warning known since #2.
+- **Decisions:** `function`, not `fixture-scope`. Every async fixture in `conftest.py` is function-scoped, so behaviour is unchanged, and it is the default pytest-asyncio's warning says a future version will adopt. The module-level engine needed no change.
+- **State:** nothing half-finished; the PR is ready to merge. A venv built on Python 3.15 still shows one beartype `DeprecationWarning` (`AsyncKeyValue`, FastMCP dependency tree). It does not appear on 3.13, which CI uses, and was left alone as a dependency matter. The pytest `rm_rf` warning did not appear in the concurrent runs.
+- **Waiting on the owner:** merge PR #38.
+- **Next:** #4 (docs, in flight) and #36 (CI lock check, in flight); then M1: #6, #7, #8. #36 may want a Python 3.15 look if the beartype warning matters later.
+
 ## 2026-11-13 — Claude Code (Fable 5.2) — orchestration rules merged (PR #37); ready for an orchestrator thread
 
 - **Done:** [PR #37](https://github.com/DeusMaximus/TLG-IPAM/pull/37) merged as `bffd5b9`. `.agents/orchestration.md` now holds the loop for handing issues to worker sessions, the model roster, the worker brief, the verify checklist, the refusal hand-over, and the list of things to ask the owner first. `AGENTS.md` → Workflow points at it.
@@ -74,31 +100,3 @@ Template:
   - Not tried: installs on Python 3.14 / 3.15.
 - **Waiting on the owner:** merge PR #34. Reinstall the long-lived venv with the new setup command; it is still on FastMCP 3.4.2.
 - **Next:** #4, then M1 (#6, #7, #8). From now on, dependency changes go through the `.in` files and a regenerated lock, never a hand-edited lock.
-
-## 2026-11-13 — Claude Code (Fable 5.2) — #2 merged (PR #33); parallel test sessions are safe
-
-- **Done:** [PR #33](https://github.com/DeusMaximus/TLG-IPAM/pull/33) merged as `98b844e`, closing #2. Each pytest session now has its own database directory, removed at session end. Codex and Greptile reviewed it with no findings.
-- **Decisions:** none.
-- **State:**
-  - `main` at `98b844e`: backend suite 80 passed. Several pytest sessions can run on one machine at once, so agents can work in separate worktrees.
-  - Concurrent sessions can make pytest print `PytestWarning: (rm_rf) error removing …/garbage-…` after the summary. That is pytest's own `tmp_path` housekeeping; the run still passes.
-  - `api/requirements.txt` is still unpinned (#3). No application code has changed yet.
-  - Milestones M0–M3 and issues #3–#32 are open; the entry below has the labels and the review tiers.
-- **Waiting on the owner:** nothing right now. Later: #5 (redeploy and a deliberate restore), #25 (client-compatibility spike), the real-VLAN check in #14, registry permissions for #24, #32 (acceptance run).
-- **Next:** #3 (lock dependencies, pin FastMCP 4), then #4, then M1 in order: #6, #7, #8. After M1, M2a (#9 onwards) and M3 (#25 onwards) can run side by side.
-
-## 2026-11-13 — Claude Code (Fable 5.2) — PR #1 merged; milestones and 31 issues filed; #2 in review as PR #33
-
-- **Done:**
-  - [PR #1](https://github.com/DeusMaximus/TLG-IPAM/pull/1) merged as `4953b5c`: the spec, this log, the Workflow section, `.agents/`.
-  - Five milestones (M0, M1, M2a, M2b, M3) and issues #2–#32 filed. Each issue names its spec sections, what it depends on, its acceptance list, and which review it owes. Labels: `owner` (needs the owner), `briefed-review` (owes a briefed round), `stretch`.
-  - [PR #33](https://github.com/DeusMaximus/TLG-IPAM/pull/33) open for #2: each pytest session gets its own database directory.
-- **Decisions:**
-  - Review is tiered (in `AGENTS.md`): every PR answers the automatic Codex and Greptile findings; twelve issues carry `briefed-review` and owe a briefed round as well (#6, #8, #10, #11, #13, #14, #21, #22, #26, #27, #28, #29).
-  - The §7.2 invariants are each assigned to the issue that introduces them, so `AGENTS.md` gains them as the code lands and not before.
-- **State:**
-  - `main` at `4953b5c`: backend suite 80 passed. No application code has changed yet.
-  - Until PR #33 merges, run one pytest session at a time on a machine: on `main`, two at once fail each other (measured: 2 and 3 failures). With PR #33, three at once passed in 33 of 33 runs.
-  - `api/requirements.txt` is still unpinned (#3).
-- **Waiting on the owner:** merge PR #33. Later: #5 (redeploy and a deliberate restore), #25 (client-compatibility spike: real web-client accounts and a public URL), the real-VLAN check in #14, registry permissions for #24, #32 (acceptance run).
-- **Next:** #3 (lock dependencies, pin FastMCP 4), then #4, then M1 in order: #6, #7, #8. After M1, M2a (#9 onwards) and M3 (#25 onwards) can run side by side; inside M2a the agent package (#13) can be built beside ingest (#11) once check-in (#10) is merged.
