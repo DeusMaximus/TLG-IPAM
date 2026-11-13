@@ -27,6 +27,19 @@ Template:
 
 ---
 
+## 2026-11-13 — Claude Code (Opus 5.5) — #45: harden the owner-key auth tests (PR #48)
+- **Done:** [PR #48](https://github.com/DeusMaximus/TLG-IPAM/pull/48) closes #45, head `ce9b9f9`. CI green (backend, frontend, locks). Codex: no findings. Greptile: 5/5, no findings. Briefed round not started; brief at `.dev/45/review-brief-1.md` in the #45 worktree (gitignored). Merge is the owner's.
+  - Only `api/tests/test_auth.py` changes (26 → 59 tests; suite 101 → 134). Nothing under `api/app/`, brief or `AGENTS.md`.
+  - Comparison: owner key, a near miss and a wrong key, on REST, `/mcp` and `/mcp/`, must reach `hmac.compare_digest` (`DigestStandIn` replaces `app.auth.hmac`). Forcing the digest's answer flips the outcome. An AST check refuses `==`/`!=`/`in`/`not in` in `is_owner_key`.
+  - Session reuse: 18 cases (2 paths × GET/POST/DELETE × no bearer, wrong bearer, `X-API-Key` only) get 401. A `tools/list` with the owner bearer afterwards shows the session was live and survived. Replays go through raw ASGI (`_response_start`): an accepted GET is an endless SSE stream that the httpx transports buffer.
+  - Every `/mcp` refusal test enters `running_app()`, with its assertions after the block.
+  - Five mutations measured in a throwaway worktree. The equality shortcut fails 7 tests (26 pass on `main`); accept-any fails 23, the wrong-bearer 8 at `assert 200 == 401`; the X-API-Key-as-bearer translation fails 8; session-id-as-credential fails exactly the 18. Output is in the PR body.
+  - **Merged:** `a75cb15`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #45 closed. Before the merge, the briefed round by GPT-6.1 Sol returned GO on `ce9b9f9` with one P3, posted on the PR; the orchestrator used its own brief (`.dev/45/review-brief-1.md` in the main checkout). Follow-up filed from the P3: #50 (`stretch`: widen the source guard to callers and helpers). Live state after the merge: `main` has #7 (`ada7db1`) and this, so the suite is 137 tests. #8 is in its own thread and its PR is being verified. #46 and #43 wait behind #8.
+- **Decisions:** acceptance line 2 is met by two mutations. Accept-any cannot redden the `X-API-Key`-only tests, because no token reaches the verifier; the translation mutation does. Deliberate call 5; the briefed reviewer may overrule. Session-reuse assertions run after the lifespan block, so failures report at the test line.
+- **State:** nothing half-finished; no schema, dependency or app change. Reversed order and three concurrent sessions: 59 passed each. Not covered: HEAD replays, duplicate or whitespace `Authorization` variants (measured on #44), and timing itself.
+- **Waiting on the owner:** start the briefed round (a model family other than Opus); merge PR #48.
+- **Next:** #46 (refuse an empty or placeholder `API_KEY` at startup; briefed review; before M3). #7 is in flight separately. #8 should reuse `DigestStandIn` and `_response_start` for agent-token tests.
+
 ## 2026-11-13 — Claude Code (Opus 5.5) — #7: changes.actor in the audit log (PR #47)
 - **Done:** [PR #47](https://github.com/DeusMaximus/TLG-IPAM/pull/47) closes #7, head `ad466b1`. CI green (backend, frontend, locks). Codex: no findings on `ad466b1`. Greptile: 5/5, no findings on `ad466b1`. Automatic reviews only; no briefed round owed. Merge is the owner's.
   - `Change.actor` (`String(80)`, nullable); `changes.record(..., actor=None)`; `ChangeOut.actor`, so `GET /api/v1/changes` and the `list_changes` tool return it (docstring updated). None of the 17 `record()` call sites passes it: every write records null.
@@ -90,11 +103,3 @@ Template:
   - The check accepts a `.in` change that the current pins already satisfy, and a hash removed from a lock by hand. Both are by design and listed in the PR.
 - **Waiting on the owner:** merge PR #41. Bumping uv means changing `ci.yml` and `AGENTS.md` together. Later items are unchanged: #5, #25, the real-VLAN check in #14, registry permissions for #24, #32.
 - **Next:** M0 has #4 and #35 in flight, plus #5 (`owner`). Then M1 in order: #6, #7, #8; #6 and #8 owe a briefed review round.
-
-## 2026-11-13 — Claude Code (Sonnet 5.5) — #35: fixture loop scope set (PR #38)
-- **Done:** [PR #38](https://github.com/DeusMaximus/TLG-IPAM/pull/38), head `bf0a0fe`, adds `asyncio_default_fixture_loop_scope = function` to `api/pytest.ini`. It is the only file changed. On Python 3.13 the pytest-asyncio deprecation warning is gone and the warning summary is empty. Three concurrent sessions each gave 80 passed. CI green (4/4); Codex and Greptile finished with no findings.
-  - **Merged:** `8a0c89e`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #35 closed. No follow-up issues filed. The orchestrator's own three concurrent sessions all passed, and one printed the pytest `rm_rf` warning known since #2.
-- **Decisions:** `function`, not `fixture-scope`. Every async fixture in `conftest.py` is function-scoped, so behaviour is unchanged, and it is the default pytest-asyncio's warning says a future version will adopt. The module-level engine needed no change.
-- **State:** nothing half-finished; the PR is ready to merge. A venv built on Python 3.15 still shows one beartype `DeprecationWarning` (`AsyncKeyValue`, FastMCP dependency tree). It does not appear on 3.13, which CI uses, and was left alone as a dependency matter. The pytest `rm_rf` warning did not appear in the concurrent runs.
-- **Waiting on the owner:** merge PR #38.
-- **Next:** #4 (docs, in flight) and #36 (CI lock check, in flight); then M1: #6, #7, #8. #36 may want a Python 3.15 look if the beartype warning matters later.
