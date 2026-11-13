@@ -27,6 +27,22 @@ Template:
 
 ---
 
+## 2026-11-13 — Claude Code (Fable 5.2) — PR #1 merged; milestones and 31 issues filed; #2 in review as PR #33
+
+- **Done:**
+  - [PR #1](https://github.com/DeusMaximus/TLG-IPAM/pull/1) merged as `4953b5c`: the spec, this log, the Workflow section, `.agents/`.
+  - Five milestones (M0, M1, M2a, M2b, M3) and issues #2–#32 filed. Each issue names its spec sections, what it depends on, its acceptance list, and which review it owes. Labels: `owner` (needs the owner), `briefed-review` (owes a briefed round), `stretch`.
+  - [PR #33](https://github.com/DeusMaximus/TLG-IPAM/pull/33) open for #2: each pytest session gets its own database directory.
+- **Decisions:**
+  - Review is tiered (in `AGENTS.md`): every PR answers the automatic Codex and Greptile findings; twelve issues carry `briefed-review` and owe a briefed round as well (#6, #8, #10, #11, #13, #14, #21, #22, #26, #27, #28, #29).
+  - The §7.2 invariants are each assigned to the issue that introduces them, so `AGENTS.md` gains them as the code lands and not before.
+- **State:**
+  - `main` at `4953b5c`: backend suite 80 passed. No application code has changed yet.
+  - Until PR #33 merges, run one pytest session at a time on a machine: on `main`, two at once fail each other (measured: 2 and 3 failures). With PR #33, three at once passed in 33 of 33 runs.
+  - `api/requirements.txt` is still unpinned (#3).
+- **Waiting on the owner:** merge PR #33. Later: #5 (redeploy and a deliberate restore), #25 (client-compatibility spike: real web-client accounts and a public URL), the real-VLAN check in #14, registry permissions for #24, #32 (acceptance run).
+- **Next:** #3 (lock dependencies, pin FastMCP 4), then #4, then M1 in order: #6, #7, #8. After M1, M2a (#9 onwards) and M3 (#25 onwards) can run side by side; inside M2a the agent package (#13) can be built beside ingest (#11) once check-in (#10) is merged.
+
 ## 2026-11-13 — Claude Code (Fable 5.2) — v0.2 spec accepted; process skeleton added
 
 - **Done:**
