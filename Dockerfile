@@ -10,7 +10,8 @@ RUN npm run build
 FROM python:3.12-slim
 WORKDIR /app
 COPY api/requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# The lock pins every package by version and hash; pip refuses anything else.
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 COPY api/app ./app
 COPY --from=web /web/dist ./static
 ENV STATIC_DIR=/app/static \

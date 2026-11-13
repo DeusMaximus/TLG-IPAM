@@ -55,7 +55,7 @@ Backend (Python 3.12+):
 
 ```sh
 cd api
-python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+python3 -m venv .venv && .venv/bin/pip install --require-hashes -r requirements-dev.txt
 .venv/bin/python -m pytest                  # test suite
 API_KEY=dev-key .venv/bin/uvicorn app.main:app --port 8080 --reload
 ```
