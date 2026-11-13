@@ -36,11 +36,7 @@ Template:
 - **State:**
   - `main` at `d735977` plus this entry. Backend suite 186 passed on Python 3.13, no warnings. No open PRs, no worker running.
   - Open in M0: #43, #5 (`owner`). Open in M1: #46 (`briefed-review`; must land before M3), #50 (`stretch`). M2a: #9 is ready; #51 is ready. M2b: #21 is ready. M3: #25 (`owner`) is ready.
-  - Things the loop does not say yet, learned this session:
-    - A worker thread cannot always subscribe to its PR, and then stops before Greptile finishes. The briefs for #7, #45 and #8 told the worker to wait on the PR's checks from the shell, and that worked.
-    - Nothing wakes the orchestrator when a worker thread finishes. It was woken by watching the PR, or by the briefed review completing.
-    - A briefed reviewer started as a delegated task gets a worktree cut from `main`. Each brief told it to check out the PR head detached; see `.dev/<issue>/review-brief-1.md` in the main checkout for the four used.
-    - A PR that merges while another is open leaves the open one's test count behind. Re-measure the suite on the PR merged with `main`.
+  - What this session learned about running the loop is now in `.agents/orchestration.md`: how the orchestrator is woken, the two review rules in the worker brief, where a briefed reviewer's worktree starts, and re-measuring on the PR merged with `main`.
   - Worker worktrees and local branches from this session are still on disk under the T3 worktrees folder. Nothing in them is unmerged.
 - **Waiting on the owner:** #5 (redeploy and a deliberate restore; the procedure is `docs/backup-and-restore.md`). #25 (client-compatibility spike). Later: the real-VLAN check in #14, registry permissions for #24, #32.
 - **Next:** a wave of three, under the relaxed rule: #9 (scan targets; Opus 5.5), #46 (the `API_KEY` guard; Opus 5.5 and a GPT-6.1 Sol round) and #43 (`--workers 1`; Sonnet 5.5). Then #10, which owes a test of `require_agent` on the real router. #50 and #51 fit beside any wave that leaves `test_auth.py` and `services/agents.py` alone.

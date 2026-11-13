@@ -25,7 +25,7 @@ Review PR #‹N› — branch `‹branch›`, head `‹sha›`, against `main` a
 
 **Context.** TLG-IPAM is a single-owner homelab IP address manager: FastAPI + SQLite, a React SPA, and an MCP server at `/mcp`. ‹Two or three sentences: what the issue asks for and what this branch does about it. File names, not adjectives.› ‹"No schema change" / "Schema: additive only — new tables …, new nullable column …".›
 
-**Environment.** You are in a worktree at this head. Create `api/.venv` from `api/requirements-dev.txt` if it is missing. Run the backend suite from `api/` with `.venv/bin/python -m pytest`. ‹"Frontend untouched" / "From `web/`: `npm ci`, then `npm run lint`, `npm run test`, `npm run build`".› Keep scratch files in a temp directory of your own and delete it before you finish. Leave the tree as you found it: `git status --short` empty, same branch and head.
+**Environment.** ‹"You are in a worktree at this head." / "Your worktree was cut from `main`, not from the PR head. Before anything else run `git fetch origin` and `git checkout --detach ‹sha›`, and confirm `git rev-parse HEAD` prints that sha."› Create `api/.venv` from `api/requirements-dev.txt` if it is missing. Run the backend suite from `api/` with `.venv/bin/python -m pytest`. ‹"Frontend untouched" / "From `web/`: `npm ci`, then `npm run lint`, `npm run test`, `npm run build`".› Keep scratch files in a temp directory of your own and delete it before you finish. Leave the tree as you found it: `git status --short` empty, same branch and head. ‹When another PR has merged since the branch was cut: the test count on the head alone, and the count merged with `main`.›
 
 **Two jobs, in this order.**
 

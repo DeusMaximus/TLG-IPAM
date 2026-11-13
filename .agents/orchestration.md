@@ -12,7 +12,7 @@ Run these in order for each issue. Each step ends when its last line is true.
 2. **Decide what runs together.** Up to three ready issues at once, and only when their Scope sections name different code files. Two issues that both edit `models.py`, `main.py`, or `mcp_server.py` run one after the other. Two issues may both edit the brief, the README, or `AGENTS.md` when they touch different sections: tell each worker which sections the other owns, and the PR that merges second rebases. Done when each issue you will start has no code file in common with another in flight, and no docs section.
 3. **Choose the model** from the roster below. Done when each issue has a seat.
 4. **Launch.** One standalone thread per issue, in its own worktree cut from `origin/main`, on branch `<issue>-<slug>`, with the brief below. Done when the thread reports a run in progress.
-5. **Wait** for the worker's final message. The worker answers its own review findings; the PR is its work until it hands back. Done when the final message has the PR URL, head sha, review states, and a hand-off entry.
+5. **Wait** for the worker's final message. The worker answers its own review findings; the PR is its work until it hands back. Nothing wakes you when a worker thread finishes, so watch its PR once it opens: you are woken when checks or reviews change. A wake is not a hand-back. Read the worker's last message each time, and use the wait to read the diff. Done when the final message has the PR URL, head sha, review states, and a hand-off entry.
 6. **Verify** with the checklist below. Done when every line is ticked or reported as failed.
 7. **Report to the owner:** ready or not, which claims you re-measured and which are the worker's alone, and any follow-up worth an issue. Done when the owner has what they need to decide the merge.
 8. **Close out** once the owner merges or tells you to: squash-merge, delete the remote branch, and commit the hand-off entry (rule below). Done when `main` has the entry and the issue is closed.
@@ -24,9 +24,9 @@ The owner's working experience, as of 2026-11-13. Edit in place when a seat chan
 | Seat | Model | Use for |
 |------|-------|---------|
 | Orchestrator | Claude Fable 5.2, high | This loop, and questions about the shape of the work |
-| Implementer | Claude Opus 5.5, high | The default for any issue with logic in it: services, auth, ingest, the agent package, UI with state |
+| Implementer | Claude Opus 5.5, high | The default for any issue with logic in it: services, auth, ingest, the agent package, UI with state. On #6, #7, #8, #36 and #45 its counts and mutation results matched every re-measurement |
 | Implementer, mechanical | Claude Sonnet 5.5, high | Docs, configuration, dependencies, test plumbing. Proven here on #3, #4 and #35 (dependencies, docs, test plumbing); give it one UI issue and record the result in this table before relying on it for more |
-| Briefed reviewer | GPT-6.1 Sol through Codex, high | Every briefed round. It is strict and finds what the implementer missed. Quota is ample: when unsure whether a PR owes a briefed round, run one |
+| Briefed reviewer | GPT-6.1 Sol through Codex, high | Every briefed round. It is strict and finds what the implementer missed. Quota is ample: when unsure whether a PR owes a briefed round, run one. Three rounds so far (#44, #48, #49): each GO, each with P3s the automatic reviews had not raised |
 | Light second read | GLM 5.3, or Mistral Large 4 | Optional, for a PR that owes no briefed round but where you want one more reader. Mistral Large 4 is nearly as good and much cheaper on its plan |
 | Manual fallback | GPT-6 with Daybreak Blue, in the Codex app | Work a model here has refused. The owner runs it by hand; no session here can start it. See "When a model refuses" |
 
@@ -43,14 +43,17 @@ Implement GitHub issue #‹N› in this repository: "‹title›". Read the issu
 Before you start, read `AGENTS.md` and the newest entry in `HANDOFF.md`. The spec sections the issue cites are in `docs/v0.2-spec.md` ‹§›.
 
 What is already known, so you do not have to rediscover it:
-- You are in a fresh git worktree cut from `origin/main`, on branch `‹N›-‹slug›`. Create the virtual environment and `node_modules` you need.
+- You are in a fresh git worktree cut from `origin/main` (`‹sha›`), on branch `‹N›-‹slug›`. Create the virtual environment and `node_modules` you need. Use Python 3.13 for the venv, as CI does.
+- ‹Each other issue in flight, and the files or document sections it owns. "No other issue is in flight" when that is so.›
 - ‹Facts this session has measured that bear on the issue: versions, a failing command, a decision taken since the issue was written.›
 
 Scope: only what issue #‹N› lists. ‹Name the neighbouring issue that owns the nearest out-of-scope work.›
 
 Rules beyond `AGENTS.md`:
 - The repository is public. Commits and the PR carry no person's name, real domain, local path containing a username, or reference to the owner's other projects.
-- Open one PR that closes #‹N›. It owes ‹the automatic reviews only / the automatic reviews and a briefed round, which the orchestrator will start›. Wait for Codex and Greptile, then fix each finding or reply on its thread with the reason it stands.
+- Open one PR that closes #‹N›. It owes ‹the automatic reviews only / the automatic reviews and a briefed round, which the orchestrator will start and brief: do not write a review brief›. Wait for Codex and Greptile, then fix each finding or reply on its thread with the reason it stands.
+- Do not finish until both reviews have posted. If you cannot subscribe to the PR, wait on its checks from the shell until the `Greptile Review` check completes, then read its comments. Greptile usually takes three to five minutes.
+- The automatic reviews do not run again after a fix commit. If you push after they have reviewed, comment `@codex review` on the PR and say in your final message that Greptile needs a manual retrigger.
 - The owner merges.
 - End your final message with your hand-off entry, written to the template in `HANDOFF.md`.
 - If a safety filter or a refusal stops you on a step, stop there. Push what you have, and report the step, the message you got word for word, and what is left on the acceptance list.
@@ -59,6 +62,8 @@ Finish with: the PR URL, its head sha, the state of CI and of each automatic rev
 ```
 
 Give facts, not instructions on how to do the work. A brief that needs more than the "already known" list to be usable means the issue is underspecified: fix the issue.
+
+When an acceptance line can only be shown by running something (a restore, a CI failure, a route that does not exist yet), say so in the "already known" list and ask for the commands and output in the PR body. The workers on #4, #36 and #8 each met such a line.
 
 ## Verifying a result
 
@@ -69,6 +74,7 @@ A worker's report is a claim. Before telling the owner a PR is ready:
 - [ ] Both reviews cover the current head. Neither re-runs after a fix commit: comment `@codex review` on the PR, and ask the owner to retrigger Greptile. The Codex summary comment names the commit it reviewed.
 - [ ] Each acceptance line in the issue maps to evidence in the PR body.
 - [ ] **One claim CI does not cover is re-measured by you**: a Docker build, a count, a command from the documentation run from scratch. Pick the claim the acceptance list leans on most.
+- [ ] When another PR has merged since the branch was cut, the suite is run on the PR merged with `main`. The count on the PR head alone is then out of date.
 - [ ] The diff stays inside the issue's Scope. Anything extra is either reverted or listed under the PR's Deliberate calls.
 - [ ] The diff and PR body contain no personal names, real domains, or local paths.
 - [ ] Counts and procedural claims in the hand-off entry are checked against the repo. (The #3 worker reported five entries in `HANDOFF.md` when there were three.)
@@ -81,8 +87,12 @@ Tell the owner which lines you ticked by running something and which by reading.
 For an issue labelled `briefed-review`, after the automatic reviews are answered:
 
 1. Fill the template in `.agents/review-brief.md` and save it as `.dev/<issue>/review-brief-<round>.md` in the main checkout.
-2. Start the reviewer from the roster in a worktree at the PR head, with the one line: *"Follow the review brief at `<absolute path>`"*.
-3. Findings go back to the worker's thread to fix. A fix means a new head, so the round repeats until the verdict is GO at the current head.
+2. Start the reviewer from the roster in a worktree, with the one line: *"Follow the review brief at `<absolute path>`"*. A reviewer started as a delegated task gets a worktree cut from `main`, not from the PR head: the brief's Environment paragraph tells it to fetch and check out the head sha detached.
+3. The round does not need the worker's final message. Start it as soon as both automatic reviews cover the current head and their findings are answered.
+4. A P1 or P2 goes back to the worker's thread to fix. A fix means a new head, so both automatic reviews and the round repeat until the verdict is GO at the current head.
+5. P3s on a GO become follow-up issues you propose to the owner. Folding one into the PR moves the head and restarts all three reviews.
+
+The briefs used so far are in `.dev/6/`, `.dev/45/` and `.dev/8/` in the main checkout. They are not committed; where they are present, read one before writing the next.
 
 ## When a model refuses
 
@@ -105,8 +115,9 @@ Send the same task to another model in the roster first only when the refusal is
 ## Hand-off entries
 
 - A worker in a worktree cannot commit to `main`. It ends its final message with its entry, and you commit it.
-- **One entry per issue, committed after the merge.** Take the worker's entry as written and add a `Merged:` line under **Done** with the merge commit and any follow-up issues filed. Commit it before the merge only when the PR will sit unmerged past the end of your session.
+- **One entry per issue, committed after the merge.** Take the worker's entry as written and add a `Merged:` line under **Done** with the merge commit and any follow-up issues filed. The worker wrote its entry before the reviews finished, so the `Merged:` line also says how each review ended. Commit it before the merge only when the PR will sit unmerged past the end of your session.
 - Then apply the rotation rule in `HANDOFF.md`'s header. Count the entries; do not take a worker's count.
+- **End your own session with an orchestrator entry on top.** It holds live state for the next orchestrator: what is merged, what is in flight, which issues are ready, and the wave you would start next.
 
 ## Stop for the owner
 
