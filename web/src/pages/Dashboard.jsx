@@ -2,14 +2,13 @@ import { useState } from 'react'
 import { Search } from 'lucide-react'
 import { listChanges, listHosts } from '../api/ipam'
 import { useTree } from '../context'
+import ActivityItem from '../components/ActivityItem'
 import EmptyState from '../components/EmptyState'
 import HostTable from '../components/HostTable'
 import HostDrawer from '../components/HostDrawer'
 import StatusBadge from '../components/StatusBadge'
 import { inputCls } from '../components/Modal'
 import { useFetch } from '../hooks/useFetch'
-
-const SOURCE_LABEL = { ui: 'UI', api: 'API', mcp: 'MCP' }
 
 function Stat({ label, value }) {
   return (
@@ -98,15 +97,7 @@ export default function Dashboard() {
               <EmptyState>No changes yet — activity will appear here.</EmptyState>
             )}
             {changes.map((c) => (
-              <div key={c.id} className="rounded-md border border-slate-800 bg-slate-800/50 px-3 py-2">
-                <div className="text-xs text-slate-300">{c.summary}</div>
-                <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-500">
-                  <span className="rounded bg-slate-700 px-1.5 py-0.5 font-medium text-slate-300">
-                    {SOURCE_LABEL[c.source] || c.source}
-                  </span>
-                  {new Date(c.ts).toLocaleString()}
-                </div>
-              </div>
+              <ActivityItem key={c.id} change={c} />
             ))}
           </div>
         </div>

@@ -1,5 +1,5 @@
 from sqlalchemy import event, inspect, text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from .config import settings
 from .models import Base
@@ -39,7 +39,7 @@ def _add_missing_columns(conn):
                 conn.execute(text(ddl))
 
 
-async def init_models():
-    async with engine.begin() as conn:
+async def init_models(target: AsyncEngine = engine):
+    async with target.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_add_missing_columns)

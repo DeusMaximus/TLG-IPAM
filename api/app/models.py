@@ -112,3 +112,6 @@ class Change(Base):
     before: Mapped[dict | None] = mapped_column(JSON)
     after: Mapped[dict | None] = mapped_column(JSON)
     source: Mapped[str] = mapped_column(String(8))
+    # who acted, when narrower than `source` (spec §4.3): null for the owner key,
+    # later `agent:<name>` or `grant:<client name>`
+    actor: Mapped[str | None] = mapped_column(String(80))

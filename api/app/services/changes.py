@@ -29,6 +29,7 @@ def record(
     source: str,
     before: dict | None = None,
     after: dict | None = None,
+    actor: str | None = None,
 ) -> None:
     session.add(
         Change(
@@ -39,6 +40,7 @@ def record(
             before=before,
             after=after,
             source=source,
+            actor=actor,
         )
     )
 

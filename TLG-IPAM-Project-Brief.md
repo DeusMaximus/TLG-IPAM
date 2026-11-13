@@ -150,6 +150,7 @@ Append-only record of every write. Because Claude can write to this system via M
 | `summary` | str — human-readable one-liner, e.g. `host pbs-01 created at 10.10.20.45` |
 | `before` / `after` | JSON snapshots, nullable |
 | `source` | enum: `ui` \| `api` \| `mcp` — MCP is server-assigned; REST uses the advisory `X-TLG-Client: ui` hint, so `ui` versus `api` is a UX label rather than trusted provenance |
+| `actor` | str(80), nullable — who acted, when that is narrower than `source`. Every write path today records null: that is the owner key, whether over REST or MCP. Later values are `agent:<agent name>` and `grant:<client name>` (v0.2 spec §4.3). It is a field of its own and never part of `summary`. Databases created before it gain the column, null in existing rows, on startup. |
 
 ### 3.7 Validation constraints
 
@@ -295,7 +296,7 @@ Tool descriptions are the documentation Claude reads at runtime — write them w
 | `bulk_delete_hosts` | Delete many hosts by ID in one call (cleanup workflows). Returns deleted count + not-found IDs. |
 | `add_reserved_range` | Reserve a block of IPs in a subnet so automatic allocation skips it (manual creation inside it stays allowed). |
 | `delete_reserved_range` | Remove a reserved range, returning its addresses to the allocation pool. |
-| `list_changes` | Recent changes to the IPAM (audit log), newest first. Use to answer "what changed recently?" or to review previous MCP-driven edits. |
+| `list_changes` | Recent changes to the IPAM (audit log), newest first, each with its `source` and `actor` (null for the owner's own writes). Use to answer "what changed recently?" or to review previous MCP-driven edits. |
 
 All MCP writes are recorded in the change log with `source = mcp`.
 
@@ -355,7 +356,7 @@ Clean, data-dense, dark-mode-first. Reference aesthetic: linear.app sidebar dens
 
 ### 6.2 Views
 
-- **Dashboard** — summary stats: total subnets, total hosts, hosts by status, plus a **recent activity feed** driven by the change log (shows source: UI / API / MCP)
+- **Dashboard** — summary stats: total subnets, total hosts, hosts by status, plus a **recent activity feed** driven by the change log (shows source: UI / API / MCP, and the actor when set)
 - **Section view** — click section in sidebar; shows its subnets with utilisation
 - **Subnet view** — click subnet; shows host table + free IP count + VLAN/gateway/domain/DHCP-pool info header, with reserved ranges shown as removable chips + a "Reserve range" action
 - **Host drawer** — slide-over on row click; all fields editable (domain field shows the inherited subnet default as placeholder; blank = inherit); delete button with confirmation

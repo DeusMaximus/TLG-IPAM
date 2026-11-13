@@ -267,3 +267,4 @@ class ChangeOut(BaseModel):
     before: dict | None
     after: dict | None
     source: str
+    actor: str | None
