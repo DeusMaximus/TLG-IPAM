@@ -1,7 +1,18 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import JSON, BigInteger, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -115,3 +126,58 @@ class Change(Base):
     # who acted, when narrower than `source` (spec §4.3): null for the owner key,
     # later `agent:<name>` or `grant:<client name>`
     actor: Mapped[str | None] = mapped_column(String(80))
+
+
+class Agent(Base):
+    """A scan agent (v0.2 spec §5.4). Created by the owner; its credential lives in
+    `tokens`, which points here, so a token can be replaced without touching the agent."""
+
+    __tablename__ = "agents"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String(120), unique=True)
+    # pending (never held an agent token), active, disabled
+    state: Mapped[str] = mapped_column(String(16), default="pending")
+    # reported at check-in (#10); null until the agent first checks in
+    version: Mapped[str | None] = mapped_column(String(40))
+    platform: Mapped[str | None] = mapped_column(String(120))
+    hostname: Mapped[str | None] = mapped_column(String(253))
+    interfaces: Mapped[list | None] = mapped_column(JSON)
+    last_checkin_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    tokens: Mapped[list["Token"]] = relationship(
+        back_populates="agent", order_by="Token.created_at.desc()", cascade="all, delete-orphan"
+    )
+
+
+class Token(Base):
+    """A credential bound to an agent (v0.2 spec §4.2). Only the SHA-256 of the token
+    is stored, with a short prefix for display; the plain token is shown once."""
+
+    __tablename__ = "tokens"
+    __table_args__ = (
+        # at most one unrevoked `agent` token per agent; the service revokes before issuing
+        Index(
+            "uq_tokens_live_agent_token",
+            "agent_id",
+            unique=True,
+            sqlite_where=text("kind = 'agent' AND revoked_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # `agent`, or `enrol` (M2b: nothing issues one yet)
+    kind: Mapped[str] = mapped_column(String(8))
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    token_prefix: Mapped[str] = mapped_column(String(16))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # enrolment tokens only
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    agent: Mapped[Agent] = relationship(back_populates="tokens")
