@@ -178,7 +178,7 @@ Single static API key passed as a header:
 X-API-Key: <value from API_KEY env var>
 ```
 
-All endpoints except `GET /health` require this header. Return `401` if missing, `403` if wrong. Key is set at container start — no key rotation UI needed in v1.
+All endpoints except `GET /health` require this header. Return `401` if missing, `403` if wrong. The key is compared in constant time (`hmac.compare_digest`, in `auth.is_owner_key`). Key is set at container start — no key rotation UI needed in v1. REST does not accept the key as a bearer, and `/mcp` does not accept `X-API-Key` (§5.1).
 
 ### 4.2 Endpoints
 
@@ -263,7 +263,16 @@ app = FastAPI(lifespan=mcp_app.lifespan, ...)
 app.mount("/mcp", mcp_app)
 ```
 
-Auth for `/mcp` uses the same `X-API-Key` header, enforced by ASGI middleware on the mount path.
+Auth for `/mcp` is the same owner key (`API_KEY`), sent as a bearer token: `Authorization: Bearer <API_KEY>`. FastMCP enforces it through its own `auth=`: `OwnerKeyVerifier` in `auth.py` compares the token in constant time and grants the scopes `ipam:read` and `ipam:write`. No tool checks the scopes yet. `X-API-Key` is not accepted on `/mcp`.
+
+A refused request gets FastMCP's RFC 6750 response, not the REST error envelope:
+
+| Request | Status | Response |
+|---|---|---|
+| No `Authorization: Bearer` header (none, `X-API-Key` only, or another scheme) | `401` | Empty body; `WWW-Authenticate: Bearer` |
+| A bearer that is not the owner key | `401` | `WWW-Authenticate: Bearer error="invalid_token", error_description="…"`; JSON body `{"error": "invalid_token", "error_description": "…"}` |
+
+Both `/mcp` and `/mcp/` behave the same.
 
 ### 5.2 MCP tool inventory
 
@@ -292,7 +301,7 @@ All MCP writes are recorded in the change log with `source = mcp`.
 
 ### 5.3 Claude Desktop config
 
-Claude Desktop's native remote connectors require OAuth or no auth, so the API-key path goes through `mcp-remote`. Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+Claude Desktop's native remote connectors require OAuth or no auth, so the owner-key path goes through `mcp-remote`, which sends the key as a bearer token. Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 "mcpServers": {
@@ -301,7 +310,7 @@ Claude Desktop's native remote connectors require OAuth or no auth, so the API-k
     "args": [
       "-y", "mcp-remote",
       "https://ipam.example.com/mcp",
-      "--header", "X-API-Key:${TLG_IPAM_KEY}"
+      "--header", "Authorization: Bearer ${TLG_IPAM_KEY}"
     ]
   }
 }
@@ -374,7 +383,7 @@ tlg-ipam/
 │       ├── database.py       # SQLAlchemy async engine + session
 │       ├── models.py         # ORM models (Section, Subnet, ReservedRange, Host, DeviceType, Change)
 │       ├── schemas.py        # Pydantic request/response schemas
-│       ├── auth.py           # API key dependency + /mcp ASGI middleware
+│       ├── auth.py           # owner-key check: REST dependency + /mcp bearer verifier
 │       ├── mcp_server.py     # FastMCP tools (thin wrappers over services)
 │       ├── services/         # business logic — single source of truth
 │       │   ├── backups.py    # consistent SQLite online-backup snapshots
@@ -462,7 +471,8 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 - ESLint, Vitest component tests, and the production frontend build run in CI alongside pytest, with a check that the dependency locks match their `.in` files.
 
 ### MCP integration
-- Claude Desktop connects via `mcp-remote` and lists all available tools.
+- Claude Desktop connects via `mcp-remote` with the owner key as a bearer and lists all available tools.
+- `/mcp` answers `401` to a missing or wrong bearer, and to `X-API-Key` alone.
 - All 16 MCP tools are callable from Claude Desktop.
 - Bulk import reports per-record outcomes; a batch with some bad rows still imports the good ones.
 - Natural-language queries resolve to correct tool calls without ambiguity.

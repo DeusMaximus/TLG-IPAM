@@ -1,15 +1,29 @@
-import json
+import hmac
 
 from fastapi import Header
+from fastmcp.server.auth import AccessToken, TokenVerifier
 
 from .config import settings
 from .errors import ApiError
+
+# Every scope the owner key carries. Write tools start requiring `ipam:write` in M3,
+# when OAuth grants that lack it exist; until then nothing checks them.
+OWNER_SCOPES = ["ipam:read", "ipam:write"]
+
+
+def is_owner_key(presented: str) -> bool:
+    """Constant-time comparison against the owner key (`API_KEY`).
+
+    Compared as UTF-8 bytes: `hmac.compare_digest` raises on a non-ASCII `str`,
+    and a header value can be any Latin-1 text.
+    """
+    return hmac.compare_digest(presented.encode(), settings.api_key.encode())
 
 
 async def require_api_key(x_api_key: str | None = Header(default=None)):
     if x_api_key is None:
         raise ApiError("UNAUTHORIZED", "Missing X-API-Key header", 401)
-    if x_api_key != settings.api_key:
+    if not is_owner_key(x_api_key):
         raise ApiError("FORBIDDEN", "Invalid API key", 403)
 
 
@@ -18,35 +32,14 @@ async def request_source(x_tlg_client: str | None = Header(default=None)) -> str
     return "ui" if x_tlg_client == "ui" else "api"
 
 
-class APIKeyASGIMiddleware:
-    """X-API-Key enforcement for the mounted MCP sub-app, which bypasses FastAPI dependencies."""
+class OwnerKeyVerifier(TokenVerifier):
+    """Bearer auth for `/mcp`: accepts the owner key and grants every scope.
 
-    def __init__(self, app, api_key: str):
-        self.app = app
-        self.api_key = api_key
+    FastMCP's HTTP app answers 401 itself when the bearer is missing or this
+    returns None, so `/mcp` never sees `X-API-Key`.
+    """
 
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
-        key = headers.get("x-api-key")
-        if key is None:
-            await self._reject(send, 401, "UNAUTHORIZED", "Missing X-API-Key header")
-            return
-        if key != self.api_key:
-            await self._reject(send, 403, "FORBIDDEN", "Invalid API key")
-            return
-        await self.app(scope, receive, send)
-
-    @staticmethod
-    async def _reject(send, status: int, code: str, message: str):
-        body = json.dumps({"error": {"code": code, "message": message}}).encode()
-        await send(
-            {
-                "type": "http.response.start",
-                "status": status,
-                "headers": [(b"content-type", b"application/json")],
-            }
-        )
-        await send({"type": "http.response.body", "body": body})
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if not is_owner_key(token):
+            return None
+        return AccessToken(token=token, client_id="owner", scopes=list(OWNER_SCOPES))

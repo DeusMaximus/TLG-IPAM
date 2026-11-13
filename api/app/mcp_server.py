@@ -11,6 +11,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import ValidationError
 
+from .auth import OwnerKeyVerifier
 from .database import SessionLocal
 from .errors import ApiError
 from .schemas import (
@@ -38,6 +39,9 @@ mcp = FastMCP(
         "addresses, subnets, VLANs, hostnames, or MAC addresses. Writes are audited; "
         "use list_changes to review what was done."
     ),
+    # Bearer auth on the HTTP app (`/mcp`). In-process clients, as in the tests,
+    # skip it: FastMCP applies it only at the HTTP layer.
+    auth=OwnerKeyVerifier(),
 )
 
 
