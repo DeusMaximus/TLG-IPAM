@@ -175,7 +175,8 @@ A scan agent (v0.2 spec §5.4). The owner creates it over REST; check-in, scanni
 | Field | Type / notes |
 |---|---|
 | `id` | UUID, primary key |
-| `name` | str, unique case-insensitively. 1–74 printable characters, trimmed: `agent:<name>` is the audit `actor` for the agent's own writes and must fit `changes.actor` (80) |
+| `name` | str. 1–74 printable characters, trimmed: `agent:<name>` is the audit `actor` for the agent's own writes and must fit `changes.actor` (80). Unique case-insensitively (`409`) |
+| `name_key` | str, unique — `name.casefold()`, so the database itself refuses two names that differ only in case, even from racing requests. Internal: not returned, not in audit snapshots |
 | `state` | enum: `pending` (has never held an agent token; enrolment, v0.2 M2b) \| `active` \| `disabled`. An agent created over REST gets its token at once, so it starts `active` |
 | `version`, `platform`, `hostname`, `interfaces`, `last_checkin_at`, `last_error` | nullable; reported by the agent at check-in (M2a). Null until then |
 | `created_at` | datetime, auto |

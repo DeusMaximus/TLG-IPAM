@@ -135,7 +135,11 @@ class Agent(Base):
     __tablename__ = "agents"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    name: Mapped[str] = mapped_column(String(120), unique=True)
+    name: Mapped[str] = mapped_column(String(120))
+    # name.casefold(): makes names unique case-insensitively in the database itself, so
+    # two racing requests cannot save `Scanner` and `scanner`. Case-folding can lengthen
+    # a name (ß → ss), hence the wider column.
+    name_key: Mapped[str] = mapped_column(String(255), unique=True)
     # pending (never held an agent token), active, disabled
     state: Mapped[str] = mapped_column(String(16), default="pending")
     # reported at check-in (#10); null until the agent first checks in

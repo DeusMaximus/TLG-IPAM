@@ -56,16 +56,19 @@ async def get_agent(session: AsyncSession, agent_id: str) -> Agent:
     return agent
 
 
+def _name_key(name: str) -> str:
+    # folded in Python: SQLite's lower() and NOCASE fold ASCII only
+    return name.casefold()
+
+
 async def _check_name_free(session: AsyncSession, name: str, agent_id: str | None = None) -> None:
-    # compared in Python: SQLite's lower() folds ASCII only
-    rows = (await session.execute(select(Agent.id, Agent.name))).all()
-    for other_id, other_name in rows:
-        if other_id != agent_id and other_name.casefold() == name.casefold():
-            raise conflict(f"Agent {other_name} already exists")
+    other = await session.scalar(select(Agent).where(Agent.name_key == _name_key(name)))
+    if other is not None and other.id != agent_id:
+        raise conflict(f"Agent {other.name} already exists")
 
 
 async def _flush_name(session: AsyncSession, name: str) -> None:
-    # UNIQUE(name) is the backstop for two requests racing past _check_name_free
+    # UNIQUE(name_key) is the backstop for two requests racing past _check_name_free
     try:
         await session.flush()
     except IntegrityError:
@@ -107,7 +110,13 @@ async def create_agent(
     """Create an agent together with its agent token. Returns the agent and the plain
     token, which the caller shows once and must not store."""
     await _check_name_free(session, payload.name)
-    agent = Agent(name=payload.name, state="active", created_at=_now(), tokens=[])
+    agent = Agent(
+        name=payload.name,
+        name_key=_name_key(payload.name),
+        state="active",
+        created_at=_now(),
+        tokens=[],
+    )
     session.add(agent)
     token, plain = _issue_agent_token(session, agent)
     await _flush_name(session, agent.name)
@@ -143,6 +152,7 @@ async def update_agent(
         await _check_name_free(session, data["name"], agent.id)
         parts.append(f"renamed from {agent.name}")
         agent.name = data["name"]
+        agent.name_key = _name_key(agent.name)
         await _flush_name(session, agent.name)
     if "enabled" in data:
         state = _enabled_state(agent) if data["enabled"] else "disabled"

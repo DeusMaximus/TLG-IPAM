@@ -381,6 +381,37 @@ async def test_duplicate_names_are_409_case_insensitively(client):
     assert res.status_code == 200
 
 
+async def test_database_refuses_names_that_differ_only_in_case(client, monkeypatch):
+    """The race the service check alone cannot stop: two requests both pass
+    `_check_name_free` before either writes. The database's UNIQUE(name_key) answers."""
+
+    async def passes(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(agents_svc, "_check_name_free", passes)
+    first, _ = await make_agent(client, "Scanner")
+    res = await client.post("/api/v1/agents", json={"name": "scanner"})
+    assert res.status_code == 409, res.text
+    assert res.json()["error"]["code"] == "CONFLICT"
+    other, _ = await make_agent(client, "other")
+    res = await client.put(f"/api/v1/agents/{other['id']}", json={"name": "SCANNER"})
+    assert res.status_code == 409, res.text
+    res = await client.post("/api/v1/agents", json={"name": "STRASSE"})
+    assert res.status_code == 201
+    res = await client.post("/api/v1/agents", json={"name": "straße"})  # casefolds to strasse
+    assert res.status_code == 409
+    names = [a["name"] for a in (await client.get("/api/v1/agents")).json()["data"]]
+    assert sorted(names) == ["STRASSE", "Scanner", "other"]
+    # the losing requests wrote nothing: one create + one token entry per agent
+    assert len((await client.get("/api/v1/changes?limit=200")).json()["data"]) == 6
+
+
+async def test_name_key_is_not_in_responses_or_snapshots(client):
+    agent, _ = await make_agent(client, "Scanner")
+    assert "name_key" not in agent
+    assert "name_key" not in (await client.get("/api/v1/changes")).text
+
+
 @pytest.mark.parametrize("field", ["name", "enabled"])
 async def test_null_fields_are_422(client, field):
     agent, _ = await make_agent(client)
