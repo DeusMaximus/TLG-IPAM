@@ -31,11 +31,11 @@ The container runs a single uvicorn worker, and it should stay that way: do not 
 
 ## Connect an AI assistant
 
-The MCP server at `/mcp` speaks Streamable HTTP with API-key auth, so any MCP-capable client can use it. Claude Desktop setup is documented below; instructions for other clients (ChatGPT, Codex CLI, …) coming soon.
+The MCP server at `/mcp` speaks Streamable HTTP. It takes the same `API_KEY` as the REST API, sent as a bearer token (`Authorization: Bearer <API_KEY>`), so any MCP-capable client that can send a header can use it. `X-API-Key` works on the REST API only. Claude Desktop setup is documented below; instructions for other clients (ChatGPT, Codex CLI, …) coming soon.
 
 ### Claude Desktop
 
-Claude Desktop's native connectors want OAuth, so API-key auth goes through `mcp-remote`. Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+Claude Desktop's native connectors want OAuth, so the key goes through `mcp-remote`. Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 "mcpServers": {
@@ -44,7 +44,7 @@ Claude Desktop's native connectors want OAuth, so API-key auth goes through `mcp
     "args": [
       "-y", "mcp-remote",
       "http://localhost:8080/mcp",
-      "--header", "X-API-Key:${TLG_IPAM_KEY}"
+      "--header", "Authorization: Bearer ${TLG_IPAM_KEY}"
     ]
   }
 }

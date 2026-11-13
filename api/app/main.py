@@ -9,7 +9,7 @@ from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from .auth import APIKeyASGIMiddleware, require_api_key
+from .auth import require_api_key
 from .config import settings
 from .database import SessionLocal, init_models
 from .errors import ApiError
@@ -93,7 +93,8 @@ async def backup():
 for router in (sections.router, subnets.router, hosts.router, changes.router, device_types.router):
     app.include_router(router, prefix="/api/v1", dependencies=[Depends(require_api_key)])
 
-app.mount("/mcp", APIKeyASGIMiddleware(mcp_app, settings.api_key))
+# Bearer auth for /mcp is the FastMCP server's own `auth=` (mcp_server.py).
+app.mount("/mcp", mcp_app)
 
 
 class SPAStaticFiles(StaticFiles):
