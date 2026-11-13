@@ -27,6 +27,18 @@ Template:
 
 ---
 
+## 2026-11-13 — Claude Code (Fable 5.2) — #2 merged (PR #33); parallel test sessions are safe
+
+- **Done:** [PR #33](https://github.com/DeusMaximus/TLG-IPAM/pull/33) merged as `98b844e`, closing #2. Each pytest session now has its own database directory, removed at session end. Codex and Greptile reviewed it with no findings.
+- **Decisions:** none.
+- **State:**
+  - `main` at `98b844e`: backend suite 80 passed. Several pytest sessions can run on one machine at once, so agents can work in separate worktrees.
+  - Concurrent sessions can make pytest print `PytestWarning: (rm_rf) error removing …/garbage-…` after the summary. That is pytest's own `tmp_path` housekeeping; the run still passes.
+  - `api/requirements.txt` is still unpinned (#3). No application code has changed yet.
+  - Milestones M0–M3 and issues #3–#32 are open; the entry below has the labels and the review tiers.
+- **Waiting on the owner:** nothing right now. Later: #5 (redeploy and a deliberate restore), #25 (client-compatibility spike), the real-VLAN check in #14, registry permissions for #24, #32 (acceptance run).
+- **Next:** #3 (lock dependencies, pin FastMCP 4), then #4, then M1 in order: #6, #7, #8. After M1, M2a (#9 onwards) and M3 (#25 onwards) can run side by side.
+
 ## 2026-11-13 — Claude Code (Fable 5.2) — PR #1 merged; milestones and 31 issues filed; #2 in review as PR #33
 
 - **Done:**
