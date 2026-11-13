@@ -35,6 +35,8 @@ TLG-IPAM is a clean, modern IP address manager designed for homelabs. It replace
 
 One container. FastAPI serves the built Vite `dist/` as static files with an SPA fallback, so `/`, `/api`, and `/mcp` share a single origin — no nginx config, no CORS, one port to tunnel. SQLite lives in a named volume.
 
+**One uvicorn worker, by design.** The image starts a single uvicorn process and must stay that way: no `--workers`, no `WEB_CONCURRENCY`, no replicas behind a load balancer. The MCP server runs stateful Streamable HTTP, so a session's state lives in the memory of the process that opened it, and a request carrying that session id that reached another process would not find it. SQLite is a single file with one writer at a time; one process is what the `busy_timeout` queueing in §9 is sized for. Startup (create tables, add missing columns, seed device types) runs once per process with no coordination between processes: two workers starting on a fresh database sometimes fail to come up with `database is locked`. Scale-out is not a goal for a homelab tool.
+
 ```yaml
 services:
   ipam:
@@ -205,7 +207,7 @@ All endpoints except `GET /health` require this header. Return `401` if missing,
 | `DELETE /api/v1/subnets/{id}/reserved/{range_id}` | Remove a reserved range. |
 | `GET  /api/v1/changes` | Recent changes, newest first. Filters: `?entity_type=` `?limit=`. |
 | `GET/POST /api/v1/device-types` + `PUT/DELETE /api/v1/device-types/{id}` | Device type CRUD with host counts. Rename cascades to hosts; delete refused while in use or for `other`. |
-| `GET  /api/v1/backup` | Download a consistent temporary snapshot made with SQLite's online backup API (powers the Settings backup button). |
+| `GET  /api/v1/backup` | Download a consistent temporary snapshot made with SQLite's online backup API (powers the Settings backup button). `docs/backup-and-restore.md` documents the scheduled pull from another host and the restore. |
 
 ### 4.3 Standard response shapes
 
@@ -433,6 +435,7 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 | FastAPI not Flask | Native async, automatic OpenAPI schema generation, Pydantic validation built in. |
 | FastMCP with curated tools, not OpenAPI auto-generation | Hand-written tools have better names, parameters, and denormalised answers — materially better Claude ergonomics. Shared `services/` layer eliminates the drift risk that auto-generation was meant to solve. FastMCP is the actively-maintained de facto standard. |
 | Streamable HTTP not stdio | Works with mcp-remote for Claude Desktop. Also compatible with any future MCP client without modification. |
+| One uvicorn worker | MCP session state is per-process memory and SQLite has one writer; the session state is not shared between processes, and a second process adds no capacity a homelab needs (see §2.2). |
 | Single container, FastAPI serves the SPA | One origin (no CORS), no nginx config, one port to tunnel, `docker compose up` is the whole story. |
 | Audit log from day one | Claude writes to this system; you need to be able to review what it did. Also free "recent activity" UI. |
 | React + Vite not Next.js | No SSR needed. Vite builds faster, static output served straight from FastAPI. |
@@ -469,6 +472,8 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 - All data persists across container restarts (named volume).
 - API key changeable via env var without rebuild.
 - Settings exposes a SQLite backup download created through the online backup API rather than streaming the active database file.
+- `docs/backup-and-restore.md` describes a scheduled pull of `GET /api/v1/backup` from another host (dated files, retention) and a restore procedure; following it against a running instance produces a dated snapshot and a working restore from it. Its examples use placeholder domains only.
+- The container runs one uvicorn worker (§2.2).
 
 ### UI quality
 - Dark mode correct — no hardcoded colours bleeding through.

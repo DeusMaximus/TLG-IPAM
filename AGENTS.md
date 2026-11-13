@@ -56,6 +56,7 @@ Use uv **0.13.6**, the version CI pins. `uvx uv@0.13.6 pip compile …` runs it 
 - **Schema changes are additive only** — new nullable columns or new tables. `database._add_missing_columns` auto-migrates existing databases on startup; there is no migration framework, so never rename/drop columns or add non-nullable ones without a default.
 - **Response shapes**: `{"data": ...}` on success, `{"error": {"code", "message"}}` on failure. Domain errors raise `ApiError` (`api/app/errors.py`); never return bare HTTPExceptions from services.
 - **IP maths goes through `api/app/ipnet.py`** and Python's `ipaddress`. No string parsing, no `/24` assumptions — the codebase is deliberately IPv6-ready even though v1 is IPv4-only.
+- **One uvicorn worker.** The image runs a single process (no `--workers`, no `WEB_CONCURRENCY`, no replicas): MCP session state is per-process memory and SQLite has one writer. Reason in the brief §2.2; backup and restore procedure in `docs/backup-and-restore.md`.
 - **Bulk endpoints report per-record results** (`created`/`skipped`/`error` + reason) and never abort the batch on a bad record.
 - Frontend: shared reference data (sections, subnets, device types) comes from `TreeContext` (`web/src/context.jsx`) — call `refreshTree()` after any mutation that affects it. Checkboxes use the `.tlg-check` class; device icons come from the `ICONS` registry in `DeviceIcon.jsx`.
 

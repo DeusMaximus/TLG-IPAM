@@ -21,6 +21,14 @@ docker compose up --build
 
 Open http://localhost:8080, paste your API key, done.
 
+## Backups and restore
+
+`GET /api/v1/backup` returns a consistent snapshot of the database (also the Settings → backup button). [docs/backup-and-restore.md](docs/backup-and-restore.md) sets up a scheduled pull of it from another host with dated files and retention, and walks through restoring from one. Try the restore once before you need it.
+
+## One worker
+
+The container runs a single uvicorn worker, and it should stay that way: do not add `--workers`, set `WEB_CONCURRENCY`, or run several replicas behind a load balancer. MCP sessions are held in the memory of the process that opened them, and SQLite allows one writer at a time, so a second process would not share them, and adds no capacity a homelab needs.
+
 ## Connect an AI assistant
 
 The MCP server at `/mcp` speaks Streamable HTTP with API-key auth, so any MCP-capable client can use it. Claude Desktop setup is documented below; instructions for other clients (ChatGPT, Codex CLI, …) coming soon.
