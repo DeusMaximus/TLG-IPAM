@@ -15,7 +15,7 @@ Run these in order for each issue. Each step ends when its last line is true.
 5. **Wait** for the worker's final message. The worker answers its own review findings; the PR is its work until it hands back. Done when the final message has the PR URL, head sha, review states, and a hand-off entry.
 6. **Verify** with the checklist below. Done when every line is ticked or reported as failed.
 7. **Report to the owner:** ready or not, which claims you re-measured and which are the worker's alone, and any follow-up worth an issue. Done when the owner has what they need to decide the merge.
-8. **Close out** once the owner merges or tells you to: squash-merge, delete the remote branch, rebuild nothing the owner did not ask for, and commit the hand-off entry (rule below). Done when `main` has the entry and the issue is closed.
+8. **Close out** once the owner merges or tells you to: squash-merge, delete the remote branch, and commit the hand-off entry (rule below). Done when `main` has the entry and the issue is closed.
 
 ## Roster
 
