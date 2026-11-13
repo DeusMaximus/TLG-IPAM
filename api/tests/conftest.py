@@ -1,9 +1,15 @@
 import os
+import shutil
 import tempfile
 
+# Each pytest session gets its own directory, so two sessions on one machine
+# (agents in separate worktrees, say) never share a database. The environment
+# must be set before `app` is imported, hence module level and not a fixture.
+_SESSION_DIR = tempfile.mkdtemp(prefix="tlg-ipam-test-")
+
 os.environ["API_KEY"] = "test-key"
-os.environ["DB_PATH"] = os.path.join(tempfile.gettempdir(), "tlg-ipam-test.db")
-os.environ["STATIC_DIR"] = os.path.join(tempfile.gettempdir(), "tlg-ipam-no-static")
+os.environ["DB_PATH"] = os.path.join(_SESSION_DIR, "ipam.db")
+os.environ["STATIC_DIR"] = os.path.join(_SESSION_DIR, "no-static")
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -12,6 +18,10 @@ from app.database import SessionLocal, engine
 from app.main import app
 from app.models import Base
 from app.services.device_types import seed_defaults
+
+
+def pytest_sessionfinish(session, exitstatus):
+    shutil.rmtree(_SESSION_DIR, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)
