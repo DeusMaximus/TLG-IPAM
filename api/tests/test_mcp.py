@@ -30,7 +30,7 @@ async def test_all_tools_registered():
         # descriptions are Claude's documentation — they must exist
         assert all(t.description for t in tools)
         update_host = next(t for t in tools if t.name == "update_host")
-        clear_fields = update_host.inputSchema["properties"]["clear_fields"]
+        clear_fields = update_host.input_schema["properties"]["clear_fields"]
         allowed = clear_fields["anyOf"][0]["items"]["enum"]
         assert set(allowed) == {"hostname", "domain", "mac", "owner", "notes", "last_seen"}
 

@@ -27,7 +27,7 @@ TLG-IPAM is a clean, modern IP address manager designed for homelabs. It replace
 | Frontend | React 19 + Vite + Tailwind CSS 4 |
 | Backend API | Python 3.12 + FastAPI |
 | Database | SQLite via SQLAlchemy 2 (async, `aiosqlite`) |
-| MCP server | FastMCP 3.x — curated tools, mounted at `/mcp` in the same process |
+| MCP server | FastMCP 4.x (locked at 4.1.8, MCP SDK 2.3.0) — curated tools, mounted at `/mcp` in the same process |
 | Container | Docker — **single container**: FastAPI serves the API, MCP, and the built SPA |
 | Reverse proxy | Cloudflare Tunnel / Caddy compatible (`/mcp` path exposed) |
 
@@ -239,7 +239,7 @@ Gateway, DHCP, reserved-range, and allocated-address exclusions are represented 
 
 ### 5.1 Overview
 
-The MCP server runs in the same FastAPI process, mounted at `/mcp` (Streamable HTTP transport), implemented with **FastMCP 3.x**.
+The MCP server runs in the same FastAPI process, mounted at `/mcp` (Streamable HTTP transport), implemented with **FastMCP 4.x** (`fastmcp>=4.1,<5`, locked).
 
 Tools are **hand-curated, not auto-generated** from the OpenAPI schema. Auto-generated REST-shaped tools are worse for Claude: generic names, HTTP-flavoured parameters, paginated CRUD responses instead of answers. Since Claude Desktop usage is the headline feature, the tools are first-class citizens.
 
@@ -363,7 +363,8 @@ tlg-ipam/
 ├── docker-compose.yml
 ├── Dockerfile               # multi-stage: node builds web/dist, python runs API + serves it
 ├── api/
-│   ├── requirements.txt
+│   ├── requirements.in / requirements-dev.in    # direct dependencies (edit these)
+│   ├── requirements.txt / requirements-dev.txt  # generated locks: pinned versions + hashes, installed with --require-hashes
 │   ├── tests/                # pytest — API, MCP, validation, allocation, and backup coverage
 │   └── app/
 │       ├── main.py           # FastAPI app + static SPA serving + MCP mount

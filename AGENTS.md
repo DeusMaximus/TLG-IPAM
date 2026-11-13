@@ -20,7 +20,7 @@ v0.2 (scan agents, remote MCP) is specified in `docs/v0.2-spec.md` and tracked a
 ## Commands
 
 ```sh
-# Backend (one-time setup: python3 -m venv api/.venv && api/.venv/bin/pip install -r api/requirements-dev.txt)
+# Backend (one-time setup: python3 -m venv api/.venv && api/.venv/bin/pip install --require-hashes -r api/requirements-dev.txt)
 cd api && .venv/bin/python -m pytest                  # test suite — run before declaring any backend change done
 cd api && API_KEY=dev-key .venv/bin/uvicorn app.main:app --port 8080 --reload
 #   add STATIC_DIR=../web/dist to also serve the built SPA (single-origin, like production)
@@ -32,6 +32,18 @@ cd web && npm run build                                # production bundle to we
 # Full stack (needs .env with API_KEY)
 docker compose up --build
 ```
+
+### Dependency lock
+
+`api/requirements.txt` (runtime) and `api/requirements-dev.txt` (runtime + test) are **generated lock files**: every package pinned by version and hash, resolved for Python ≥ 3.12 on any platform. The Dockerfile and CI install them with `pip install --require-hashes`. Edit the direct dependencies in `api/requirements.in` / `api/requirements-dev.in` (`fastmcp` stays `>=4.1,<5`), never the lock files, then regenerate **both** from `api/` with [uv](https://docs.astral.sh/uv/):
+
+```sh
+uv pip compile requirements.in --universal --python-version 3.12 --generate-hashes --no-header -o requirements.txt
+uv pip compile requirements-dev.in --universal --python-version 3.12 --generate-hashes --no-header -c requirements.txt -o requirements-dev.txt
+#   append -P <package> to either command to upgrade just that package; -U to upgrade everything
+```
+
+Commit the `.in` and lock changes together. The `-c requirements.txt` constraint keeps shared packages at the same version in production and in tests.
 
 ## Architecture invariants
 

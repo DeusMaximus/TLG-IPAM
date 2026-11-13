@@ -1,0 +1,7 @@
+# Direct dev/test dependencies, on top of the runtime set. `requirements-dev.txt`
+# is the lock compiled from this file, constrained to `requirements.txt` so
+# shared packages never differ between production and the test environment.
+-r requirements.in
+pytest>=8.0
+pytest-asyncio>=0.24
+httpx>=0.27
