@@ -25,7 +25,7 @@ The owner's working experience, as of 2026-11-13. Edit in place when a seat chan
 |------|-------|---------|
 | Orchestrator | Claude Fable 5.2, high | This loop, and questions about the shape of the work |
 | Implementer | Claude Opus 5.5, high | The default for any issue with logic in it: services, auth, ingest, the agent package, UI with state |
-| Implementer, mechanical | Claude Sonnet 5.5, high | Docs, configuration, dependencies, test plumbing. Proven here on #3 only; give it one UI issue and record the result in this table before relying on it for more |
+| Implementer, mechanical | Claude Sonnet 5.5, high | Docs, configuration, dependencies, test plumbing. Proven here on #3, #4 and #35 (dependencies, docs, test plumbing); give it one UI issue and record the result in this table before relying on it for more |
 | Briefed reviewer | GPT-6.1 Sol through Codex, high | Every briefed round. It is strict and finds what the implementer missed. Quota is ample: when unsure whether a PR owes a briefed round, run one |
 | Light second read | GLM 5.3, or Mistral Large 4 | Optional, for a PR that owes no briefed round but where you want one more reader. Mistral Large 4 is nearly as good and much cheaper on its plan |
 | Manual fallback | GPT-6 with Daybreak Blue, in the Codex app | Work a model here has refused. The owner runs it by hand; no session here can start it. See "When a model refuses" |
@@ -66,6 +66,7 @@ A worker's report is a claim. Before telling the owner a PR is ready:
 
 - [ ] CI is green at the head sha the worker named, and that sha is still the head.
 - [ ] Codex and Greptile have both finished, and every finding has a fix or a reply on its thread.
+- [ ] Both reviews cover the current head. Neither re-runs after a fix commit: comment `@codex review` on the PR, and ask the owner to retrigger Greptile. The Codex summary comment names the commit it reviewed.
 - [ ] Each acceptance line in the issue maps to evidence in the PR body.
 - [ ] **One claim CI does not cover is re-measured by you**: a Docker build, a count, a command from the documentation run from scratch. Pick the claim the acceptance list leans on most.
 - [ ] The diff stays inside the issue's Scope. Anything extra is either reverted or listed under the PR's Deliberate calls.

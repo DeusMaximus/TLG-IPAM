@@ -27,6 +27,25 @@ Template:
 
 ---
 
+## 2026-11-13 — Claude Code (Sonnet 5.5) — #4: scheduled backup pull and restore procedure (PR #42)
+- **Done:** [PR #42](https://github.com/DeusMaximus/TLG-IPAM/pull/42) closes #4, head `21b7bba`. CI green. Codex: no findings (on `16303b1`). Greptile: three P2s, all fixed and answered; no re-review of `21b7bba` had arrived. CodeRabbit skips this repo (under 10 stars). Merge is the owner's. Docs and one `AGENTS.md` line only; no application code, endpoint or schema change.
+  - `docs/backup-and-restore.md` (new):
+    - **Pull:** a scheduled pull of `GET /api/v1/backup` from another host. A POSIX sh script writes dated `ipam-<UTC stamp>.db` files and keeps the newest N. Before saving or pruning it requires HTTP 200 (redirects not followed), a non-empty file, `integrity_check = ok` and the `sections`/`subnets`/`hosts` tables. Systemd timer and cron variants; cron mails stderr only.
+    - **Restore:** `tlg-ipam-restore restore <snapshot>` and `undo <dir>`, one `set -eu` script. It refuses a bad snapshot before stopping the app, and checks the saved database exists before removing the current one.
+  - README ("Backups and restore", "One worker"), the brief (§2.2 one-worker paragraph, §4.2 pointer, §9 row, two §10 lines) and an `AGENTS.md` invariant line for the single worker.
+  - Measured on a local `docker compose` instance, from the doc's own code blocks. Pull, restore, undo and cleanup all worked. An empty 302, an empty 200, a foreign database and a wrong key were each rejected with no file left. A missing, empty and corrupt snapshot were each refused with the app still up. Output is in the PR body.
+  - **Merged:** `59acad5`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #4 closed. Before the merge, Codex and Greptile both re-reviewed `21b7bba` with no findings (Greptile 5/5), and the orchestrator re-ran pull, restore and undo at that head. Follow-up filed: #43 (pin `--workers 1` in the Dockerfile, M0). Live state after the merge: #35 and #36 are merged (entries below), so M0 has only #43 and #5 (`owner`, now unblocked) left. #6 was started next, in its own thread, with Opus 5.5.
+- **Decisions:**
+  - The restore moves the old `ipam.db`, `-wal` and `-shm` into `/data/before-restore-<stamp>/` instead of overwriting. After a normal stop the data was in a 168 KB `-wal` beside a 4 KB `ipam.db`.
+  - Retention keeps the newest N files, not an age window, and runs only after a successful pull.
+  - The integrity check opens the snapshot with `?immutable=1`. The snapshot is in WAL mode, and a plain open left `-wal`/`-shm` litter.
+  - The one-worker reasons are the ones true on `main`: stateful MCP sessions (from the code, not reproduced), SQLite's single writer, and uncoordinated per-process startup (measured: two workers on a fresh database sometimes fail with `database is locked`). The spec's M3 linking-state reason is not stated in the brief or README, which describe `main`.
+  - Not done: `--workers 1` in the Dockerfile `CMD`. `WEB_CONCURRENCY` would override the default, which is why the docs name it.
+  - Orchestrator, with the owner (2026-11-13): the automatic reviews do not re-run after a fix commit. `.agents/orchestration.md` → "Verifying a result" now says how to retrigger them.
+- **State:** backend suite 80 passed; frontend lint, 3 tests and build pass. Not run: the systemd timer, the cron line including the mail itself, a pull from another host over a real network.
+- **Waiting on the owner:** merge PR #42. #5 (redeploy and a deliberate restore on the deployed instance) is the owner's; its restore step is `docs/backup-and-restore.md`. Decide whether to pin `--workers 1` in the Dockerfile.
+- **Next:** #35 and #36 are independent of this. M1 follows: #6, #7, #8; #6 and #8 owe a briefed review round. #6 will edit the MCP auth parts of the README and the brief, which this PR left alone.
+
 ## 2026-11-13 — Claude Code (Opus 5.5) — #36: CI checks the locks match their .in files (PR #41)
 
 - **Done:** [PR #41](https://github.com/DeusMaximus/TLG-IPAM/pull/41) closes #36, head `a317b81`. CI green. Codex: no findings. Greptile: 5/5, no findings. Merge is the owner's.
@@ -82,21 +101,3 @@ Template:
   - No application code has changed yet beyond the one-line test fix in #3.
 - **Waiting on the owner:** nothing blocks the next issue. Later: #5 (redeploy and a deliberate restore), #25 (client-compatibility spike), the real-VLAN check in #14, registry permissions for #24, #32 (acceptance run).
 - **Next:** #4 (scheduled backup and restore procedure) and #35 are independent and can run side by side. Then M1 in order: #6, #7, #8; #6 and #8 owe a briefed review round.
-
-## 2026-11-13 — Claude Code (Sonnet 5.5) — #3: dependencies locked, FastMCP 4 pinned (PR #34)
-
-- **Done:** [PR #34](https://github.com/DeusMaximus/TLG-IPAM/pull/34) closes #3, head `85e96f8`. CI green. Codex: no findings. Greptile: 5/5, no findings. Merge is the owner's.
-  - `api/requirements.in` / `requirements-dev.in` hold the direct dependencies (`fastmcp>=4.1,<5`). `requirements.txt` / `requirements-dev.txt` are now generated locks: `uv pip compile --universal --python-version 3.12 --generate-hashes`, 71 and 78 pins. They resolve FastMCP 4.1.8, MCP SDK 2.3.0, FastAPI 0.162.5. The dev lock is constrained to the runtime lock.
-  - The Dockerfile and CI install with `pip install --require-hashes`. `api/tests/test_mcp.py` reads `input_schema`, so the FastMCP deprecation warning is gone.
-  - `AGENTS.md` has the new setup command and a "Dependency lock" section with the regenerate commands. README and the brief are updated.
-- **Decisions:**
-  - uv, not pip-compile, because `--universal` gives one lock for the 3.12 image, 3.13 CI, and any dev machine. Only `pip` is needed to install it; `uv` is needed only to regenerate.
-  - The lock file names are unchanged and `--no-header` is used, so the locks hold no local paths. Recompiling reproduces them byte for byte.
-- **State:**
-  - Backend suite: 80 passed on Python 3.12 and 3.13 from fresh venvs. Frontend lint, tests and build pass. No schema change.
-  - The image built on `python:3.12-slim` matches the lock. The container started, `/health` returned 200, and `/mcp` returned 401 without a key.
-  - pytest-asyncio 1.5.0 prints a `PytestDeprecationWarning` at configure time about `asyncio_default_fixture_loop_scope` (unset). It is not a FastMCP warning, and `pytest.ini` is untouched. It is worth its own small issue.
-  - There is no CI check that the locks match the `.in` files. Install-time `--require-hashes` catches a hand-edited lock.
-  - Not tried: installs on Python 3.14 / 3.15.
-- **Waiting on the owner:** merge PR #34. Reinstall the long-lived venv with the new setup command; it is still on FastMCP 3.4.2.
-- **Next:** #4, then M1 (#6, #7, #8). From now on, dependency changes go through the `.in` files and a regenerated lock, never a hand-edited lock.
