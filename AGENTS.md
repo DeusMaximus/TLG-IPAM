@@ -51,7 +51,7 @@ Use uv **0.13.6**, the version CI pins. `uvx uv@0.13.6 pip compile …` runs it 
 ## Architecture invariants
 
 - **All business logic lives in `api/app/services/`.** REST routers (`api/app/routers/`) and MCP tools (`api/app/mcp_server.py`) are thin wrappers over the same service functions. Never put validation or logic in a router or tool.
-- **Every write is audit-logged** via `services/changes.record()` with the correct `source` (`ui`/`api`/`mcp`). A write path without a change-log entry is a bug.
+- **Every write is audit-logged** via `services/changes.record()` with the correct `source` (`ui`/`api`/`mcp`). A write path without a change-log entry is a bug. `actor` names who acted when that is narrower than the `source`; it is null for the owner key (spec §4.3). A name a client or agent declares goes in `actor`, never into `summary`.
 - **MCP tools are hand-curated**, never auto-generated from OpenAPI. When adding or changing one: the docstring is the connected assistant's runtime documentation (write it for tool selection), update `EXPECTED_TOOLS` in `api/tests/test_mcp.py`, and update the tool table in the brief. MCP may only mutate hosts and reserved ranges — subnet/section deletion stays UI-only by design.
 - **Schema changes are additive only** — new nullable columns or new tables. `database._add_missing_columns` auto-migrates existing databases on startup; there is no migration framework, so never rename/drop columns or add non-nullable ones without a default.
 - **Response shapes**: `{"data": ...}` on success, `{"error": {"code", "message"}}` on failure. Domain errors raise `ApiError` (`api/app/errors.py`); never return bare HTTPExceptions from services.

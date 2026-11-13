@@ -331,8 +331,9 @@ async def delete_host(host_id: str) -> dict:
 async def list_changes(entity_type: str | None = None, limit: int = 20) -> dict:
     """Recent changes to the IPAM (audit log), newest first. Each entry records what
     changed, before/after snapshots, and whether it came from the UI, the REST API, or
-    MCP. Use to answer "what changed recently?" or to review earlier MCP-driven edits.
-    entity_type filters to: section|subnet|host."""
+    MCP (source). actor names who acted when that is narrower than source; it is null
+    for the owner's own writes. Use to answer "what changed recently?" or to review
+    earlier MCP-driven edits. entity_type filters to: section|subnet|host."""
     async with SessionLocal() as session:
         rows = await changes_svc.list_changes(session, entity_type=entity_type, limit=limit)
         return {"changes": [ChangeOut.model_validate(c).model_dump(mode="json") for c in rows]}
