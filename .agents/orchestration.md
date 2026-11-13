@@ -28,6 +28,7 @@ The owner's working experience, as of 2026-11-13. Edit in place when a seat chan
 | Implementer, mechanical | Claude Sonnet 5.5, high | Docs, configuration, dependencies, test plumbing. Proven here on #3 only; give it one UI issue and record the result in this table before relying on it for more |
 | Briefed reviewer | GPT-6.1 Sol through Codex, high | Every briefed round. It is strict and finds what the implementer missed. Quota is ample: when unsure whether a PR owes a briefed round, run one |
 | Light second read | GLM 5.3, or Mistral Large 4 | Optional, for a PR that owes no briefed round but where you want one more reader. Mistral Large 4 is nearly as good and much cheaper on its plan |
+| Manual fallback | GPT-6 with Daybreak Blue, in the Codex app | Work a model here has refused. The owner runs it by hand; no session here can start it. See "When a model refuses" |
 
 - Implementers are Claude models and the reviewers are not, so every PR gets a read from outside the author's model family. Keep that true when a seat changes.
 - Move an issue up to Fable 5.2 as implementer when it has failed two review rounds, or when the work is deciding what to build (a spike's write-up, a spec change).
@@ -52,6 +53,7 @@ Rules beyond `AGENTS.md`:
 - Open one PR that closes #‹N›. It owes ‹the automatic reviews only / the automatic reviews and a briefed round, which the orchestrator will start›. Wait for Codex and Greptile, then fix each finding or reply on its thread with the reason it stands.
 - The owner merges.
 - End your final message with your hand-off entry, written to the template in `HANDOFF.md`.
+- If a safety filter or a refusal stops you on a step, stop there. Push what you have, and report the step, the message you got word for word, and what is left on the acceptance list.
 
 Finish with: the PR URL, its head sha, the state of CI and of each automatic review, each acceptance line you could not verify and why, then the hand-off entry.
 ```
@@ -81,6 +83,24 @@ For an issue labelled `briefed-review`, after the automatic reviews are answered
 2. Start the reviewer from the roster in a worktree at the PR head, with the one line: *"Follow the review brief at `<absolute path>`"*.
 3. Findings go back to the worker's thread to fix. A fix means a new head, so the round repeats until the verdict is GO at the current head.
 
+## When a model refuses
+
+Parts of v0.2 look like offensive tooling to a safety filter although they are ordinary network administration on the owner's own network: the ICMP and ARP sweeps (#13, #14), the OAuth server and its consent page (#26–#29), and tests that feed hostile input to ingest. A worker, a reviewer, or you may be refused or cut off partway through.
+
+A refusal is a hand-over to the owner. They continue the work by hand in the Codex app with the manual-fallback model from the roster.
+
+1. Leave the branch as it is, with everything committed and pushed.
+2. Write `.dev/<issue>/manual-handover.md` in the main checkout. The session that picks it up has no context, so the file stands alone:
+   - the repository, the branch, and the issue number, with "read `AGENTS.md` and the issue first";
+   - what is done, by commit;
+   - the step that was refused, and the refusal message word for word;
+   - what is left on the issue's acceptance list;
+   - how to finish: push to the same branch, and add the model's name to the PR body's opening line.
+3. Tell the owner the path and that the issue is waiting on them. Carry on with other ready issues.
+4. When the branch moves again, verify it as you would any worker's result. The part written by the fallback model is from the briefed reviewer's own model family, so its briefed round goes to a Claude model that did not write the PR.
+
+Send the same task to another model in the roster first only when the refusal is plainly about wording in your brief. One retry; then hand over.
+
 ## Hand-off entries
 
 - A worker in a worktree cannot commit to `main`. It ends its final message with its entry, and you commit it.
@@ -96,4 +116,5 @@ Ask before any of these. Everything else in the loop is yours.
 - Starting an issue labelled `owner`, or the part of an issue that needs a real network, a real account, or a deployed instance.
 - A spec change that alters a row in the spec's §9 Decisions table.
 - A briefed round that returns NO-GO twice on the same PR.
+- A refusal or safety block on legitimate work. Hand it over as "When a model refuses" describes.
 - Changing a seat in the roster.
