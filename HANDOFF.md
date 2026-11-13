@@ -29,7 +29,7 @@ Template:
 
 ## 2026-11-13 — Claude Code (Fable 5.2) — orchestrator session: M0 and M1 critical path merged; nothing in flight
 
-- **Done:** eight issues taken from ready to merged through `.agents/orchestration.md`, one worker thread each: #4 (PR #42), #35 (#38), #36 (#41), #6 (#44), #7 (#47), #45 (#48), #8 (#49). Each has its own entry below or in `.agents/handoff/2026-11.md`. Follow-ups filed on the owner's go-ahead: #43, #45, #46, #50, #51. A note for the implementer is on #10.
+- **Done:** seven issues taken from ready to merged through `.agents/orchestration.md`, one worker thread each: #4 (PR #42), #35 (#38), #36 (#41), #6 (#44), #7 (#47), #45 (#48), #8 (#49). Each has its own entry below or in `.agents/handoff/2026-11.md`. Follow-ups filed on the owner's go-ahead: #43, #45, #46, #50, #51. A note for the implementer is on #10.
 - **Decisions** (owner, 2026-11-13):
   - Two issues may now run together when they edit different sections of the brief, the README or `AGENTS.md`; code files still run one after the other (`.agents/orchestration.md`, step 2). Untried: the next wave is its first use.
   - The automatic reviews do not run again after a fix commit. Comment `@codex review`; the owner retriggers Greptile (`.agents/orchestration.md` → "Verifying a result").
