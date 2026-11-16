@@ -1,12 +1,12 @@
 import { useState } from 'react'
 import { Lock, Plus, X } from 'lucide-react'
-import { createReservedRange, deleteReservedRange } from '../api/ipam'
+import { createReservedRange, deleteReservedRange, updateReservedRange } from '../api/ipam'
 import { useToast } from '../context'
 import Modal, { inputCls, labelCls, primaryBtn, secondaryBtn } from './Modal'
 
 function ReserveModal({ subnet, onClose, onSaved }) {
   const toast = useToast()
-  const [form, setForm] = useState({ start_ip: '', end_ip: '', description: '' })
+  const [form, setForm] = useState({ start_ip: '', end_ip: '', description: '', scan: true })
   const [busy, setBusy] = useState(false)
 
   const set = (field) => (e) => setForm({ ...form, [field]: e.target.value })
@@ -19,6 +19,7 @@ function ReserveModal({ subnet, onClose, onSaved }) {
         start_ip: form.start_ip.trim(),
         end_ip: form.end_ip.trim(),
         description: form.description.trim() || null,
+        scan_excluded: !form.scan,
       })
       toast.success(`Reserved ${form.start_ip}–${form.end_ip}`)
       onSaved()
@@ -48,6 +49,20 @@ function ReserveModal({ subnet, onClose, onSaved }) {
         </div>
         <label className={labelCls}>Description</label>
         <input className={inputCls} value={form.description} onChange={set('description')} placeholder="network gear" />
+        <label className="mt-3 flex items-start gap-2 text-sm text-slate-300">
+          <input
+            type="checkbox"
+            className="tlg-check mt-0.5"
+            checked={form.scan}
+            onChange={(e) => setForm({ ...form, scan: e.target.checked })}
+          />
+          <span>
+            Scan this range
+            <span className="block text-xs text-slate-500">
+              Untick for devices that should not be probed, or that someone else manages.
+            </span>
+          </span>
+        </label>
         <div className="mt-5 flex justify-end gap-2">
           <button type="button" onClick={onClose} className={secondaryBtn}>
             Cancel
@@ -64,14 +79,34 @@ function ReserveModal({ subnet, onClose, onSaved }) {
 export default function ReservedRanges({ subnet, onChanged }) {
   const toast = useToast()
   const [adding, setAdding] = useState(false)
+  const [saving, setSaving] = useState(null) // id of the range whose Scan box is saving
+
+  // onChanged reloads the tree (its subnets carry their reserved ranges, scan_excluded
+  // included) and this view; it reports its own failures, so it never throws here
+  const changed = onChanged
 
   const remove = async (block) => {
     try {
       await deleteReservedRange(subnet.id, block.id)
       toast.success(`Unreserved ${block.start_ip}–${block.end_ip}`)
-      onChanged()
+      await changed()
     } catch (err) {
       toast.error(err.message)
+    }
+  }
+
+  const setScanned = async (block, scanned) => {
+    setSaving(block.id)
+    try {
+      await updateReservedRange(subnet.id, block.id, { scan_excluded: !scanned })
+      toast.success(
+        `${block.start_ip}–${block.end_ip} ${scanned ? 'is scanned' : 'is no longer scanned'}`
+      )
+      await changed()
+    } catch (err) {
+      toast.error(err.message)
+    } finally {
+      setSaving(null)
     }
   }
 
@@ -92,6 +127,24 @@ export default function ReservedRanges({ subnet, onChanged }) {
             {block.start_ip}–{block.end_ip}
           </code>
           {block.description && <span className="text-slate-500">{block.description}</span>}
+          <label
+            className="flex items-center gap-1 text-slate-400"
+            title={
+              block.scan_excluded
+                ? 'Not scanned: no packet is sent to these addresses'
+                : 'Scanned. Unticking deletes what scans saw in this range'
+            }
+          >
+            <input
+              type="checkbox"
+              className="tlg-check"
+              checked={!block.scan_excluded}
+              disabled={saving === block.id}
+              onChange={(e) => setScanned(block, e.target.checked)}
+              aria-label={`Scan ${block.start_ip}–${block.end_ip}`}
+            />
+            {block.scan_excluded ? <span className="text-amber-400">not scanned</span> : 'Scan'}
+          </label>
           <button
             onClick={() => remove(block)}
             className="text-slate-600 hover:text-red-400"
@@ -109,7 +162,7 @@ export default function ReservedRanges({ subnet, onChanged }) {
         <Plus size={12} /> Reserve range
       </button>
       {adding && (
-        <ReserveModal subnet={subnet} onClose={() => setAdding(false)} onSaved={onChanged} />
+        <ReserveModal subnet={subnet} onClose={() => setAdding(false)} onSaved={changed} />
       )}
     </div>
   )
