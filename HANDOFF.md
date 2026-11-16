@@ -27,6 +27,44 @@ Template:
 
 ---
 
+## 2026-11-16 — Claude Code (Opus 5.5) — #13: scan agent package, through three briefed rounds (PR #70)
+- **Done:** [PR #70](https://github.com/DeusMaximus/TLG-IPAM/pull/70) closes #13, head `214fb82` (merges `main` at `9f47b28`: #59, #12, #15, #73). CI green. Agent 374, server 677 (674 on `main` + 3 new), Python 3.13.
+  - `agent/`, package `tlg-ipam-agent`, httpx + icmplib + dnspython, hashed locks constrained to `api/requirements-dev.txt`:
+    - Check-in loop with the spec §5.7 refusal rule (`agent_protocol.CHECKIN_RETRY_*`: 10–300 s jittered back-off; 13.5–15 min for refusals only the owner can clear). Only a 200 in the check-in shape queues a job.
+    - Jobs one at a time. `guard.plan` refuses before any packet a job outside `ALLOWED_CIDRS`, with ranges outside its subnet, or over 4,096 addresses, and reports the refusal.
+    - Paced ICMP sweep. PTR lookups sent query by query: one UDP query per server, at most 3 servers, EDNS(0)/1232, no retransmission, no TCP, truncated replies unused. Every datagram is paced by `MAX_PPS`; a lookup's 2 s start at its first slot.
+    - 10-minute timeout gives `complete: false`; `arp`/`fdns` not run here also give `complete: false`.
+    - HTTP: TLS always verified, https except to loopback; one 30 s deadline per request; results also capped by the lease; undecoded reads checked against 1 MiB before they are held.
+    - Logs: no server text (status, code, validated counts); the token is redacted.
+    - rtnetlink interfaces, at most `DUMP_MAX` held. Dockerfile: root in the container, `python -m`.
+  - CI: `agent` job (pytest; image built and started with `--network none`); `locks` job checks the agent locks.
+  - The one server rule change (`api/app/services/results.py`, round 3, owner's decision): an incomplete result set never clears a stored `rdns_name`; a name still replaces it. The wire is unchanged, so `PROTOCOL_VERSION` stays 1.
+  - Docs: `AGENTS.md` (invariant 1 bullet, agent commands and locks, ingest rule); README "Scan agent"; brief §2.2, §3.11, §4.6, §7, §10; spec §5.4, §5.6, §5.7.
+  - **Merged:** `de13ee9`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #13 closed. The fourth briefed round by GPT-6.1 Sol returned GO on `214fb82` with one P3, posted on the PR; it accepted the owner's server rule and confirmed with its own replays that names an incomplete scan never asked about now survive. Codex was clean on `214fb82`; Greptile last saw `cf65345`, which is optional after a GO at the current head. The orchestrator re-measured 374 agent and 677 server tests on the head and 677 on `main` after the merge, and confirmed the rule is guarded (two server and three agent end-to-end tests red without it). How the rounds went, since the order mattered: round 2 reviewed a head that moved under it, and its only blocker was already fixed; that second NO-GO went to the owner, who kept the worker on the issue. Round 3 found that an incomplete scan still cleared names it never looked up, because of an ingest rule from #11; the owner chose a server rule over leaving addresses out of the result set, which would have cost hosts their last-seen update on slow scans. The first round's review was posted by the orchestrator because the reviewer's own clean-up was refused by its sandbox; later briefs tell the reviewer to post first. Follow-ups filed on the owner's say-so: #75 (M2a) bounds a subnet's `dns_servers` and what a job carries; #78 (M2a, `briefed-review`) makes "no resolver to ask" an incomplete scan, not a complete one. Stated by the last review and worth carrying: a name kept by an incomplete scan can be stale, can raise a name finding, and can be accepted into a host; until #14, scans on an agent's own link are always incomplete. Not run, and the owner's to run: a real VLAN sweep, PTR lookups against the owner's DNS, TLS against the owner's certificate, the packet rate on the wire, and Python 3.11; commands are in the PR body. Live state after this merge: two PRs are open. #76 (#17, MCP tools) has a GO at `4ed7465` with three P3s (filed as #79) and the owner's approval to merge once its worker has merged this `main` in (one conflicted bullet in `AGENTS.md`). #77 (#19, findings UI) is at `1873ee8` with CI green and Codex clean, waiting on Greptile's re-review after the owner's retrigger. Also done the same day: #68 gained a scope-membership bullet from #19, and #26 and #28 a note on the order they ship in. Ready and not started: #14, #60, #65, #68, #75, #78, #79, #20. The `owner` issues #5 and #25 still wait on the owner.
+- **Reviews:**
+  - Codex: clean on `214fb82`; all Codex threads answered.
+  - Greptile: last reviewed `cf65345`, both findings fixed and answered; no re-review needed.
+  - Briefed rounds:
+    - Round 1 (NO-GO `797e249`): DNS pacing, HTTP deadline, acknowledgments and logs; fixed in `dbb2f1c`.
+    - Round 2 (NO-GO `ce60198`): low-rate PTR, the answer cap, truncated DNS replies; fixed in `9ea136b` and `e70d298`.
+    - Round 3 (NO-GO `cfe8208`): incomplete scans clearing names, plus the no-append test; fixed in `214fb82`.
+    - Round 4: can start now.
+- **Decisions:** 17 Deliberate calls in the PR body. Rewritten: 12 (DNS, with which dnspython settings are tested and which are belt and braces) and 15 (deadline and bounded read). New: 16 (logs) and 17 (the name rule, replacing call 3 of PR #64). Consequence of 17: until #14, on an agent's own subnet names are only set or replaced, never cleared.
+- **State:**
+  - No schema change.
+  - Server changes: the `agent_protocol.py` constants block and the one ingest rule.
+  - Agent locks are reproducible with uv 0.13.6.
+  - The agent test session deletes its temp directory.
+- **Waiting on the owner:**
+  - Briefed round 4.
+  - #75 (a server-side limit on `dns_servers`).
+  - Follow-ups to decide: an http-origin warning in the Add agent dialog; a resolver allowlist on the agent's host; pinning `python:3.13-slim` by digest.
+  - The five not-run network checks in the PR body.
+  - Merge.
+- **Next:**
+  - #14: ARP. Add `arp` to `protocol.SUPPORTED`, so complete scans mark addresses dead and clear names again. ARP requests take slots from the same `MAX_PPS` budget; report MACs.
+  - #22 and #24: the wheel, publishing the image, aligning versions.
+
 ## 2026-11-16 — Claude Code (Opus 5.5) — #15: findings round-1 fixes (PR #72)
 - **Done:** [PR #72](https://github.com/DeusMaximus/TLG-IPAM/pull/72), head `78a435b`: fix commit `d3ace54` on `f962a58`, plus a merge of `main` at `c6e579e`. CI green. 674 passed (597 + 77). `@codex review` posted after the push. Greptile has not re-reviewed `78a435b`.
   - R1 P2: findings carry a `fingerprint` (SHA-256 over key, `host_id`, `proposed`, 32 hex). Accept requires it; dismiss checks it only when sent. Dismissals are still matched on the four-part key (spec §9 unchanged).
@@ -115,41 +153,3 @@ Template:
   - #19 shows `last_seen_source` in the UI.
   - #15 reads observations for findings; its `stale` finding should use the same `last_seen` rule (`hosts._last_seen`).
   - #65 can rely on stored host `last_seen` being UTC.
-
-## 2026-11-16 — Claude Code (Opus 5.5) — #11: scan results ingest and observations (PR #64)
-- **Done:** [PR #64](https://github.com/DeusMaximus/TLG-IPAM/pull/64) closes #11, head `69a9b77` (merges `main` at `a7f96d6`; earlier merge `c51b8a1` brought in #51). CI green. Codex: one P2 on `9a427eb` fixed; clean on `373f94d`, `cb83075` and `69a9b77`. Greptile: three findings on `9a427eb`/`373f94d`, all fixed and answered on their threads; 5/5 on `cb83075`; needs a retrigger on `69a9b77`. Briefed round 1 (GPT-6.1 Sol) NO-GO at `cb83075`: P2 fixed and both review P3s handled in `c6d8acc` (the lock-during-ingest 500 → #59). Round 2 not started. The owner merges.
-  - `services/results.py` (new): `POST /api/v1/agent/results`.
-    - Refuses the whole set with `409 JOB_NOT_CURRENT` unless `job_id` is both the agent's and a target's `current_job_id`.
-    - Clears both lease copies in one transaction, each a compare-and-set. `last_scan_at` = `job_issued_at`.
-    - Rejects records one by one, judged by `job_methods` and by the scope read under the write lock.
-    - Only a `complete` job issued a liveness method marks addresses dead. The 90-day prune covers every subnet.
-    - The answer is built and encoded before the commit. Nothing is written to `hosts` or the change log.
-  - `agent_protocol.py`: results shapes; `rdns_name` (a hostname, or dropped whole); `scan_error`; `echo_ip` (only short, ASCII, printable strings, otherwise null); `RESULTS_BODY_MAX` (2 MiB, read after auth, `413`).
-  - `services/scans.py`:
-    - `scan_scope` reads the subnet, the target's `scan_dhcp_pool` and the excluded ranges as committed columns, never from loaded objects and never refreshing them.
-    - `drop_out_of_scope` takes the write lock (`take_write_lock`), decides membership in Python, and deletes by id in batches of 500.
-    - Every scope-narrowing write calls `drop_out_of_scope`; subnet deletion deletes the subnet's observations.
-  - Schema, additive: table `observations`; nullable `scan_targets.last_scan_error`, kept out of audit snapshots.
-  - Docs:
-    - Brief: §2.3, §3.6, §3.8, §3.10, new §3.11, §4.1 (one sentence), §4.2, §4.5, new §4.6, §7, §10.
-    - Spec: §5.3, §5.4, §5.7.
-    - `AGENTS.md`: audit bullet (four exceptions), scan-scope bullet (deletion on scope change, write-lock rule), wire-contract bullet, new bullets for invariants 3 and 8.
-  - Tests: 559 on `69a9b77` (425 + 134). Every mutant in the PR's tables is killed; the barrier race test kills the both-predicates mutant 10/10.
-  - **Merged:** `f720f88`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #11 closed. Before the merge, the second briefed round by GPT-6.1 Sol returned GO on `69a9b77` with two P3s, posted on the PR: it replayed its reproduction against a real server (200, the valid record stored, both lease copies cleared) and sent the same input through every other agent string on both routes with no further 500. Greptile did not re-review `69a9b77`; under the rule adopted the same day that is optional after a GO at the current head. The orchestrator re-measured 559 on the head and on `main` after the merge, confirmed the fix's mutation red, and confirmed the merge commit `69a9b77` identical to a mechanical merge. The P3s went into existing issues on the owner's say-so: #59 now also owns the 503 for a lock during results persistence, tests for each half of the `echo_ip` rule, and the wording of the pre-commit guarantee in spec §5.7 and the brief (it promises response construction and encoding, not delivery); #13 carries a note that a rejection has no record index. Live state after this merge: no PR is open.
-- **Decisions:** 14 under Deliberate calls in the PR; round 1 accepted all of them. The main ones:
-  - `error` lives in `scan_targets.last_scan_error`, made printable and capped.
-  - A record carrying a field its job was not issued to collect is rejected whole.
-  - An address named in a rejected record is not marked dead.
-  - A refusal of a whole result set is not recorded on the agent.
-  - A late result for an expired lease is accepted until either lease copy is overwritten.
-  - `fdns` entries are checked for shape and not stored until #20.
-  - The PR body has a table of every scope caller and whether it runs under the write lock.
-- **State:** green, nothing half-finished. No route reads observations yet. #15 must add dismissals to `drop_out_of_scope`. Any new caller that writes on the strength of the scope must hold the write lock first (`AGENTS.md`). `_capped_json` is route-specific until #60. A database lock during results persistence is still a bare 500 (#59). Round 1 noted that `ip_int` as BIGINT cannot hold IPv6, on hosts as on observations; this is inherited, and IPv6 support needs an additive representation change.
-- **Waiting on the owner:** retrigger Greptile on `69a9b77`; the second briefed round; merge.
-- **Next:**
-  - #12: `last_seen` from observation timestamps, not `alive`.
-  - #15: findings and dismissals. Dismissals join `drop_out_of_scope`. Treat `rdns_name` and `last_scan_error` as data.
-  - #20: `fdns` address validity, issued-host membership and `fdns_results`.
-  - #59: the 503 for a lock during results and check-in persistence.
-  - #60: one shared body cap.
-  - #13: the agent, against `agent_protocol.ResultsRequest`.
