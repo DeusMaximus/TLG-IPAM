@@ -262,21 +262,26 @@ function SettingsForm({ subnet, target, agents, agentsFailed, onSaved }) {
   )
 }
 
-// The scanning section of the subnet view (spec §5.8). `subnet` is the subnet as the
-// server last returned it; a new object (after any refresh) reloads the target, whose
-// scope may have changed with it.
-export default function ScanSettings({ subnet, onChanged }) {
-  const toast = useToast()
-  const [open, setOpen] = useState(false)
-  const [asking, setAsking] = useState(false)
+// The scan targets, reloaded whenever `subnet` is a new object (after any refresh: its
+// scope may have changed with it) and every REFRESH_MS while the view is open.
+export function useScanTargets(subnet) {
   const targetsRes = useFetch(() => listScanTargets(), [subnet])
-  const agentsRes = useFetch(() => listAgents(), [])
   const reloadTargets = targetsRes.refresh
-
   useEffect(() => {
     const timer = setInterval(reloadTargets, REFRESH_MS)
     return () => clearInterval(timer)
   }, [reloadTargets])
+  return targetsRes
+}
+
+// The scanning section of the subnet view (spec §5.8). `subnet` is the subnet as the
+// server last returned it. `targetsRes` is `useScanTargets(subnet)`, held by the subnet
+// view, which also reads the target's scope for the host table's last-seen column.
+export default function ScanSettings({ subnet, targetsRes, onChanged }) {
+  const toast = useToast()
+  const [open, setOpen] = useState(false)
+  const [asking, setAsking] = useState(false)
+  const agentsRes = useFetch(() => listAgents(), [])
 
   const loaded = targetsRes.data != null
   const target = targetForSubnet(targetsRes.data?.data, subnet.id)
@@ -325,6 +330,12 @@ export default function ScanSettings({ subnet, onChanged }) {
           <Radar size={14} className="text-slate-400" />
           <h2 className="text-sm font-semibold text-slate-200">Scanning</h2>
           <span className="text-xs text-slate-400">{summary}</span>
+          {targetsRes.error && loaded && (
+            // the last target stays when a reload fails: say it is not current
+            <span role="alert" className="text-xs text-amber-400">
+              Could not be reloaded: {targetsRes.error.message}
+            </span>
+          )}
         </div>
         <div className="flex gap-2">
           {loaded && (
