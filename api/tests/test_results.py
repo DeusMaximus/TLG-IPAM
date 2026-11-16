@@ -723,10 +723,18 @@ async def test_ingest_writes_no_host_and_no_change_entry(client, agent_api):
     assert got["mac"] is None and got["last_seen_source"] == "scan"
 
 
-def test_the_ingest_module_does_not_reach_hosts_or_the_change_log():
-    """Invariants 3 and 8 at the source: `services/results` imports neither the host
-    model, the hosts service nor the change log, so no later edit there writes them
-    without changing this test."""
+def test_the_ingest_module_binds_neither_hosts_nor_the_change_log():
+    """Invariants 3 and 8, as far as a source check goes: no name in the namespace of
+    `services/results` is the host model, the hosts service, the change-log model or the
+    change-log service, so a later edit that imports one of them to use it here fails
+    this test.
+
+    That is all it proves. It does not follow imports: the module calls into
+    `services/agents` (`record_token_use`) and `services/scans`, and both import
+    `changes`, so the change log is reachable from it by that route. That those helpers
+    write nothing there on this path is shown by
+    `test_ingest_writes_no_host_and_no_change_entry`, which runs ingest and counts the
+    rows."""
     names = vars(results)
     assert not {"Host", "hosts", "changes", "Change"} & names.keys()
 

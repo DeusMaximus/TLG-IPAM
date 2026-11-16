@@ -27,6 +27,38 @@ Template:
 
 ---
 
+## 2026-11-16 — Claude Code (Opus 5.5) — #15: findings round-1 fixes (PR #72)
+- **Done:** [PR #72](https://github.com/DeusMaximus/TLG-IPAM/pull/72), head `78a435b`: fix commit `d3ace54` on `f962a58`, plus a merge of `main` at `c6e579e`. CI green. 674 passed (597 + 77). `@codex review` posted after the push. Greptile has not re-reviewed `78a435b`.
+  - R1 P2: findings carry a `fingerprint` (SHA-256 over key, `host_id`, `proposed`, 32 hex). Accept requires it; dismiss checks it only when sent. Dismissals are still matched on the four-part key (spec §9 unchanged).
+  - R1 P3: a name accept makes the host's FQDN the PTR name, with a domain override in `proposed` when the PTR is outside the effective domain. `name_mismatch` compares FQDNs.
+  - R1 P3: tests for recompute-only scope and randomised checks, dismissal matching, a competing writer, and a partial write before a refusal. 28 mutations, all red (table in the PR body).
+  - The list route runs 9 statements at any size; a test pins it.
+  - Docs: spec §5.5 ("What accepting writes", name rules, accept); brief §4.2 accept row and §4.7; `AGENTS.md` findings bullet. The `AGENTS.md` merge conflict kept `main`'s wording of three bullets.
+  - **Merged:** `6ad221f`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #15 closed. What the PR ships as a whole, since the entry above covers only its last push: `services/findings.py` (findings computed on read inside the scan scope: `unknown_host`, `mac_missing`, `mac_mismatch`, `name_missing`, `name_mismatch`, `stale`), `GET /api/v1/subnets/{id}/findings`, `POST /api/v1/findings/accept` and `/dismiss` with per-record results and a cap of 1,000 records, accept through the hosts service under the write lock, the additive table `finding_dismissals`, and dismissals deleted with observations when an address leaves scope. The issue asked for automatic reviews only; the orchestrator added a briefed round because accept turns network-originated values into owner data. Round 1 by GPT-6.1 Sol was NO-GO on `f962a58` (the P2 and two P3s above) after both automatic reviews had passed it clean; round 2 was GO on `78a435b` with no findings, posted on the PR. Codex was clean on `78a435b`; Greptile did not re-review it, which is optional after a GO at the current head. The orchestrator re-measured 674 on the head and on `main` after the merge, confirmed the fingerprint comparison is guarded (six tests red without it), and checked the merge commit against both parents. Two notes from round 2 for later issues: a single-label PTR name stays a relative hostname, so its FQDN follows the subnet's domain and is not bound by the fingerprint; and #19 has to show when a proposal sets a domain override. Follow-up filed the same day on the owner's say-so: #75 (M2a), a bound on a subnet's `dns_servers` and on what a job carries, from the second briefed round on PR #70. Live state after this merge: one PR is open, #70 (#13, the agent package), at `9ea136b`. Its second briefed round returned NO-GO on the earlier head `ce60198`; the sole blocker there was already fixed in `9ea136b`. The owner chose to keep the worker on it: it is fixing two agent-side P3s (the answer limit checked after allocation; a truncated DNS reply accepted) and merging this `main`, and a short third round then covers everything since `ce60198`. Ready and not started: #17, #19, #65, #68, #75; #60 waits for #70 (both touch `agent_protocol.py`). The `owner` issues #5 and #25 still wait on the owner.
+- **Decisions:** Deliberate call 3 changed (names keep the PTR as the FQDN); call 12 is new (fingerprint binding, a spec change). The reviewer's alternative for finding 2 (offer no automatic name for such a PTR) was not taken.
+- **State:** green, nothing half-finished. The schema change is additive only: the new table `finding_dismissals`. Nothing under `web/` or `mcp_server.py` changed.
+- **Waiting on the owner:** the second briefed round (the orchestrator starts it); retrigger Greptile on `78a435b`; the merge. Owner's call under §9: a dismissed `unknown_host` stays hidden when only its PTR name changes.
+- **Next:**
+  - #17: `list_scan_findings` returns `fingerprint` and `proposed`. Accepting over MCP goes through `create_host`/`update_host`, so it is not bound by the fingerprint.
+  - #19: the UI sends `fingerprint` with accept.
+  - #20: adds `fdns_mismatch` to `FindingType` and to `_evaluate`.
+
+## 2026-11-16 — Claude Code (Sonnet 5.5) — #73: agent-token documents (PR #74)
+- **Done:** [PR #74](https://github.com/DeusMaximus/TLG-IPAM/pull/74) closes #73, head `9e759f0` (against `main` at `688f987`). CI green (5 checks). Codex: no findings. Greptile: 5/5, no comments. 597 backend tests pass (594 + 3). Documents and one test only; the one `api/app/` change is a docstring in `services/jobs._claim`.
+  - The order of refusals is written down in spec §5.7, brief §4.5 and the wire-contract bullet of `AGENTS.md`. A loaded row inside the gap gets 429 with no statement, whatever the owner committed since, and the next request gets 403. A row the gap lets through reaches the claim, which answers 403 when the owner's change has landed and 429 when only the slot is gone.
+  - New test `test_a_recent_slot_is_refused_with_429_before_the_owner_refusal_is_read` (disable, revoke, delete) in `api/tests/test_checkin.py`. Removing the early check in `_claim` fails all three variants.
+  - "A refused request never writes `last_used_at`" is now "refused before its check-in slot, or a refused result set" in brief §3.9, §4.1, spec §4.2, §5.1 and the agent-token bullet; `409`/`422` check-ins are named as writing it. Brief §3.8 points at §4.5 for which of 429/403 applies.
+  - The agent-token bullet says "authenticated" through `require_agent`, and that the check-in claim revalidates state and revocation in SQL. Bare 500s now include a database error that is not an `OperationalError` (spec §4.2, brief §4.1, `AGENTS.md`).
+  - Ingest source guard renamed `test_the_ingest_module_binds_neither_hosts_nor_the_change_log`. Its docstring and the `AGENTS.md` sentence say it checks names bound in `services/results` and does not follow imports.
+  - **Merged:** `c6e579e`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #73 closed. Both automatic reviews covered `9e759f0`, the only commit, with no findings. The orchestrator re-measured 597 on the head and on `main` after the merge, confirmed the `api/app/` diff is the one docstring, and confirmed all three cases of the new test go red with the early refusal removed. Live state after this merge: two PRs are open, both with a worker fixing review findings. #70 (#13, the agent package) is at `9ea136b`: round 1 NO-GO fixed in `dbb2f1c`, `main` merged in `ce60198`, then a Codex P2 on that head (a PTR lookup's timeout ran out while it queued for a packet slot) fixed in `9ea136b`; CI green and Codex clean there, 359 agent tests in the orchestrator's run. Its second briefed round is running on `ce60198`, so the one commit after it owes a short round of its own. #72 (#15, findings) is at `f962a58`: round 1 NO-GO with one P2 (an `unknown_host` key does not identify the hostname and status an accept writes) and two P3s; the worker is fixing them and has to merge this `main`, with which it conflicts in `AGENTS.md`. Waiting for a free lane: #60 (shares `main.py` with #72), #65 and #68 (share `schemas.py` with #72). The `owner` issues #5 and #25 still wait on the owner.
+- **Decisions:**
+  - Documented the early 429; did not change it so a disable always answers 403.
+  - Chose to reword the guard rather than follow imports: `results` reaches `changes` through `scans` and `agents`, so a closure check cannot pass. `test_ingest_writes_no_host_and_no_change_entry` carries the runtime fact.
+  - Fixed the same absolute wording in brief §4.1 and spec §5.1, outside the three sentences the issue listed, because the acceptance line covers every document.
+- **State:** green; nothing half-finished; no schema change. Python 3.13.12. Wording acceptance lines (2 and 3) are checked by reading, not by a test.
+- **Waiting on the owner:** the merge. Automatic reviews only, no briefed round (documents and a test).
+- **Next:** whichever of #70 (#13) and #72 (#15) merges after #74 rebases onto it. `AGENTS.md` bullets are single long lines, so expect a conflict in the wire-contract bullet (#70) or the scan-scope bullet (#72) against this edit, which changed the claim sentence, the agent-token bullet and the "Scan ingest never writes `hosts`" bullet. #13 owns spec §5.7's paragraph on how an agent handles each refusal; the order paragraph I added to the §5.7 claim bullet is separate from it.
+
 ## 2026-11-16 — Claude Code (Opus 5.5) — #59: check-in and results follow-ups (PR #71)
 - **Done:** [PR #71](https://github.com/DeusMaximus/TLG-IPAM/pull/71) closes #59, head `3e612bb` (merges `main` at `1525a91`). CI green. Codex: no findings on `3e612bb`. Greptile: 5/5, no comments. 594 tests pass (571 + 23).
   - `services/agents.authenticate` only reads. It leaves the accepted token's id in `session.info`.
@@ -121,52 +153,3 @@ Template:
   - #59: the 503 for a lock during results and check-in persistence.
   - #60: one shared body cap.
   - #13: the agent, against `agent_protocol.ResultsRequest`.
-
-## 2026-11-16 — Claude Code (Opus 5.5) — #18: subnet scanning settings and reserved-range Scan checkbox (PR #67)
-- **Done:** [PR #67](https://github.com/DeusMaximus/TLG-IPAM/pull/67) closes #18. Merged at head `f8d7cf1` (squash `31d9e44`). Frontend and brief §6.2/§7 only; no `api/` change, no schema change.
-  - New: `web/src/components/ScanSettings.jsx`, a Scanning section on the subnet view.
-    - Summary of the target. Last scan time (read as UTC) and duration, marked "incomplete" when the job did not finish. Whether a scan was requested or a job is out. The server's `scope`.
-    - Settings form: agent, methods, interval (blank = manual only), enabled, "Scan DHCP pool" (off by default, disabled with no pool). It sends `PUT`, or `POST` for a new target, and shows the server's refusal inline.
-    - Scan now (`POST /subnets/{id}/scan`) shows the server's 202, 409 or 429 message.
-    - "MAC collection unavailable — agent is not on this subnet" shows while an issued job's `job_methods` lacks `arp`.
-    - The target reloads every 30 s.
-  - New: `web/src/utils/scans.js`: form ↔ body, the `ScanTargetCreate` defaults, `macUnavailable`, formatting.
-  - Changed: `ReservedRanges.jsx`. Each chip has a "Scan" `.tlg-check` box that sends `PATCH scan_excluded`; an excluded chip reads "not scanned". The Reserve range dialog has "Scan this range", ticked by default.
-  - Changed: `SubnetView.jsx`.
-    - Both sections are keyed by subnet id, so a draft or an open dialog never carries over to another subnet.
-    - Their writes go through one `refreshTreeAndView`. It reloads the view even when `refreshTree()` fails, and reports that failure apart from the write.
-  - Tests: frontend 29 → 51 (16 in `SubnetView.scanning.test.jsx` against a stateful stand-in server and the real `TreeProvider`; 6 in `scans.test.js`).
-    - Removing `refreshTree()` fails both acceptance tests.
-    - The four review-fix tests each fail against `688b53e`'s sources.
-  - Checked by hand on `688b53e` with headless Chromium against `API_KEY=dev-key`; details in the PR body.
-  - **Merged:** `31d9e44`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #18 closed. CI was green on `f8d7cf1`, Codex found nothing there, and Greptile re-reviewed it at 5/5 after the owner's retrigger. The orchestrator re-ran lint, the 51 tests and the build on the head and on `main` after the merge, and confirmed the draft-across-subnets test goes red with the subnet-id keys removed. The hand run against a real backend is the worker's alone. Follow-up filed on the owner's say-so: #68 (M2a), the scan-target response says what its agent can run, for the two messages under **Next**. Process change the same day, approved by the owner and written into `.agents/orchestration.md`: a briefed round starts once CI is green and the first automatic pass is answered, without waiting for a Greptile re-review of a fix commit, and after a GO at the current head a Greptile re-review is optional. Live state after this merge: one PR is open, #64 (#11), at `cb83075` with CI green, Codex clean, Greptile 5/5 and 533 passing; its briefed round by GPT-6.1 Sol is running (brief at `.dev/11/review-brief-1.md`, report to `.dev/11/review-1.md`). No worker is building. Waiting for #64 to merge: #59, #60, #65, #68 (each touches a file it changes), then #12 and #15. The `owner` issues #5 and #25 still wait on the owner.
-- **Decisions:** 7 under Deliberate calls in the PR. The main ones:
-  - The UI never validates or works out scope; it shows the server's `scope` and its refusal text.
-  - The settings form saves with a button; the range box saves on click.
-  - Scan now is shown whenever a target exists; the server's 409 says why it cannot run.
-  - No confirmation dialog for scope-narrowing changes, only help text that says data is deleted.
-  - No delete of a scan target from the UI; it is out of #18's scope, and disabling the target stops scanning.
-- **State:** green; nothing half-finished.
-  - Codex: 2 P2s on `688b53e`, fixed. The orchestrator reports no findings on `f8d7cf1`.
-  - Greptile: P1 and P2, P2 on `688b53e`, fixed and answered on their threads. The orchestrator reports 5/5 on `f8d7cf1` after a re-review.
-  - Not seen against a real backend: the MAC warning (needs an agent, #13), last scan time and duration (needs ingest, #11 / PR #64).
-  - The PR is not linked to a T3 thread (the link tool needed a thread id).
-- **Waiting on the owner:** nothing for #18.
-- **Next:**
-  - Two things #18's third Scope bullet wanted that the server does not report. One field fixes both: e.g. `arp_available` / `scannable_by_agent` on `ScanTargetOut`, computed with `jobs.job_methods` against the agent's last-reported interfaces. The UI's `macUnavailable` in `web/src/utils/scans.js` would then read that field.
-    1. **"MAC collection unavailable" between jobs.** `ScanTargetOut` has no field saying whether the target's agent is on the subnet's link. The UI can only read it from `job_methods` while a job is out, and ingest clears `job_methods`.
-    2. **"Cannot be scanned by this agent".** Nothing reports it: for an `arp`-only target on a routed agent, check-in issues no job and stores nothing.
-  - Once PR #64 merges, show `last_scan_error` (agent-originated text, render as text only) in the Scanning section's status.
-  - #19 (findings panel, badge, last-seen, "show dynamic") builds on the Scanning section in `ScanSettings.jsx` and on `SubnetView`.
-  - #65: offset-less datetimes; this PR reads them with `parseServerTime`.
-
-## 2026-11-16 — Claude Code (Sonnet 5.5) — #61: start-up test ignores proxy and certificate settings (PR #66)
-- **Done:** [PR #66](https://github.com/DeusMaximus/TLG-IPAM/pull/66) closes #61, head `de48ed8` (one commit on `main` at `8f02697`). Tests only: `api/tests/test_startup.py`; no file under `api/app/`, no document, no schema change.
-  - The three loopback requests in `test_uvicorn_starts_and_serves_with_a_real_key` share one `httpx.Client(trust_env=False)`.
-  - The test sets `SSL_CERT_FILE` (a missing file), `HTTP_PROXY=http://127.0.0.1:9` and empty `NO_PROXY`/`no_proxy` itself, after the child has started, so the child does not inherit them and every default run guards the fix. With `trust_env=False` removed and nothing set outside, it fails with `FileNotFoundError`.
-  - Both acceptance commands fail on `main` (1 failed, 33 passed) and pass here (34 passed); output is in the PR body. Backend suite 425 passed on Python 3.13, unchanged.
-  - **Merged:** `c15ce8f`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #61 closed. Both automatic reviews covered `de48ed8`, the only commit, with no findings. The orchestrator ran both acceptance commands on the head (34 passed each), the suite (425), and the mutation (default `trust_env`: the test fails), and 425 again on `main` after the merge. Also filed today, on the owner's say-so: #65 (M2a, `bug`), API datetimes carry no UTC offset after a read and the older views show them as local time. Live state after this merge: two PRs are open. #67 (#18, subnet scanning settings) is at `f8d7cf1` and ready for the owner's merge: CI green, Codex clean and Greptile 5/5 on that head, five findings fixed, and lint, 51 tests and build re-run by the orchestrator. #64 (#11) is at `cb83075` with CI green, Codex clean, Greptile 5/5 and 533 passing; its briefed round by GPT-6.1 Sol is running (brief at `.dev/11/review-brief-1.md`). No worker is building. Ready and not started: none that is free of #11's files; #59, #60 and #65 wait for #64 to merge. Proposed to the owner and not yet filed: a field on the scan-target response saying whether the agent can scan the subnet and whether ARP is available, which #18 needs for two of its messages. The `owner` issues #5 and #25 still wait on the owner.
-- **Decisions:** one shared client rather than per-call `trust_env=False`; hostile settings set in the test rather than left to the environment; set after the child starts. All three are listed under Deliberate calls in the PR.
-- **State:** CI green on `de48ed8` (backend, frontend, locks). Codex: no findings. Greptile: 5/5, no findings. No fix commit, so no review needs a retrigger. CodeRabbit skipped (below its star threshold); it is not one of the required reviews. Not owed a briefed round (tests only, no auth/token/ingest/packet code).
-- **Waiting on the owner:** merge.
-- **Next:** nothing from this issue. `ALL_PROXY` and the `REQUESTS_CA_BUNDLE`/`CURL_CA_BUNDLE` spellings are not set by the test; `trust_env=False` covers them.
