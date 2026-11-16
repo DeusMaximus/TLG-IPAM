@@ -166,7 +166,8 @@ async def list_hosts(
 ) -> dict:
     """Search and filter host records across the whole network. `q` is a free-text
     match against hostname, IP, and MAC. `status` is one of: active, reserved, dhcp,
-    offline. Use to answer "what device is at X?" or "show me all offline hosts"."""
+    offline. Use to answer "what device is at X?" or "show me all offline hosts". Each
+    host has the same fields as get_host, last_seen and last_seen_source included."""
     async with SessionLocal() as session:
         hosts = await hosts_svc.list_hosts(session, subnet_id=subnet_id, status=status, q=q)
         return {"hosts": await hosts_svc.hosts_out(session, hosts), "total": len(hosts)}
@@ -175,7 +176,10 @@ async def list_hosts(
 @ipam_tool
 async def get_host(host_id: str) -> dict:
     """Get full detail for a specific host record, including MAC address, device type,
-    owner, notes, and last-seen timestamp."""
+    owner, notes, and last-seen timestamp. last_seen is the later of a time set by hand
+    and the last time a network scan saw the address answer; last_seen_source says which
+    (manual or scan), and both are null when the host has never been seen. Times are
+    UTC."""
     async with SessionLocal() as session:
         return {"host": await _host(session, await hosts_svc.get_host(session, host_id))}
 
@@ -295,7 +299,9 @@ async def update_host(
     override is set). device_type: any name from list_device_types (defaults: server|vm|lxc|network|iot|desktop|laptop|phone|other).
     status: active|reserved|dhcp|offline. To clear nullable values, pass their names in
     clear_fields; for example, clear_fields=["domain", "notes"] removes the domain
-    override and notes. A field cannot be both set and cleared in the same call."""
+    override and notes. A field cannot be both set and cleared in the same call.
+    Clearing last_seen removes only the time set by hand: if a network scan has seen the
+    address, the result still shows that scan time, with last_seen_source "scan"."""
     provided = {
         k: v
         for k, v in {
