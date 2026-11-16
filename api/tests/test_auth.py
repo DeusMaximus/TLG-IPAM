@@ -174,6 +174,42 @@ async def test_owner_key_verifier_grants_both_scopes():
     assert await verifier.verify_token("") is None
 
 
+# --- Empty keys ---------------------------------------------------------------------
+#
+# The server refuses to start with an empty API_KEY (test_startup.py). These tests
+# set the key to "" after startup, so they show that an empty X-API-Key or bearer is
+# refused by the request check itself, not only because startup refused the setting.
+
+CONFIGURED_KEYS = pytest.mark.parametrize("configured", ["test-key", ""], ids=["key-set", "key-empty"])
+
+
+@CONFIGURED_KEYS
+async def test_empty_value_is_never_the_owner_key(monkeypatch, configured):
+    monkeypatch.setattr(auth.settings, "api_key", configured)
+    assert auth.is_owner_key("") is False
+    assert await OwnerKeyVerifier().verify_token("") is None
+
+
+@CONFIGURED_KEYS
+async def test_empty_x_api_key_is_403(anon_client, monkeypatch, configured):
+    monkeypatch.setattr(auth.settings, "api_key", configured)
+    res = await anon_client.get("/api/v1/sections", headers={"X-API-Key": ""})
+    assert res.status_code == 403
+    assert res.json()["error"]["code"] == "FORBIDDEN"
+
+
+@CONFIGURED_KEYS
+@pytest.mark.parametrize("path", MCP_PATHS)
+async def test_empty_bearer_is_401(anon_client, monkeypatch, path, configured):
+    monkeypatch.setattr(auth.settings, "api_key", configured)
+    async with running_app():
+        res = await anon_client.post(
+            path, json=INITIALIZE, headers={"Authorization": "Bearer ", "Accept": MCP_ACCEPT}
+        )
+    assert res.status_code == 401
+    assert res.headers["www-authenticate"].startswith('Bearer error="invalid_token"')
+
+
 # --- The owner-key comparison -------------------------------------------------------
 #
 # Every surface that takes the owner key must reach a decision through
