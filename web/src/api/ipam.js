@@ -46,6 +46,16 @@ export const updateDeviceType = (id, body) =>
   api(`/api/v1/device-types/${id}`, { method: 'PUT', body })
 export const deleteDeviceType = (id) => api(`/api/v1/device-types/${id}`, { method: 'DELETE' })
 
+// agents (owner routes; the plain token is only ever in createAgent's response)
+export const listAgents = () => api('/api/v1/agents')
+export const createAgent = (body) => api('/api/v1/agents', { method: 'POST', body })
+export const updateAgent = (id, body) => api(`/api/v1/agents/${id}`, { method: 'PUT', body })
+export const revokeAgentTokens = (id) => api(`/api/v1/agents/${id}/revoke`, { method: 'POST' })
+export const deleteAgent = (id) => api(`/api/v1/agents/${id}`, { method: 'DELETE' })
+
+// scan targets
+export const listScanTargets = () => api('/api/v1/scan-targets')
+
 // changes / misc
 export const listChanges = (params) => api(`/api/v1/changes${qs(params)}`)
 export const getHealth = () => api('/health')

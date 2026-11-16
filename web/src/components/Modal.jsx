@@ -1,13 +1,23 @@
 import { X } from 'lucide-react'
 
-export default function Modal({ title, onClose, children, wide = false }) {
+export default function Modal({
+  title,
+  onClose,
+  children,
+  wide = false,
+  maxWidth,
+  closeOnBackdrop = true,
+}) {
   return (
     <div
       className="fixed inset-0 z-40 flex items-start justify-center bg-black/60 pt-24"
-      onMouseDown={(e) => e.target === e.currentTarget && onClose()}
+      onMouseDown={(e) => closeOnBackdrop && e.target === e.currentTarget && onClose()}
     >
       <div
-        className={`w-full ${wide ? 'max-w-xl' : 'max-w-md'} rounded-lg border border-slate-700 bg-slate-800 shadow-xl`}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        className={`w-full ${maxWidth || (wide ? 'max-w-xl' : 'max-w-md')} rounded-lg border border-slate-700 bg-slate-800 shadow-xl`}
       >
         <div className="flex items-center justify-between border-b border-slate-700 px-5 py-3">
           <h2 className="text-sm font-semibold text-slate-100">{title}</h2>
