@@ -22,6 +22,7 @@ from app.agent_protocol import (
 from app.database import SessionLocal
 from app.models import Agent, Change, Host, Observation, ReservedRange, ScanTarget
 from app.schemas import ScanTargetUpdate, SubnetUpdate
+from app.errors import ApiError
 from app.services import jobs, results, scans, subnets
 
 from .conftest import make_host
@@ -268,12 +269,35 @@ async def test_racing_result_sets_for_one_job_are_accepted_once(client, agent_ap
     assert len(await observations()) == 1
 
 
+async def test_result_sets_that_meet_at_the_compare_and_set_are_accepted_once(
+    client, agent_api, monkeypatch
+):
+    """The race above, made deterministic (review finding 2): all five requests pass
+    the read-only checks first, and only then reach `_release`. With either
+    compare-and-set in place one is accepted; with neither, all five were."""
+    agent, token, subnet, target, job = await setup(client, agent_api)
+    barrier = asyncio.Barrier(5)
+    real = results._release
+
+    async def together(*args):
+        await asyncio.wait_for(barrier.wait(), timeout=10)
+        return await real(*args)
+
+    monkeypatch.setattr(results, "_release", together)
+    answers = await asyncio.gather(
+        *(post_results(agent_api, token, job, [obs(f"10.0.0.{10 + i}")]) for i in range(5))
+    )
+    assert sorted(res.status_code for res in answers) == [200, 409, 409, 409, 409]
+    assert len(await observations()) == 1
+
+
 @pytest.mark.parametrize("side", [ScanTarget, Agent])
 async def test_each_lease_copy_is_cleared_by_compare_and_set(client, agent_api, monkeypatch, side):
     """Either copy taken by another writer after this request read it: the result set
     is refused, and the other copy's clearing is rolled back with it (one transaction)."""
     agent, token, subnet, target, job = await setup(client, agent_api)
     real = results._release
+    in_session = {}
 
     async def superseded_meanwhile(session, agent_obj, target_obj, report):
         await session.execute(
@@ -282,11 +306,21 @@ async def test_each_lease_copy_is_cleared_by_compare_and_set(client, agent_api, 
             .values(current_job_id="someone-else")
             .execution_options(synchronize_session=False)
         )
-        return await real(session, agent_obj, target_obj, report)
+        try:
+            return await real(session, agent_obj, target_obj, report)
+        except ApiError:
+            # what this session sees at once: rolled back, not left half-cleared until
+            # the session happens to close (review finding 2)
+            for model, row_id in ((ScanTarget, target["id"]), (Agent, agent["id"])):
+                in_session[model.__name__] = await session.scalar(
+                    select(model.current_job_id).where(model.id == row_id)
+                )
+            raise
 
     monkeypatch.setattr(results, "_release", superseded_meanwhile)
     res = await post_results(agent_api, token, job, [obs("10.0.0.10")])
     assert res.status_code == 409
+    assert in_session == {"ScanTarget": job["job_id"], "Agent": job["job_id"]}
     assert await observations() == {}
     row, me = await target_row(target["id"]), await agent_row(agent["id"])
     assert row.current_job_id == job["job_id"] and me.current_job_id == job["job_id"]
@@ -1009,6 +1043,47 @@ async def test_every_scope_a_write_relies_on_is_read_under_the_write_lock(
     assert len(seen) >= 3 and seen[2] is True
 
 
+@pytest.mark.parametrize("change", ["exclude_the_range", "scan_the_pool", "move_the_pool"])
+async def test_scan_scope_reads_its_inputs_as_committed_not_as_loaded(client, change):
+    """Review finding 2: a session holding the subnet, its target and a reserved range
+    as loaded objects, while another session commits a change to one of them, gets the
+    committed scope once it holds the write lock, and its objects are left as it read
+    them (check-in's lease compare-and-set relies on that)."""
+    from app.models import Subnet
+
+    subnet = await lab(client, **POOL)
+    target = await make_target(client, subnet["id"], None)
+    res = await client.post(
+        f"/api/v1/subnets/{subnet['id']}/reserved",
+        json={"start_ip": "10.0.0.20", "end_ip": "10.0.0.29"},
+    )
+    block = res.json()["data"]
+    changes_ = {
+        "exclude_the_range": (ReservedRange, block["id"], {"scan_excluded": True}),
+        "scan_the_pool": (ScanTarget, target["id"], {"scan_dhcp_pool": True}),
+        "move_the_pool": (Subnet, subnet["id"], {"dhcp_start": "10.0.0.150"}),
+    }
+    model, row_id, values = changes_[change]
+    async with SessionLocal() as mine:
+        loaded = {
+            Subnet: await mine.get(Subnet, subnet["id"]),
+            ScanTarget: await mine.get(ScanTarget, target["id"]),
+            ReservedRange: await mine.get(ReservedRange, block["id"]),
+        }
+        before = await scans.scan_scope(mine, loaded[Subnet])
+        async with SessionLocal() as other:
+            await other.execute(update(model).where(model.id == row_id).values(**values))
+            await other.commit()
+        await scans.take_write_lock(mine)
+        after = await scans.scan_scope(mine, loaded[Subnet])
+        stale = {name: getattr(loaded[model], name) for name in values}
+        await mine.rollback()
+    async with SessionLocal() as third:
+        expected = await scans.scan_scope(third, await third.get(Subnet, subnet["id"]))
+    assert after == expected != before
+    assert all(stale[name] != value for name, value in values.items())
+
+
 # --- Acceptance: subnet deletion ---
 
 
@@ -1153,6 +1228,68 @@ async def test_the_unauthenticated_are_refused_before_the_body_is_read(agent_api
     assert res.status_code == 401
 
 
+async def _asgi_post(path: str, headers: dict[str, str], body: bytes) -> tuple[int, int]:
+    """POST straight into the ASGI app, counting how often it asks for the body."""
+    from app.main import app
+
+    reads = 0
+    started = []
+
+    async def receive():
+        nonlocal reads
+        reads += 1
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            started.append(message["status"])
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+        "client": ("127.0.0.1", 1),
+        "server": ("test", 80),
+    }
+    await app(scope, receive, send)
+    return started[0], reads
+
+
+async def test_a_declared_length_over_the_cap_is_refused_without_reading(client, agent_api):
+    """Review finding 2: the declared length alone refuses, before one byte is read.
+    (The stock test above is also refused by the streaming check, after reading.)"""
+    agent, token, subnet, target, job = await setup(client, agent_api)
+    status, reads = await _asgi_post(
+        "/api/v1/agent/results",
+        {
+            "authorization": f"Bearer {token}",
+            "content-type": "application/json",
+            "content-length": str(RESULTS_BODY_MAX + 1),
+        },
+        b"{}",
+    )
+    assert (status, reads) == (413, 0)
+
+
+async def test_an_unauthenticated_results_body_is_never_read(client, agent_api):
+    """Review finding 2: a JSON body with no agent token is refused with nothing read,
+    so a `Body(...)` parameter, which FastAPI reads before the router's dependencies,
+    cannot come back unnoticed."""
+    status, reads = await _asgi_post(
+        "/api/v1/agent/results",
+        {"content-type": "application/json", "content-length": "2"},
+        b"{}",
+    )
+    assert (status, reads) == (401, 0)
+
+
 @pytest.mark.parametrize(
     "content",
     [b"not json", b"[1, 2]", b'"a string"', b"{}", b"[" * 100_000 + b"]" * 100_000, b"\xff\xfe"],
@@ -1233,3 +1370,148 @@ async def test_database_from_main_gains_the_observations_table(tmp_path):
         con.close()
     assert "observations" in tables
     assert target_columns["last_scan_error"][3] == 0  # nullable
+
+
+# --- Briefed review round 1 (PR #64): strings that UTF-8 cannot carry ---
+
+# A lone surrogate as JSON's own escape: valid JSON that Python reads into a str which
+# cannot be encoded as UTF-8. Sent as raw ASCII bytes, as any client could.
+LONE = "\\ud800"
+
+
+def _raw_json(payload: dict, holes: dict[str, str]) -> bytes:
+    """`payload` as JSON bytes, each placeholder string replaced by raw JSON text."""
+    import json
+
+    text = json.dumps(payload)
+    for placeholder, raw in holes.items():
+        assert f'"{placeholder}"' in text
+        text = text.replace(f'"{placeholder}"', raw)
+    return text.encode("ascii")
+
+
+def _payload(job, **fields) -> dict:
+    started = _now().isoformat()
+    return {
+        "job_id": job["job_id"],
+        "subnet_id": job["subnet_id"],
+        "started_at": started,
+        "finished_at": started,
+        "complete": True,
+        "observations": [],
+        **fields,
+    }
+
+
+async def test_an_unencodable_ip_is_rejected_and_the_result_set_answered(client, agent_api):
+    """Review finding 1: the rejected record's `ip` was echoed as is, and encoding the
+    answer failed after the commit: a 500 for a result set that was in fact stored,
+    and a retry got 409. Now the echo is null and the answer is a 200."""
+    agent, token, subnet, target, job = await setup(client, agent_api)
+    body = _raw_json(
+        _payload(job, observations=[obs("10.0.0.10"), obs("HOLE")]), {'HOLE': f'"{LONE}"'}
+    )
+    res = await _raw(agent_api, token, body, {"Content-Type": "application/json"})
+    assert res.status_code == 200, res.text
+    assert res.json()["data"] == {"accepted": 1, "rejected": [{"ip": None, "reason": "invalid_ip"}]}
+    assert set(await observations()) == {"10.0.0.10"}
+    row, me = await target_row(target["id"]), await agent_row(agent["id"])
+    assert row.current_job_id is None and me.current_job_id is None
+
+
+@pytest.mark.parametrize(
+    "field, raw",
+    [
+        ("job_id", f'"{LONE}"'),
+        ("subnet_id", f'"{LONE}"'),
+        ("error", f'"x{LONE}y"'),
+        ("fdns", f'[{{"host_id": "{LONE}", "addresses": ["{LONE}"]}}]'),
+        ("observations", f'[{{"ip": "10.0.0.10", "mac": "{LONE}"}}]'),
+        ("observations", f'[{{"ip": "10.0.0.10", "rdns_name": "{LONE}.home.arpa"}}]'),
+        ("observations", f'[{{"ip": "{LONE}10.0.0.10"}}, {{"ip": "1.2.3.\\u0085"}}]'),
+        ("started_at", f'"{LONE}"'),
+        ("complete", f'"{LONE}"'),
+        (f"{LONE}", f'"{LONE}"'),  # an unknown key, ignored
+    ],
+)
+async def test_no_agent_string_breaks_the_results_answer(client, agent_api, field, raw):
+    """Every agent-supplied string on the route, carrying a lone surrogate: whatever the
+    outcome, the answer is well-formed JSON in the REST shape, never a 500."""
+    agent, token, subnet, target, job = await setup(client, agent_api)
+    if field == LONE:
+        body = _raw_json(_payload(job), {}).replace(b"{", f'{{"{LONE}": {raw}, '.encode(), 1)
+    else:
+        body = _raw_json(_payload(job, **{field: "HOLE"}), {"HOLE": raw})
+    res = await _raw(agent_api, token, body, {"Content-Type": "application/json"})
+    assert res.status_code in (200, 409, 422), res.text
+    answer = res.json()
+    assert "data" in answer or set(answer["error"]) == {"code", "message"}
+    res.content.decode("utf-8")  # strictly encodable
+    if res.status_code == 200:
+        for rejected in answer["data"]["rejected"]:
+            assert rejected["ip"] is None or rejected["ip"].isascii()
+
+
+@pytest.mark.parametrize(
+    "field, raw",
+    [
+        ("version", f'"{LONE}"'),
+        ("hostname", f'"scanner{LONE}"'),
+        ("platform", f'"{LONE}"'),
+        ("interfaces", f'[{{"name": "{LONE}", "cidr": "10.0.0.5/24"}}]'),
+        ("interfaces", f'[{{"name": "eth0", "cidr": "{LONE}"}}]'),
+        ("interfaces", f'[{{"name": "eth0", "cidr": "10.0.0.5/24", "mac": "{LONE}"}}]'),
+        ("capabilities", f'["{LONE}"]'),
+        ("protocol", f'"{LONE}"'),
+    ],
+)
+async def test_no_agent_string_breaks_the_checkin_answer_or_its_record(
+    client, agent_api, field, raw
+):
+    """The same on check-in: the refusal is well-formed JSON, and what it records in
+    `last_error` is the field's name, which the server wrote, never the value."""
+    from .test_checkin import CHECKIN
+
+    agent, token = await make_agent(client)
+    body = _raw_json({**CHECKIN, field: "HOLE"}, {"HOLE": raw})
+    res = await agent_api.post(
+        "/api/v1/agent/checkin",
+        content=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    assert res.status_code in (409, 422), res.text
+    assert set(res.json()["error"]) == {"code", "message"}
+    res.content.decode("utf-8")
+    row = await agent_row(agent["id"])
+    row.last_error.encode("utf-8")
+    assert row.hostname is None  # nothing of the body was stored
+    got = await client.get(f"/api/v1/agents/{agent['id']}")
+    assert got.status_code == 200
+
+
+async def test_an_answer_that_cannot_be_encoded_fails_before_the_commit(client, monkeypatch):
+    """The second guard of review finding 1: should any value in the answer ever be
+    unencodable again, the request fails with nothing stored and the lease intact, so
+    the agent can report the job again."""
+    from httpx import ASGITransport, AsyncClient
+
+    from app.main import app
+    from app.services import results as results_module
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as raw_api:
+        agent, token, subnet, target, job = await setup(client, raw_api)
+        # the echo as it was before the fix
+        monkeypatch.setattr(results_module, "echo_ip", lambda raw: raw.get("ip"))
+        body = _raw_json(
+            _payload(job, observations=[obs("10.0.0.10"), obs("HOLE")]), {"HOLE": f'"{LONE}"'}
+        )
+        res = await raw_api.post(
+            "/api/v1/agent/results",
+            content=body,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+    assert res.status_code == 500
+    assert await observations() == {}
+    assert (await target_row(target["id"])).current_job_id == job["job_id"]
+    assert (await agent_row(agent["id"])).current_job_id == job["job_id"]

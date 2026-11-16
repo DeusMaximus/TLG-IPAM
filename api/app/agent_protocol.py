@@ -312,10 +312,14 @@ def address_of(raw: Any) -> str | None:
 
 
 def echo_ip(raw: Any) -> str | None:
-    """The `ip` of a raw record as quoted back in `rejected`: the agent's own string,
-    when it is a short one, else null."""
+    """The `ip` of a raw record as quoted back in `rejected`: the agent's own string
+    when it is short, ASCII and printable, as every IP address is; else null. Any other
+    string may not even be encodable (JSON can carry a lone surrogate, which UTF-8
+    cannot), and the answer must always be."""
     ip = raw.get("ip") if isinstance(raw, dict) else None
-    return ip if isinstance(ip, str) and len(ip) <= _IP_MAX else None
+    if isinstance(ip, str) and len(ip) <= _IP_MAX and ip.isascii() and ip.isprintable():
+        return ip
+    return None
 
 
 class FdnsAnswer(BaseModel):

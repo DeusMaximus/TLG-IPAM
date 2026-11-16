@@ -20,6 +20,7 @@ reaches a change summary (invariant 8).
 """
 
 import ipaddress
+import json
 from datetime import datetime, timedelta, timezone
 
 from pydantic import ValidationError
@@ -206,5 +207,10 @@ async def ingest(session: AsyncSession, agent: Agent, body: object) -> dict:
         .where(Observation.last_seen_at < now - RETENTION)
         .execution_options(synchronize_session="fetch")
     )
+    # The answer is built, and encoded once as the response will be, before the commit:
+    # nothing may fail after the result set is stored, or the agent would see an error
+    # for a job it can no longer report (a retry is JOB_NOT_CURRENT).
+    answer = ResultsResponse(accepted=accepted, rejected=rejected).model_dump(mode="json")
+    json.dumps({"data": answer}, ensure_ascii=False).encode("utf-8")
     await session.commit()
-    return ResultsResponse(accepted=accepted, rejected=rejected).model_dump(mode="json")
+    return answer
