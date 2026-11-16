@@ -324,15 +324,17 @@ class OwnerKeyUses:
                 if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     self.functions[prefix + fn.name] = fn
 
+        # Each followed name maps to the set of keys that can reach it: a name both can
+        # reach must keep to the rules for both
         self.seeds = {name: {} for name in self.functions}
         if "is_owner_key" in self.functions:
-            self.seeds["is_owner_key"][self._params("is_owner_key")[0]] = PRESENTED
+            self.seeds["is_owner_key"][self._params("is_owner_key")[0]] = {PRESENTED}
         for name, fn in self.functions.items():
             for call in ast.walk(fn):
                 if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "is_owner_key":
-                    for arg in call.args:
+                    for arg in [*call.args, *(k.value for k in call.keywords)]:
                         if isinstance(arg, ast.Name):
-                            self.seeds[name].setdefault(arg.id, PRESENTED)
+                            self.seeds[name].setdefault(arg.id, set()).add(PRESENTED)
 
         # A function is checked again whenever a call gives it another parameter to follow
         per_function, checked, self.followed = {}, {}, {}
@@ -341,8 +343,8 @@ class OwnerKeyUses:
             name = self._pending.pop()
             if checked.get(name) == self.seeds[name]:
                 continue
-            checked[name] = dict(self.seeds[name])
-            self.followed[name] = dict(self.seeds[name])
+            checked[name] = {var: set(kinds) for var, kinds in self.seeds[name].items()}
+            self.followed[name] = {var: set(kinds) for var, kinds in self.seeds[name].items()}
             per_function[name] = self._check(name, self.functions[name], self.followed[name])
 
         # Outside a function nothing is followed, so every read of the key there is
@@ -357,7 +359,7 @@ class OwnerKeyUses:
         found = sorted({f for fs in per_function.values() for f in fs})
         self.findings = [f"{name}, line {line}: {text}" for line, name, text in found]
         self.presented = {
-            (name, var) for name, names in self.followed.items() for var, kind in names.items() if kind == PRESENTED
+            (name, var) for name, names in self.followed.items() for var, kinds in names.items() if PRESENTED in kinds
         }
 
     def _params(self, name):
@@ -376,18 +378,18 @@ class OwnerKeyUses:
                     target = node.target
                 else:
                     continue
-                kind = self._kind(node.value, tainted)
-                if kind and isinstance(target, ast.Name) and target.id not in tainted:
-                    tainted[target.id] = kind
+                kinds = self._kind(node.value, tainted)
+                if kinds and isinstance(target, ast.Name) and not kinds <= tainted.get(target.id, set()):
+                    tainted.setdefault(target.id, set()).update(kinds)
                     changed = True
         return self._uses(name, list(ast.walk(fn)), tainted)
 
     def _uses(self, name, nodes, tainted):
         found = set()
         for node in nodes:
-            kind = self._kind(node, tainted)
-            if kind:
-                use = self._disallowed(node, kind, name)
+            kinds = self._kind(node, tainted)
+            if kinds:
+                use = self._disallowed(node, kinds, name)
                 if use:
                     found.add((node.lineno, name, use))
         return found
@@ -395,19 +397,19 @@ class OwnerKeyUses:
     @staticmethod
     def _kind(node, tainted):
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-            return tainted.get(node.id)
+            return frozenset(tainted.get(node.id, ()))
         if isinstance(node, ast.Attribute) and node.attr == "api_key" and isinstance(node.ctx, ast.Load):
-            return CONFIGURED
+            return frozenset({CONFIGURED})
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
             and node.func.id == "getattr"
             and any(isinstance(a, ast.Constant) and a.value == "api_key" for a in node.args)
         ):
-            return CONFIGURED
-        return None
+            return frozenset({CONFIGURED})
+        return frozenset()
 
-    def _disallowed(self, node, kind, name):
+    def _disallowed(self, node, kinds, name):
         """None if this use of the key is allowed; otherwise the expression that uses it."""
         parent = self.parents[node]
         if isinstance(parent, ast.Attribute) and parent.attr == "encode":
@@ -437,9 +439,9 @@ class OwnerKeyUses:
         call = self.parents.get(parent) if keyword else parent
         if isinstance(call, ast.Call) and call.func is not node:
             callee = ast.unparse(call.func)
-            if kind == PRESENTED and keyword and (callee, keyword.arg) in PRESENTED_KEY_SINKS:
+            if kinds == {PRESENTED} and keyword and (callee, keyword.arg) in PRESENTED_KEY_SINKS:
                 return None
-            if self._follow(call, node, keyword, kind, name):
+            if self._follow(call, node, keyword, kinds, name):
                 return None
         return self._describe(parent)
 
@@ -459,7 +461,7 @@ class OwnerKeyUses:
             return True
         return isinstance(parent, (ast.If, ast.While, ast.IfExp, ast.Assert)) and parent.test is node
 
-    def _follow(self, call, node, keyword, kind, name):
+    def _follow(self, call, node, keyword, kinds, name):
         """Follow the key into a function of the module it is passed to."""
         func, bound = call.func, False
         if isinstance(func, ast.Name) and func.id in self.functions:
@@ -482,8 +484,8 @@ class OwnerKeyUses:
             if index >= len(params) or any(isinstance(a, ast.Starred) for a in call.args[: index + 1]):
                 return False
             param = params[index]
-        if param not in self.seeds[callee]:
-            self.seeds[callee][param] = kind
+        if not kinds <= self.seeds[callee].get(param, set()):
+            self.seeds[callee].setdefault(param, set()).update(kinds)
             self._pending.append(callee)
         return True
 
@@ -536,13 +538,15 @@ VERIFY_CHECK = "        if not is_owner_key(token):\n"
 REST_CHECK = "    if not is_owner_key(x_api_key):\n"
 DIGEST = "    return hmac.compare_digest(presented.encode(), expected.encode())\n"
 LOG = 'logging.getLogger(__name__).debug("Owner credential matched")\n'
+WRAP = 'def _wrap(value):\n    return AccessToken(token=value, client_id="owner", scopes=[])\n\n\n'
 
 # Changes to app/auth.py that leave every behavioural test above green: each one
 # compares the owner key, and the digest still decides. They are the three kinds the
 # briefed review of PR #48 found (finding 1): an `==` feeding a log line in a caller,
 # the same in a helper that is_owner_key calls, and other comparisons than `==`
-# inside is_owner_key. The last two (a hash compared in a helper, a module-level
-# copy of the key) are ways around the guard itself.
+# inside is_owner_key. The rest are ways around the guard itself: a hash compared in
+# a helper, a caller that names its argument, the configured key handed to FastMCP
+# through a name the presented key also reaches, and a module-level copy of the key.
 SURVIVORS = {
     "verify-token-logs-a-match": (
         [_before(VERIFY_CHECK, ["        if token == settings.api_key:\n", "            " + LOG])],
@@ -618,6 +622,44 @@ SURVIVORS = {
         ],
         "_same_hash",
         "return sha256(a.encode()).digest() == sha256(b.encode()).digest()",
+    ),
+    "keyword-caller": (
+        [
+            (
+                REST_CHECK,
+                '    if x_api_key.startswith("tlg"):\n        pass\n    if not is_owner_key(presented=x_api_key):\n',
+            )
+        ],
+        "require_api_key",
+        "x_api_key.startswith('tlg')",
+    ),
+    **{
+        f"configured-key-to-the-presented-sink-{order}": (
+            [
+                _before(VERIFY_CHECK, [f"        _wrap({first})\n", f"        _wrap({second})\n"]),
+                _before("class OwnerKeyVerifier(", [WRAP]),
+            ],
+            "_wrap",
+            "return AccessToken(token=value, client_id='owner', scopes=[])",
+        )
+        for order, first, second in [
+            ("second", "token", "settings.api_key"),
+            ("first", "settings.api_key", "token"),
+        ]
+    },
+    "configured-key-to-the-presented-sink-by-a-local": (
+        [
+            _before(
+                VERIFY_CHECK,
+                [
+                    "        value = token\n",
+                    "        value = settings.api_key\n",
+                    '        AccessToken(token=value, client_id="owner", scopes=[])\n',
+                ],
+            )
+        ],
+        "OwnerKeyVerifier.verify_token",
+        "AccessToken(token=value, client_id='owner', scopes=[])",
     ),
     "module-level-copy": (
         [
