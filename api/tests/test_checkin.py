@@ -6,22 +6,29 @@ them through results ingest, as an agent does.
 """
 
 import asyncio
+import logging
 import re
+import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select, update
+from sqlalchemy import event, select, update
+from sqlalchemy.exc import OperationalError
 
 from app.agent_protocol import CHECKIN_INTERVAL_S, JOB_TIMEOUT_S, PROTOCOL_VERSION
 from app.auth import require_agent
+from app.config import settings
 from app.database import SessionLocal
+from app.errors import ApiError
 from app.main import app
-from app.models import Agent, Change, ScanTarget
+from app.models import Agent, Change, ScanTarget, Token
 from app.routers import agent as agent_router
+from app.services import agents as agents_svc
 from app.services import jobs, scans
 
-from .conftest import make_section, make_subnet
+from .conftest import app_database, make_section, make_subnet, write_lock
 
 CHECKIN = {
     "version": "0.2.0",
@@ -36,6 +43,9 @@ ROUTED = {"interfaces": [{"name": "eth0", "cidr": "192.168.50.5/24", "mac": None
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+_utc = scans.utc
 
 
 # --- helpers ---
@@ -1203,3 +1213,274 @@ async def test_the_lease_keeps_the_methods_issued(client, agent_api):
     assert row.job_methods == ["icmp", "rdns"]  # arp was not issued, so no MAC is due
     got = (await client.get(f"/api/v1/scan-targets/{target['id']}")).json()["data"]
     assert got["job_methods"] == ["icmp", "rdns"]
+
+
+# --- #59: what a refused check-in writes, the claim, and database failures ---
+
+
+@contextmanager
+def statements(target_engine=None):
+    """The write statements the app issues inside the block, each with the number of
+    rows it changed: `[(sql, rowcount)]`."""
+    from app.database import engine
+
+    target_engine = target_engine or engine
+    seen = []
+
+    def after(_conn, cursor, statement, *_):
+        if statement.lstrip().split(None, 1)[0].upper() in ("INSERT", "UPDATE", "DELETE"):
+            seen.append((statement, cursor.rowcount))
+
+    event.listen(target_engine.sync_engine, "after_cursor_execute", after)
+    try:
+        yield seen
+    finally:
+        event.remove(target_engine.sync_engine, "after_cursor_execute", after)
+
+
+async def token_row(agent_id) -> Token:
+    async with SessionLocal() as session:
+        return await session.scalar(select(Token).where(Token.agent_id == agent_id))
+
+
+async def set_times(agent_id, *, checked_in=None, used=None):
+    async with SessionLocal() as session:
+        if checked_in is not None:
+            await session.execute(
+                update(Agent).where(Agent.id == agent_id).values(last_checkin_at=checked_in)
+            )
+        if used is not None:
+            await session.execute(
+                update(Token).where(Token.agent_id == agent_id).values(last_used_at=used)
+            )
+        await session.commit()
+
+
+def database_rows() -> dict[str, list]:
+    """Every row of every table, read straight from the file."""
+    con = sqlite3.connect(settings.db_path)
+    try:
+        tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+        return {t: sorted(map(repr, con.execute(f'SELECT * FROM "{t}"'))) for t in tables}
+    finally:
+        con.close()
+
+
+async def test_an_out_of_phase_refusal_changes_no_row(client, agent_api, checkin_limit):
+    """Review finding 1 (PR #56): a token-use write came due 9 s into the check-in gap
+    (after a request refused before the claim), and the refused check-in 1.2 s later
+    wrote it. The stored times are set to that phase: the 429 issues no write."""
+    agent, token = await make_agent(client)
+    assert (await checkin(agent_api, token)).status_code == 200
+    now = _now()
+    await set_times(
+        agent["id"], checked_in=now - timedelta(seconds=1.2), used=now - timedelta(seconds=10.2)
+    )
+    before = database_rows()
+    with statements() as writes:
+        res = await checkin(agent_api, token, hostname="other")
+    assert res.status_code == 429, res.text
+    assert writes == []
+    assert database_rows() == before
+
+
+async def test_checkins_that_meet_at_the_claim_pass_once(
+    client, agent_api, checkin_limit, monkeypatch
+):
+    """Review finding 3 (PR #56), made deterministic: every request has authenticated,
+    loading its agent row, before any of them claims. Only the compare-and-set can then
+    tell them apart. On a fresh token the one accepted check-in records its use once,
+    and the four refused change no row."""
+    agent, token = await make_agent(client)
+    for i in range(2):
+        subnet = await lab(client, f"10.0.{i}.0/24", name=f"net{i}")
+        await make_target(client, subnet["id"], agent["id"])
+    assert (await token_row(agent["id"])).last_used_at is None
+    barrier = asyncio.Barrier(5)
+    real = jobs._claim
+
+    async def together(*args):
+        await asyncio.wait_for(barrier.wait(), timeout=10)
+        return await real(*args)
+
+    monkeypatch.setattr(jobs, "_claim", together)
+    with statements() as writes:
+        results = await asyncio.gather(*(checkin(agent_api, token) for _ in range(5)))
+    assert sorted(r.status_code for r in results) == [200, 429, 429, 429, 429]
+    issued = [j for r in results if r.status_code == 200 for j in r.json()["data"]["jobs"]]
+    assert len(issued) == 1
+    token_writes = [(sql, n) for sql, n in writes if sql.lstrip().startswith("UPDATE tokens")]
+    assert [n for _, n in token_writes] == [1]
+    assert (await token_row(agent["id"])).last_used_at is not None
+    # the four refused each issued only their compare-and-set, which matched no row
+    claim = "UPDATE agents SET last_checkin_at"
+    claims = [n for sql, n in writes if sql.lstrip().startswith(claim)]
+    assert sorted(claims) == [0, 0, 0, 0, 1]
+    assert len(await agent_changes()) == 1
+
+
+async def _rename_and_disable(client, agent):
+    body = {"name": "renamed", "enabled": False}
+    res = await client.put(f"/api/v1/agents/{agent['id']}", json=body)
+    assert res.status_code == 200, res.text
+
+
+async def _revoke(client, agent):
+    assert (await client.post(f"/api/v1/agents/{agent['id']}/revoke")).status_code == 200
+
+
+async def _delete(client, agent):
+    assert (await client.delete(f"/api/v1/agents/{agent['id']}")).status_code == 204
+
+
+def _before_the_claim(monkeypatch, owner_edit):
+    """Run `owner_edit` once a check-in has authenticated and before it claims."""
+    real = jobs._claim
+
+    async def edited_first(*args):
+        await owner_edit()
+        return await real(*args)
+
+    monkeypatch.setattr(jobs, "_claim", edited_first)
+
+
+@pytest.mark.parametrize(
+    "owner_edit", [_rename_and_disable, _revoke, _delete], ids=["disable", "revoke", "delete"]
+)
+async def test_an_owner_refusal_after_authentication_refuses_the_checkin(
+    client, agent_api, monkeypatch, owner_edit
+):
+    """Review finding 2 (PR #56): an owner's rename and disable committed between
+    authentication and the claim left the check-in's audit entry on the old name and
+    `active`. The claim requires the agent active and the token unrevoked, so that
+    check-in is refused, writes nothing and logs nothing: the newest entry is the
+    owner's."""
+    agent, token = await make_agent(client)
+    assert (await checkin(agent_api, token)).status_code == 200
+    stale = _now() - timedelta(minutes=1)
+    await set_times(agent["id"], checked_in=stale, used=stale)
+    _before_the_claim(monkeypatch, lambda: owner_edit(client, agent))
+
+    res = await checkin(agent_api, token, hostname="other")
+
+    assert res.status_code == 403, res.text
+    assert res.json()["error"] == {"code": "FORBIDDEN", "message": "Invalid agent token"}
+    # nothing of the check-in: not its slot, its report or its token's use
+    row, used = await agent_row(agent["id"]), await token_row(agent["id"])
+    if owner_edit is not _delete:
+        assert _utc(row.last_checkin_at) == stale and row.hostname == CHECKIN["hostname"]
+        assert _utc(used.last_used_at) == stale
+    assert [c.entity_id for c in await agent_changes()] == [agent["id"]]  # the first only
+    newest = (await client.get("/api/v1/changes?limit=1")).json()["data"][0]
+    assert newest["source"] == "api"  # the owner's, not a check-in's
+    if owner_edit is _rename_and_disable:
+        assert (row.name, row.state) == ("renamed", "disabled")
+        assert (newest["after"]["name"], newest["after"]["state"]) == ("renamed", "disabled")
+
+
+async def test_a_rename_after_authentication_is_the_name_the_checkin_logs(
+    client, agent_api, monkeypatch
+):
+    """The other half of review finding 2: the check-in logs from the row as committed,
+    so its snapshots and its actor carry the owner's new name."""
+    agent, token = await make_agent(client, "before-rename")
+
+    async def rename():
+        res = await client.put(f"/api/v1/agents/{agent['id']}", json={"name": "after-rename"})
+        assert res.status_code == 200
+
+    _before_the_claim(monkeypatch, rename)
+    assert (await checkin(agent_api, token)).status_code == 200
+    [entry] = await agent_changes()
+    assert entry.actor == "agent:after-rename"
+    assert entry.summary.startswith("agent after-rename check-in changed")
+    for side in (entry.before, entry.after):
+        assert (side["name"], side["state"]) == ("after-rename", "active")
+
+
+async def test_the_prune_keeps_an_agents_entries_of_another_entity_type(client, agent_api):
+    """Review round 1, finding 6's remainder (PR #56): an older `source="agent"` entry
+    of another entity type that shares the agent's id survives the cap."""
+    agent, token = await make_agent(client)
+    async with SessionLocal() as session:
+        session.add(
+            Change(
+                ts=_now() - timedelta(days=1),
+                entity_type="token",
+                entity_id=agent["id"],
+                action="update",
+                summary="an agent-authored entry of another kind",
+                source="agent",
+            )
+        )
+        await session.commit()
+    for i in range(jobs.AGENT_AUDIT_KEEP + 5):
+        assert (await checkin(agent_api, token, hostname=f"h{i}")).status_code == 200
+    mine = await agent_changes()
+    assert [c.entity_type for c in mine].count("token") == 1
+    assert [c.entity_type for c in mine].count("agent") == jobs.AGENT_AUDIT_KEEP
+
+
+@pytest.mark.parametrize("due", [True, False], ids=["token-use-due", "token-use-not-due"])
+async def test_a_locked_database_is_a_503_and_nothing_is_written(client, agent_api, due):
+    """With the database locked past the busy timeout (a short one here: the 5-second
+    case is `test_agents.test_failed_last_used_write_is_a_structured_503`), a check-in
+    gets 503 in the error shape whether or not its token-use write is due, and nothing
+    of it is written once the lock clears."""
+    agent, token = await make_agent(client)
+    assert (await checkin(agent_api, token)).status_code == 200
+    if due:
+        await set_times(agent["id"], used=_now() - timedelta(minutes=1))
+    before = database_rows()
+    async with app_database(busy_timeout_ms=50):
+        with write_lock():
+            res = await checkin(agent_api, token, hostname="during")
+    assert res.status_code == 503, res.text
+    assert res.json() == {
+        "error": {"code": "UNAVAILABLE", "message": "Database busy; retry the request"}
+    }
+    assert database_rows() == before
+    assert (await checkin(agent_api, token, hostname="after")).status_code == 200
+    assert (await agent_row(agent["id"])).hostname == "after"
+
+
+async def test_a_failed_checkin_is_rolled_back_in_its_own_session(client, agent_api, monkeypatch):
+    """Review finding 2 (PR #62), at the transaction's owner: after a write fails late
+    in a check-in (here once its claim, token use and report are written), the session
+    is usable at once, and nothing of the check-in is written by a later commit on it."""
+    agent, token = await make_agent(client)
+    assert (await checkin(agent_api, token)).status_code == 200
+    await set_times(agent["id"], used=_now() - timedelta(minutes=1))
+    before = database_rows()
+
+    async def fails(*_):
+        raise OperationalError("UPDATE …", {}, sqlite3.OperationalError("disk I/O error"))
+
+    monkeypatch.setattr(jobs, "_next_job", fails)
+    async with SessionLocal() as session:
+        me = await agents_svc.authenticate(session, token)
+        with pytest.raises(ApiError) as refused:
+            await jobs.checkin(session, me, {**CHECKIN, "hostname": "during"})
+        assert (refused.value.status, refused.value.code) == (503, "UNAVAILABLE")
+        assert session.is_active and not session.in_transaction()
+        await session.commit()
+    assert database_rows() == before
+
+
+async def test_a_read_only_database_is_a_503_that_does_not_say_busy(client, agent_api, caplog):
+    """Review finding 1 (PR #62): a failure that is not a lock is not reported as one,
+    and the server logs the SQLite error, with no credential and no SQL."""
+    agent, token = await make_agent(client)
+    assert (await checkin(agent_api, token)).status_code == 200
+    before = database_rows()
+    caplog.set_level(logging.WARNING, logger="app.errors")
+    async with app_database(read_only=True):
+        res = await checkin(agent_api, token, hostname="during")
+    assert res.status_code == 503, res.text
+    error = res.json()["error"]
+    assert error["code"] == "UNAVAILABLE" and "busy" not in error["message"].lower()
+    assert database_rows() == before
+    [line] = [r.getMessage() for r in caplog.records if r.name == "app.errors"]
+    assert "check-in" in line and "SQLITE_READONLY" in line
+    for secret in (token, agents_svc.hash_token(token), agent["id"], "UPDATE", "during"):
+        assert secret not in line

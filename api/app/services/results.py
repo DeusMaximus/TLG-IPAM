@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 
 from pydantic import ValidationError
 from sqlalchemy import delete, select, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agent_protocol import (
@@ -38,10 +39,11 @@ from ..agent_protocol import (
     echo_ip,
     parse_observation,
 )
-from ..errors import ApiError, validation_error
+from ..errors import ApiError, database_unavailable, internal_error, validation_error
 from ..ipnet import parse_cidr
 from ..models import Agent, Observation, ScanTarget, Subnet
 from . import scans
+from .agents import record_token_use
 from .scans import utc
 
 # spec §5.4: observations unseen for this long are pruned at ingest
@@ -122,11 +124,27 @@ async def _release(
 
 
 async def ingest(session: AsyncSession, agent: Agent, body: object) -> dict:
-    """Handle `POST /api/v1/agent/results` for an authenticated agent."""
+    """Handle `POST /api/v1/agent/results` for an authenticated agent.
+
+    One transaction: the lease is released, the observations written and the token's
+    use recorded together. If the database refuses a write (locked past its busy
+    timeout, say), it is rolled back and the request is refused with
+    `503 UNAVAILABLE`: nothing is stored, both lease copies still name the job, and the
+    same result set may be sent again. A failure of the rollback itself is not caught
+    and is a bare 500.
+    """
     try:
         report = ResultsRequest.model_validate(body)
     except ValidationError as exc:
         raise validation_error(_validation_message(exc)) from None
+    try:
+        return await _accept(session, agent, report)
+    except OperationalError as exc:
+        await session.rollback()
+        raise database_unavailable("results ingest", exc) from exc
+
+
+async def _accept(session: AsyncSession, agent: Agent, report: ResultsRequest) -> dict:
     if agent.current_job_id is None or agent.current_job_id != report.job_id:
         raise _not_current()
     target = await session.scalar(
@@ -141,6 +159,7 @@ async def ingest(session: AsyncSession, agent: Agent, body: object) -> dict:
     methods = set(target.job_methods or ())
     subnet = await session.get(Subnet, target.subnet_id)
     await _release(session, agent, target, report)
+    await record_token_use(session, _now())
     # The reads above ran before this transaction took SQLite's write lock (the driver
     # begins it at the first write), so the owner may have edited the subnet since.
     # Everything below is read under the lock: `scan_scope` reads the scope as
@@ -207,10 +226,16 @@ async def ingest(session: AsyncSession, agent: Agent, body: object) -> dict:
         .where(Observation.last_seen_at < now - RETENTION)
         .execution_options(synchronize_session="fetch")
     )
-    # The answer is built, and encoded once as the response will be, before the commit:
-    # nothing may fail after the result set is stored, or the agent would see an error
-    # for a job it can no longer report (a retry is JOB_NOT_CURRENT).
-    answer = ResultsResponse(accepted=accepted, rejected=rejected).model_dump(mode="json")
-    json.dumps({"data": answer}, ensure_ascii=False).encode("utf-8")
+    # The answer is built, and encoded once as the response will be, before the commit,
+    # so that neither step can fail for a stored result set: an agent seeing an error
+    # for one could not report the job again (a retry is JOB_NOT_CURRENT). This does not
+    # cover rendering and sending the response, which come after the commit. Should it
+    # fail, nothing is stored and the agent gets a 500 in the REST error shape.
+    try:
+        answer = ResultsResponse(accepted=accepted, rejected=rejected).model_dump(mode="json")
+        json.dumps({"data": answer}, ensure_ascii=False).encode("utf-8")
+    except (ValueError, TypeError) as exc:  # UnicodeEncodeError is a ValueError
+        await session.rollback()
+        raise internal_error("results ingest: encoding the answer", exc) from exc
     await session.commit()
     return answer
