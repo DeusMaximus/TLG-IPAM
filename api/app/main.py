@@ -14,7 +14,7 @@ from .config import settings
 from .database import SessionLocal, init_models
 from .errors import ApiError
 from .mcp_server import mcp
-from .routers import agents, changes, device_types, hosts, sections, subnets
+from .routers import agents, changes, device_types, hosts, scan_targets, sections, subnets
 from .services.backups import create_snapshot
 from .services.device_types import seed_defaults
 
@@ -97,6 +97,7 @@ for router in (
     changes.router,
     device_types.router,
     agents.router,
+    scan_targets.router,
 ):
     app.include_router(router, prefix="/api/v1", dependencies=[Depends(require_api_key)])
 

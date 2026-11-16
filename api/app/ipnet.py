@@ -84,6 +84,30 @@ def merge_intervals(
     return merged
 
 
+def subtract_intervals(
+    base: tuple[int, int], removed: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """The parts of one inclusive interval left after removing others from it."""
+    lower, upper = base
+    if lower > upper:
+        return []
+    remaining: list[tuple[int, int]] = []
+    cursor = lower
+    for start, end in merge_intervals(removed, lower=lower, upper=upper):
+        if cursor < start:
+            remaining.append((cursor, start - 1))
+        cursor = end + 1
+    if cursor <= upper:
+        remaining.append((cursor, upper))
+    return remaining
+
+
+def format_intervals(net: ipaddress.IPv4Network, intervals: list[tuple[int, int]]) -> list[dict]:
+    """Integer intervals as `[{start, end}]` address strings of the network's family."""
+    address = type(net.network_address)
+    return [{"start": str(address(start)), "end": str(address(end))} for start, end in intervals]
+
+
 def exclusion_intervals(subnet, reserved_ranges=()) -> list[tuple[int, int]]:
     """Merged usable-address intervals excluded from automatic allocation."""
     net = parse_cidr(subnet.cidr)

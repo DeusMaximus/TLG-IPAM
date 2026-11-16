@@ -18,7 +18,7 @@ from sqlalchemy.orm import selectinload
 from ..errors import conflict, not_found
 from ..models import Agent, Token
 from ..schemas import AgentCreate, AgentUpdate
-from . import changes
+from . import changes, scans
 
 AGENT_TOKEN_PREFIX = "tlga_"
 # characters of the token kept for display: the kind prefix plus 8 of the 43 random ones
@@ -200,9 +200,11 @@ async def revoke_tokens(session: AsyncSession, agent_id: str, source: str) -> Ag
 
 async def delete_agent(session: AsyncSession, agent_id: str, source: str) -> None:
     """Delete the agent. Its unrevoked tokens are revoked first, each with its own
-    change-log entry; its token rows are then deleted with it (cascade)."""
+    change-log entry; its token rows are then deleted with it (cascade). Its scan
+    targets keep their settings and become unassigned, each with its own entry."""
     agent = await get_agent(session, agent_id)
     _revoke_live_tokens(session, agent, source, " (agent deleted)")
+    await scans.unassign_agent(session, agent, source)
     changes.record(
         session,
         entity_type="agent",

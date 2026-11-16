@@ -126,12 +126,18 @@ class ReservedRangeCreate(BaseModel):
     start_ip: str
     end_ip: str
     description: str | None = Field(default=None, max_length=255)
+    # REST only: the MCP tool never sets it, so a range made over MCP is scanned
+    scan_excluded: bool = False
 
     @field_validator("start_ip", "end_ip")
     @classmethod
     def _valid_ip(cls, v):
         parse_ip(v)
         return v
+
+
+class ReservedRangeUpdate(BaseModel):
+    scan_excluded: bool
 
 
 class ReservedRangeOut(BaseModel):
@@ -141,6 +147,13 @@ class ReservedRangeOut(BaseModel):
     start_ip: str
     end_ip: str
     description: str | None
+    # stored null (a range from before the column existed) reads as scanned
+    scan_excluded: bool = False
+
+    @field_validator("scan_excluded", mode="before")
+    @classmethod
+    def _null_is_scanned(cls, v):
+        return bool(v)
 
 
 class SubnetOut(BaseModel):
@@ -163,6 +176,8 @@ class SubnetOut(BaseModel):
     usable: int = 0
     free: int = 0
     reserved_ranges: list[ReservedRangeOut] = []
+    # from the subnet's scan target; null when the subnet has none (it is not scanned)
+    scan_dhcp_pool: bool | None = None
 
 
 # --- Hosts ---
@@ -345,3 +360,67 @@ class AgentCreated(AgentOut):
     """The create response, the only one that carries the plain token."""
 
     token: str
+
+
+# --- Scan targets ---
+
+# null = manual only; otherwise between five minutes and a week
+SCAN_INTERVAL_MIN = 5
+SCAN_INTERVAL_MAX = 7 * 24 * 60
+
+
+class ScanTargetCreate(BaseModel):
+    subnet_id: str
+    agent_id: str | None = None
+    enabled: bool = True
+    # checked and put in canonical order by services/scans.normalise_methods
+    methods: list[str] = ["icmp", "arp", "rdns"]
+    scan_dhcp_pool: bool = False
+    interval_minutes: int | None = Field(
+        default=None, ge=SCAN_INTERVAL_MIN, le=SCAN_INTERVAL_MAX
+    )
+
+
+class ScanTargetUpdate(BaseModel):
+    """The subnet of a target is fixed; delete the target and create another instead."""
+
+    agent_id: str | None = None
+    enabled: bool | None = None
+    methods: list[str] | None = None
+    scan_dhcp_pool: bool | None = None
+    interval_minutes: int | None = Field(
+        default=None, ge=SCAN_INTERVAL_MIN, le=SCAN_INTERVAL_MAX
+    )
+
+    @field_validator("enabled", "methods", "scan_dhcp_pool")
+    @classmethod
+    def _required_fields_cannot_be_null(cls, v):
+        if v is None:
+            raise ValueError("must not be null")
+        return v
+
+
+class ScanRange(BaseModel):
+    start: str
+    end: str
+
+
+class ScanTargetOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    subnet_id: str
+    agent_id: str | None
+    enabled: bool
+    methods: list[str]
+    scan_dhcp_pool: bool
+    interval_minutes: int | None
+    scan_requested_at: datetime | None
+    current_job_id: str | None
+    job_issued_at: datetime | None
+    created_at: datetime
+    last_scan_at: datetime | None
+    last_scan_duration_ms: int | None
+    last_scan_complete: bool | None
+    # the subnet's scan scope (services/scans.scan_scope): inclusive address ranges
+    scope: list[ScanRange] = []
