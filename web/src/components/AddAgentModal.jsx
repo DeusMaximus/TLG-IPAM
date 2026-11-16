@@ -66,7 +66,9 @@ function CopyBlock({ label, text, testId }) {
 // Two steps: name the agent, then show its token once. The token lives only in
 // this component's state: onCreated tells the page to reload its list (whose
 // responses never carry a token), and closing unmounts the dialog, so nothing on
-// the page can show the token again.
+// the page can show the token again. While the create request is in flight no
+// path closes the dialog either: the agent may already exist, and its response
+// is the only place its token will ever appear.
 export default function AddAgentModal({ serverVersion, onClose, onCreated }) {
   const [name, setName] = useState('')
   const [error, setError] = useState(null)
@@ -125,8 +127,12 @@ export default function AddAgentModal({ serverVersion, onClose, onCreated }) {
     )
   }
 
+  const closeUnlessSaving = () => {
+    if (!saving) onClose()
+  }
+
   return (
-    <Modal title="Add agent" onClose={onClose}>
+    <Modal title="Add agent" onClose={closeUnlessSaving} closeOnBackdrop={!saving}>
       <form onSubmit={submit}>
         <label className={labelCls} htmlFor="agent-name">
           Name
@@ -150,7 +156,12 @@ export default function AddAgentModal({ serverVersion, onClose, onCreated }) {
           </p>
         )}
         <div className="mt-5 flex justify-end gap-2">
-          <button type="button" onClick={onClose} className={secondaryBtn}>
+          <button
+            type="button"
+            onClick={closeUnlessSaving}
+            disabled={saving}
+            className={`${secondaryBtn} disabled:opacity-50`}
+          >
             Cancel
           </button>
           <button type="submit" disabled={saving} className={primaryBtn}>

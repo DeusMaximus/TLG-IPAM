@@ -190,6 +190,27 @@ describe('Agents page', () => {
     expect(document.body.innerHTML).not.toContain(TOKEN)
   })
 
+  it('cannot be closed while the create request is in flight, so its token is not lost', async () => {
+    const user = userEvent.setup()
+    let respond
+    ipam.createAgent.mockReturnValue(new Promise((resolve) => (respond = resolve)))
+    renderPage()
+
+    await user.click(await screen.findByRole('button', { name: /Add agent/ }))
+    await user.type(screen.getByLabelText('Name'), 'lab-vlan20')
+    await user.click(screen.getByRole('button', { name: 'Create agent' }))
+    expect(screen.getByRole('button', { name: 'Creating…' })).toBeDisabled()
+
+    // every close path does nothing while the request is pending
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: 'Close' }))
+    await user.click(screen.getByRole('dialog').parentElement)
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+
+    respond({ data: { ...agentRow(), token: TOKEN } })
+    expect(await screen.findByTestId('agent-token')).toHaveTextContent(TOKEN)
+  })
+
   it('keeps the form open with the server error when the name is taken', async () => {
     const user = userEvent.setup()
     ipam.createAgent.mockRejectedValue(
@@ -262,5 +283,30 @@ describe('Agents page', () => {
 
     await user.click(within(dialog).getByRole('button', { name: 'Delete agent' }))
     expect(ipam.deleteAgent).toHaveBeenCalledWith('agent-1')
+  })
+
+  it('says coverage is unknown, never "none", when the scan targets fail to load', async () => {
+    const user = userEvent.setup()
+    ipam.listScanTargets.mockRejectedValue(new ApiError('HTTP_500', 'Internal Server Error', 500))
+    ipam.deleteAgent.mockResolvedValue(null)
+    renderPage()
+
+    const row = await screen.findByTestId('agent-agent-1')
+    expect(await screen.findByText(/Could not load scan targets/)).toBeInTheDocument()
+    expect(within(row).getByText('unknown')).toBeInTheDocument()
+    expect(within(row).queryByText('none')).toBeNull()
+
+    await user.click(within(row).getByRole('button', { name: /Delete/ }))
+    const dialog = screen.getByRole('dialog')
+    expect(dialog).toHaveTextContent('could not be loaded')
+    expect(dialog).not.toHaveTextContent('It covers no subnets')
+  })
+
+  it('says coverage is unknown while the scan targets are still loading', async () => {
+    ipam.listScanTargets.mockReturnValue(new Promise(() => {}))
+    renderPage()
+
+    const row = await screen.findByTestId('agent-agent-1')
+    expect(within(row).getByText('unknown')).toBeInTheDocument()
   })
 })

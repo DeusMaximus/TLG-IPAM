@@ -63,6 +63,8 @@ function Interfaces({ interfaces }) {
 }
 
 function Covered({ targets, subnets }) {
+  // null: the scan targets did not load, so which subnets it covers is unknown
+  if (!targets) return <span className="text-slate-500">unknown</span>
   if (!targets.length) return <span className="text-slate-600">none</span>
   return (
     <ul className="space-y-0.5">
@@ -178,6 +180,14 @@ function Confirm({ title, children, action, onConfirm, onClose }) {
   )
 }
 
+function deleteCoverage(covered) {
+  if (!covered) {
+    return 'Which subnets it covers could not be loaded: any it covers keep their scan settings and are left unassigned.'
+  }
+  if (!covered.length) return 'It covers no subnets.'
+  return `The ${covered.length} subnet(s) it covers keep their scan settings and are left unassigned.`
+}
+
 export default function Agents() {
   const toast = useToast()
   const { subnets } = useTree()
@@ -206,6 +216,9 @@ export default function Agents() {
     refreshTargets()
   }
 
+  // Only a successful load says which subnets each agent covers. Until then, or
+  // after a failed refresh, coverage is unknown: never "none".
+  const targetsKnown = Boolean(targets.data) && !targets.error
   const targetsByAgent = useMemo(() => {
     const map = {}
     for (const t of targets.data?.data || []) {
@@ -213,6 +226,7 @@ export default function Agents() {
     }
     return map
   }, [targets.data])
+  const coveredBy = (agentId) => (targetsKnown ? targetsByAgent[agentId] || [] : null)
 
   const act = async (fn, message) => {
     try {
@@ -253,6 +267,12 @@ export default function Agents() {
         {agents.error && !list && (
           <p className="text-sm text-red-400">Could not load agents: {agents.error.message}</p>
         )}
+        {targets.error && (
+          <p className="mb-3 text-sm text-red-400">
+            Could not load scan targets, so the subnets each agent covers are unknown:{' '}
+            {targets.error.message}
+          </p>
+        )}
         {list && list.length === 0 && (
           <EmptyState>
             No agents yet. Add one, then run the container command it gives you on a host in the
@@ -280,7 +300,7 @@ export default function Agents() {
                   <AgentRow
                     key={agent.id}
                     agent={agent}
-                    targets={targetsByAgent[agent.id] || []}
+                    targets={coveredBy(agent.id)}
                     subnets={subnets}
                     now={now}
                     onToggle={toggle}
@@ -332,9 +352,7 @@ export default function Agents() {
         >
           <p>
             Its token is revoked and the agent removed.{' '}
-            {(targetsByAgent[confirming.agent.id] || []).length > 0
-              ? `The ${targetsByAgent[confirming.agent.id].length} subnet(s) it covers keep their scan settings and are left unassigned.`
-              : 'It covers no subnets.'}
+            {deleteCoverage(coveredBy(confirming.agent.id))}
           </p>
         </Confirm>
       )}
