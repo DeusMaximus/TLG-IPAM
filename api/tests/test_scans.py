@@ -601,10 +601,14 @@ async def test_mcp_get_subnet_shows_scan_settings(client):
 
 
 async def test_no_mcp_tool_reaches_scan_configuration():
+    # Spec §5.8's two scan tools read findings and ask for a scan of the scope the owner
+    # set (#17); neither takes a scan setting, which the argument check below holds.
+    scan_tools = {"list_scan_findings", "request_scan"}
     async with Client(mcp) as mcp_client:
         tools = await mcp_client.list_tools()
+    assert scan_tools <= {tool.name for tool in tools}
     for tool in tools:
-        assert "scan" not in tool.name
+        assert "scan" not in tool.name or tool.name in scan_tools, tool.name
         for arg in tool.input_schema.get("properties", {}):
             assert "scan" not in arg and "agent" not in arg and "method" not in arg, (
                 tool.name,

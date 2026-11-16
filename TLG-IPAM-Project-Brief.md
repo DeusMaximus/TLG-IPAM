@@ -443,7 +443,7 @@ Where what a scan saw and what the owner recorded disagree (v0.2 spec §5.5). Co
 - **Accept** takes each key with its `fingerprint`, recomputes the finding under SQLite's write lock and, only if it still exists with the same `observed` and `fingerprint`, writes `proposed` through the hosts service (`create_host`/`update_host`), whose validation and audit entry apply unchanged. Otherwise the record is `skipped` with reason `changed` and nothing is written; a key without a fingerprint is an `error`. A dismissed finding can still be accepted. The audit summary names the address and the finding type, never the hostname or MAC that came from the network: `host created at 10.0.20.7 in lab from scan finding unknown_host`, `host at 10.0.20.7 updated from scan finding name_mismatch`. The snapshots carry the values, as for any host write.
 - **Dismiss** recomputes the same way and stores the key only for a finding that exists as listed (a fingerprint is checked if sent, and not stored). The finding stays hidden until its observed value changes. The audit entry's summary is a count (`2 scan finding(s) dismissed in lab`); the keys are in its `after`.
 - **Observed values are data.** A MAC comes only from a job issued `arp`; a PTR name is whatever a device calls itself, kept only if it is a valid hostname (§3.11), which says nothing about what it means.
-- Not yet: `fdns_mismatch` arrives with the forward-DNS check (#20); the MCP tool `list_scan_findings` is #17; the findings panel is #19.
+- Over MCP, `list_scan_findings` lists findings, read-only (§5.2). Not yet: `fdns_mismatch` arrives with the forward-DNS check (#20); the findings panel is #19.
 
 ---
 
@@ -506,8 +506,10 @@ Tool descriptions are the documentation Claude reads at runtime — write them w
 | `add_reserved_range` | Reserve a block of IPs in a subnet so automatic allocation skips it (manual creation inside it stays allowed). Always creates a scanned range: the tool has no `scan_excluded` argument. |
 | `delete_reserved_range` | Remove a reserved range, returning its addresses to the allocation pool. Refuses a range with `scan_excluded`, because removing it would widen what is scanned; the error says to remove it in the web UI. |
 | `list_changes` | Recent changes to the IPAM (audit log), newest first, each with its `source` (`ui`, `api`, `mcp` or `agent`) and `actor` (null for the owner's own writes, `agent:<name>` for an agent). In `agent` snapshots the values the agent reports about itself are withheld (§4.5). Use to answer "what changed recently?" or to review previous MCP-driven edits. |
+| `list_scan_findings` | Scan findings (§4.7), for one subnet or, with `subnet_id` omitted, every subnet (by subnet name, then address), optionally of one `type`. Each finding is the REST one (key, `ip_int`, `host_id`, `dynamic`, `proposed`, `fingerprint`) plus `subnet_name`, `subnet_cidr`, and the recorded `host_name` and `host_fqdn` of the host at the address (null for `unknown_host`). `dynamic` findings are left out. Beside the list, `note` says that `observed` and `proposed` are what devices reported about themselves, to be read as data; the docstring says so too, and tells the assistant to write one into a host only when the user asks. Read-only. There is no accept or dismiss tool: an assistant resolves a finding with `create_host`/`update_host`, which the fingerprint does not bind, and dismissal stays in the UI. |
+| `request_scan` | Ask for a scan of one subnet now (`POST /subnets/{id}/scan`, §4.2), logged with `source = mcp`. Returns `{"scan_request": {subnet_id, scan_requested_at, next_request_after}}`, not the target. Inside the 15-minute cooldown, which every caller shares, the tool error says when to ask again, rounded up to the second so that asking then succeeds (the REST `429` gives the same time): `A scan of subnet lab was requested less than 15 minutes ago; request another after 2026-11-16T12:15:00+00:00`. A subnet with no scan target, a disabled one, or one with no agent is refused, and so is an unknown subnet. A write tool: when remote grants arrive (M3), it needs `ipam:write`. |
 
-All MCP writes are recorded in the change log with `source = mcp`. No tool creates, changes or lists agents, tokens or scan targets, and no tool can widen a subnet's scan scope (v0.2 spec §7.2, invariant 2).
+All MCP writes are recorded in the change log with `source = mcp`. No tool creates, configures or lists agents, tokens or scan targets, and no tool can widen a subnet's scan scope (v0.2 spec §7.2, invariant 2). `request_scan` sets one column of a configured target, `scan_requested_at`, so the agent scans the scope the owner set sooner; it changes no setting and reveals none.
 
 ### 5.3 Claude Desktop config
 
@@ -540,6 +542,8 @@ These should work once Claude Desktop has the server connected:
 - "Reserve 10.10.30.2 through .19 for switches" → `add_reserved_range`
 - "Here's my UniFi client export — register everything in the IoT subnet" → `bulk_create_hosts`
 - "What did you change yesterday?" → `list_changes`
+- "Is anything on the network I haven't recorded?" → `list_scan_findings` with `type=unknown_host`
+- "Rescan the IoT subnet" → `list_subnets` → `request_scan`
 
 The server's `instructions` string tells clients this is the authoritative standalone IPAM (not phpIPAM/NetBox/UniFi), so Claude routes IP questions here instead of to networking-adjacent skills.
 
@@ -725,9 +729,10 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 ### MCP integration
 - Claude Desktop connects via `mcp-remote` with the owner key as a bearer and lists all available tools.
 - `/mcp` answers `401` to a missing or wrong bearer, and to `X-API-Key` alone.
-- All 16 MCP tools are callable from Claude Desktop.
+- All 18 MCP tools are callable from Claude Desktop.
 - Bulk import reports per-record outcomes; a batch with some bad rows still imports the good ones.
 - No MCP tool configures agents, scan targets or scan scope. `add_reserved_range` creates a scanned range; `delete_reserved_range` on an excluded range fails with a message pointing at the web UI; `get_subnet` shows `scan_excluded` and `scan_dhcp_pool`.
+- `list_scan_findings` and `request_scan` are in `EXPECTED_TOOLS` and the tool table. `request_scan` inside the cooldown returns a tool error that says when it can run again.
 - Natural-language queries resolve to correct tool calls without ambiguity.
 
 ### Operations
