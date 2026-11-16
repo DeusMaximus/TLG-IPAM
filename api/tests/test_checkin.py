@@ -86,7 +86,15 @@ async def jobs_for(agent_api, token, **body) -> list[dict]:
 
 
 async def set_target(target_id, **values):
+    """Write target columns. A change to the lease is made on the agent holding that
+    job too, as results ingest (#11) clears both, and as both expire together."""
     async with SessionLocal() as session:
+        target = await session.get(ScanTarget, target_id)
+        lease = {k: v for k, v in values.items() if k in ("current_job_id", "job_issued_at")}
+        if lease and target.current_job_id is not None:
+            await session.execute(
+                update(Agent).where(Agent.current_job_id == target.current_job_id).values(**lease)
+            )
         await session.execute(update(ScanTarget).where(ScanTarget.id == target_id).values(**values))
         await session.commit()
 
@@ -874,8 +882,8 @@ async def test_request_scan_needs_the_owner_key(client, anon_client):
 
 
 async def test_reassigning_a_target_mid_scan_leaves_the_lease_with_its_agent(client, agent_api):
-    """The lease names the agent it was issued to, apart from the target's assignment:
-    the agent still scanning stays busy, and the new one is not blocked by its lease."""
+    """The agent keeps its own record of the job: the agent still scanning stays busy,
+    and the new one is not blocked by that lease beyond the moved target."""
     a, a_token = await make_agent(client, "a")
     b, b_token = await make_agent(client, "b")
     first = await lab(client, "10.0.0.0/24", name="first")
@@ -884,11 +892,11 @@ async def test_reassigning_a_target_mid_scan_leaves_the_lease_with_its_agent(cli
     moved = await make_target(client, first["id"], a["id"])
     [job] = await jobs_for(agent_api, a_token)
     assert job["subnet_id"] == first["id"]
-    assert (await target_row(moved["id"])).job_agent_id == a["id"]
+    assert (await agent_row(a["id"])).current_job_id == job["job_id"]
     # the owner moves the target to b while a is still scanning it
     res = await client.put(f"/api/v1/scan-targets/{moved['id']}", json={"agent_id": b["id"]})
     assert res.status_code == 200, res.text
-    assert res.json()["data"]["job_agent_id"] == a["id"]
+    assert res.json()["data"]["current_job_id"] == job["job_id"]  # the lease stays
     await make_target(client, second["id"], a["id"])
     await make_target(client, third["id"], b["id"])
     # a still holds a live lease, so its other due target waits
@@ -902,7 +910,7 @@ async def test_reassigning_a_target_mid_scan_leaves_the_lease_with_its_agent(cli
     assert a_job["subnet_id"] == second["id"]
 
 
-async def test_database_from_main_gains_the_lease_agent_column(tmp_path):
+async def test_database_from_main_gains_the_agent_lease_columns(tmp_path):
     import sqlite3
 
     from sqlalchemy.ext.asyncio import create_async_engine
@@ -915,15 +923,60 @@ async def test_database_from_main_gains_the_lease_agent_column(tmp_path):
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-            # scan_targets as main had it, before this column
-            await conn.exec_driver_sql("ALTER TABLE scan_targets DROP COLUMN job_agent_id")
+            # agents as main had it, before these columns
+            await conn.exec_driver_sql("ALTER TABLE agents DROP COLUMN current_job_id")
+            await conn.exec_driver_sql("ALTER TABLE agents DROP COLUMN job_issued_at")
         await init_models(engine)
         await init_models(engine)  # a second start-up adds nothing twice
     finally:
         await engine.dispose()
     con = sqlite3.connect(path)
     try:
-        columns = {r[1]: r for r in con.execute("PRAGMA table_info(scan_targets)")}
+        columns = {r[1]: r for r in con.execute("PRAGMA table_info(agents)")}
     finally:
         con.close()
-    assert columns["job_agent_id"][3] == 0  # nullable
+    assert columns["current_job_id"][3] == 0 and columns["job_issued_at"][3] == 0  # nullable
+
+
+async def test_deleting_a_leased_target_leaves_its_agent_busy(client, agent_api):
+    """Deleting the target, or its subnet, mid-scan sends the agent nothing, so it is
+    still scanning: it gets no second job until its own lease is cleared or expires."""
+    agent, token = await make_agent(client)
+    first = await lab(client, "10.0.0.0/24", name="first")
+    second = await lab(client, "10.0.1.0/24", name="second")
+    third = await lab(client, "10.0.2.0/24", name="third")
+    doomed = await make_target(client, first["id"], agent["id"])
+    [job] = await jobs_for(agent_api, token)
+    assert job["subnet_id"] == first["id"]
+    assert (await client.delete(f"/api/v1/scan-targets/{doomed['id']}")).status_code == 204
+    await make_target(client, second["id"], agent["id"])
+    assert await jobs_for(agent_api, token) == []
+    # and the same when the subnet goes, with its target
+    async with SessionLocal() as session:
+        await session.execute(
+            update(Agent)
+            .where(Agent.id == agent["id"])
+            .values(job_issued_at=_now() - jobs.LEASE - timedelta(seconds=1))
+        )
+        await session.commit()
+    [second_job] = await jobs_for(agent_api, token)
+    assert second_job["subnet_id"] == second["id"]
+    res = await client.delete(f"/api/v1/subnets/{second['id']}")
+    assert res.status_code == 204, res.text
+    await make_target(client, third["id"], agent["id"])
+    assert await jobs_for(agent_api, token) == []
+    got = (await client.get(f"/api/v1/agents/{agent['id']}")).json()["data"]
+    assert got["current_job_id"] == second_job["job_id"]
+
+
+async def test_concurrent_checkins_of_one_agent_issue_one_job(client, agent_api):
+    """Two due targets: racing check-ins of one agent must still hand out one job, so
+    each check-in reads the agent's lease after taking the write lock."""
+    agent, token = await make_agent(client)
+    for i in range(2):
+        subnet = await lab(client, f"10.0.{i}.0/24", name=f"net{i}")
+        await make_target(client, subnet["id"], agent["id"])
+    results = await asyncio.gather(*(checkin(agent_api, token) for _ in range(5)))
+    assert all(res.status_code == 200 for res in results)
+    issued = [job for res in results for job in res.json()["data"]["jobs"]]
+    assert len(issued) == 1

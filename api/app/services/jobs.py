@@ -1,10 +1,13 @@
 """Agent check-in, scheduling and job leases (v0.2 spec §5.1, §5.2, §5.7).
 
 The server is the scheduler. At each check-in it stores what the agent reports and
-hands back at most one due job. Issuing a job leases its target: `current_job_id`,
-`job_issued_at` and `job_agent_id` are set, and the target is not issued again until
-the lease is cleared by an accepted result (#11) or expires. A target reassigned
-mid-scan keeps its lease, and the agent it was issued to stays busy, until then.
+hands back at most one due job. Issuing a job leases its target: `current_job_id`
+and `job_issued_at` are set, and the target is not issued again until the lease is
+cleared by an accepted result (#11) or expires.
+
+The same two columns on the agent record the job it was issued. An agent is busy, and
+gets no new job, while that lease is live. It is kept on the agent so that the owner
+reassigning or deleting the target mid-scan does not free an agent still scanning.
 
 A target is due when it is enabled, assigned to the agent, not under a live lease,
 and either
@@ -113,7 +116,7 @@ def _priority(target: ScanTarget):
 
 
 async def _lease(
-    session: AsyncSession, target: ScanTarget, agent_id: str, now: datetime
+    session: AsyncSession, target: ScanTarget, agent: Agent, now: datetime
 ) -> str | None:
     """Lease the target to a new job. The update only applies if the lease is still the
     one this check-in read, so two check-ins can never both issue the same target."""
@@ -124,27 +127,28 @@ async def _lease(
             ScanTarget.id == target.id,
             ScanTarget.current_job_id.is_not_distinct_from(target.current_job_id),
         )
-        .values(current_job_id=job_id, job_issued_at=now, job_agent_id=agent_id)
+        .values(current_job_id=job_id, job_issued_at=now)
         .execution_options(synchronize_session=False)
     )
     if result.rowcount != 1:
         return None
-    target.current_job_id, target.job_issued_at, target.job_agent_id = job_id, now, agent_id
+    target.current_job_id, target.job_issued_at = job_id, now
+    # the agent's own record: it is busy until this lease is cleared or expires
+    agent.current_job_id, agent.job_issued_at = job_id, now
     return job_id
 
 
-async def _busy(session: AsyncSession, agent: Agent, now: datetime) -> bool:
-    """Whether the agent still holds a live lease, on any target: found by the agent
-    the lease was issued to, not by the target's assignment, which the owner may have
-    changed while the scan runs."""
-    held = await session.scalars(select(ScanTarget).where(ScanTarget.job_agent_id == agent.id))
-    return any(lease_live(target, now) for target in held)
+def agent_busy(agent: Agent, now: datetime) -> bool:
+    """Whether the agent holds a live lease. Read from the agent itself, so it holds
+    whatever has since happened to the target: reassigned, disabled or deleted."""
+    issued = utc(agent.job_issued_at)
+    return agent.current_job_id is not None and issued is not None and now < issued + LEASE
 
 
 async def _next_job(session: AsyncSession, agent: Agent, now: datetime) -> Job | None:
     # One job at a time: an agent still holding a live lease is still scanning, so a
     # second job would wait in its queue while its own lease ran out.
-    if await _busy(session, agent, now):
+    if agent_busy(agent, now):
         return None
     rows = (
         await session.execute(
@@ -162,7 +166,7 @@ async def _next_job(session: AsyncSession, agent: Agent, now: datetime) -> Job |
         ranges = await scans.scan_scope_ranges(session, subnet)
         if not ranges:
             continue
-        job_id = await _lease(session, target, agent.id, now)
+        job_id = await _lease(session, target, agent, now)
         if job_id is None:
             continue
         return Job(
@@ -248,9 +252,11 @@ async def checkin(session: AsyncSession, agent: Agent, body: dict) -> dict:
 
     data = report.model_dump()
     _store(session, agent, now, {**{f: data[f] for f in REPORTED_FIELDS}, "last_error": None})
-    # Write before reading the targets: SQLite has one writer, so a concurrent
-    # check-in waits here until this one commits, then reads the leases it set.
+    # Write before reading the leases: SQLite has one writer, so a concurrent check-in
+    # waits here until this one commits. The agent was loaded before that, at
+    # authentication, so its own lease is read again now.
     await session.flush()
+    await session.refresh(agent, ["current_job_id", "job_issued_at"])
     job = await _next_job(session, agent, now)
     await session.commit()
     response = CheckinResponse(checkin_interval_s=CHECKIN_INTERVAL_S, jobs=[job] if job else [])

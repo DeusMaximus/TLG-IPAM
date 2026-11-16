@@ -353,6 +353,9 @@ class AgentOut(BaseModel):
     interfaces: list | None
     last_checkin_at: datetime | None
     last_error: str | None
+    # the agent's own record of its last job; it is busy while that is live
+    current_job_id: str | None
+    job_issued_at: datetime | None
     created_at: datetime
     tokens: list[TokenOut]
 
@@ -414,7 +417,6 @@ class ScanTargetOut(BaseModel):
     scan_requested_at: datetime | None
     current_job_id: str | None
     job_issued_at: datetime | None
-    job_agent_id: str | None
     created_at: datetime
     last_scan_at: datetime | None
     last_scan_duration_ms: int | None

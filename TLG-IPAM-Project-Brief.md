@@ -182,6 +182,7 @@ A scan agent (v0.2 spec §5.4). The owner creates it over REST; the agent checks
 | `state` | enum: `pending` (has never held an agent token; enrolment, v0.2 M2b) \| `active` \| `disabled`. An agent created over REST gets its token at once, so it starts `active` |
 | `version`, `platform`, `hostname`, `interfaces` | nullable; reported by the agent at check-in, and null until its first. Trimmed, printable characters only, at most 40, 120 and 253 characters; `interfaces` is up to 64 `{name, cidr, mac}` (name at most 15 characters; `cidr` an address with its prefix length, normalised, no IPv6 scope id; `mac` normalised or null). A check-in that fails these checks changes none of them |
 | `last_checkin_at` | datetime, nullable — set by every authenticated check-in, refused ones included |
+| `current_job_id`, `job_issued_at` | nullable, read-only — the job the agent was last issued, and when (§4.5). The agent is busy while that lease is live, whatever has since happened to the target. Databases created before them gain the columns on startup |
 | `last_error` | text, nullable — why the last check-in was refused (protocol mismatch, or the first field that failed validation, by name and never by value). Cleared by a check-in that succeeds |
 | `created_at` | datetime, auto |
 
@@ -218,7 +219,7 @@ A subnet the owner has chosen to scan, and how (v0.2 spec §5.3, §5.4). At most
 | `scan_dhcp_pool` | bool, default `false` — whether the subnet's DHCP pool is in scope |
 | `interval_minutes` | int, nullable — 5 to 10080 (a week); null = manual only |
 | `scan_requested_at` | datetime, nullable, read-only — when a scan was last requested (`POST /subnets/{id}/scan`). Never cleared: it also times the cooldown |
-| `current_job_id`, `job_issued_at`, `job_agent_id` | nullable, read-only — the job lease, set when check-in issues a job (§4.5). `job_agent_id` is the agent it was issued to, which stays put when the target is reassigned; no foreign key. Databases created before it gain the column on startup |
+| `current_job_id`, `job_issued_at` | nullable, read-only — the job lease, set when check-in issues a job (§4.5) |
 | `last_scan_at`, `last_scan_duration_ms`, `last_scan_complete` | nullable, read-only — the last-scan record. `last_scan_at` is when the last completed job was issued, by the server's clock. Written by results ingest (#11); nothing writes them yet |
 | `created_at` | datetime, auto |
 
@@ -334,7 +335,7 @@ Gateway, DHCP, reserved-range, and allocated-address exclusions are represented 
 
 **When a target is due.** It is enabled, assigned to this agent, not under a live lease, and either a scan was requested after its last scan started (`scan_requested_at` > `last_scan_at`), or it has an interval and has never been scanned or its last scan started at least `interval_minutes` ago. Requested targets go first, then the one scanned longest ago.
 
-**Leases.** Issuing a job sets `current_job_id` and `job_issued_at`. The lease is live for 15 minutes (the 10-minute job timeout plus a margin); a target under a live lease is not issued again, and once it expires the target is due again. The write is a compare-and-set on the lease the check-in read, so two check-ins never lease one target twice. An agent holding any live lease gets no new job: it runs one job at a time. Leases are found by `job_agent_id`, not by the target's `agent_id`, so a target reassigned mid-scan keeps its lease until it expires or its result arrives: the agent still scanning stays busy, and the new agent waits for that target only. Results ingest (#11) clears the lease.
+**Leases.** Issuing a job sets `current_job_id` and `job_issued_at`. The lease is live for 15 minutes (the 10-minute job timeout plus a margin); a target under a live lease is not issued again, and once it expires the target is due again. The write is a compare-and-set on the lease the check-in read, so two check-ins never lease one target twice. The same lease is recorded on the agent (`agents.current_job_id`, `job_issued_at`), and an agent whose lease is live gets no new job: it runs one job at a time. Because the record is on the agent, reassigning, disabling or deleting the target (or its subnet) mid-scan does not free an agent that is still scanning; nothing is sent to cancel a job. A reassigned target keeps its lease until it expires or its result arrives, so the new agent waits for that target only. Results ingest (#11) clears the lease.
 
 **The job.** `ranges` is the subnet's scan scope from `services/scans.scan_scope` (§3.10); a target whose scope is empty gets no job. `methods` are the target's, minus `arp` when the subnet is not on the agent's link, and minus `fdns` until the forward-DNS check exists (#20), so `fdns` is always empty. The subnet is on the agent's link when one reported IPv4 interface's network contains the whole subnet. A target left with neither `icmp` nor `arp` gets no job, and is not leased. `dns_servers` are the subnet's, or empty. `timeout_s` is 600.
 
