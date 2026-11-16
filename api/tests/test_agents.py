@@ -6,14 +6,16 @@ tested in `test_checkin.py`.
 """
 
 import hashlib
-from datetime import timedelta
 import sqlite3
+import time
+from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 from fastmcp import Client
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -330,14 +332,179 @@ async def test_agent_token_is_refused_on_owner_routes(client, anon_client):
     assert res.status_code == 401
 
 
+def running_app():
+    """The app's lifespan, as `test_auth.running_app` enters it: with the MCP session
+    manager started, a verifier that wrongly accepted the bearer would fail the status
+    assertion below, not an uninitialised task group."""
+    return app.router.lifespan_context(app)
+
+
 @pytest.mark.parametrize("path", MCP_PATHS)
 async def test_agent_token_is_refused_on_mcp(client, anon_client, path):
     _, token = await make_agent(client)
-    res = await anon_client.post(
-        path, json=INITIALIZE, headers={**bearer(token), "Accept": MCP_ACCEPT}
-    )
+    async with running_app():
+        res = await anon_client.post(
+            path, json=INITIALIZE, headers={**bearer(token), "Accept": MCP_ACCEPT}
+        )
+    # asserted outside the lifespan, so a failure is reported here and not re-raised
+    # through its task group
     assert res.status_code == 401
     assert res.headers["www-authenticate"].startswith('Bearer error="invalid_token"')
+
+
+# --- A failed last_used_at write (#51) ---
+
+
+@contextmanager
+def write_lock():
+    """Another connection holding SQLite's write lock (`BEGIN IMMEDIATE`) until the block
+    ends. Readers carry on (WAL); a writer waits out its busy timeout, then fails."""
+    con = sqlite3.connect(settings.db_path, isolation_level=None)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        yield
+    finally:
+        con.rollback()
+        con.close()
+
+
+async def busy_timeout() -> float:
+    """The app's busy timeout in seconds, as its connections have it set."""
+    async with SessionLocal() as session:
+        return (await session.scalar(text("PRAGMA busy_timeout"))) / 1000
+
+
+async def set_last_used(token_id: str, when) -> None:
+    async with SessionLocal() as session:
+        await session.execute(update(Token).where(Token.id == token_id).values(last_used_at=when))
+        await session.commit()
+
+
+@pytest.fixture
+async def raw_agent_api():
+    """The real app with no owner key, and an exception the app does not handle
+    answered as the server would (a bare 500), not raised into the test."""
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        yield c
+
+
+async def test_failed_last_used_write_is_a_structured_503(client, raw_agent_api):
+    """Acceptance: with the database locked past the busy timeout, an authenticated
+    agent request gets 503 in the REST error shape, and nothing is half-written."""
+    agent, token = await make_agent(client)
+    assert (await checkin(raw_agent_api, token, hostname="before")).status_code == 200
+    [row] = await token_rows(agent["id"])
+    # the write is due: the last use is a full interval old
+    stale = row.last_used_at - agents_svc.LAST_USED_GRANULARITY
+    await set_last_used(row.id, stale)
+    detail_before = (await client.get(f"/api/v1/agents/{agent['id']}")).json()["data"]
+    changes_before = (await client.get("/api/v1/changes?limit=200")).json()
+    timeout = await busy_timeout()
+
+    with write_lock():
+        started = time.monotonic()
+        res = await checkin(raw_agent_api, token, hostname="during")
+        waited = time.monotonic() - started
+
+    assert res.status_code == 503, res.text
+    assert res.json() == {
+        "error": {"code": "UNAVAILABLE", "message": "Database busy; retry the request"}
+    }
+    assert waited >= timeout  # it failed on the busy timeout, not on something sooner
+    [row] = await token_rows(agent["id"])
+    assert row.last_used_at == stale
+    assert (await client.get(f"/api/v1/agents/{agent['id']}")).json()["data"] == detail_before
+    assert (await client.get("/api/v1/changes?limit=200")).json() == changes_before
+
+    # rolled back, not left open: the next request writes, and so does the owner
+    assert (await checkin(raw_agent_api, token, hostname="after")).status_code == 200
+    [row] = await token_rows(agent["id"])
+    assert row.last_used_at > stale
+    assert await agent_hostname(client, agent["id"]) == "after"
+    assert (await client.post("/api/v1/sections", json={"name": "x"})).status_code == 201
+
+
+async def test_authentication_inside_the_interval_only_reads(client, agent_api):
+    """With the database locked, a token used inside LAST_USED_GRANULARITY still
+    authenticates, at once: nothing waits on the lock, so nothing was written."""
+    agent, token = await make_agent(client)
+    assert (await checkin(agent_api, token)).status_code == 200
+    [before] = await token_rows(agent["id"])
+    timeout = await busy_timeout()
+
+    with write_lock():
+        started = time.monotonic()
+        async with SessionLocal() as session:
+            got = await agents_svc.authenticate(session, token)
+        waited = time.monotonic() - started
+
+    assert got is not None and got.id == agent["id"]
+    assert waited < timeout / 2
+    [after] = await token_rows(agent["id"])
+    assert after.last_used_at == before.last_used_at
+
+
+async def _revoked(client, agent):
+    assert (await client.post(f"/api/v1/agents/{agent['id']}/revoke")).status_code == 200
+
+
+async def _disabled(client, agent):
+    res = await client.put(f"/api/v1/agents/{agent['id']}", json={"enabled": False})
+    assert res.status_code == 200
+
+
+@pytest.mark.parametrize("refuse", [_revoked, _disabled], ids=["revoked", "disabled-agent"])
+async def test_refused_token_is_403_and_never_reaches_the_write(
+    client, raw_agent_api, refuse
+):
+    """Acceptance: a refused token still gets 403 and does not touch last_used_at,
+    even with its write due and the database locked: the credential and state checks
+    come first, so the write cannot stand in for them."""
+    agent, token = await make_agent(client)
+    assert (await checkin(raw_agent_api, token)).status_code == 200
+    [row] = await token_rows(agent["id"])
+    stale = row.last_used_at - agents_svc.LAST_USED_GRANULARITY
+    await set_last_used(row.id, stale)
+    await refuse(client, agent)
+    timeout = await busy_timeout()
+
+    with write_lock():
+        started = time.monotonic()
+        res = await checkin(raw_agent_api, token)
+        waited = time.monotonic() - started
+
+    assert res.status_code == 403, res.text
+    assert res.json()["error"] == {"code": "FORBIDDEN", "message": "Invalid agent token"}
+    assert waited < timeout / 2
+    [row] = await token_rows(agent["id"])
+    assert row.last_used_at == stale
+
+
+async def test_refused_enrol_token_is_403_and_never_reaches_the_write(client, raw_agent_api):
+    agent, _ = await make_agent(client)
+    plain = "tlge_enrol-token-for-test"
+    async with SessionLocal() as session:
+        session.add(
+            Token(
+                kind="enrol",
+                agent_id=agent["id"],
+                token_hash=agents_svc.hash_token(plain),
+                token_prefix=plain[:13],
+            )
+        )
+        await session.commit()
+    timeout = await busy_timeout()
+
+    with write_lock():
+        started = time.monotonic()
+        res = await checkin(raw_agent_api, plain)
+        waited = time.monotonic() - started
+
+    assert res.status_code == 403, res.text
+    assert waited < timeout / 2
+    enrol = [t for t in await token_rows(agent["id"]) if t.kind == "enrol"]
+    assert [t.last_used_at for t in enrol] == [None]
 
 
 # --- Owner REST ---

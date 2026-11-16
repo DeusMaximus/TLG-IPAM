@@ -11,11 +11,11 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from ..errors import conflict, not_found
+from ..errors import conflict, not_found, unavailable
 from ..models import Agent, Token
 from ..schemas import AgentCreate, AgentUpdate
 from . import changes, scans
@@ -224,10 +224,16 @@ async def delete_agent(session: AsyncSession, agent_id: str, source: str) -> Non
 async def authenticate(session: AsyncSession, presented: str) -> Agent | None:
     """The agent a presented bearer belongs to, or None. Accepts only an unrevoked
     `agent` token of an `active` agent, and records its use in `last_used_at` when the
-    stored time is LAST_USED_GRANULARITY old or more (or unset).
+    stored time is LAST_USED_GRANULARITY old or more (or unset). Inside that interval
+    it only reads.
 
     The lookup is by SHA-256 of the presented value, so no comparison ever touches
     the stored secret: timing reveals at most where an attacker's own hash sorts.
+
+    The write comes after every credential and state check, so a refused bearer never
+    reaches it. If it fails (the database stays locked past its busy timeout, say), it
+    is rolled back and the request is refused with a retryable `503 UNAVAILABLE`: the
+    token was valid, but the request is not served without its use being recorded.
     """
     row = (
         await session.execute(
@@ -247,5 +253,9 @@ async def authenticate(session: AsyncSession, presented: str) -> Agent | None:
         used = used.replace(tzinfo=timezone.utc)  # SQLite hands it back without a zone
     if used is None or now - used >= LAST_USED_GRANULARITY:
         token.last_used_at = now
-        await session.commit()
+        try:
+            await session.commit()
+        except OperationalError:
+            await session.rollback()
+            raise unavailable("Database busy; retry the request") from None
     return agent
