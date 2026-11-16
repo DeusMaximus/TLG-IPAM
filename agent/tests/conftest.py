@@ -20,9 +20,11 @@ import pytest
 _API = Path(__file__).resolve().parents[2] / "api"
 sys.path.insert(0, str(_API))
 _SESSION_DIR = tempfile.mkdtemp(prefix="tlg-ipam-agent-test-")
-os.environ.setdefault("API_KEY", "test-key")
-os.environ.setdefault("DB_PATH", os.path.join(_SESSION_DIR, "ipam.db"))
-os.environ.setdefault("STATIC_DIR", os.path.join(_SESSION_DIR, "no-static"))
+# Assigned, never defaulted: a DB_PATH already exported (a real database, say) must
+# not reach the server's engine, which `fresh_db` in test_e2e.py empties.
+os.environ["API_KEY"] = "test-key"
+os.environ["DB_PATH"] = os.path.join(_SESSION_DIR, "ipam.db")
+os.environ["STATIC_DIR"] = os.path.join(_SESSION_DIR, "no-static")
 
 from tlg_ipam_agent import scan  # noqa: E402
 from tlg_ipam_agent.client import AgentClient  # noqa: E402
@@ -65,9 +67,11 @@ class FakeProber:
         self.delay = delay
         self.in_flight = 0
         self.max_in_flight = 0
+        self.timeouts: list[float] = []
 
     async def ping(self, address, timeout):
         self.sent.append(address)
+        self.timeouts.append(timeout)
         if self.clock is not None:
             self.times.append(self.clock.t)
         self.in_flight += 1
@@ -83,13 +87,19 @@ class FakeProber:
 
 
 class FakeResolver:
-    def __init__(self, names=None):
+    def __init__(self, names=None, clock: FakeClock | None = None, delay: float = 0.0):
         self.names = {ipaddress.ip_address(k): v for k, v in (names or {}).items()}
         self.asked: list = []
+        self.timeouts: list[float] = []
+        self.clock, self.delay = clock, delay
 
     async def ptr(self, address, servers, timeout):
         self.asked.append((address, servers))
-        await asyncio.sleep(0)
+        self.timeouts.append(timeout)
+        if self.delay and self.clock is not None:
+            await self.clock.sleep(self.delay)
+        else:
+            await asyncio.sleep(0)
         return self.names.get(address)
 
 

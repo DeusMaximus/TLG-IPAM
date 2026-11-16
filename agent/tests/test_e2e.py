@@ -277,3 +277,10 @@ async def test_a_superseded_result_set_is_not_retried(owner):
 def test_backoff_bounds_are_the_servers():
     backoff = Backoff(random.Random(0))
     assert all(CHECKIN_RETRY_MIN_S <= backoff.next() <= CHECKIN_RETRY_MAX_S for _ in range(50))
+
+
+def test_the_server_under_test_uses_this_sessions_own_database():
+    """An exported DB_PATH never reaches the server's engine, which these tests empty."""
+    from conftest import _SESSION_DIR
+
+    assert str(engine.url.database).startswith(_SESSION_DIR)

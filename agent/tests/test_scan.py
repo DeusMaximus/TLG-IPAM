@@ -172,3 +172,50 @@ def test_network_and_broadcast_are_skipped():
     assert ipaddress.ip_address("10.0.0.0") not in addresses
     assert ipaddress.ip_address("10.0.0.255") not in addresses
     assert len(addresses) == 254
+
+
+async def test_probes_that_run_past_the_deadline_make_the_result_incomplete():
+    """Both sends start inside a 1 s job, but the probes take 0.75 s each: the job
+    ends after its deadline, so it is not complete (Codex and Greptile on PR #70)."""
+    clock = FakeClock()
+    prober = FakeProber(alive=["10.0.0.1", "10.0.0.2"], clock=clock, delay=0.75)
+    parsed, addresses = planned(ranges=[{"start": "10.0.0.1", "end": "10.0.0.2"}], methods=["icmp"], timeout_s=1)
+    result = await sweep(parsed, addresses, prober=prober, clock=clock, max_pps=2)
+    assert len(prober.sent) == 2
+    assert result["complete"] is False
+    assert "timed out after 1 s" in result["error"]
+
+
+async def test_a_ptr_lookup_that_crosses_the_deadline_makes_the_result_incomplete():
+    clock = FakeClock()
+    prober = FakeProber(alive=["10.0.0.1"], clock=clock)
+    resolver = FakeResolver({"10.0.0.1": "a.home.arpa"}, clock=clock, delay=5.0)
+    parsed, addresses = planned(ranges=[{"start": "10.0.0.1", "end": "10.0.0.2"}], timeout_s=3)
+    result = await sweep(parsed, addresses, prober=prober, resolver=resolver, clock=clock)
+    assert len(resolver.asked) == 1
+    assert result["complete"] is False
+    assert "during the PTR lookups" in result["error"]
+
+
+async def test_no_probe_is_given_longer_than_the_time_left():
+    clock = FakeClock()
+    prober = FakeProber(clock=clock)
+    resolver = FakeResolver({"10.0.0.1": "a.home.arpa"}, clock=clock)
+    # 10 sends a second over a 2 s job: the later sends have under a second left
+    parsed, addresses = planned(ranges=[{"start": "10.0.0.1", "end": "10.0.0.30"}], timeout_s=2)
+    await sweep(parsed, addresses, prober=prober, resolver=resolver, clock=clock, max_pps=10)
+    start = prober.times[0]
+    for sent_at, timeout in zip(prober.times, prober.timeouts, strict=True):
+        assert 0 < timeout <= scan.PING_TIMEOUT_S
+        assert sent_at + timeout <= start + 2 + 1e-9
+    assert min(prober.timeouts) < scan.PING_TIMEOUT_S
+
+
+async def test_a_scan_well_inside_its_timeout_is_complete():
+    clock = FakeClock()
+    prober = FakeProber(alive=["10.0.0.1"], clock=clock, delay=0.5)
+    resolver = FakeResolver({"10.0.0.1": "a.home.arpa"}, clock=clock, delay=0.5)
+    parsed, addresses = planned()
+    result = await sweep(parsed, addresses, prober=prober, resolver=resolver, clock=clock)
+    assert result["complete"] is True and result["error"] is None
+    assert set(resolver.timeouts) == {scan.RDNS_TIMEOUT_S}

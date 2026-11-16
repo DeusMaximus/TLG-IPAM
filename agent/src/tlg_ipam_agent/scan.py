@@ -53,11 +53,13 @@ class Pacer:
 
 
 class _Pool:
-    """Runs `work` on each item, at most `limit` at once, each start paced, none started
-    after `deadline`. Returns whether every item was started."""
+    """Runs `work(item, timeout)` on each item, at most `limit` at once, each start
+    paced, none started after `deadline`, and none given longer than what is left
+    before it. Returns whether every item started and finished before the deadline."""
 
-    def __init__(self, limit: int, pacer: Pacer, clock: Clock, deadline: float):
+    def __init__(self, limit: int, item_timeout: float, pacer: Pacer, clock: Clock, deadline: float):
         self._sem = asyncio.Semaphore(limit)
+        self._item_timeout = item_timeout
         self._pacer, self._clock, self._deadline = pacer, clock, deadline
 
     async def run(self, items, work) -> bool:
@@ -65,10 +67,10 @@ class _Pool:
         finished = True
         failed = False
 
-        async def one(item):
+        async def one(item, timeout):
             nonlocal failed
             try:
-                await work(item)
+                await work(item, timeout)
             except BaseException:
                 failed = True
                 raise
@@ -85,16 +87,22 @@ class _Pool:
                 if failed:
                     self._sem.release()
                     break
-                if self._clock.monotonic() >= self._deadline:
+                left = self._deadline - self._clock.monotonic()
+                if left <= 0:
                     self._sem.release()
                     finished = False
                     break
-                tasks.append(asyncio.create_task(one(item)))
+                # a probe started near the deadline waits only until the deadline, so
+                # the work in flight never carries the job past it
+                tasks.append(asyncio.create_task(one(item, min(self._item_timeout, left))))
         finally:
             results = await asyncio.gather(*tasks, return_exceptions=True)
         for result in results:
             if isinstance(result, BaseException):
                 raise result
+        # work that ran into the deadline did not finish: its answer is unknown
+        if self._clock.monotonic() >= self._deadline:
+            finished = False
         return finished
 
 
@@ -141,12 +149,12 @@ async def run(
     timed_out = False
     if "icmp" in job.methods:
 
-        async def ping(address: Address) -> None:
-            if await prober.ping(address, PING_TIMEOUT_S):
+        async def ping(address: Address, timeout: float) -> None:
+            if await prober.ping(address, timeout):
                 alive.add(address)
 
         try:
-            if not await _Pool(PING_CONCURRENCY, pacer, clock, deadline).run(addresses, ping):
+            if not await _Pool(PING_CONCURRENCY, PING_TIMEOUT_S, pacer, clock, deadline).run(addresses, ping):
                 timed_out = True
                 errors.append(f"timed out after {job.timeout_s} s during the ICMP sweep")
         except ProbeError as exc:
@@ -157,12 +165,12 @@ async def run(
     names: dict[Address, str] = {}
     if "rdns" in job.methods and alive and not timed_out:
 
-        async def lookup(address: Address) -> None:
-            name = rdns_name(await resolver.ptr(address, job.dns_servers, RDNS_TIMEOUT_S))
+        async def lookup(address: Address, timeout: float) -> None:
+            name = rdns_name(await resolver.ptr(address, job.dns_servers, timeout))
             if name is not None:
                 names[address] = name
 
-        if not await _Pool(RDNS_CONCURRENCY, pacer, clock, deadline).run(sorted(alive), lookup):
+        if not await _Pool(RDNS_CONCURRENCY, RDNS_TIMEOUT_S, pacer, clock, deadline).run(sorted(alive), lookup):
             timed_out = True
             errors.append(f"timed out after {job.timeout_s} s during the PTR lookups")
     if timed_out:
