@@ -8,8 +8,7 @@ tested in `test_checkin.py`.
 import hashlib
 import sqlite3
 import time
-from contextlib import contextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -27,6 +26,8 @@ from app.models import Agent, Token
 from app.mcp_server import mcp
 from app.schemas import AGENT_NAME_MAX, AgentCreate
 from app.services import agents as agents_svc
+
+from .conftest import write_lock
 
 SCHEMA_BEFORE_AGENTS = Path(__file__).parent / "data" / "schema_before_agents.sql"
 MCP_PATHS = ("/mcp", "/mcp/")
@@ -355,19 +356,6 @@ async def test_agent_token_is_refused_on_mcp(client, anon_client, path):
 # --- A failed last_used_at write (#51) ---
 
 
-@contextmanager
-def write_lock():
-    """Another connection holding SQLite's write lock (`BEGIN IMMEDIATE`) until the block
-    ends. Readers carry on (WAL); a writer waits out its busy timeout, then fails."""
-    con = sqlite3.connect(settings.db_path, isolation_level=None)
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        yield
-    finally:
-        con.rollback()
-        con.close()
-
-
 async def busy_timeout() -> float:
     """The app's busy timeout in seconds, as its connections have it set."""
     async with SessionLocal() as session:
@@ -425,12 +413,17 @@ async def test_failed_last_used_write_is_a_structured_503(client, raw_agent_api)
     assert (await client.post("/api/v1/sections", json={"name": "x"})).status_code == 201
 
 
-async def test_authentication_inside_the_interval_only_reads(client, agent_api):
-    """With the database locked, a token used inside LAST_USED_GRANULARITY still
-    authenticates, at once: nothing waits on the lock, so nothing was written."""
+@pytest.mark.parametrize("due", [False, True], ids=["inside-the-interval", "use-due"])
+async def test_authentication_only_reads(client, agent_api, due):
+    """With the database locked, a token still authenticates, at once, whether or not
+    its use is due to be recorded: nothing waits on the lock, so nothing was written.
+    The route that serves the request records the use (#59)."""
     agent, token = await make_agent(client)
     assert (await checkin(agent_api, token)).status_code == 200
     [before] = await token_rows(agent["id"])
+    if due:
+        await set_last_used(before.id, before.last_used_at - agents_svc.LAST_USED_GRANULARITY)
+        [before] = await token_rows(agent["id"])
     timeout = await busy_timeout()
 
     with write_lock():
@@ -443,6 +436,23 @@ async def test_authentication_inside_the_interval_only_reads(client, agent_api):
     assert waited < timeout / 2
     [after] = await token_rows(agent["id"])
     assert after.last_used_at == before.last_used_at
+
+
+async def test_token_use_is_written_once_per_interval_by_racing_requests(client, agent_api):
+    """`record_token_use` is conditional in SQL, not on what each request loaded: two
+    requests that both authenticated with the use due record it once."""
+    agent, token = await make_agent(client)
+    async with SessionLocal() as first, SessionLocal() as second:
+        for session in (first, second):
+            assert await agents_svc.authenticate(session, token) is not None
+        now = datetime.now(timezone.utc)
+        await agents_svc.record_token_use(first, now)
+        await first.commit()
+        later = now + agents_svc.LAST_USED_GRANULARITY / 2
+        await agents_svc.record_token_use(second, later)
+        await second.commit()
+    [row] = await token_rows(agent["id"])
+    assert row.last_used_at.replace(tzinfo=timezone.utc) == now
 
 
 async def _revoked(client, agent):

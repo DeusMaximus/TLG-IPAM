@@ -27,6 +27,63 @@ Template:
 
 ---
 
+## 2026-11-16 — Claude Code (Opus 5.5) — #59: check-in and results follow-ups (PR #71)
+- **Done:** [PR #71](https://github.com/DeusMaximus/TLG-IPAM/pull/71) closes #59, head `3e612bb` (merges `main` at `1525a91`). CI green. Codex: no findings on `3e612bb`. Greptile: 5/5, no comments. 594 tests pass (571 + 23).
+  - `services/agents.authenticate` only reads. It leaves the accepted token's id in `session.info`.
+  - New `agents.record_token_use`: a SQL-conditional `UPDATE` that runs inside the serving request's transaction. Check-in calls it after its claim; results ingest calls it after `_release`. A refused request never writes token use.
+  - `jobs._claim`: the compare-and-set also requires the agent `active` and the token unrevoked. If it loses, it answers 429 or 403. If it wins, it refreshes the whole agent row before the audit entry is built.
+  - `jobs.checkin` and `results.ingest`: on `OperationalError`, roll back and answer 503 UNAVAILABLE via `errors.database_unavailable`. That logs the SQLite error name, never SQL, parameters or the bearer. The message says "busy" only for a lock.
+  - Results ingest: a failure of the pre-commit encoding is rolled back and answered `500 INTERNAL_ERROR` in the error shape, via `errors.internal_error`.
+  - Tests:
+    - a barrier race test at `_claim` that catches the time-condition mutant 10/10;
+    - the prune `entity_type` case;
+    - `echo_ip` tests for each half of the rule, at the helper and through the route;
+    - same-session rollback tests for check-in and ingest;
+    - lock tests at a 50 ms busy timeout and real read-only-database tests (`conftest.app_database`), plus `write_lock` moved into `conftest.py`.
+  - Docs:
+    - Brief: §3.6, §3.8, §3.9, §4.1, §4.3, §4.5 (new **The claim** bullet), §4.6.
+    - Spec: §4.2, §5.1 (new bullet), §5.7.
+    - `AGENTS.md`: the agent-token and wire-contract bullets.
+  - **Merged:** `072dc73`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #59 closed. Before the merge, the briefed round by GPT-6.1 Sol returned GO on `3e612bb` with two documentation P3s, posted on the PR: it replayed all eleven earlier findings against a real server and caught all 21 of its mutants. The orchestrator re-measured 594 on the head and on `main` after the merge, and confirmed the claim's state condition is guarded. Follow-ups on the owner's say-so: #73 (M2a, `documentation`) for the 429-before-403 order, the three too-absolute sentences and the ingest source guard's wording; and a note on #21 that enrolment must not reuse the per-request token context and that every new agent route records token use itself. Live state after this merge: two PRs are open. #70 (#13, the agent package) is at `797e249`: its first briefed round returned NO-GO with two P2s (DNS packets escape `MAX_PPS`; a slow response defeats the retry and lease bounds) and one P3, posted on the PR by the orchestrator because the reviewer's own clean-up was refused; the worker is fixing them and has to merge this `main` in. #72 (#15, findings) is at `f962a58` with CI green, Codex and Greptile clean and 614 passing; its briefed round is running (brief at `.dev/15/review-brief-1.md`). Waiting for a free lane: #60 (shares `main.py` with #72), #65 and #68 (share `schemas.py` with #72). The `owner` issues #5 and #25 still wait on the owner.
+- **Decisions:** ten under Deliberate calls in the PR. The main ones:
+  - An owner disable, revoke or delete after authentication refuses the in-flight check-in (403). Results ingest does not repeat that check.
+  - Token use is recorded by served requests only: a check-in that takes its slot, or an accepted result set.
+  - There are two 503 messages under one code, chosen by SQLite's error code.
+  - A failed rollback, a failed authentication `SELECT`, and non-`OperationalError` database errors stay a bare 500.
+  - The token id travels in `session.info`, so `auth.py` and its source-guard anchors are unchanged.
+- **State:** green; nothing half-finished; no schema change. `api/tests/conftest.py` changed: it gained `write_lock` and `app_database`. Not verified: a real full disk or I/O failure (injected in the same-session tests), losing the response after a results commit, and Python 3.12.
+- **Waiting on the owner:** the briefed round (author is Claude, so the reviewer should come from another model family), then the merge.
+- **Next:**
+  - #13 (agent): `last_used_at` now means "last served use".
+  - The agent should treat these responses as follows:
+    - 403 after an owner disable: stop.
+    - 503 "busy": back off and retry.
+    - 503 "unavailable": back off longer; the owner needs to look at the server.
+    - 500 `INTERNAL_ERROR` on results: a server bug, so don't retry tightly.
+  - #60: shared body cap.
+  - #15: unaffected beyond its `main.py` line.
+
+## 2026-11-16 — Claude Code (Opus 5.5) — #12: last_seen derived from observations (PR #69)
+- **Done:** [PR #69](https://github.com/DeusMaximus/TLG-IPAM/pull/69) closes #12, head `47caa6d`, against `main` at `6845664`. CI green. Codex: no findings on `039837e` or `47caa6d`. Greptile: 4/5 on `039837e`, one P2 (test helper parsed the IP by hand), fixed in `47caa6d` and answered on its thread; not re-reviewed since. Automatic reviews only; the owner merges.
+  - `services/hosts.py`: `hosts_out` joins in each host's observation (`(subnet_id, ip_int)`, `last_seen_at`, never `alive`) in one statement; `last_seen` is the later of the stored and the scan value, and the new `last_seen_source` (`manual`/`scan`/null) says which; a tie is reported as `scan`. Two statements per batch of any size.
+  - `schemas.py`: `HostOut.last_seen_source`; a `last_seen` sent with an offset is converted to UTC before storage (SQLite was storing the wall-clock time and dropping the zone).
+  - `mcp_server.py`: `get_host`, `list_hosts`, `update_host` docstrings (what clearing `last_seen` does). `EXPECTED_TOOLS` unchanged.
+  - Docs: brief §3.4, §3.11, §5.2; spec §5.4 (three bullets under `Host.last_seen`); `AGENTS.md` invariant-3 bullet, one sentence.
+  - Tests: new `api/tests/test_last_seen.py` (12). 571 passed (559 + 12). Mutation table in the PR body.
+  - **Merged:** `272564a`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #12 closed. Before the merge, Greptile re-reviewed `47caa6d` after the owner's retrigger (5/5, finding fixed). The orchestrator re-measured 571 on `039837e` and on `main` after the merge, and confirmed both one-query tests go red when observations are queried once per host. Live state after this merge: no PR is open. Two workers are building, both Opus 5.5: #13 (the agent package, branch `13-agent-package`, `briefed-review`) and #59 (check-in and results follow-ups, branch `59-checkin-results-followups`, `briefed-review`); #59 has to pick up this PR's one-line change to `test_results.py` when it merges `main`. #15 (findings) is now ready and is the next to start. Waiting for a free lane: #60 (shares `main.py` and `test_results.py` with #59), #65 and #68 (share `schemas.py` with #15). The `owner` issues #5 and #25 still wait on the owner.
+- **Decisions:** six under Deliberate calls in the PR. The main ones:
+  - The match key is `(subnet_id, ip_int)`, because subnets may overlap across sections.
+  - A tie counts as `scan`.
+  - Offset input is converted to UTC.
+  - Above `EXACT_LOOKUP_MAX` (500) hosts, the query reads the batch's subnets whole, to stay under SQLite's 32766 bound-value limit.
+  - One line of #59's `test_results.py` changed: it asserted the response's `last_seen` stays null after ingest.
+- **State:** green, nothing half-finished. No schema change, nothing under `web/`. Read-back datetimes still carry no offset (#65). Whichever of #59 and #69 merges second rebases `test_results.py`.
+- **Waiting on the owner:** retrigger Greptile on `47caa6d`; merge.
+- **Next:**
+  - #19 shows `last_seen_source` in the UI.
+  - #15 reads observations for findings; its `stale` finding should use the same `last_seen` rule (`hosts._last_seen`).
+  - #65 can rely on stored host `last_seen` being UTC.
+
 ## 2026-11-16 — Claude Code (Opus 5.5) — #11: scan results ingest and observations (PR #64)
 - **Done:** [PR #64](https://github.com/DeusMaximus/TLG-IPAM/pull/64) closes #11, head `69a9b77` (merges `main` at `a7f96d6`; earlier merge `c51b8a1` brought in #51). CI green. Codex: one P2 on `9a427eb` fixed; clean on `373f94d`, `cb83075` and `69a9b77`. Greptile: three findings on `9a427eb`/`373f94d`, all fixed and answered on their threads; 5/5 on `cb83075`; needs a retrigger on `69a9b77`. Briefed round 1 (GPT-6.1 Sol) NO-GO at `cb83075`: P2 fixed and both review P3s handled in `c6d8acc` (the lock-during-ingest 500 → #59). Round 2 not started. The owner merges.
   - `services/results.py` (new): `POST /api/v1/agent/results`.
@@ -113,40 +170,3 @@ Template:
 - **State:** CI green on `de48ed8` (backend, frontend, locks). Codex: no findings. Greptile: 5/5, no findings. No fix commit, so no review needs a retrigger. CodeRabbit skipped (below its star threshold); it is not one of the required reviews. Not owed a briefed round (tests only, no auth/token/ingest/packet code).
 - **Waiting on the owner:** merge.
 - **Next:** nothing from this issue. `ALL_PROXY` and the `REQUESTS_CA_BUNDLE`/`CURL_CA_BUNDLE` spellings are not set by the test; `trust_env=False` covers them.
-
-## 2026-11-16 — Claude Code (Opus 5.5) — #16: Agents page (PR #63)
-- **Done:** [PR #63](https://github.com/DeusMaximus/TLG-IPAM/pull/63) closes #16, head `b89283f`. Frontend only, no `api/` change, no schema change.
-  - New: `web/src/pages/Agents.jsx` at `/agents` (sidebar item under Dashboard). Each row shows a status dot from `last_checkin_at`, the version, hostname, platform, interfaces, the subnets covered (from `/scan-targets`), the token prefix or "revoked", and `last_error`. Row actions: Disable/Enable, Revoke and Delete, the last two with confirmations. The list refreshes every 30 s.
-  - New: `web/src/components/AddAgentModal.jsx`. Name the agent, then see the `tlga_…` token once with the M2a container command.
-  - New: `web/src/utils/agents.js` with `parseServerTime`, `agentStatus`, `containerCommand` and `AGENT_IMAGE`.
-  - Changed: `Modal.jsx` gains `role="dialog"` and the `closeOnBackdrop` and `maxWidth` props.
-  - Brief: §6.2 has the Agents view; §7 has my lines only.
-  - Tests: 29 frontend (6 + 23 new); backend 420, unchanged.
-  - **Merged:** `7103b4b`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #16 closed. Before the merge, Greptile re-reviewed `b89283f` after the owner's retrigger (5/5, both findings fixed). The orchestrator re-ran lint, the 29 tests and the build on the head and on `main` after the merge, and confirmed the token-once test goes red when the dialog is made to keep the token in session storage. The worker's run against a real backend (curl and headless Chromium, on `0f0fca5`) was not repeated. Follow-up proposed to the owner and not yet filed: the API returns datetimes read back from SQLite without an offset (`/changes` `ts`, the agents list), and `ActivityItem`, `HostDrawer` and `HostTable` parse them as local time; the orchestrator confirmed the offset-less values against a running app. Live state after this merge: one PR is open, #64 (#11), at `373f94d` with CI green, Codex clean and 522 passing; Greptile is re-reviewing that head after the owner's retrigger, and the briefed round (brief at `.dev/11/review-brief-1.md`) starts when it has. No other worker is in flight. Ready and not started: #18, #61; #59 waits for #11 (same file), #60 follows #11. The `owner` issues #5 and #25 still wait on the owner.
-- **Decisions:** 8 under Deliberate calls in the PR. The main ones:
-  - The token lives only in the dialog's state, and no close path works while create is in flight.
-  - Offset-less server datetimes are read as UTC, because SQLite drops the offset on reads.
-  - The M2a command is the spec's M2b shape with `IPAM_AGENT_TOKEN` and no volume. The image is `ghcr.io/deusmaximus/tlg-ipam-agent:<server version>`, in one constant that #24 should confirm.
-  - Status thresholds: online within 3 min, late within 15 min, then offline.
-- **State:** CI green on `b89283f`.
-  - Codex: one P2 on `0f0fca5`, fixed; no findings on `b89283f`.
-  - Greptile: P1 and P2 on `0f0fca5`, both fixed and replied to on their threads; it has not reviewed `b89283f`.
-  - Checked by hand on `0f0fca5` with `curl` and headless Chromium against `API_KEY=dev-key`; details in the PR body.
-- **Waiting on the owner:** retrigger Greptile on `b89283f`, then merge.
-- **Next:**
-  - File a follow-up issue: offset-less datetimes are read as local time in `ActivityItem` and `HostTable`. Fix it either by having the API emit offsets or by using `parseServerTime` everywhere.
-  - #23 builds on this page: guided install, enrolment, re-enrol, the version flag.
-  - #24 should confirm or change `AGENT_IMAGE` in `web/src/utils/agents.js`.
-  - Whichever of #11 / #51 / #63 merges second rebases. The overlap with this PR is the brief's §7 only.
-
-## 2026-11-16 — Claude Code (Opus 5.5) — #51: structured 503 on a failed last_used_at write; lifespan in the /mcp refusal tests (PR #62)
-- **Done:** [PR #62](https://github.com/DeusMaximus/TLG-IPAM/pull/62) closes #51, head `b01cd1a` (one commit on `main` at `1c6f1d5`). CI green (5 checks). Codex: no findings on `b01cd1a`. Greptile: 5/5, no findings, on `b01cd1a`. Briefed round owed (`briefed-review`), not started. Merge is the owner's.
-  - `services/agents.authenticate`: a due `last_used_at` commit that raises `OperationalError` is rolled back and answered `503 UNAVAILABLE` ("Database busy; retry the request") through the new `errors.unavailable`, not a bare 500. Check order, the 10 s granularity and the read-only path inside the interval are unchanged.
-  - `test_agents.py` 49 → 54: a real-lock test (`BEGIN IMMEDIATE` on a second connection, waits out the live `PRAGMA busy_timeout`, 5.2 s); a read-only-inside-the-interval check under the lock; refused revoked, disabled-agent and `enrol` tokens get 403 under the lock without waiting and leave `last_used_at` alone; `test_agent_token_is_refused_on_mcp` now runs inside the lifespan.
-  - Docs: spec §4.2 (new bullet), brief §4.1 second paragraph, brief §4.3 (what `503 UNAVAILABLE` means), `AGENTS.md` agent-token bullet.
-  - Measured: backend 420 → 425 on Python 3.13, 35.4 s. Four mutations each red (table in the PR body); the old harness failed the `/mcp` mutation on `RuntimeError: Task group is not initialized`, the new one on `assert 200 == 401`.
-  - **Merged:** `3c5692c`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #51 closed. Before the merge, the briefed round by GPT-6.1 Sol returned GO on `b01cd1a` with three P3s, posted on the PR, and the orchestrator re-measured 425 on the head with the fix's mutation red, and 425 again on `main` after the merge. The P3s went into existing issues on the owner's say-so, with no new issue filed: #59 now also owns a neutral 503 message with a server-side log line, a same-session test of the rollback, and the 503 for a lock that outlasts the timeout later in the check-in (still a bare 500 today); #13 now owns the agent's back-off rule for `429` and `503`. Live state after this merge: PR #63 (#16, the Agents page) is open at `b89283f` with CI green and Codex clean; Greptile reviewed only `0f0fca5`, both its findings are fixed in `b89283f`, and it waits on a Greptile re-review of that head, then the owner's merge. The orchestrator re-measured its lint, 29 tests and build. One worker is in flight on #11 (Opus 5.5, branch `11-results-ingest`); no PR yet. Ready and not started: #18, #61; #59 waits for #11 (same file), #60 follows #11. The `owner` issues #5 and #25 still wait on the owner.
-- **Decisions:** six under Deliberate calls in the PR: catch all `OperationalError` on that commit; refuse the request rather than serve it without the heartbeat; a 503 is reachable only with a usable token; no `Retry-After` (would need `main.py`, owned by #11); the explicit rollback is defensive (`get_session` closes the session anyway, and no mutation of it goes red); one real-lock test, stale case only.
-- **State:** green, nothing half-finished. No schema, dependency or `auth.py` change, so the `test_auth.py` mutation anchors are untouched. A lock held past the busy timeout after authentication, in `jobs.checkin`, is still a bare 500 (#11's file). No file owned by another issue was touched.
-- **Waiting on the owner:** start the briefed round on `b01cd1a` (reviewer outside the Claude family); merge PR #62.
-- **Next:** #59 moves the token-use write into the check-in claim's transaction and makes it conditional in SQL. It must keep this PR's three acceptance tests green: `test_failed_last_used_write_is_a_structured_503`, `test_refused_token_is_403_and_never_reaches_the_write`, `test_agent_token_is_refused_on_mcp`. #59 must not start until #62 merges. Whichever of #11 and this PR merges second rebases; expected overlap is the `AGENTS.md` bullets and brief §4.1/§4.3 only.

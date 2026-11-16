@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -8,6 +8,7 @@ from .ipnet import normalise_domain, normalise_mac, parse_ip
 
 HostStatus = Literal["active", "reserved", "dhcp", "offline"]
 HostClearField = Literal["hostname", "domain", "mac", "owner", "notes", "last_seen"]
+LastSeenSource = Literal["manual", "scan"]
 
 
 # --- Device types ---
@@ -198,6 +199,13 @@ class _HostFields(BaseModel):
     def _norm_mac(cls, v):
         return normalise_mac(v) if v else v
 
+    @field_validator("last_seen")
+    @classmethod
+    def _last_seen_utc(cls, v):
+        # SQLite keeps the wall-clock time and drops the zone, so a value sent with an
+        # offset is converted to UTC first; a value without one is taken as UTC
+        return v.astimezone(timezone.utc) if v is not None and v.tzinfo else v
+
     @field_validator("domain")
     @classmethod
     def _norm_domain(cls, v):
@@ -241,7 +249,10 @@ class HostOut(BaseModel):
     status: str
     owner: str | None
     notes: str | None
+    # the later of the stored value (set by hand) and the address's observation
     last_seen: datetime | None
+    # which of the two `last_seen` is: "manual", "scan", or null when neither is set
+    last_seen_source: LastSeenSource | None = None
     created_at: datetime
     updated_at: datetime
 

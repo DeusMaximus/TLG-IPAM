@@ -125,7 +125,8 @@ A single IP assignment within a Subnet.
 | `status` | enum: `active` \| `reserved` \| `dhcp` \| `offline` |
 | `owner` | str, nullable — e.g. `proxmox`, `personal` |
 | `notes` | text, nullable |
-| `last_seen` | datetime, nullable — set manually or via future ping sweep |
+| `last_seen` | datetime, nullable — the stored column is set by hand: writable, and cleared by writing null (`clear_fields: ["last_seen"]` over MCP). A value sent with a UTC offset is converted to UTC before it is stored. Responses show the later of the stored value and the `last_seen_at` of the observation at the host's subnet and address (§3.11), derived on read: scan ingest never writes hosts. Clearing the stored value therefore still shows the scan time if the address has been seen |
+| `last_seen_source` | output only: `manual` (the stored value), `scan` (the observation; also on a tie), or null when neither exists. Taken from the observation's `last_seen_at`, never from `alive`, so an address a later sweep missed still shows when it last answered |
 | `created_at` / `updated_at` | datetime, auto-managed |
 
 ### 3.5 DeviceType
@@ -142,7 +143,7 @@ Rules: renaming a type cascades to all hosts using it (one transaction). A type 
 
 ### 3.6 Change (audit log)
 
-Append-only record of every write. Because Claude can write to this system via MCP, you need to be able to review what it did. Also powers the dashboard "recent activity" feed.
+A record of every write, never edited, with one deletion: an agent's own check-in entries (`source="agent"`) are capped at its newest 100, so the older ones are deleted (§4.5); owner entries are never deleted. Because Claude can write to this system via MCP, you need to be able to review what it did. Also powers the dashboard "recent activity" feed.
 
 | Field | Type / notes |
 |---|---|
@@ -183,7 +184,7 @@ A scan agent (v0.2 spec §5.4). The owner creates it over REST; the agent checks
 | `name_key` | str, unique — `name.casefold()`, so the database itself refuses two names that differ only in case, even from racing requests. Internal: not returned, not in audit snapshots |
 | `state` | enum: `pending` (has never held an agent token; enrolment, v0.2 M2b) \| `active` \| `disabled`. An agent created over REST gets its token at once, so it starts `active` |
 | `version`, `platform`, `hostname`, `interfaces` | nullable; reported by the agent at check-in, and null until its first. Trimmed, printable characters only, at most 40, 120 and 253 characters; `interfaces` is up to 64 `{name, cidr, mac}` (name at most 15 characters; `cidr` an address with its prefix length, normalised, no IPv6 scope id; `mac` normalised or null). A check-in that fails these checks changes none of them |
-| `last_checkin_at` | datetime, nullable — set by every authenticated check-in, refused ones included |
+| `last_checkin_at` | datetime, nullable — set by every check-in that takes its slot (§4.5), including one then refused for its protocol or a field (`409`, `422`). A check-in refused by the rate limit (`429`), or because the agent was disabled or its token revoked after it authenticated (`403`), does not set it |
 | `current_job_id`, `job_issued_at` | nullable, read-only — the job the agent was last issued, and when (§4.5). The agent is busy while that lease is live, whatever has since happened to the target. Databases created before them gain the columns on startup |
 | `last_error` | text, nullable — why the last check-in was refused (protocol mismatch, or the first field that failed validation, by name and never by value). Cleared by a check-in that succeeds |
 | `created_at` | datetime, auto |
@@ -201,7 +202,7 @@ A credential bound to an agent (v0.2 spec §4.2). An agent token is `tlga_` foll
 | `agent_id` | FK → Agent |
 | `token_hash` | SHA-256 of the token, hex, unique. Never returned and never in an audit snapshot |
 | `token_prefix` | the first 13 characters (`tlga_` + 8), for display |
-| `created_at`, `last_used_at` | `last_used_at` is set when the token authenticates and the stored time is at least 10 seconds old (`agents.LAST_USED_GRANULARITY`), so a token used at request rate drives no writes |
+| `created_at`, `last_used_at` | `last_used_at` is set by a request the route serves — a check-in that takes its slot, an accepted result set — in that request's transaction, when the stored time is unset or at least 10 seconds old (`agents.LAST_USED_GRANULARITY`; the condition is in the SQL `UPDATE`, so racing requests write it once). A refused request never sets it, so a token used at request rate drives no writes |
 | `expires_at`, `used_at` | enrolment tokens only; null for agent tokens |
 | `revoked_at` | datetime, nullable |
 
@@ -234,7 +235,7 @@ Rules: one target per subnet (`409`, also enforced by `UNIQUE(subnet_id)`). Unkn
 
 ### 3.11 Observation
 
-The latest scan state of one address (v0.2 spec §5.4), upserted by results ingest (§4.6). `UNIQUE(subnet_id, ip)`. No history, and no route reads it yet: `last_seen` on hosts (#12) and findings (#15) do.
+The latest scan state of one address (v0.2 spec §5.4), upserted by results ingest (§4.6). `UNIQUE(subnet_id, ip)`. No history. Host responses read it for `last_seen` (§3.4), in one query per batch of hosts; findings (#15) will read it too.
 
 | Field | Type / notes |
 |---|---|
@@ -264,7 +265,7 @@ X-API-Key: <value from API_KEY env var>
 
 All endpoints except `GET /health` and the agent-facing `/api/v1/agent/*` require this header. Return `401` if missing, `403` if wrong. The key is compared in constant time (`hmac.compare_digest`, in `auth.is_owner_key`). Key is set at container start — no key rotation UI needed in v1. The server refuses to start unless `API_KEY` is set, non-empty (not only whitespace), free of whitespace at either end and not `change-me`, the placeholder `.env.example` ships: `config.load_settings` runs when `app.config` is imported, so uvicorn exits with a message that names `API_KEY` and says how to generate a key, before it serves anything (under `--reload`, the reloader stays up and its server process exits). A key with a leading or trailing space, tab or newline is refused, not trimmed: most HTTP clients cannot send such a header value, a raw one can, and trimming would leave two candidate keys. The message is fixed and never contains the key. Separately, `is_owner_key` never matches an empty value, so an empty `X-API-Key` is refused (`403`) whatever the setting holds. REST does not accept the key as a bearer, and `/mcp` does not accept `X-API-Key` (§5.1).
 
-Agent-facing routes, `/api/v1/agent/*`, take an agent token instead (§3.9), as `Authorization: Bearer tlga_…`, through the `auth.require_agent` dependency and nothing else. It accepts only an unrevoked `agent` token of an `active` agent and records `last_used_at`, at most once every 10 seconds per token. That write comes after the checks, so a refused bearer never makes it; if it fails (the database stays locked past SQLite's 5-second busy timeout), it is rolled back and the request gets `503 UNAVAILABLE`, safe to retry, and nothing of it is written. The token is found by the SHA-256 of the presented value, so the stored secret is never compared. Refusals use the REST error shape: `401 UNAUTHORIZED` when no bearer is sent (including `X-API-Key` alone), `403 FORBIDDEN` "Invalid agent token" for any bearer that is not a usable agent token — the owner key, an unknown, revoked or `enrol` token, or the token of a disabled or deleted agent. The owner routes refuse an agent token (`403` as `X-API-Key`, `401` as a bearer), and so does `/mcp` (`401 invalid_token`). The router for `/api/v1/agent/*` carries `require_agent` itself, so a route added to it is guarded too, and it is mounted apart from the owner routers, so the owner key never reaches it. The routes are check-in (§4.5) and scan results (§4.6).
+Agent-facing routes, `/api/v1/agent/*`, take an agent token instead (§3.9), as `Authorization: Bearer tlga_…`, through the `auth.require_agent` dependency and nothing else. It accepts only an unrevoked `agent` token of an `active` agent, and only reads: the route that serves the request records `last_used_at` in its own transaction (§3.9), so a refused bearer or a refused request never writes it. If the database refuses a write of an agent route (locked past SQLite's 5-second busy timeout, a read-only file, a full disk), the route's transaction is rolled back and the request gets `503 UNAVAILABLE`, safe to retry, and nothing of it is written. The message says "busy" only for a lock, and the server logs the operation and SQLite's error name, never SQL, parameter values or the bearer. A failed rollback, and a failure of the authentication read itself, are a bare 500. The token is found by the SHA-256 of the presented value, so the stored secret is never compared. Refusals use the REST error shape: `401 UNAUTHORIZED` when no bearer is sent (including `X-API-Key` alone), `403 FORBIDDEN` "Invalid agent token" for any bearer that is not a usable agent token — the owner key, an unknown, revoked or `enrol` token, or the token of a disabled or deleted agent. The owner routes refuse an agent token (`403` as `X-API-Key`, `401` as a bearer), and so does `/mcp` (`401 invalid_token`). The router for `/api/v1/agent/*` carries `require_agent` itself, so a route added to it is guarded too, and it is mounted apart from the owner routers, so the owner key never reaches it. The routes are check-in (§4.5) and scan results (§4.6).
 
 ### 4.2 Endpoints
 
@@ -319,7 +320,7 @@ Agent-facing routes, `/api/v1/agent/*`, take an agent token instead (§3.9), as 
 { "error": { "code": "VALIDATION_ERROR", "message": "IP 10.10.30.300 is invalid" } }
 ```
 
-`503 UNAVAILABLE` means the request was not served and wrote nothing, and the same request may succeed if retried. Today only agent routes return it, when the database stays busy (§4.1).
+`503 UNAVAILABLE` means the request was not served and wrote nothing, and the same request may succeed if retried. Today only agent routes return it, when the database refuses a write (§4.1): "Database busy; retry the request" for a lock, "Database unavailable; retry later" for anything else, which needs the owner. `500 INTERNAL_ERROR` is a failure the server caught before committing anything (§4.6).
 
 ### 4.4 Free-IP and allocation semantics
 
@@ -353,7 +354,8 @@ Gateway, DHCP, reserved-range, and allocated-address exclusions are represented 
                        "timeout_s": 600, "fdns": [] }] } }
 ```
 
-- **Rate limit first.** An agent may check in once every 10 seconds (`jobs.MIN_CHECKIN_GAP`; its own interval is 60). A check-in inside that gap is `429 RATE_LIMITED`, written as a compare-and-set on `last_checkin_at`, before any other write and before the body is looked at: it changes nothing and is not recorded. Inside the gap it is refused from the agent row loaded at authentication, so with `last_used_at`'s 10-second granularity (§3.9) a refused check-in issues no write statement at all; the compare-and-set catches check-ins that race. The agent waits `checkin_interval_s` and tries again.
+- **Rate limit first.** An agent may check in once every 10 seconds (`jobs.MIN_CHECKIN_GAP`; its own interval is 60). A check-in inside that gap is `429 RATE_LIMITED` before the body is looked at, and changes no row: not `last_checkin_at`, not the token's `last_used_at`, nothing in the change log. Inside the gap it is refused from the agent row loaded at authentication, with no write statement at all; check-ins that race are refused by the claim, a compare-and-set on `last_checkin_at` whose losing statements match no row. The agent waits `checkin_interval_s` and tries again.
+- **The claim.** That compare-and-set is the check-in's first write, and it also requires the agent `active` and its token unrevoked: a disable, revoke or delete the owner commits after a check-in authenticated refuses it with `403` "Invalid agent token", and nothing of it is written. The token's use (§3.9) is recorded in the claim's transaction, and the agent row is then read again whole, so the check-in's audit snapshots and `actor` carry the name and state as committed. Everything a check-in writes is that one transaction: if the database refuses a write, it is rolled back and the check-in gets `503 UNAVAILABLE` (§4.1).
 - **Protocol first.** `protocol` is checked before anything else in the body, since another protocol may shape the rest differently. Anything but the integer `PROTOCOL_VERSION` (1) is `409 PROTOCOL_MISMATCH` with a message naming both protocols; it issues no job, stores none of the body, and is recorded in the agent's `last_error`.
 - **Then the fields** (§3.8). The first that fails is `422 VALIDATION_ERROR` "Check-in refused: <field>: <reason>", recorded in `last_error` the same way; the reported fields keep their earlier values. Unknown fields are ignored. `capabilities` (up to 16 tokens of `a-z0-9_-`) is checked and not yet used.
 - **A good check-in** stores the reported fields and `last_checkin_at`, clears `last_error`, and returns at most one job.
@@ -388,7 +390,8 @@ An accepted result set clears both copies of the lease (§4.6). Expiry clears ne
 - **Alive and dead.** Each accepted record is upserted `alive=true` with `last_seen_at` now. Only a result set with `complete: true` from a job issued `icmp` or `arp` marks every other observation in the subnet's scope `alive=false`; an address the result set named, even in a rejected record, is not marked. An incomplete job only adds what it saw.
 - **`fdns`** is checked for shape and not stored: no job names a host until the forward-DNS check (#20), so no answer can be for one the job sent.
 - **Prune.** Every ingest deletes observations, in any subnet, unseen for 90 days.
-- **The answer before the commit.** The `200` answer is built and encoded before the result set is committed, so no failure can follow a stored result set: an agent never sees an error for a job it can no longer report.
+- **The answer before the commit.** The `200` answer is built and UTF-8-encoded before the result set is committed, so neither step can fail for a stored result set. That covers the answer's construction and encoding, not its delivery: rendering and sending the response come after the commit, and an agent that loses the response gets `409` on a retry. Should the encoding fail, the transaction is rolled back and the answer is `500 INTERNAL_ERROR` in the error shape, logged server-side.
+- **Database failures.** The lease release, the observations, the prune and the token's use (§3.9) are one transaction. If the database refuses a write, it is rolled back and the result set gets `503 UNAVAILABLE` (§4.1): both lease copies still name the job, nothing is stored, and the same result set is accepted once the database is writable. A refused result set (`409`, `422`) writes nothing, the token's use included.
 - **Nothing else.** Ingest never writes `hosts` and writes nothing to the change log.
 
 ---
@@ -442,11 +445,11 @@ Tool descriptions are the documentation Claude reads at runtime — write them w
 | `get_subnet` | Full detail for a subnet: VLAN tag, gateway, DNS servers, DHCP pool, utilisation, and free-IP count — one call, no follow-ups needed. Shows each reserved range's `scan_excluded` and the subnet's `scan_dhcp_pool` (null when the subnet has no scan target), so an assistant can explain why an address is not scanned. `list_subnets` returns the same shape. |
 | `get_free_ips` | Return unallocated IPs in a subnet (respects gateway, DHCP-pool, reserved-range, and network/broadcast exclusions). Use before allocating to check availability or find a specific address. |
 | `list_hosts` | Search and filter host records across the network. Free-text search (hostname, IP, MAC) plus filtering by subnet or status. |
-| `get_host` | Full detail for a specific host record including MAC, device type, owner, and last seen. |
+| `get_host` | Full detail for a specific host record including MAC, device type, owner, and last seen: `last_seen` is the later of the manual value and the scan's, and `last_seen_source` (`manual`, `scan` or null) says which (§3.4). `list_hosts` and every tool that returns a host return the same shape. |
 | `create_host` | Register a new host at a specific IP address. Validates that it is assignable within the target subnet and not already allocated. Manual placement at the gateway or inside DHCP/reserved ranges is allowed. |
 | `bulk_create_hosts` | Create many hosts in one subnet in a single call (e.g. importing devices from a UniFi export). Per-record results; duplicates skipped, bad records errored, batch never aborts. One audit entry. |
 | `allocate_next_ip` | Allocate the next available IP in a subnet and create a host record in one step. Use when the caller does not need a specific IP address. |
-| `update_host` | Update hostname, domain override, MAC address, status, device type, owner, or notes for an existing host record. Pass nullable field names in `clear_fields` to clear them; clearing a domain override restores subnet-domain inheritance. |
+| `update_host` | Update hostname, domain override, MAC address, status, device type, owner, or notes for an existing host record. Pass nullable field names in `clear_fields` to clear them; clearing a domain override restores subnet-domain inheritance. Clearing `last_seen` removes only the manual value: a host whose address a scan has seen still shows the scan time, with `last_seen_source: scan`. |
 | `delete_host` | Remove a host record, freeing the IP address for future allocation. |
 | `bulk_delete_hosts` | Delete many hosts by ID in one call (cleanup workflows). Returns deleted count + not-found IDs. |
 | `add_reserved_range` | Reserve a block of IPs in a subnet so automatic allocation skips it (manual creation inside it stays allowed). Always creates a scanned range: the tool has no `scan_excluded` argument. |

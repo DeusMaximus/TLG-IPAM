@@ -6,26 +6,32 @@ pass, it writes the columns straight to the database.
 
 import asyncio
 import ipaddress
+import json
+import logging
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import OperationalError
 
 from app.agent_protocol import (
     OBSERVATIONS_MAX,
     RDNS_NAME_MAX,
     RESULTS_BODY_MAX,
     SCAN_ERROR_MAX,
+    echo_ip,
     rdns_name,
     scan_error,
 )
 from app.database import SessionLocal
-from app.models import Agent, Change, Host, Observation, ReservedRange, ScanTarget
+from app.models import Agent, Change, Host, Observation, ReservedRange, ScanTarget, Token
 from app.schemas import ScanTargetUpdate, SubnetUpdate
 from app.errors import ApiError
+from app.services import agents as agents_svc
 from app.services import jobs, results, scans, subnets
 
-from .conftest import make_host
+from .conftest import app_database, make_host, write_lock
 from .test_checkin import (  # noqa: F401 (agent_api is a fixture)
     ROUTED,
     agent_api,
@@ -713,7 +719,8 @@ async def test_ingest_writes_no_host_and_no_change_entry(client, agent_api):
     assert {c: after[c] for c in columns} == {c: before[c] for c in columns}
     assert count == 1  # no host created for the unknown address
     got = (await client.get(f"/api/v1/hosts/{host['id']}")).json()["data"]
-    assert got["mac"] is None and got["last_seen"] is None
+    # the stored column is untouched (above); the response derives last_seen on read (#12)
+    assert got["mac"] is None and got["last_seen_source"] == "scan"
 
 
 def test_the_ingest_module_does_not_reach_hosts_or_the_change_log():
@@ -1489,7 +1496,9 @@ async def test_no_agent_string_breaks_the_checkin_answer_or_its_record(
     assert got.status_code == 200
 
 
-async def test_an_answer_that_cannot_be_encoded_fails_before_the_commit(client, monkeypatch):
+async def test_an_answer_that_cannot_be_encoded_fails_before_the_commit(
+    client, monkeypatch, caplog
+):
     """The second guard of review finding 1: should any value in the answer ever be
     unencodable again, the request fails with nothing stored and the lease intact, so
     the agent can report the job again."""
@@ -1498,6 +1507,7 @@ async def test_an_answer_that_cannot_be_encoded_fails_before_the_commit(client, 
     from app.main import app
     from app.services import results as results_module
 
+    caplog.set_level(logging.WARNING, logger="app.errors")
     transport = ASGITransport(app=app, raise_app_exceptions=False)
     async with AsyncClient(transport=transport, base_url="http://test") as raw_api:
         agent, token, subnet, target, job = await setup(client, raw_api)
@@ -1512,6 +1522,140 @@ async def test_an_answer_that_cannot_be_encoded_fails_before_the_commit(client, 
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         )
     assert res.status_code == 500
+    # in the REST error shape, and logged (#59), rather than a bare 500
+    assert res.json() == {
+        "error": {
+            "code": "INTERNAL_ERROR",
+            "message": "The server failed to answer this request; nothing was stored",
+        }
+    }
+    [line] = [r.getMessage() for r in caplog.records if r.name == "app.errors"]
+    assert "results ingest: encoding the answer" in line and "UnicodeEncodeError" in line
+    assert token not in line
     assert await observations() == {}
     assert (await target_row(target["id"])).current_job_id == job["job_id"]
     assert (await agent_row(agent["id"])).current_job_id == job["job_id"]
+
+
+# --- #59: the echo rule, token use, and database failures ---
+
+
+@pytest.mark.parametrize(
+    "ip",
+    [
+        "10.0.0.\u00e9",  # an accented letter: printable, not ASCII
+        "\uff11\uff10.\uff10.\uff10.\uff11",  # full-width digits: printable, not ASCII
+        "10.0.\n0.1",  # a newline inside an address: ASCII, not printable
+        "10.0.0.1\x00",  # NUL
+        "10.0.0.1\x7f",  # DEL
+    ],
+    ids=["accented", "full-width", "newline", "nul", "del"],
+)
+async def test_an_ip_that_is_not_ascii_and_printable_is_echoed_as_null(client, agent_api, ip):
+    """Review finding 1 (PR #64, round 2): each half of the echo rule on its own.
+    Printable non-ASCII text fails only `isascii()`; ASCII control characters fail
+    only `isprintable()`. Each is rejected as `invalid_ip` and echoed as null, at the
+    helper and through the route."""
+    assert ip.isprintable() != ip.isascii()  # each case tests one half alone
+    assert echo_ip({"ip": ip}) is None
+    agent, token, subnet, target, job = await setup(client, agent_api)
+    data = await accepted(agent_api, token, job, [obs("10.0.0.10"), obs(ip)])
+    assert data == {"accepted": 1, "rejected": [{"ip": None, "reason": "invalid_ip"}]}
+
+
+def test_a_short_ascii_printable_ip_is_echoed_as_sent():
+    assert echo_ip({"ip": "10.0.0.300"}) == "10.0.0.300"
+    assert echo_ip({"ip": "not an address"}) == "not an address"
+
+
+async def test_an_accepted_result_set_records_its_tokens_use(client, agent_api):
+    """Token use is recorded in the result set's own transaction, conditionally in SQL
+    (`agents.record_token_use`); a refused result set writes nothing, its token's use
+    included."""
+    agent, token, subnet, target, job = await setup(client, agent_api)
+    stale = _now() - timedelta(minutes=1)
+
+    async def set_used(when):
+        async with SessionLocal() as session:
+            await session.execute(
+                update(Token).where(Token.agent_id == agent["id"]).values(last_used_at=when)
+            )
+            await session.commit()
+
+    async def used():
+        async with SessionLocal() as session:
+            return _utc(await session.scalar(select(Token.last_used_at)))
+
+    await set_used(stale)
+    res = await post_results(agent_api, token, {**job, "job_id": "not-the-job"})
+    assert res.status_code == 409
+    assert await used() == stale
+    await accepted(agent_api, token, job, [obs("10.0.0.10")])
+    assert await used() > stale
+
+
+async def test_a_locked_database_is_a_503_and_the_result_set_can_be_sent_again(
+    client, agent_api
+):
+    """Review finding 3 (PR #64): with the database locked past the busy timeout (a
+    short one here), a valid result set gets 503 in the error shape, both lease copies
+    still name the job, nothing is stored, and the same result set is accepted once the
+    lock clears."""
+    agent, token, subnet, target, job = await setup(client, agent_api)
+    started = _now() - timedelta(seconds=30)
+    body = _payload(job, observations=[obs("10.0.0.10")], started_at=started.isoformat())
+    async with app_database(busy_timeout_ms=50):
+        with write_lock():
+            res = await _raw(agent_api, token, json.dumps(body).encode())
+    assert res.status_code == 503, res.text
+    assert res.json() == {
+        "error": {"code": "UNAVAILABLE", "message": "Database busy; retry the request"}
+    }
+    assert await observations() == {}
+    row, me = await target_row(target["id"]), await agent_row(agent["id"])
+    assert row.current_job_id == job["job_id"] and me.current_job_id == job["job_id"]
+    assert row.last_scan_at is None and row.job_methods == job["methods"]
+
+    res = await _raw(agent_api, token, json.dumps(body).encode())
+    assert res.status_code == 200, res.text
+    assert res.json()["data"] == {"accepted": 1, "rejected": []}
+    assert set(await observations()) == {"10.0.0.10"}
+
+
+async def test_a_failed_ingest_is_rolled_back_in_its_own_session(client, agent_api, monkeypatch):
+    """The rollback at the transaction's owner: a write that fails after the lease is
+    released and the token's use recorded leaves the session usable at once, and a
+    later commit on it writes nothing of the result set."""
+    agent, token, subnet, target, job = await setup(client, agent_api)
+
+    async def fails(*_):
+        raise OperationalError("SELECT …", {}, sqlite3.OperationalError("disk I/O error"))
+
+    monkeypatch.setattr(results.scans, "scan_scope", fails)
+    async with SessionLocal() as session:
+        me = await agents_svc.authenticate(session, token)
+        with pytest.raises(ApiError) as refused:
+            await results.ingest(session, me, _payload(job, observations=[obs("10.0.0.10")]))
+        assert (refused.value.status, refused.value.code) == (503, "UNAVAILABLE")
+        assert refused.value.message == "Database unavailable; retry later"
+        assert session.is_active and not session.in_transaction()
+        await session.commit()
+    row, me = await target_row(target["id"]), await agent_row(agent["id"])
+    assert row.current_job_id == job["job_id"] and me.current_job_id == job["job_id"]
+    assert await observations() == {}
+
+
+async def test_a_read_only_database_is_a_503_that_does_not_say_busy(client, agent_api, caplog):
+    agent, token, subnet, target, job = await setup(client, agent_api)
+    caplog.set_level(logging.WARNING, logger="app.errors")
+    body = _payload(job, observations=[obs("10.0.0.10")])
+    async with app_database(read_only=True):
+        res = await _raw(agent_api, token, json.dumps(body).encode())
+    assert res.status_code == 503, res.text
+    error = res.json()["error"]
+    assert error["code"] == "UNAVAILABLE" and "busy" not in error["message"].lower()
+    [line] = [r.getMessage() for r in caplog.records if r.name == "app.errors"]
+    assert "results ingest" in line and "SQLITE_READONLY" in line
+    for secret in (token, agents_svc.hash_token(token), job["job_id"], "UPDATE"):
+        assert secret not in line
+    assert (await target_row(target["id"])).current_job_id == job["job_id"]
