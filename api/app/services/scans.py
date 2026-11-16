@@ -18,7 +18,7 @@ through `services/subnets`, which imports it.
 from bisect import bisect_right
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete, false, not_, or_, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
@@ -37,6 +37,8 @@ LIVENESS_METHODS = frozenset({"icmp", "arp"})
 MIN_PREFIX = 20
 # spec §5.8, §9: at most one requested scan per subnet in this time, from any caller
 REQUEST_COOLDOWN = timedelta(minutes=15)
+# ids per DELETE in `drop_out_of_scope`, well inside SQLite's bound-parameter limit
+_DELETE_BATCH = 500
 
 
 # --- Scope ---
@@ -94,13 +96,19 @@ async def drop_out_of_scope(session: AsyncSession, subnet: Subnet) -> None:
     """
     await session.flush()
     scope = await scan_scope(session, subnet)
-    # an empty scope keeps nothing
-    inside = or_(false(), *(Observation.ip_int.between(start, end) for start, end in scope))
-    await session.execute(
-        delete(Observation)
-        .where(Observation.subnet_id == subnet.id, not_(inside))
-        .execution_options(synchronize_session="fetch")
+    # Membership is decided here with `in_scope`, not in SQL: a scope can hold more
+    # ranges than SQLite's expression-depth limit allows as OR branches, and a statement
+    # that failed would roll back the owner's edit.
+    rows = await session.execute(
+        select(Observation.id, Observation.ip_int).where(Observation.subnet_id == subnet.id)
     )
+    gone = [row_id for row_id, ip_int in rows.all() if not in_scope(scope, ip_int)]
+    for i in range(0, len(gone), _DELETE_BATCH):
+        await session.execute(
+            delete(Observation)
+            .where(Observation.id.in_(gone[i : i + _DELETE_BATCH]))
+            .execution_options(synchronize_session="fetch")
+        )
 
 
 async def delete_observations(session: AsyncSession, subnet: Subnet) -> None:

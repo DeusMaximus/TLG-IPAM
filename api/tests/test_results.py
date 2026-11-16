@@ -5,6 +5,7 @@ pass, it writes the columns straight to the database.
 """
 
 import asyncio
+import ipaddress
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -19,7 +20,7 @@ from app.agent_protocol import (
     scan_error,
 )
 from app.database import SessionLocal
-from app.models import Agent, Change, Host, Observation, ScanTarget
+from app.models import Agent, Change, Host, Observation, ReservedRange, ScanTarget
 from app.schemas import ScanTargetUpdate, SubnetUpdate
 from app.services import jobs, results, scans, subnets
 
@@ -834,6 +835,37 @@ async def test_returning_a_range_to_scanning_and_other_edits_keep_observations(
         assert (await client.put(path, json=body)).status_code == 200
     assert (await client.delete(f"/api/v1/subnets/{subnet['id']}/reserved/{block['id']}")).status_code == 204
     assert set(await observations()) == {"10.0.0.10", "10.0.0.30"}
+
+
+async def test_a_scope_of_many_ranges_does_not_block_edits(client, agent_api):
+    """A /20 with 1,200 separate single-address exclusions has a scope of 1,201 ranges:
+    more than SQLite's expression-depth limit of 1,000 if each became an OR branch."""
+    agent, token, subnet, target, job = await setup(
+        client,
+        agent_api,
+        subnet={"cidr": "10.0.0.0/20"},
+        checkin_body={"interfaces": [{"name": "eth0", "cidr": "10.0.0.5/20", "mac": None}]},
+    )
+    await _observe(agent_api, token, job, ["10.0.0.3", "10.0.9.200"])
+    base = 0x0A000000
+    async with SessionLocal() as session:
+        for i in range(1200):
+            ip_int = base + 2 + 2 * i
+            ip = str(ipaddress.IPv4Address(ip_int))
+            session.add(
+                ReservedRange(
+                    subnet_id=subnet["id"], start_ip=ip, end_ip=ip,
+                    start_int=ip_int, end_int=ip_int, scan_excluded=True,
+                )
+            )
+        # an observation now inside an exclusion, as if it predated it
+        await session.execute(
+            update(Observation).where(Observation.ip == "10.0.9.200").values(ip="10.0.0.4", ip_int=base + 4)
+        )
+        await session.commit()
+    res = await client.put(f"/api/v1/subnets/{subnet['id']}", json={"notes": "many ranges"})
+    assert res.status_code == 200, res.text
+    assert set(await observations()) == {"10.0.0.3"}
 
 
 # --- Acceptance: subnet deletion ---
