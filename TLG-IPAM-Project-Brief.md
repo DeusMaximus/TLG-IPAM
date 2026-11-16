@@ -308,7 +308,7 @@ Agent-facing routes, `/api/v1/agent/*`, take an agent token instead (§3.9), as 
 | `DELETE /api/v1/subnets/{id}/reserved/{range_id}` | Remove a reserved range. |
 | `POST /api/v1/subnets/{id}/scan` | Request a scan ("Scan now"): sets the scan target's `scan_requested_at`, logged as a `scan_target` update. `202` with the target. The agent picks it up at its next check-in. At most one request per subnet in 15 minutes, from any caller: a second is `429 COOLDOWN`, changes nothing and does not restart the wait. No scan target, a disabled one, or one with no agent: `409`. |
 | `GET  /api/v1/subnets/{id}/findings` | The subnet's scan findings (§4.7), by address. `?type=` filters to one type (unknown: `422`); `?include_dynamic=true` adds unknown hosts inside a scanned DHCP pool. Dismissed findings are left out. Unknown subnet: `404`. |
-| `POST /api/v1/findings/accept` | Accept findings by key (`{findings: [{subnet_id, ip, type, observed}]}`, 1–1000). Per-record results: `accepted` (with `host_id`), `skipped` (`changed`), `error`. Each accepted finding is written and committed on its own through the hosts service, with its normal audit entry. |
+| `POST /api/v1/findings/accept` | Accept findings by key and fingerprint (`{findings: [{subnet_id, ip, type, observed, fingerprint}]}`, 1–1000). Per-record results: `accepted` (with `host_id`), `skipped` (`changed`), `error`. Each accepted finding is written and committed on its own through the hosts service, with its normal audit entry. |
 | `POST /api/v1/findings/dismiss` | Dismiss findings by key, same body. Per-record results: `dismissed`, `skipped` (`changed`, `already dismissed`), `error`. One transaction; one `subnet` audit entry per subnet with a dismissal. |
 | `GET  /api/v1/changes` | Recent changes, newest first. Filters: `?entity_type=` `?limit=`. |
 | `GET  /api/v1/agents` | List agents, by name, each with its tokens (prefix and timestamps only, newest first). |
@@ -417,26 +417,28 @@ Where what a scan saw and what the owner recorded disagree (v0.2 spec §5.5). Co
 ```json
 // GET /api/v1/subnets/{id}/findings
 { "data": [{ "subnet_id": "…", "ip": "10.0.20.7", "type": "name_mismatch", "observed": "storage.home.arpa",
-             "ip_int": 167777287, "host_id": "…", "dynamic": false, "proposed": { "hostname": "storage" } }],
+             "ip_int": 167777287, "host_id": "…", "dynamic": false, "proposed": { "hostname": "storage" },
+             "fingerprint": "3f9c…" }],
   "total": 1 }
 ```
 
 | Type | Raised when | `observed` | Accepting writes (`proposed`) |
 |---|---|---|---|
-| `unknown_host` | the observation is `alive` and no host is recorded at the address | the MAC, or empty | a new host: `mac`, and `hostname` from the PTR name; `status` `active`, or `dhcp` when `dynamic` |
+| `unknown_host` | the observation is `alive` and no host is recorded at the address | the MAC, or empty | a new host: `mac`, and `hostname` (and `domain`, see Names) from the PTR name; `status` `active`, or `dhcp` when `dynamic` |
 | `mac_missing` | the host has no MAC, the observation has one | the MAC | `mac` |
 | `mac_mismatch` | both have one, and they differ | the MAC | `mac` |
-| `name_missing` | the host has no hostname, the observation has a PTR name | the PTR name | `hostname` |
-| `name_mismatch` | the PTR name, without the effective domain, differs from `hostname`, case-insensitively | the PTR name | `hostname` |
+| `name_missing` | the host has no hostname, the observation has a PTR name | the PTR name | `hostname`, and `domain` when the name is outside the effective domain |
+| `name_mismatch` | the PTR name differs from the host's FQDN, case-insensitively | the PTR name | the same |
 | `stale` | the host is `active`, the subnet has a scan target, and the host's `last_seen` (§3.4) is more than 30 days old | that `last_seen`, as an ISO-8601 UTC time, or `never` | `status` `offline` |
 
 - **The key.** A finding is identified by `(subnet_id, ip, type, observed)`, and every finding carries all four. `ip_int` is the sort key, `host_id` the host at the address (null for `unknown_host`).
+- **The fingerprint.** The key does not say everything an accept writes (an `unknown_host`'s name and status, a hostname that depends on the domain), so each finding also carries `fingerprint`, a digest the server computes from the key, `host_id` and `proposed`. Accept needs it; a later scan, a domain or pool edit, or a new host at the address changes it.
 - **No MAC finding for a randomised MAC** (`mac_randomised`, §3.11).
-- **Names.** The effective domain (the host's override, else the subnet's) is stripped from the end of the PTR name before it is compared with, or written to, `hostname`. A PTR name outside that domain is compared and written whole.
+- **Names.** Accepting a name makes the host's FQDN the PTR name. Under the effective domain (the host's override, else the subnet's), `hostname` is the part before it, nested labels included (`a.b.home.arpa` → `a.b`). Outside it, the bare domain included, `hostname` is the first label and `domain` the rest, as an explicit override in `proposed`: `nas.example.com` in a `home.arpa` subnet becomes `nas` + `example.com`, FQDN `nas.example.com`. A single-label PTR name is a relative hostname. `name_mismatch` compares FQDNs, so a PTR name outside the effective domain always differs.
 - **Stale and never seen.** `last_seen` is the rule host responses use: the later of the value set by hand and the observation's `last_seen_at`, never `alive`. A host with neither is stale (`never`) only when both the scan target and the host record are more than 30 days old, so switching scanning on does not make every host stale. A subnet without a scan target raises no `stale`.
 - **Dynamic.** An `unknown_host` inside the DHCP pool, possible only when the pool is scanned, has `dynamic: true` and is left out unless `?include_dynamic=true`.
-- **Accept** recomputes the finding under SQLite's write lock and, only if it still exists with the same `observed`, writes `proposed` through the hosts service (`create_host`/`update_host`), whose validation and audit entry apply unchanged. Otherwise the record is `skipped` with reason `changed` and nothing is written. A dismissed finding can still be accepted. The audit summary names the address and the finding type, never the hostname or MAC that came from the network: `host created at 10.0.20.7 in lab from scan finding unknown_host`, `host at 10.0.20.7 updated from scan finding name_mismatch`. The snapshots carry the values, as for any host write.
-- **Dismiss** recomputes the same way and stores the key only for a finding that exists as listed. The finding stays hidden until its observed value changes. The audit entry's summary is a count (`2 scan finding(s) dismissed in lab`); the keys are in its `after`.
+- **Accept** takes each key with its `fingerprint`, recomputes the finding under SQLite's write lock and, only if it still exists with the same `observed` and `fingerprint`, writes `proposed` through the hosts service (`create_host`/`update_host`), whose validation and audit entry apply unchanged. Otherwise the record is `skipped` with reason `changed` and nothing is written; a key without a fingerprint is an `error`. A dismissed finding can still be accepted. The audit summary names the address and the finding type, never the hostname or MAC that came from the network: `host created at 10.0.20.7 in lab from scan finding unknown_host`, `host at 10.0.20.7 updated from scan finding name_mismatch`. The snapshots carry the values, as for any host write.
+- **Dismiss** recomputes the same way and stores the key only for a finding that exists as listed (a fingerprint is checked if sent, and not stored). The finding stays hidden until its observed value changes. The audit entry's summary is a count (`2 scan finding(s) dismissed in lab`); the keys are in its `after`.
 - **Observed values are data.** A MAC comes only from a job issued `arp`; a PTR name is whatever a device calls itself, kept only if it is a valid hostname (§3.11), which says nothing about what it means.
 - Not yet: `fdns_mismatch` arrives with the forward-DNS check (#20); the MCP tool `list_scan_findings` is #17; the findings panel is #19.
 

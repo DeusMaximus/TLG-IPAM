@@ -457,6 +457,8 @@ class FindingKey(BaseModel):
     type: FindingType
     # a MAC, a PTR name, a last-seen timestamp, `never`, or empty
     observed: str = Field(max_length=253)
+    # the finding's fingerprint as listed: required to accept, checked if sent to dismiss
+    fingerprint: str | None = Field(default=None, max_length=64)
 
 
 class FindingKeysRequest(BaseModel):
@@ -477,3 +479,5 @@ class FindingOut(FindingKey):
     dynamic: bool
     # the host fields accepting the finding writes
     proposed: dict
+    # digest of the key, `host_id` and `proposed`: accept is refused once it changes
+    fingerprint: str

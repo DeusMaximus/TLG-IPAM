@@ -3,15 +3,21 @@ disagree, offered to the owner, never applied on their own.
 
 Findings are computed at read time from the subnet's hosts and observations, restricted
 to its scan scope (`scans.scan_scope`), and never stored. A finding is identified by its
-key, `(subnet_id, ip, type, observed)`; the owner accepts or dismisses it by that key.
+key, `(subnet_id, ip, type, observed)`; the owner dismisses it by that key. Each finding
+also carries `proposed`, the host fields accepting it writes, and `fingerprint`, a digest
+of the key, the host and `proposed` together.
 
-- **Accept** recomputes the finding and writes only if it still exists with the same
-  observed value. The write goes through the hosts service, so its validation and its
-  audit entry apply unchanged. This is the one path by which something a device on the
+- **Accept** takes the key and the fingerprint, recomputes the finding, and writes only
+  if both still match. The observed value alone does not say what is written: an
+  `unknown_host` keyed by its MAC (or by nothing) also proposes a name from the PTR record
+  and a status from the DHCP pool, and a name finding's hostname depends on the domain.
+  The write goes through the hosts service, so its validation and its audit entry apply
+  unchanged. This is the one path by which something a device on the
   network said becomes owner data, and it is an owner action: scan ingest still never
   writes `hosts` (spec §7.2, invariant 3).
 - **Dismiss** stores the key in `finding_dismissals`. A dismissed finding stays hidden
   while its observed value is the one dismissed, and comes back when the value changes.
+  A fingerprint, if sent, must match too; it is not stored.
 
 Observed values come from the network: a MAC an `arp` job reported, a PTR name any
 device can set for itself (sanitised to the hostname character set at ingest, which
@@ -22,6 +28,8 @@ Accept and dismiss write on the strength of the scope, so each takes SQLite's wr
 before it recomputes (`scans.take_write_lock`), and holds it until it commits.
 """
 
+import hashlib
+import json
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -107,14 +115,32 @@ async def _context(session: AsyncSession, subnet_id: str) -> _Context | None:
     return _Context(subnet_id, name, domain, pool, scope, target_created_at)
 
 
-def _strip_domain(name: str, domain: str | None) -> str:
-    """The PTR name without the effective domain, the form compared with and written to
-    `hostname` (spec §5.5). A name outside the domain is kept whole."""
-    if domain:
-        suffix = "." + domain.casefold()
-        if name.casefold().endswith(suffix) and len(name) > len(suffix):
-            return name[: -len(suffix)]
-    return name
+def _name_proposal(ptr: str, effective: str | None) -> dict:
+    """The host fields that make the host's FQDN the PTR name (spec §5.5).
+
+    Under the effective domain (the host's override, else the subnet's), the hostname is
+    the part before it, nested labels included, and the domain is left alone. Outside it,
+    the hostname is the first label and the rest becomes the host's domain override, so
+    the stored FQDN is the PTR name and never the PTR name plus the subnet's domain. A
+    single-label answer is a relative name: it becomes the hostname, with no domain.
+    """
+    if effective:
+        suffix = "." + effective.casefold()
+        if ptr.casefold().endswith(suffix) and len(ptr) > len(suffix):
+            return {"hostname": ptr[: -len(suffix)]}
+    if "." not in ptr:
+        return {"hostname": ptr}
+    first, rest = ptr.split(".", 1)
+    return {"hostname": first, "domain": rest}
+
+
+def _fingerprint(key: dict, host_id: str | None, proposed: dict) -> str:
+    """A digest of everything accepting the finding would write and where: accept is
+    refused when it differs from the one listed, even if the observed value did not."""
+    canonical = json.dumps(
+        {**key, "host_id": host_id, "proposed": proposed}, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()[:32]
 
 
 def _stale(ctx: _Context, host, observation, now: datetime) -> str | None:
@@ -143,16 +169,17 @@ def _evaluate(ctx: _Context, host, observation, now: datetime) -> list[FindingOu
         return []
     ip = host.ip if host is not None else observation.ip
 
+    host_id = host.id if host is not None else None
+
     def finding(type_: str, observed: str, proposed: dict, dynamic: bool = False):
+        key = {"subnet_id": ctx.id, "ip": ip, "type": type_, "observed": observed}
         return FindingOut(
-            subnet_id=ctx.id,
-            ip=ip,
-            type=type_,
-            observed=observed,
+            **key,
             ip_int=ip_int,
-            host_id=host.id if host is not None else None,
+            host_id=host_id,
             dynamic=dynamic,
             proposed=proposed,
+            fingerprint=_fingerprint(key, host_id, proposed),
         )
 
     if host is None:
@@ -164,7 +191,7 @@ def _evaluate(ctx: _Context, host, observation, now: datetime) -> list[FindingOu
         if observation.mac:
             proposed["mac"] = observation.mac
         if observation.rdns_name:
-            proposed["hostname"] = _strip_domain(observation.rdns_name, ctx.domain)
+            proposed.update(_name_proposal(observation.rdns_name, ctx.domain))
         return [finding("unknown_host", observation.mac or "", proposed, dynamic)]
 
     found = []
@@ -174,11 +201,14 @@ def _evaluate(ctx: _Context, host, observation, now: datetime) -> list[FindingOu
         elif host.mac.lower() != observation.mac.lower():
             found.append(finding("mac_mismatch", observation.mac, {"mac": observation.mac}))
     if observation is not None and observation.rdns_name:
-        name = _strip_domain(observation.rdns_name, host.domain or ctx.domain)
+        ptr = observation.rdns_name
+        names = _name_proposal(ptr, host.domain or ctx.domain)
         if not host.hostname:
-            found.append(finding("name_missing", observation.rdns_name, {"hostname": name}))
-        elif name.casefold() != host.hostname.casefold():
-            found.append(finding("name_mismatch", observation.rdns_name, {"hostname": name}))
+            found.append(finding("name_missing", ptr, names))
+        # A proposal with a domain means the PTR name is outside the effective domain,
+        # so the host's FQDN cannot be it, whatever its hostname.
+        elif "domain" in names or names["hostname"].casefold() != host.hostname.casefold():
+            found.append(finding("name_mismatch", ptr, names))
     stale = _stale(ctx, host, observation, now)
     if stale is not None:
         found.append(finding("stale", stale, {"status": "offline"}))
@@ -192,7 +222,9 @@ async def list_findings(
     include_dynamic: bool = False,
 ) -> list[dict]:
     """The subnet's findings, by address, without the dismissed ones and, unless asked
-    for, without the `dynamic` ones. Four queries for the whole subnet."""
+    for, without the `dynamic` ones. A fixed number of statements however large the
+    subnet: the subnet, its scope (three), its target, and its hosts, observations and
+    dismissals once each."""
     if type_ is not None and type_ not in FINDING_TYPES:
         raise validation_error(
             f"Unknown finding type {type_!r}: types are {', '.join(FINDING_TYPES)}"
@@ -262,9 +294,9 @@ def _parse_key(raw) -> tuple[FindingKey, int]:
 async def _current(
     session: AsyncSession, ctx: _Context | None, key: FindingKey, ip_int: int
 ) -> FindingOut | None:
-    """The finding the key names, recomputed now; None if it no longer exists or its
-    observed value has changed. Dismissals are not applied: a dismissed finding can
-    still be accepted."""
+    """The finding the key names, recomputed now; None if it no longer exists, its
+    observed value has changed, or the key carries a fingerprint that no longer matches.
+    Dismissals are not applied: a dismissed finding can still be accepted."""
     if ctx is None:
         return None
     host = (
@@ -283,8 +315,11 @@ async def _current(
         return None
     now = datetime.now(timezone.utc)
     for f in _evaluate(ctx, host, observation, now):
-        if f.type == key.type and f.observed == key.observed:
-            return f
+        if f.type != key.type or f.observed != key.observed:
+            continue
+        if key.fingerprint is not None and f.fingerprint != key.fingerprint:
+            continue
+        return f
     return None
 
 
@@ -313,10 +348,11 @@ def _report(results: list[dict], done: str) -> dict:
 
 async def accept(session: AsyncSession, raw_keys: list, source: str) -> dict:
     """Accept each finding the keys name: create the host for `unknown_host`, set or
-    replace the MAC or hostname, or set a stale host `offline` (spec §5.5). Per record,
-    `accepted` (with `host_id`), `skipped` with reason `changed` when the finding no
-    longer exists as listed, or `error`. A record is written and committed on its own,
-    so one that fails leaves the others in place."""
+    replace the MAC or hostname, or set a stale host `offline` (spec §5.5). Each key
+    needs the finding's `fingerprint`, so what is written is what the owner was shown.
+    Per record, `accepted` (with `host_id`), `skipped` with reason `changed` when the
+    finding no longer exists as listed, or `error`. A record is written and committed on
+    its own, so one that fails leaves the others in place."""
     results: list[dict] = []
     for index, raw in enumerate(raw_keys):
         result: dict = {"index": index}
@@ -326,6 +362,11 @@ async def accept(session: AsyncSession, raw_keys: list, source: str) -> dict:
             results.append({**result, "status": "error", "reason": exc.message})
             continue
         result.update(subnet_id=key.subnet_id, ip=key.ip, type=key.type)
+        if key.fingerprint is None:
+            results.append(
+                {**result, "status": "error", "reason": "fingerprint: required to accept"}
+            )
+            continue
         # Held until the hosts service commits: what is written is what was just checked.
         await scans.take_write_lock(session)
         ctx = await _context(session, key.subnet_id)

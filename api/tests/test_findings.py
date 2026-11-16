@@ -2,18 +2,29 @@
 by key (v0.2 spec §5.5; issue #15). Observations are written directly, as results
 ingest would store them; hosts, targets and ranges go through REST."""
 
+import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import func, select, update
+from pydantic import ValidationError
+from sqlalchemy import event, func, select, update
 
-from app.database import SessionLocal
+from app.config import settings
+from app.database import SessionLocal, engine
 from app.ipnet import parse_ip
-from app.models import Change, FindingDismissal, Host, Observation, ScanTarget
+from app.models import Change, FindingDismissal, Host, Observation, ScanTarget, Section
+from app.schemas import HostCreate
 from app.services import findings as findings_svc
 from app.services import scans
 
 from .conftest import make_host, make_section, make_subnet
+from .test_checkin import (  # noqa: F401 (agent_api is a fixture)
+    agent_api,
+    jobs_for,
+    make_agent,
+    make_target,
+)
 
 NOW = datetime.now(timezone.utc)
 RECENT = NOW - timedelta(days=1)
@@ -79,7 +90,8 @@ async def findings(client, subnet_id, **params) -> list[dict]:
 
 
 def key(f: dict) -> dict:
-    return {k: f[k] for k in ("subnet_id", "ip", "type", "observed")}
+    """A listed finding as accept and dismiss take it: its key and its fingerprint."""
+    return {k: f[k] for k in ("subnet_id", "ip", "type", "observed", "fingerprint")}
 
 
 async def accept(client, *keys) -> dict:
@@ -117,6 +129,7 @@ async def test_unknown_host(client):
     subnet = await _subnet(client)
     await observe(subnet["id"], "10.0.0.20", mac=MAC, rdns="printer.home.arpa")
     [f] = await findings(client, subnet["id"])
+    assert len(f.pop("fingerprint")) == 32
     assert f == {
         "subnet_id": subnet["id"],
         "ip": "10.0.0.20",
@@ -197,8 +210,12 @@ async def test_name_mismatch(client):
         ("NAS", None, "nas.home.arpa", False),  # case-insensitive
         ("nas", "lab.example.com", "nas.lab.example.com", False),  # host override wins
         ("nas", "lab.example.com", "nas.home.arpa", True),  # override, not subnet default
-        ("nas", None, "nas.example.com", True),  # outside the domain: compared whole
-        ("nas.example.com", None, "nas.example.com", False),
+        ("nas", None, "nas.example.com", True),  # outside the domain
+        # the FQDN is nas.example.com.home.arpa, not the PTR name
+        ("nas.example.com", None, "nas.example.com", True),
+        ("nas", "example.com", "nas.example.com", False),
+        ("a.b", None, "a.b.home.arpa", False),  # nested relative labels
+        ("nas", None, "nas", False),  # a single label is a relative name
     ],
 )
 async def test_the_ptr_name_is_compared_without_the_effective_domain(
@@ -699,7 +716,382 @@ async def test_a_name_from_the_network_never_reaches_a_change_summary(client):
     assert sorted(f["type"] for f in found) == ["name_mismatch", "name_missing", "unknown_host"]
     report = await accept(client, *[key(f) for f in found])
     assert report["accepted"] == 3
-    assert (await _host(host["id"])).hostname == HOSTILE
+    got = (await client.get(f"/api/v1/hosts/{host['id']}")).json()["data"]
+    assert got["fqdn"] == HOSTILE
     async with SessionLocal() as session:
         summaries = (await session.scalars(select(Change.summary))).all()
     assert not [s for s in summaries if "ignore" in s or MAC in s]
+
+
+# --- Accept is bound to the whole proposal (fingerprint) ---
+
+
+async def test_accept_needs_the_listed_fingerprint(client):
+    subnet = await _subnet(client)
+    await observe(subnet["id"], "10.0.0.20", mac=MAC)
+    [f] = await findings(client, subnet["id"])
+    unkeyed = {k: v for k, v in key(f).items() if k != "fingerprint"}
+    report = await accept(client, unkeyed, {**key(f), "fingerprint": "0" * 32})
+    assert [(r["status"], r["reason"]) for r in report["results"]] == [
+        ("error", "fingerprint: required to accept"),
+        ("skipped", "changed"),
+    ]
+    assert (await accept(client, key(f)))["accepted"] == 1
+
+
+async def post_results(agent_api, token, job, records):
+    started = datetime.now(timezone.utc) - timedelta(seconds=30)
+    res = await agent_api.post(
+        "/api/v1/agent/results",
+        json={
+            "job_id": job["job_id"],
+            "subnet_id": job["subnet_id"],
+            "started_at": started.isoformat(),
+            "finished_at": (started + timedelta(seconds=5)).isoformat(),
+            "complete": True,
+            "observations": records,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["data"]["rejected"] == []
+
+
+async def scanned_twice(client, agent_api, first: dict, second: dict) -> tuple[dict, dict]:
+    """A scanned subnet, its finding at 10.0.0.22 after a first real scan, and the
+    subnet after a second scan reports `second` there."""
+    agent, token = await make_agent(client)
+    subnet = await _subnet(client)
+    await make_target(client, subnet["id"], agent["id"])
+    [job] = await jobs_for(agent_api, token)
+    await post_results(agent_api, token, job, [{"ip": "10.0.0.22", **first}])
+    [f] = await findings(client, subnet["id"])
+    res = await client.post(f"/api/v1/subnets/{subnet['id']}/scan")
+    assert res.status_code == 202, res.text
+    [job] = await jobs_for(agent_api, token)
+    await post_results(agent_api, token, job, [{"ip": "10.0.0.22", **second}])
+    return subnet, f
+
+
+@pytest.mark.parametrize("mac", [None, MAC], ids=["no-mac", "same-mac"])
+async def test_a_later_scan_with_another_name_makes_the_listed_proposal_stale(
+    client, agent_api, mac
+):
+    """The review's reproduction: `observed` is the MAC (or empty) and did not change,
+    but the name accepting would write did."""
+    with_mac = {"mac": mac} if mac else {}
+    subnet, f = await scanned_twice(
+        client,
+        agent_api,
+        {**with_mac, "rdns_name": "old.home.arpa"},
+        {**with_mac, "rdns_name": "replacement.home.arpa"},
+    )
+    assert (f["observed"], f["proposed"]["hostname"]) == (mac or "", "old")
+    [now] = await findings(client, subnet["id"])
+    assert now["observed"] == f["observed"] and now["fingerprint"] != f["fingerprint"]
+    before = await change_count()
+    report = await accept(client, key(f))
+    assert (report["accepted"], report["skipped"]) == (0, 1)
+    assert report["results"][0]["reason"] == "changed"
+    assert (await client.get("/api/v1/hosts")).json()["data"] == []
+    assert await change_count() == before
+    # the proposal as it now stands is still accepted
+    assert (await accept(client, key(now)))["accepted"] == 1
+
+
+async def test_a_later_scan_with_the_same_answer_keeps_the_proposal(client, agent_api):
+    answer = {"mac": MAC, "rdns_name": "old.home.arpa"}
+    subnet, f = await scanned_twice(client, agent_api, answer, answer)
+    report = await accept(client, key(f))
+    assert report["accepted"] == 1
+    host = (await client.get(f"/api/v1/hosts/{report['results'][0]['host_id']}")).json()
+    assert (host["data"]["fqdn"], host["data"]["mac"]) == ("old.home.arpa", MAC)
+
+
+async def test_a_domain_change_makes_a_name_proposal_stale(client):
+    subnet = await _subnet(client)
+    host = await make_host(client, subnet["id"], "10.0.0.10")
+    await observe(subnet["id"], "10.0.0.10", rdns="nas.lab.home.arpa")
+    [f] = await findings(client, subnet["id"])
+    assert f["proposed"] == {"hostname": "nas.lab"}
+    res = await client.put(f"/api/v1/subnets/{subnet['id']}", json={"domain": "lab.home.arpa"})
+    assert res.status_code == 200, res.text
+    [now] = await findings(client, subnet["id"])
+    assert now["observed"] == f["observed"] and now["proposed"] == {"hostname": "nas"}
+    assert (await accept(client, key(f)))["results"][0]["reason"] == "changed"
+    assert (await _host(host["id"])).hostname is None
+
+
+async def test_a_pool_change_makes_an_unknown_host_proposal_stale(client):
+    subnet = await _subnet(client, dhcp_start="10.0.0.100", dhcp_end="10.0.0.199")
+    await _target(client, subnet["id"], scan_dhcp_pool=True)
+    await observe(subnet["id"], "10.0.0.50", mac=MAC)
+    [f] = await findings(client, subnet["id"])
+    assert (f["dynamic"], f["proposed"]["status"]) == (False, "active")
+    res = await client.put(f"/api/v1/subnets/{subnet['id']}", json={"dhcp_start": "10.0.0.40"})
+    assert res.status_code == 200, res.text
+    [now] = await findings(client, subnet["id"], include_dynamic=True)
+    assert (now["observed"], now["dynamic"], now["proposed"]["status"]) == (MAC, True, "dhcp")
+    assert (await accept(client, key(f)))["results"][0]["reason"] == "changed"
+    assert (await client.get("/api/v1/hosts")).json()["data"] == []
+
+
+async def test_a_new_host_at_the_address_makes_a_proposal_stale(client):
+    subnet = await _subnet(client)
+    first = await make_host(client, subnet["id"], "10.0.0.10")
+    await observe(subnet["id"], "10.0.0.10", mac=MAC)
+    [f] = await findings(client, subnet["id"])
+    assert (await client.delete(f"/api/v1/hosts/{first['id']}")).status_code == 204
+    second = await make_host(client, subnet["id"], "10.0.0.10")
+    assert (await accept(client, key(f)))["results"][0]["reason"] == "changed"
+    assert (await _host(second["id"])).mac is None
+
+
+# --- Accepted names: the stored FQDN is the PTR name ---
+
+
+@pytest.mark.parametrize(
+    ("ptr", "hostname", "domain"),
+    [
+        ("nas.home.arpa", "nas", None),
+        ("a.b.home.arpa", "a.b", None),  # nested relative labels
+        ("nas.example.com", "nas", "example.com"),  # outside the subnet's domain
+        ("home.arpa", "home", "arpa"),  # the bare domain
+    ],
+)
+@pytest.mark.parametrize("type_", ["unknown_host", "name_missing", "name_mismatch"])
+async def test_an_accepted_name_gives_the_host_the_ptr_name_as_its_fqdn(
+    client, type_, ptr, hostname, domain
+):
+    subnet = await _subnet(client)
+    if type_ == "name_missing":
+        await make_host(client, subnet["id"], "10.0.0.10")
+    elif type_ == "name_mismatch":
+        await make_host(client, subnet["id"], "10.0.0.10", hostname="old")
+    await observe(subnet["id"], "10.0.0.10", rdns=ptr)
+    f = only(await findings(client, subnet["id"]), type_)
+    expected = {"hostname": hostname, **({"domain": domain} if domain else {})}
+    assert {k: v for k, v in f["proposed"].items() if k in ("hostname", "domain")} == expected
+    report = await accept(client, key(f))
+    assert report["accepted"] == 1
+    host = (await client.get(f"/api/v1/hosts/{report['results'][0]['host_id']}")).json()["data"]
+    assert (host["hostname"], host["domain"], host["fqdn"]) == (hostname, domain, ptr)
+    assert await findings(client, subnet["id"]) == []
+
+
+async def test_a_ptr_name_outside_a_host_override_sets_the_override(client):
+    subnet = await _subnet(client)
+    host = await make_host(client, subnet["id"], "10.0.0.10", hostname="nas", domain="lab.example.com")
+    await observe(subnet["id"], "10.0.0.10", rdns="nas.home.arpa")
+    [f] = await findings(client, subnet["id"])
+    assert (f["type"], f["proposed"]) == ("name_mismatch", {"hostname": "nas", "domain": "home.arpa"})
+    assert (await accept(client, key(f)))["accepted"] == 1
+    got = (await client.get(f"/api/v1/hosts/{host['id']}")).json()["data"]
+    assert got["fqdn"] == "nas.home.arpa"
+
+
+async def test_a_single_label_ptr_name_is_a_relative_hostname(client):
+    subnet = await _subnet(client)
+    await observe(subnet["id"], "10.0.0.20", rdns="printer")
+    [f] = await findings(client, subnet["id"])
+    assert f["proposed"] == {"status": "active", "hostname": "printer"}
+
+
+# --- The recompute is what accept and dismiss judge ---
+
+
+async def test_an_address_put_out_of_scope_after_listing_is_skipped(client):
+    """The finding listed in scope; the observation row is then back out of scope (it
+    is written directly: drop_out_of_scope deleted the real one). Only the recompute can
+    refuse it."""
+    subnet = await _subnet(client)
+    await make_host(client, subnet["id"], "10.0.0.5")
+    await observe(subnet["id"], "10.0.0.5", mac=MAC)
+    await observe(subnet["id"], "10.0.0.6", mac=OTHER_MAC)
+    first, second = await findings(client, subnet["id"])
+    res = await client.post(
+        f"/api/v1/subnets/{subnet['id']}/reserved",
+        json={"start_ip": "10.0.0.2", "end_ip": "10.0.0.9", "scan_excluded": True},
+    )
+    assert res.status_code == 201
+    await observe(subnet["id"], "10.0.0.5", mac=MAC)
+    await observe(subnet["id"], "10.0.0.6", mac=OTHER_MAC)
+    assert (await accept(client, key(first)))["results"][0]["reason"] == "changed"
+    assert (await dismiss(client, key(second)))["results"][0]["reason"] == "changed"
+    assert await dismissal_count() == 0
+
+
+async def test_a_mac_found_randomised_after_listing_is_skipped(client):
+    subnet = await _subnet(client)
+    await make_host(client, subnet["id"], "10.0.0.10")
+    await make_host(client, subnet["id"], "10.0.0.11")
+    await observe(subnet["id"], "10.0.0.10", mac=MAC)
+    await observe(subnet["id"], "10.0.0.11", mac=OTHER_MAC)
+    first, second = await findings(client, subnet["id"])
+    for ip in ("10.0.0.10", "10.0.0.11"):
+        await set_observation(subnet["id"], ip, mac_randomised=True)
+    assert (await accept(client, key(first)))["results"][0]["reason"] == "changed"
+    assert (await dismiss(client, key(second)))["results"][0]["reason"] == "changed"
+
+
+async def test_a_dismissal_hides_only_its_own_address_and_type(client):
+    subnet = await _subnet(client)
+    # the same type and observed value at two addresses
+    await observe(subnet["id"], "10.0.0.20")
+    await observe(subnet["id"], "10.0.0.21")
+    # two types at one address
+    await make_host(client, subnet["id"], "10.0.0.10")
+    await observe(subnet["id"], "10.0.0.10", mac=MAC, rdns="nas.home.arpa")
+    found = await findings(client, subnet["id"])
+    by = {(f["ip"], f["type"]): f for f in found}
+    await dismiss(client, key(by[("10.0.0.20", "unknown_host")]))
+    assert ("10.0.0.21", "unknown_host") in {(f["ip"], f["type"]) for f in await findings(client, subnet["id"])}
+    await dismiss(client, key(by[("10.0.0.10", "mac_missing")]), key(by[("10.0.0.10", "name_missing")]))
+    assert [(f["ip"], f["type"]) for f in await findings(client, subnet["id"])] == [
+        ("10.0.0.21", "unknown_host")
+    ]
+
+
+def _another_writer_gets_in() -> bool:
+    """Whether a second connection can take SQLite's write lock right now."""
+    con = sqlite3.connect(settings.db_path, timeout=0.1, isolation_level=None)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.rollback()
+        return True
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        con.close()
+
+
+@pytest.mark.parametrize("route", ["accept", "dismiss"])
+async def test_no_other_writer_gets_in_between_the_recompute_and_the_write(
+    client, monkeypatch, route
+):
+    """The lock is held from before the recompute until the write commits: a lock taken
+    and then lost to a commit or a rollback would let another writer in here."""
+    subnet = await _subnet(client)
+    await observe(subnet["id"], "10.0.0.20", mac=MAC)
+    [f] = await findings(client, subnet["id"])
+    seen = []
+    current, create = findings_svc._current, findings_svc.hosts_svc.create_host
+
+    async def after_recompute(*args):
+        found = await current(*args)
+        seen.append(("recomputed", _another_writer_gets_in()))
+        return found
+
+    async def at_the_write(*args, **kw):
+        seen.append(("writing", _another_writer_gets_in()))
+        return await create(*args, **kw)
+
+    monkeypatch.setattr(findings_svc, "_current", after_recompute)
+    monkeypatch.setattr(findings_svc.hosts_svc, "create_host", at_the_write)
+    report = await (accept if route == "accept" else dismiss)(client, key(f))
+    assert report[{"accept": "accepted", "dismiss": "dismissed"}[route]] == 1
+    expected = [("recomputed", False)] + ([("writing", False)] if route == "accept" else [])
+    assert seen == expected
+    assert _another_writer_gets_in()
+
+
+def _validation_error() -> ValidationError:
+    try:
+        HostCreate.model_validate({})
+    except ValidationError as exc:
+        return exc
+    raise AssertionError("HostCreate accepted an empty body")
+
+
+@pytest.mark.parametrize("refusal", ["api_error", "validation_error"])
+async def test_a_refused_record_leaves_nothing_behind_for_the_next(client, monkeypatch, refusal):
+    """The hosts service may have written before it refused; the next record's commit
+    must not carry that partial write with it."""
+    subnet = await _subnet(client)
+    await observe(subnet["id"], "10.0.0.20", mac=MAC)
+    await observe(subnet["id"], "10.0.0.21", mac=OTHER_MAC)
+    first, second = await findings(client, subnet["id"])
+    real = findings_svc.hosts_svc.create_host
+
+    async def refuse_first(session, payload, source, **kw):
+        if payload.ip == "10.0.0.20":
+            session.add(Section(name="partial write"))
+            await session.flush()
+            raise (
+                findings_svc.validation_error("refused")
+                if refusal == "api_error"
+                else _validation_error()
+            )
+        return await real(session, payload, source, **kw)
+
+    monkeypatch.setattr(findings_svc.hosts_svc, "create_host", refuse_first)
+    report = await accept(client, key(first), key(second))
+    assert [r["status"] for r in report["results"]] == ["error", "accepted"]
+    async with SessionLocal() as session:
+        names = (await session.scalars(select(Section.name))).all()
+    assert "partial write" not in names
+
+
+# --- Cost ---
+
+
+@contextmanager
+def statements():
+    count = [0]
+
+    def before(*_args):
+        count[0] += 1
+
+    event.listen(engine.sync_engine, "before_cursor_execute", before)
+    try:
+        yield count
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", before)
+
+
+async def test_listing_costs_the_same_statements_however_many_hosts(client):
+    small = await _subnet(client)
+    await make_host(client, small["id"], "10.0.0.10")
+    await observe(small["id"], "10.0.0.10", mac=MAC)
+    section = await make_section(client, name="big")
+    big = await make_subnet(client, section["id"], cidr="10.1.0.0/24", name="big")
+    async with SessionLocal() as session:
+        for i in range(1, 201):
+            ip = f"10.1.0.{i}"
+            session.add(Host(subnet_id=big["id"], ip=ip, ip_int=int(parse_ip(ip))))
+            session.add(
+                Observation(subnet_id=big["id"], ip=ip, ip_int=int(parse_ip(ip)), mac=MAC)
+            )
+        await session.commit()
+    counts = []
+    for subnet in (small, big):
+        with statements() as count:
+            found = await findings(client, subnet["id"])
+        counts.append(count[0])
+    assert len(found) == 200
+    # the subnet, its scope (three), its target, then hosts, observations, dismissals
+    assert counts == [9, 9]
+
+
+@pytest.mark.parametrize(
+    ("observation", "dismissed", "edit", "shown"),
+    [
+        ({"rdns": "nas.home.arpa"}, "name_missing", {"hostname": "other"}, "name_mismatch"),
+        ({"mac": MAC}, "mac_missing", {"mac": OTHER_MAC}, "mac_mismatch"),
+    ],
+)
+async def test_a_dismissal_does_not_hide_another_type_with_the_same_value(
+    client, observation, dismissed, edit, shown
+):
+    """Same address, same observed value, another type: an owner edit turns a dismissed
+    `*_missing` into a `*_mismatch`, which is a new finding."""
+    subnet = await _subnet(client)
+    host = await make_host(client, subnet["id"], "10.0.0.10")
+    await observe(subnet["id"], "10.0.0.10", **observation)
+    [f] = await findings(client, subnet["id"])
+    assert f["type"] == dismissed
+    await dismiss(client, key(f))
+    assert await findings(client, subnet["id"]) == []
+    assert (await client.put(f"/api/v1/hosts/{host['id']}", json=edit)).status_code == 200
+    [now] = await findings(client, subnet["id"])
+    assert (now["type"], now["observed"]) == (shown, f["observed"])
