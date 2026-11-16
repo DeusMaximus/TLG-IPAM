@@ -2,7 +2,7 @@ import ast
 import hmac
 import inspect
 import json
-import textwrap
+import re
 
 import anyio
 import httpx2
@@ -281,15 +281,394 @@ async def test_digest_answer_decides_acceptance(anon_client, monkeypatch, surfac
     )
 
 
-def test_is_owner_key_has_no_equality_shortcut():
-    source = textwrap.dedent(inspect.getsource(auth.is_owner_key))
-    shortcuts = [
-        ast.unparse(node)
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Compare)
-        and any(isinstance(op, (ast.Eq, ast.NotEq, ast.In, ast.NotIn)) for op in node.ops)
-    ]
-    assert shortcuts == [], f"is_owner_key compares outside hmac.compare_digest: {shortcuts}"
+# --- Where the owner key may go -----------------------------------------------------
+#
+# The spy and the forced answers above show that the digest decides. They cannot show
+# that nothing looked at the key before it: an `==` that only feeds a log line, or a
+# `startswith` whose answer is thrown away, changes no outcome. This check reads the
+# source of `app.auth` and follows two values through every function in it:
+#
+# - the configured key: every read of an `api_key` attribute;
+# - the presented key: `is_owner_key`'s parameter, and each name a function of the
+#   module passes to `is_owner_key` (`x_api_key` in `require_api_key`, `token` in
+#   `OwnerKeyVerifier.verify_token`).
+#
+# Either value, and a local name assigned from one, may only be:
+#
+# - an argument of `hmac.compare_digest`, as it is or through `.encode()`;
+# - tested for emptiness (`not value`, `if value:`) or for None (`is None`, `is not None`);
+# - assigned to a local name, which is then followed in its place;
+# - passed to another function of the module, which is then followed with it;
+# - for the presented key only, handed to FastMCP as `AccessToken(token=...)`.
+#
+# Any other use is reported with the expression that makes it. This is a bounded
+# check, not a proof of constant time: it reads one module, by name, and does not
+# follow the key through attributes, containers, globals or other modules.
+
+PRESENTED, CONFIGURED = "presented key", "configured key"
+PRESENTED_KEY_SINKS = {("AccessToken", "token")}
+
+
+class OwnerKeyUses:
+    """Every use of the owner key in a module's source that the rules above do not
+    allow, as `findings`, and the names followed as the presented key, as `presented`."""
+
+    def __init__(self, source):
+        tree = ast.parse(source)
+        self.parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+        self.functions = {}
+        for node in tree.body:
+            methods = node.body if isinstance(node, ast.ClassDef) else [node]
+            prefix = f"{node.name}." if isinstance(node, ast.ClassDef) else ""
+            for fn in methods:
+                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    self.functions[prefix + fn.name] = fn
+
+        self.seeds = {name: {} for name in self.functions}
+        if "is_owner_key" in self.functions:
+            self.seeds["is_owner_key"][self._params("is_owner_key")[0]] = PRESENTED
+        for name, fn in self.functions.items():
+            for call in ast.walk(fn):
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "is_owner_key":
+                    for arg in call.args:
+                        if isinstance(arg, ast.Name):
+                            self.seeds[name].setdefault(arg.id, PRESENTED)
+
+        # A function is checked again whenever a call gives it another parameter to follow
+        per_function, checked, self.followed = {}, {}, {}
+        self._pending = list(self.functions)
+        while self._pending:
+            name = self._pending.pop()
+            if checked.get(name) == self.seeds[name]:
+                continue
+            checked[name] = dict(self.seeds[name])
+            self.followed[name] = dict(self.seeds[name])
+            per_function[name] = self._check(name, self.functions[name], self.followed[name])
+
+        # Outside a function nothing is followed, so every read of the key there is
+        # reported: a module-level copy would otherwise reach functions unseen
+        inside = {id(n) for fn in self.functions.values() for n in ast.walk(fn)}
+        per_function["<module>"] = {
+            (node.lineno, "<module>", self._describe(self.parents[node]))
+            for node in ast.walk(tree)
+            if id(node) not in inside and self._kind(node, {})
+        }
+
+        found = sorted({f for fs in per_function.values() for f in fs})
+        self.findings = [f"{name}, line {line}: {text}" for line, name, text in found]
+        self.presented = {
+            (name, var) for name, names in self.followed.items() for var, kind in names.items() if kind == PRESENTED
+        }
+
+    def _params(self, name):
+        args = self.functions[name].args
+        return [a.arg for a in args.posonlyargs + args.args]
+
+    def _check(self, name, fn, tainted):
+        # A local assigned from a followed value is followed too, until nothing changes
+        changed = True
+        while changed:
+            changed = False
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                    target = node.targets[0]
+                elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                    target = node.target
+                else:
+                    continue
+                kind = self._kind(node.value, tainted)
+                if kind and isinstance(target, ast.Name) and target.id not in tainted:
+                    tainted[target.id] = kind
+                    changed = True
+        return self._uses(name, list(ast.walk(fn)), tainted)
+
+    def _uses(self, name, nodes, tainted):
+        found = set()
+        for node in nodes:
+            kind = self._kind(node, tainted)
+            if kind:
+                use = self._disallowed(node, kind, name)
+                if use:
+                    found.add((node.lineno, name, use))
+        return found
+
+    @staticmethod
+    def _kind(node, tainted):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            return tainted.get(node.id)
+        if isinstance(node, ast.Attribute) and node.attr == "api_key" and isinstance(node.ctx, ast.Load):
+            return CONFIGURED
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and any(isinstance(a, ast.Constant) and a.value == "api_key" for a in node.args)
+        ):
+            return CONFIGURED
+        return None
+
+    def _disallowed(self, node, kind, name):
+        """None if this use of the key is allowed; otherwise the expression that uses it."""
+        parent = self.parents[node]
+        if isinstance(parent, ast.Attribute) and parent.attr == "encode":
+            call = self.parents.get(parent)
+            if isinstance(call, ast.Call) and call.func is parent and not (call.args or call.keywords):
+                if self._is_digest_argument(call):
+                    return None
+            return self._describe(parent)
+        if self._is_digest_argument(node) or self._is_truth_test(node):
+            return None
+        if (
+            isinstance(parent, ast.Compare)
+            and len(parent.ops) == 1
+            and isinstance(parent.ops[0], (ast.Is, ast.IsNot))
+            and any(
+                isinstance(side, ast.Constant) and side.value is None
+                for side in (parent.left, *parent.comparators)
+            )
+        ):
+            return None
+        if isinstance(parent, ast.Assign) and parent.value is node and len(parent.targets) == 1:
+            if isinstance(parent.targets[0], ast.Name):
+                return None
+        if isinstance(parent, ast.AnnAssign) and parent.value is node and isinstance(parent.target, ast.Name):
+            return None
+        keyword = parent if isinstance(parent, ast.keyword) else None
+        call = self.parents.get(parent) if keyword else parent
+        if isinstance(call, ast.Call) and call.func is not node:
+            callee = ast.unparse(call.func)
+            if kind == PRESENTED and keyword and (callee, keyword.arg) in PRESENTED_KEY_SINKS:
+                return None
+            if self._follow(call, node, keyword, kind, name):
+                return None
+        return self._describe(parent)
+
+    def _is_digest_argument(self, node):
+        call = self.parents.get(node)
+        return (
+            isinstance(call, ast.Call)
+            and any(arg is node for arg in call.args)
+            and ast.unparse(call.func) == "hmac.compare_digest"
+        )
+
+    def _is_truth_test(self, node):
+        while isinstance(self.parents.get(node), ast.BoolOp):
+            node = self.parents[node]
+        parent = self.parents.get(node)
+        if isinstance(parent, ast.UnaryOp) and isinstance(parent.op, ast.Not):
+            return True
+        return isinstance(parent, (ast.If, ast.While, ast.IfExp, ast.Assert)) and parent.test is node
+
+    def _follow(self, call, node, keyword, kind, name):
+        """Follow the key into a function of the module it is passed to."""
+        func, bound = call.func, False
+        if isinstance(func, ast.Name) and func.id in self.functions:
+            callee = func.id
+        elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            owner = name.split(".")[0] if func.value.id == "self" and "." in name else func.value.id
+            callee, bound = f"{owner}.{func.attr}", func.value.id == "self"
+            if callee not in self.functions:
+                return False
+        else:
+            return False
+        params = self._params(callee)[1:] if bound else self._params(callee)
+        params_by_keyword = params + [a.arg for a in self.functions[callee].args.kwonlyargs]
+        if keyword:
+            if keyword.arg not in params_by_keyword:
+                return False
+            param = keyword.arg
+        else:
+            index = next(i for i, arg in enumerate(call.args) if arg is node)
+            if index >= len(params) or any(isinstance(a, ast.Starred) for a in call.args[: index + 1]):
+                return False
+            param = params[index]
+        if param not in self.seeds[callee]:
+            self.seeds[callee][param] = kind
+            self._pending.append(callee)
+        return True
+
+    def _describe(self, node):
+        """The use, as source: the largest expression it sits in, or the first line of
+        the statement or match case that holds it."""
+        while not isinstance(node, (ast.stmt, ast.match_case)):
+            parent = self.parents[node]
+            if isinstance(parent, ast.stmt) and not isinstance(node, ast.pattern):
+                break
+            node = parent
+        if isinstance(node, ast.match_case):
+            guard = f" if {ast.unparse(node.guard)}" if node.guard else ""
+            return f"case {ast.unparse(node.pattern)}{guard}:"
+        if isinstance(node, ast.expr) and not isinstance(
+            self.parents[node], (ast.If, ast.While, ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Expr, ast.Assert)
+        ):
+            node = self.parents[node]
+        return ast.unparse(node).splitlines()[0]
+
+
+def test_owner_key_reaches_only_the_digest():
+    findings = OwnerKeyUses(inspect.getsource(auth)).findings
+    assert findings == [], "app.auth uses the owner key outside hmac.compare_digest:\n" + "\n".join(findings)
+
+
+def test_owner_key_guard_finds_every_surface():
+    # The guard finds the surfaces itself, from the calls to is_owner_key. These are
+    # the ones on main: a change that stopped it finding one fails here.
+    assert {
+        ("is_owner_key", "presented"),
+        ("require_api_key", "x_api_key"),
+        ("OwnerKeyVerifier.verify_token", "token"),
+    } <= OwnerKeyUses(inspect.getsource(auth)).presented
+
+
+def _mutated_auth_source(edits):
+    source = inspect.getsource(auth)
+    for anchor, replacement in edits:
+        assert source.count(anchor) == 1, f"mutation anchor is not in app/auth.py exactly once: {anchor!r}"
+        source = source.replace(anchor, replacement)
+    return source
+
+
+def _before(anchor, lines):
+    return (anchor, "".join(lines) + anchor)
+
+
+VERIFY_CHECK = "        if not is_owner_key(token):\n"
+REST_CHECK = "    if not is_owner_key(x_api_key):\n"
+DIGEST = "    return hmac.compare_digest(presented.encode(), expected.encode())\n"
+LOG = 'logging.getLogger(__name__).debug("Owner credential matched")\n'
+
+# Changes to app/auth.py that leave every behavioural test above green: each one
+# compares the owner key, and the digest still decides. They are the three kinds the
+# briefed review of PR #48 found (finding 1): an `==` feeding a log line in a caller,
+# the same in a helper that is_owner_key calls, and other comparisons than `==`
+# inside is_owner_key. The last two (a hash compared in a helper, a module-level
+# copy of the key) are ways around the guard itself.
+SURVIVORS = {
+    "verify-token-logs-a-match": (
+        [_before(VERIFY_CHECK, ["        if token == settings.api_key:\n", "            " + LOG])],
+        "OwnerKeyVerifier.verify_token",
+        "token == settings.api_key",
+    ),
+    "require-api-key-logs-a-match": (
+        [_before(REST_CHECK, ["    if x_api_key == settings.api_key:\n", "        " + LOG])],
+        "require_api_key",
+        "x_api_key == settings.api_key",
+    ),
+    "helper-logs-a-match": (
+        [
+            (DIGEST, "    return _compare(presented)\n"),
+            _before(
+                "def is_owner_key(",
+                [
+                    "def _compare(presented):\n",
+                    "    if presented == settings.api_key:\n",
+                    "        " + LOG,
+                    "    return hmac.compare_digest(presented.encode(), settings.api_key.encode())\n\n\n",
+                ],
+            ),
+        ],
+        "_compare",
+        "presented == settings.api_key",
+    ),
+    "startswith": (
+        [_before(DIGEST, ["    prefix = presented.startswith(settings.api_key)\n"])],
+        "is_owner_key",
+        "presented.startswith(settings.api_key)",
+    ),
+    "set-membership": (
+        [_before(DIGEST, ["    member = presented in {settings.api_key}\n"])],
+        "is_owner_key",
+        "presented in {settings.api_key}",
+    ),
+    "set-issuperset": (
+        [_before(DIGEST, ["    member = {settings.api_key}.issuperset({presented})\n"])],
+        "is_owner_key",
+        "{settings.api_key}.issuperset({presented})",
+    ),
+    "dict-lookup": (
+        [_before(DIGEST, ['    known = {settings.api_key: "owner"}.get(presented)\n'])],
+        "is_owner_key",
+        "{settings.api_key: 'owner'}.get(presented)",
+    ),
+    "operator-eq": (
+        [_before(DIGEST, ["    same = operator.eq(presented, expected)\n"])],
+        "is_owner_key",
+        "operator.eq(presented, expected)",
+    ),
+    "match": (
+        [_before(DIGEST, ["    match presented:\n", "        case settings.api_key:\n", "            " + LOG])],
+        "is_owner_key",
+        "case settings.api_key:",
+    ),
+    "hash-equality": (
+        [_before(DIGEST, ["    same = sha256(presented.encode()).digest() == sha256(expected.encode()).digest()\n"])],
+        "is_owner_key",
+        "sha256(presented.encode()).digest() == sha256(expected.encode()).digest()",
+    ),
+    "hash-equality-in-a-helper": (
+        [
+            _before(DIGEST, ["    _same_hash(presented, expected)\n"]),
+            _before(
+                "def is_owner_key(",
+                [
+                    "def _same_hash(a, b):\n",
+                    "    return sha256(a.encode()).digest() == sha256(b.encode()).digest()\n\n\n",
+                ],
+            ),
+        ],
+        "_same_hash",
+        "return sha256(a.encode()).digest() == sha256(b.encode()).digest()",
+    ),
+    "module-level-copy": (
+        [
+            _before("def is_owner_key(", ["OWNER_KEY = settings.api_key\n\n\n"]),
+            _before(DIGEST, ["    same = presented == OWNER_KEY\n"]),
+        ],
+        "<module>",
+        "OWNER_KEY = settings.api_key",
+    ),
+}
+
+
+@pytest.mark.parametrize(("edits", "function", "comparison"), SURVIVORS.values(), ids=SURVIVORS)
+def test_owner_key_guard_names_each_comparison(edits, function, comparison):
+    findings = OwnerKeyUses(_mutated_auth_source(edits)).findings
+    assert any(f.startswith(f"{function}, line ") and f.endswith(f": {comparison}") for f in findings), (
+        f"the guard did not report `{comparison}` in {function}; it reported {findings}"
+    )
+
+
+# Changes that compare nothing secret. The guard must leave them alone, or it would be
+# a ban on touching the key rather than a check on comparing it.
+ALLOWED = {
+    "presented-is-none": [
+        _before("    expected = settings.api_key\n", ["    if presented is None:\n", "        return False\n"]),
+    ],
+    "configured-is-not-none": [
+        _before("    if not presented or not expected:\n", ["    assert expected is not None\n"]),
+    ],
+    "configured-read-into-the-digest": [
+        (DIGEST, "    return hmac.compare_digest(presented.encode(), settings.api_key.encode())\n"),
+    ],
+    "helper-that-only-digests": [
+        (DIGEST, "    return _digest(presented, expected)\n"),
+        _before(
+            "def is_owner_key(",
+            ["def _digest(a, b):\n", "    return hmac.compare_digest(a.encode(), b.encode())\n\n\n"],
+        ),
+    ],
+}
+
+
+@pytest.mark.parametrize("edits", ALLOWED.values(), ids=ALLOWED)
+def test_owner_key_guard_allows_what_compares_nothing(edits):
+    # Measured against app/auth.py as it stands, so that these fail only for their own
+    # reason: a finding in the module itself is test_owner_key_reaches_only_the_digest's
+    def uses(source):
+        # Without line numbers, which the edits shift
+        return {re.sub(r", line \d+:", ":", f) for f in OwnerKeyUses(source).findings}
+
+    assert uses(_mutated_auth_source(edits)) - uses(inspect.getsource(auth)) == set()
 
 
 # --- Session reuse ------------------------------------------------------------------
