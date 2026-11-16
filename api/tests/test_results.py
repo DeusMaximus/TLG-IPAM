@@ -713,7 +713,8 @@ async def test_ingest_writes_no_host_and_no_change_entry(client, agent_api):
     assert {c: after[c] for c in columns} == {c: before[c] for c in columns}
     assert count == 1  # no host created for the unknown address
     got = (await client.get(f"/api/v1/hosts/{host['id']}")).json()["data"]
-    assert got["mac"] is None and got["last_seen"] is None
+    # the stored column is untouched (above); the response derives last_seen on read (#12)
+    assert got["mac"] is None and got["last_seen_source"] == "scan"
 
 
 def test_the_ingest_module_does_not_reach_hosts_or_the_change_log():

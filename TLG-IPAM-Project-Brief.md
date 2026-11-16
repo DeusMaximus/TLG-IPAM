@@ -123,7 +123,8 @@ A single IP assignment within a Subnet.
 | `status` | enum: `active` \| `reserved` \| `dhcp` \| `offline` |
 | `owner` | str, nullable — e.g. `proxmox`, `personal` |
 | `notes` | text, nullable |
-| `last_seen` | datetime, nullable — set manually or via future ping sweep |
+| `last_seen` | datetime, nullable — the stored column is set by hand: writable, and cleared by writing null (`clear_fields: ["last_seen"]` over MCP). A value sent with a UTC offset is converted to UTC before it is stored. Responses show the later of the stored value and the `last_seen_at` of the observation at the host's subnet and address (§3.11), derived on read: scan ingest never writes hosts. Clearing the stored value therefore still shows the scan time if the address has been seen |
+| `last_seen_source` | output only: `manual` (the stored value), `scan` (the observation; also on a tie), or null when neither exists. Taken from the observation's `last_seen_at`, never from `alive`, so an address a later sweep missed still shows when it last answered |
 | `created_at` / `updated_at` | datetime, auto-managed |
 
 ### 3.5 DeviceType
@@ -232,7 +233,7 @@ Rules: one target per subnet (`409`, also enforced by `UNIQUE(subnet_id)`). Unkn
 
 ### 3.11 Observation
 
-The latest scan state of one address (v0.2 spec §5.4), upserted by results ingest (§4.6). `UNIQUE(subnet_id, ip)`. No history, and no route reads it yet: `last_seen` on hosts (#12) and findings (#15) do.
+The latest scan state of one address (v0.2 spec §5.4), upserted by results ingest (§4.6). `UNIQUE(subnet_id, ip)`. No history. Host responses read it for `last_seen` (§3.4), in one query per batch of hosts; findings (#15) will read it too.
 
 | Field | Type / notes |
 |---|---|
@@ -440,11 +441,11 @@ Tool descriptions are the documentation Claude reads at runtime — write them w
 | `get_subnet` | Full detail for a subnet: VLAN tag, gateway, DNS servers, DHCP pool, utilisation, and free-IP count — one call, no follow-ups needed. Shows each reserved range's `scan_excluded` and the subnet's `scan_dhcp_pool` (null when the subnet has no scan target), so an assistant can explain why an address is not scanned. `list_subnets` returns the same shape. |
 | `get_free_ips` | Return unallocated IPs in a subnet (respects gateway, DHCP-pool, reserved-range, and network/broadcast exclusions). Use before allocating to check availability or find a specific address. |
 | `list_hosts` | Search and filter host records across the network. Free-text search (hostname, IP, MAC) plus filtering by subnet or status. |
-| `get_host` | Full detail for a specific host record including MAC, device type, owner, and last seen. |
+| `get_host` | Full detail for a specific host record including MAC, device type, owner, and last seen: `last_seen` is the later of the manual value and the scan's, and `last_seen_source` (`manual`, `scan` or null) says which (§3.4). `list_hosts` and every tool that returns a host return the same shape. |
 | `create_host` | Register a new host at a specific IP address. Validates that it is assignable within the target subnet and not already allocated. Manual placement at the gateway or inside DHCP/reserved ranges is allowed. |
 | `bulk_create_hosts` | Create many hosts in one subnet in a single call (e.g. importing devices from a UniFi export). Per-record results; duplicates skipped, bad records errored, batch never aborts. One audit entry. |
 | `allocate_next_ip` | Allocate the next available IP in a subnet and create a host record in one step. Use when the caller does not need a specific IP address. |
-| `update_host` | Update hostname, domain override, MAC address, status, device type, owner, or notes for an existing host record. Pass nullable field names in `clear_fields` to clear them; clearing a domain override restores subnet-domain inheritance. |
+| `update_host` | Update hostname, domain override, MAC address, status, device type, owner, or notes for an existing host record. Pass nullable field names in `clear_fields` to clear them; clearing a domain override restores subnet-domain inheritance. Clearing `last_seen` removes only the manual value: a host whose address a scan has seen still shows the scan time, with `last_seen_source: scan`. |
 | `delete_host` | Remove a host record, freeing the IP address for future allocation. |
 | `bulk_delete_hosts` | Delete many hosts by ID in one call (cleanup workflows). Returns deleted count + not-found IDs. |
 | `add_reserved_range` | Reserve a block of IPs in a subnet so automatic allocation skips it (manual creation inside it stays allowed). Always creates a scanned range: the tool has no `scan_excluded` argument. |
