@@ -9,6 +9,7 @@ from fastmcp import Client
 from sqlalchemy import event, select
 
 from app.database import SessionLocal, engine
+from app.ipnet import parse_ip
 from app.mcp_server import mcp
 from app.models import Host, Observation
 from app.services import hosts as hosts_svc
@@ -27,7 +28,7 @@ async def _subnet(client, cidr="10.0.0.0/24", name="lab"):
 
 
 async def observe(subnet_id, ip, seen=SCAN, alive=True):
-    addr = int.from_bytes(bytes(int(part) for part in ip.split(".")), "big")
+    addr = int(parse_ip(ip))
     async with SessionLocal() as session:
         session.add(
             Observation(
