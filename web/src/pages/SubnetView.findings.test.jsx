@@ -266,15 +266,54 @@ describe('acceptance: a skipped accept shows its reason', () => {
     expect(status).toHaveTextContent('10.20.0.41 (Unknown hosts): error, ip: 10.20.0.41 is already allocated')
   })
 
-  it('a request the server refuses whole is reported, with nothing claimed as done', async () => {
+  it('a request refused whole (4xx) is reported as not sent, with nothing reloaded', async () => {
     const user = userEvent.setup()
-    ipam.dismissFindings.mockRejectedValue(new ApiError('HTTP_502', 'Bad Gateway', 502))
+    ipam.dismissFindings.mockRejectedValue(new ApiError('VALIDATION_ERROR', 'findings: too many', 422))
     renderView()
     const group = await within(await findPanel()).findByRole('group', { name: 'MAC mismatch' })
+    const lists = ipam.listFindings.mock.calls.length
     await user.click(within(group).getByRole('button', { name: 'Dismiss 10.20.0.5' }))
     const status = await within(panel()).findByRole('status')
     expect(status).toHaveTextContent('0 dismissed, 1 not sent.')
-    expect(status).toHaveTextContent('The request failed: Bad Gateway')
+    expect(status).toHaveTextContent('The request failed: findings: too many')
+    expect(status).not.toHaveTextContent('unknown')
+    expect(ipam.listFindings.mock.calls.length).toBe(lists)
+  })
+
+  it('an accept that fails with no answer is reported as unknown, and reloads the hosts and the tree', async () => {
+    const user = userEvent.setup()
+    // the server committed the record, then failed (or its answer was lost)
+    ipam.acceptFindings.mockImplementation(async () => {
+      db.hosts[0].mac = 'bb:bb:bb:bb:bb:01'
+      db.findings = db.findings.filter((f) => f.type !== 'mac_mismatch')
+      throw new ApiError('HTTP_502', 'Bad Gateway', 502)
+    })
+    renderView()
+    const group = await within(await findPanel()).findByRole('group', { name: 'MAC mismatch' })
+    await waitFor(() => expect(ipam.listSubnets).toHaveBeenCalled())
+    const tree = ipam.listSubnets.mock.calls.length
+    const hosts = ipam.listHosts.mock.calls.length
+    await user.click(within(group).getByRole('button', { name: 'Replace MAC 10.20.0.5' }))
+    const status = await within(panel()).findByRole('status')
+    expect(status).toHaveTextContent('0 accepted, 1 unknown.')
+    expect(status).toHaveTextContent('The request failed: Bad Gateway — 1 finding(s) were sent with no answer')
+    // what the server wrote shows
+    await waitFor(() => expect(within(hostRow('10.20.0.5')).getByText('bb:bb:bb:bb:bb:01')).toBeInTheDocument())
+    expect(ipam.listSubnets.mock.calls.length).toBeGreaterThan(tree)
+    expect(ipam.listHosts.mock.calls.length).toBeGreaterThan(hosts)
+    expect(within(panel()).queryByRole('group', { name: 'MAC mismatch' })).toBeNull()
+  })
+
+  it('a dismiss that fails with no answer is reported as unknown, and reloads the findings', async () => {
+    const user = userEvent.setup()
+    ipam.dismissFindings.mockRejectedValue(new TypeError('Failed to fetch'))
+    renderView()
+    const group = await within(await findPanel()).findByRole('group', { name: 'MAC mismatch' })
+    const lists = ipam.listFindings.mock.calls.length
+    await user.click(within(group).getByRole('button', { name: 'Dismiss 10.20.0.5' }))
+    const status = await within(panel()).findByRole('status')
+    expect(status).toHaveTextContent('0 dismissed, 1 unknown.')
+    await waitFor(() => expect(ipam.listFindings.mock.calls.length).toBeGreaterThan(lists))
   })
 })
 
@@ -479,7 +518,7 @@ describe('show dynamic', () => {
 })
 
 describe('last seen on host rows', () => {
-  it('reads "not scanned" outside the server’s scope, and dates as UTC', async () => {
+  it('reads dates as UTC with their source, and makes no scope claim the server has not made', async () => {
     const ago = new Date(Date.UTC(2026, 10, 15, 23, 30))
     seed({
       hosts: [
@@ -488,20 +527,40 @@ describe('last seen on host rows', () => {
           last_seen_source: 'scan',
         }),
         host('h2', '10.20.0.6'),
-        host('h3', '10.20.0.150'), // in the pool, which is not scanned
+        // in the pool, which is not scanned: the target's scope ranges are address
+        // strings, which the UI does not compare, so it says nothing either way
+        host('h3', '10.20.0.150'),
         host('h4', '10.20.0.151', { last_seen: '2026-10-01T12:00:00', last_seen_source: 'manual' }),
       ],
       findings: [],
     })
     renderView()
-    await screen.findByText('10.20.0.150')
-    await waitFor(() => expect(within(hostRow('10.20.0.150')).getByText('not scanned')).toBeInTheDocument())
+    await screen.findByRole('table', { name: 'Hosts' })
+    await waitFor(() => expect(ipam.listScanTargets).toHaveBeenCalled())
+    await screen.findByRole('region', { name: 'Findings' }) // the target has loaded
     const seen = within(hostRow('10.20.0.5')).getByText(ago.toLocaleDateString())
     expect(seen.closest('[role="cell"]')).toHaveAttribute('title', `${ago.toLocaleString()} (seen by a scan)`)
-    expect(within(hostRow('10.20.0.6')).getByText('never')).toBeInTheDocument()
-    // a date set by hand still shows outside the scope, marked as not scanned
-    const manual = hostRow('10.20.0.151')
-    expect(manual).toHaveTextContent(`${new Date(Date.UTC(2026, 9, 1, 12)).toLocaleDateString()} · not scanned`)
+    expect(within(hostRow('10.20.0.6')).getAllByRole('cell').at(-1)).toHaveTextContent(/^—$/)
+    expect(within(hostRow('10.20.0.150')).getAllByRole('cell').at(-1)).toHaveTextContent(/^—$/)
+    expect(hostRow('10.20.0.151')).toHaveTextContent(
+      `${new Date(Date.UTC(2026, 9, 1, 12)).toLocaleDateString()} · manual`
+    )
+    expect(screen.queryByText('not scanned')).toBeNull()
+  })
+
+  it('a date set by hand on a host of a subnet with no scan target reads as not scanned', async () => {
+    seed({
+      target: null,
+      findings: [],
+      hosts: [host('h1', '10.20.0.5', { last_seen: '2026-10-01T12:00:00', last_seen_source: 'manual' })],
+    })
+    renderView()
+    await screen.findByRole('table', { name: 'Hosts' })
+    await waitFor(() =>
+      expect(hostRow('10.20.0.5')).toHaveTextContent(
+        `${new Date(Date.UTC(2026, 9, 1, 12)).toLocaleDateString()} · not scanned`
+      )
+    )
   })
 
   it('reads "not scanned" for every host when the subnet has no scan target', async () => {

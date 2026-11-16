@@ -37,8 +37,9 @@ export default function HostTable({
   selected,
   onToggle,
   onToggleAll,
-  // (host) => 'in' | 'out' | null: whether the host is inside its subnet's scan scope,
-  // as the server reports the scope. Without it the column shows the date alone.
+  // (host) => 'out' | null: 'out' when the server's answers say the host is outside its
+  // subnet's scan scope (utils/findings scopeChecker). Without it the column shows the
+  // date alone.
   scopeOf = null,
 }) {
   const [sortDirection, setSortDirection] = useState('asc')

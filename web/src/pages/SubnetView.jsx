@@ -95,7 +95,7 @@ export default function SubnetView() {
   }
 
   const hostsById = Object.fromEntries(hosts.map((h) => [h.id, h]))
-  // the server's scope, read per host: 'in', 'out', or null while it is not known
+  // 'out' for every host when the subnet has no scan target; otherwise not known here
   const scopeOf = scopeChecker({ loaded: targetsLoaded, target })
   const showFindings = Boolean(target) || findings.length > 0
 

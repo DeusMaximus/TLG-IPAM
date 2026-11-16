@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest'
 import {
-  addressValue,
   chunk,
   domainOverride,
   findingKey,
@@ -132,41 +131,20 @@ describe('what a finding shows', () => {
 })
 
 describe('scope and last seen', () => {
-  it('reads IPv4 and IPv6 addresses, and refuses what is not one', () => {
-    expect(addressValue('10.0.0.1')).toBe(167772161n)
-    expect(addressValue('255.255.255.255')).toBe(4294967295n)
-    expect(addressValue('10.0.0.256')).toBeNull()
-    expect(addressValue('::1')).toBe(1n)
-    expect(addressValue('2001:db8::1')).toBe((0x20010db8n << 96n) + 1n)
-    expect(addressValue('::ffff:10.0.0.1')).toBe((0xffffn << 32n) + 167772161n)
-    expect(addressValue('1:2:3:4:5:6:7:8') & 0xffffn).toBe(8n)
-    for (const bad of ['', 'nas', '1:2:3', '1::2::3', '1:2:3:4:5:6:7:8:9', '12345::', null]) {
-      expect(addressValue(bad)).toBeNull()
-    }
-  })
-
-  it('checks a host against the server’s ranges, inclusive at both ends', () => {
-    const inScope = scopeChecker({
-      loaded: true,
-      target: { scope: [{ start: '10.0.0.1', end: '10.0.0.99' }, { start: '10.0.0.201', end: '10.0.0.254' }] },
-    })
-    expect(inScope({ ip: '10.0.0.1' })).toBe('in')
-    expect(inScope({ ip: '10.0.0.99' })).toBe('in')
-    expect(inScope({ ip: '10.0.0.100' })).toBe('out')
-    expect(inScope({ ip: '10.0.0.201' })).toBe('in')
-    expect(scopeChecker({ loaded: true, target: { scope: [] } })({ ip: '10.0.0.1' })).toBe('out')
+  it('says a host is outside scope only when the subnet has no scan target', () => {
     expect(scopeChecker({ loaded: true, target: null })({ ip: '10.0.0.1' })).toBe('out')
     expect(scopeChecker({ loaded: false, target: null })({ ip: '10.0.0.1' })).toBeNull()
-    // a range it cannot read: no claim either way
-    expect(scopeChecker({ loaded: true, target: { scope: [{ start: 'x', end: '10.0.0.9' }] } })({ ip: '10.0.0.1' })).toBeNull()
+    // the ranges are address strings: the UI does not compare them with a host
+    const target = { scope: [{ start: '10.0.0.1', end: '10.0.0.9' }] }
+    expect(scopeChecker({ loaded: true, target })({ ip: '10.0.0.200' })).toBeNull()
+    expect(scopeChecker({ loaded: true, target: { scope: [] } })({ ip: '10.0.0.1' })).toBeNull()
   })
 
   it('the last-seen cell', () => {
     expect(lastSeenCell({ last_seen: null }, 'out')).toMatchObject({ text: 'not scanned', notScanned: true })
-    expect(lastSeenCell({ last_seen: null }, 'in')).toMatchObject({ text: 'never', notScanned: false })
     expect(lastSeenCell({ last_seen: null }, null)).toMatchObject({ text: '—' })
     const at = new Date(Date.UTC(2026, 10, 15, 23, 30))
-    const cell = lastSeenCell({ last_seen: '2026-11-15T23:30:00.123456', last_seen_source: 'manual' }, 'in')
+    const cell = lastSeenCell({ last_seen: '2026-11-15T23:30:00.123456', last_seen_source: 'manual' }, null)
     expect(cell).toMatchObject({ text: at.toLocaleDateString(), source: 'manual', notScanned: false })
     expect(cell.title).toBe(`${new Date(Date.UTC(2026, 10, 15, 23, 30, 0, 123)).toLocaleString()} (set by hand)`)
   })

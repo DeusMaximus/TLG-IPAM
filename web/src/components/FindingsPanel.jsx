@@ -61,8 +61,13 @@ function Proposal({ finding, subnet, host }) {
   )
 }
 
+// A 4xx answer refuses the request as a whole before anything is written (a body the
+// server will not read, a missing or wrong key). Anything else (a 5xx, or no answer at
+// all) leaves what was written unknown.
+const refusedWhole = (err) => err?.status >= 400 && err.status < 500
+
 function Outcome({ outcome, onClose }) {
-  const { verb, done, lines, failure, unsent } = outcome
+  const { verb, done, lines, failure, unknown, unsent } = outcome
   const past = verb === 'accept' ? 'accepted' : 'dismissed'
   return (
     <div
@@ -73,6 +78,7 @@ function Outcome({ outcome, onClose }) {
         <p>
           {done} {past}
           {lines.length > 0 && `, ${lines.length} not ${past}`}
+          {unknown > 0 && `, ${unknown} unknown`}
           {unsent > 0 && `, ${unsent} not sent`}.
         </p>
         <button type="button" onClick={onClose} aria-label="Close result" className="text-slate-500 hover:text-slate-300">
@@ -95,6 +101,8 @@ function Outcome({ outcome, onClose }) {
       {failure && (
         <p className="mt-1 text-red-400">
           The request failed: {failure}
+          {unknown > 0 &&
+            ` — ${unknown} finding(s) were sent with no answer, so some may have been ${past}: the view has been reloaded to show what the server has now.`}
           {unsent > 0 && ` ${unsent} finding(s) were not sent.`}
         </p>
       )}
@@ -235,6 +243,10 @@ export default function FindingsPanel({
     const reports = []
     const sizes = []
     let failure = null
+    // keys in a request that failed without a refusal: the server may have written some
+    // of them (accept commits each record on its own) before it failed, or answered and
+    // the answer was lost
+    let unknown = 0
     for (const part of chunk(list)) {
       try {
         const res = await call(part.map(findingKey))
@@ -242,18 +254,29 @@ export default function FindingsPanel({
         sizes.push(part.length)
       } catch (err) {
         failure = err.message
+        if (!refusedWhole(err)) unknown = part.length
         break
       }
     }
     const report = mergeReports(reports, sizes, done)
-    const sent = sizes.reduce((a, b) => a + b, 0)
+    const answered = sizes.reduce((a, b) => a + b, 0)
     const lines = notDone(report, list, done)
-    setOutcome({ verb, done: report[done], lines, failure, unsent: list.length - sent })
+    setOutcome({
+      verb,
+      done: report[done],
+      lines,
+      failure,
+      unknown,
+      unsent: list.length - answered - unknown,
+    })
     if (report[done] > 0) toast.success(`${report[done]} finding(s) ${done}`)
     if (failure) toast.error(failure)
     setBusy(false)
-    // whatever the answer, reload: a skipped finding changed, and the list shows it now
-    if (sent > 0) await onWritten(verb === 'accept' && report[done] > 0)
+    // Reload after anything that may have been written: a skipped finding changed, and
+    // the list shows it now; an accept of unknown outcome may have written hosts.
+    if (answered + unknown > 0) {
+      await onWritten(verb === 'accept' && (report[done] > 0 || unknown > 0))
+    }
   }
 
   return (

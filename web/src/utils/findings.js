@@ -189,62 +189,20 @@ export function mergeReports(reports, sizes, done) {
 
 // --- Scan scope and last seen ---
 
-// An address as a BigInt, for comparing a host with the server's scope ranges, or null
-// when the text is not an address. The scope ranges carry no integer form, so their
-// ends are read here; which addresses are in scope is still the server's answer.
-export function addressValue(text) {
-  const s = String(text ?? '')
-  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s)
-  if (v4) {
-    const octets = v4.slice(1).map(Number)
-    if (octets.some((o) => o > 255)) return null
-    return octets.reduce((total, o) => total * 256n + BigInt(o), 0n)
-  }
-  if (!s.includes(':')) return null
-  let tail = []
-  let head = s
-  const embedded = /^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/.exec(s)
-  if (embedded) {
-    const v = addressValue(embedded[2])
-    if (v == null) return null
-    tail = [Number(v >> 16n), Number(v & 0xffffn)]
-    head = embedded[1].endsWith('::') ? embedded[1] : embedded[1].slice(0, -1)
-  }
-  const halves = head.split('::')
-  if (halves.length > 2) return null
-  const groups = (part) => (part === '' ? [] : part.split(':'))
-  const left = groups(halves[0])
-  const right = halves.length === 2 ? groups(halves[1]) : []
-  if ([...left, ...right].some((g) => !/^[0-9a-fA-F]{1,4}$/.test(g))) return null
-  const known = left.length + right.length + tail.length
-  if (halves.length === 1 ? known !== 8 : known > 7) return null
-  const words = [
-    ...left.map((g) => parseInt(g, 16)),
-    ...Array(8 - known).fill(0),
-    ...right.map((g) => parseInt(g, 16)),
-    ...tail,
-  ]
-  return words.reduce((total, w) => total * 65536n + BigInt(w), 0n)
-}
-
-// Whether each host is inside the subnet's scan scope: 'in', 'out', or null when that
-// is not known (the scan targets have not loaded, or a range end could not be read).
-// `targetState` is { loaded, target }: a subnet with no scan target scans nothing.
+// Whether each host is outside the subnet's scan scope: 'out', or null when the server
+// has not said. The UI never works scope out, and does no address arithmetic (IP maths
+// stays in the backend's `ipnet.py`): the scan target's `scope` ranges carry address
+// strings only, so they cannot be compared with a host here. What the server's answers
+// do settle is a subnet with no scan target, which scans nothing. `targetState` is
+// { loaded, target }; while the targets have not loaded, nothing is known.
 export function scopeChecker({ loaded, target }) {
-  if (!loaded) return () => null
-  if (!target) return () => 'out'
-  const ranges = (target.scope || []).map((r) => [addressValue(r.start), addressValue(r.end)])
-  if (ranges.some(([a, b]) => a == null || b == null)) return () => null
-  return (host) => {
-    const v = addressValue(host.ip)
-    if (v == null) return null
-    return ranges.some(([a, b]) => a <= v && v <= b) ? 'in' : 'out'
-  }
+  if (loaded && !target) return () => 'out'
+  return () => null
 }
 
 const SOURCE_TEXT = { scan: 'seen by a scan', manual: 'set by hand' }
 
-// The last-seen cell of a host row. `scope` is 'in', 'out' or null (not known).
+// The last-seen cell of a host row. `scope` is 'out' or null (not known).
 // `last_seen` is the later of the value set by hand and the scan's (spec §5.4), and
 // `last_seen_source` says which.
 export function lastSeenCell(host, scope = null) {
@@ -252,7 +210,7 @@ export function lastSeenCell(host, scope = null) {
   const notScanned = scope === 'out'
   if (!date) {
     if (notScanned) return { text: 'not scanned', title: 'Outside this subnet’s scan scope', notScanned }
-    return { text: scope === 'in' ? 'never' : '—', title: null, notScanned }
+    return { text: '—', title: null, notScanned }
   }
   const source = SOURCE_TEXT[host.last_seen_source]
   return {
