@@ -1378,6 +1378,49 @@ async def test_an_owner_refusal_after_authentication_refuses_the_checkin(
         assert (newest["after"]["name"], newest["after"]["state"]) == ("renamed", "disabled")
 
 
+@pytest.mark.parametrize(
+    "owner_edit", [_rename_and_disable, _revoke, _delete], ids=["disable", "revoke", "delete"]
+)
+async def test_a_recent_slot_is_refused_with_429_before_the_owner_refusal_is_read(
+    client, agent_api, checkin_limit, monkeypatch, owner_edit
+):
+    """Issue #73 (review of PR #71, finding 1). The in-flight 403 has one exception: a
+    check-in whose agent row, as loaded at authentication, took its slot inside the gap
+    is refused from that row with 429, before the claim's SQL (which would answer 403)
+    runs. Whatever the owner committed in between, the 429 writes nothing; the next
+    request then meets the owner's refusal as an ordinary 403. Nothing is served."""
+    agent, token = await make_agent(client)
+    assert (await checkin(agent_api, token)).status_code == 200
+    now = _now()
+    await set_times(
+        agent["id"], checked_in=now - timedelta(seconds=1), used=now - timedelta(minutes=1)
+    )
+    seen = {}
+    real = jobs._claim
+
+    async def edited_first(*args):
+        await owner_edit(client, agent)
+        seen["rows"], seen["writes"] = database_rows(), len(writes)
+        return await real(*args)
+
+    monkeypatch.setattr(jobs, "_claim", edited_first)
+
+    with statements() as writes:
+        res = await checkin(agent_api, token, hostname="other")
+
+    assert res.status_code == 429, res.text
+    assert res.json()["error"]["code"] == "RATE_LIMITED"
+    assert seen, "the check-in never reached the claim"
+    # nothing after the owner's edit: no statement, and every row as the owner left it
+    assert writes[seen["writes"] :] == []
+    assert database_rows() == seen["rows"]
+    # the next request is refused by authentication, as for any disabled agent
+    monkeypatch.setattr(jobs, "_claim", real)
+    again = await checkin(agent_api, token)
+    assert again.status_code == 403, again.text
+    assert again.json()["error"] == {"code": "FORBIDDEN", "message": "Invalid agent token"}
+
+
 async def test_a_rename_after_authentication_is_the_name_the_checkin_logs(
     client, agent_api, monkeypatch
 ):
