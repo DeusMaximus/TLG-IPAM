@@ -8,8 +8,9 @@ Scan targets and scan scope are configured by the owner over REST only. No MCP t
 creates, changes or lists a scan target, and no MCP call can widen the scope
 (spec §7.2, invariant 2); `list_changes` still shows their audit entries.
 
-Observations exist only inside the scope. Every write that can narrow it calls
-`drop_out_of_scope` in its own transaction (spec §5.3, "leaving scope deletes data").
+Observations and finding dismissals exist only inside the scope. Every write that can
+narrow it calls `drop_out_of_scope` in its own transaction (spec §5.3, "leaving scope
+deletes data").
 
 This module reads subnets and reserved ranges straight from the models rather than
 through `services/subnets`, which imports it.
@@ -25,7 +26,7 @@ from sqlalchemy.orm.attributes import set_committed_value
 
 from ..errors import ApiError, conflict, not_found, validation_error
 from ..ipnet import format_intervals, parse_cidr, parse_ip, subtract_intervals, usable_bounds
-from ..models import Agent, Observation, ReservedRange, ScanTarget, Subnet
+from ..models import Agent, FindingDismissal, Observation, ReservedRange, ScanTarget, Subnet
 from ..schemas import ScanTargetCreate, ScanTargetOut, ScanTargetUpdate
 from . import changes
 
@@ -96,12 +97,13 @@ async def _scope_as_committed(
     return cidr, scope
 
 
-async def scan_scope(session: AsyncSession, subnet: Subnet) -> list[tuple[int, int]]:
+async def scan_scope(session: AsyncSession, subnet: Subnet | str) -> list[tuple[int, int]]:
     """The subnet's scan scope: merged, inclusive integer address ranges, ascending.
     A subnet without a scan target gets the default scope (DHCP pool not scanned).
-    Read as committed (`_scope_as_committed`): `subnet` names the subnet, and its
-    loaded attributes are not used. A deleted subnet has an empty scope."""
-    found = await _scope_as_committed(session, subnet.id)
+    Read as committed (`_scope_as_committed`): `subnet` names the subnet, as the loaded
+    subnet or its id, and its loaded attributes are not used. A deleted subnet has an
+    empty scope."""
+    found = await _scope_as_committed(session, subnet if isinstance(subnet, str) else subnet.id)
     return found[1] if found else []
 
 
@@ -131,8 +133,8 @@ def in_scope(scope: list[tuple[int, int]], ip_int: int) -> bool:
 
 
 async def drop_out_of_scope(session: AsyncSession, subnet: Subnet) -> None:
-    """Delete the subnet's observations outside its scan scope as it now stands: the
-    "leaving scope" rule (spec §5.3). Every write that can narrow the scope calls this
+    """Delete the subnet's observations and finding dismissals outside its scan scope as
+    it now stands: the "leaving scope" rule (spec §5.3). Every write that can narrow the scope calls this
     in its own transaction, after its change (pool scanning turned off or the target
     deleted, a range excluded, the pool or the CIDR edited). Does not commit.
 
@@ -143,8 +145,9 @@ async def drop_out_of_scope(session: AsyncSession, subnet: Subnet) -> None:
     when the caller's own change wrote nothing, and `scan_scope` then reads the scope
     as committed. The caller's own change is flushed first and is part of it.
 
-    The rows deleted are scan state, not owner records, and are not audit-logged; the
-    write that narrowed the scope is. (#15 adds dismissals, which go the same way.)
+    The rows deleted are not audit-logged; the write that narrowed the scope is.
+    Observations are scan state. A dismissal is the owner's, but it only ever hides a
+    finding, and an address out of scope raises none (spec §5.5).
     """
     await session.flush()
     await take_write_lock(session)
@@ -152,25 +155,28 @@ async def drop_out_of_scope(session: AsyncSession, subnet: Subnet) -> None:
     # Membership is decided here with `in_scope`, not in SQL: a scope can hold more
     # ranges than SQLite's expression-depth limit allows as OR branches, and a statement
     # that failed would roll back the owner's edit.
-    rows = await session.execute(
-        select(Observation.id, Observation.ip_int).where(Observation.subnet_id == subnet.id)
-    )
-    gone = [row_id for row_id, ip_int in rows.all() if not in_scope(scope, ip_int)]
-    for i in range(0, len(gone), _DELETE_BATCH):
+    for model in (Observation, FindingDismissal):
+        rows = await session.execute(
+            select(model.id, model.ip_int).where(model.subnet_id == subnet.id)
+        )
+        gone = [row_id for row_id, ip_int in rows.all() if not in_scope(scope, ip_int)]
+        for i in range(0, len(gone), _DELETE_BATCH):
+            await session.execute(
+                delete(model)
+                .where(model.id.in_(gone[i : i + _DELETE_BATCH]))
+                .execution_options(synchronize_session="fetch")
+            )
+
+
+async def delete_scan_data(session: AsyncSession, subnet: Subnet) -> None:
+    """Delete every observation and finding dismissal of the subnet, as part of deleting
+    it. Does not commit."""
+    for model in (Observation, FindingDismissal):
         await session.execute(
-            delete(Observation)
-            .where(Observation.id.in_(gone[i : i + _DELETE_BATCH]))
+            delete(model)
+            .where(model.subnet_id == subnet.id)
             .execution_options(synchronize_session="fetch")
         )
-
-
-async def delete_observations(session: AsyncSession, subnet: Subnet) -> None:
-    """Delete every observation of the subnet, as part of deleting it. Does not commit."""
-    await session.execute(
-        delete(Observation)
-        .where(Observation.subnet_id == subnet.id)
-        .execution_options(synchronize_session="fetch")
-    )
 
 
 # --- Validation ---
@@ -344,11 +350,11 @@ async def delete_target(session: AsyncSession, target_id: str, source: str) -> N
 
 
 async def delete_for_subnet(session: AsyncSession, subnet: Subnet, source: str) -> None:
-    """Delete the subnet's observations and its scan target, if any, as part of deleting
-    the subnet. Does not commit: `subnets.delete_subnet` does, after deleting the subnet
+    """Delete the subnet's observations, finding dismissals and scan target, if any, as
+    part of deleting the subnet. Does not commit: `subnets.delete_subnet` does, after deleting the subnet
     itself."""
     # first, and whether or not a target is left: they reference the subnet
-    await delete_observations(session, subnet)
+    await delete_scan_data(session, subnet)
     target = await target_for_subnet(session, subnet.id)
     if target is None:
         return

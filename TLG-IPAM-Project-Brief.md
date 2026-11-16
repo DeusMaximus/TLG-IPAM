@@ -229,11 +229,11 @@ A subnet the owner has chosen to scan, and how (v0.2 spec §5.3, §5.4). At most
 
 Rules: one target per subnet (`409`, also enforced by `UNIQUE(subnet_id)`). Unknown subnet or agent: `404`. A method outside the four, or a set without `icmp` or `arp`: `422`. Every create, update and delete is audit-logged as `scan_target`; an update that changes nothing writes no entry.
 
-**Leaving scope deletes observations** (§3.11). A write that can narrow the scope deletes the subnet's observations outside the scope as it then stands, in the same transaction: turning `scan_dhcp_pool` off, deleting the target (the default scope leaves the pool out), excluding a reserved range or adding one excluded, and editing the DHCP pool or the CIDR (`services/scans.drop_out_of_scope`). The write itself is logged as usual; the deleted observations are not. The deletion judges the scope as committed, under SQLite's write lock, so a pool another request moved, or an observation an ingest stored, after the edit first read the subnet is not undone by it.
+**Leaving scope deletes observations and finding dismissals** (§3.11, §3.12). A write that can narrow the scope deletes the subnet's observations and dismissals outside the scope as it then stands, in the same transaction: turning `scan_dhcp_pool` off, deleting the target (the default scope leaves the pool out), excluding a reserved range or adding one excluded, and editing the DHCP pool or the CIDR (`services/scans.drop_out_of_scope`). The write itself is logged as usual; the deleted rows are not. The deletion judges the scope as committed, under SQLite's write lock, so a pool another request moved, or an observation an ingest stored, after the edit first read the subnet is not undone by it.
 
 ### 3.11 Observation
 
-The latest scan state of one address (v0.2 spec §5.4), upserted by results ingest (§4.6). `UNIQUE(subnet_id, ip)`. No history. Host responses read it for `last_seen` (§3.4), in one query per batch of hosts; findings (#15) will read it too.
+The latest scan state of one address (v0.2 spec §5.4), upserted by results ingest (§4.6). `UNIQUE(subnet_id, ip)`. No history. Host responses read it for `last_seen` (§3.4), in one query per batch of hosts; findings (§4.7) read it too.
 
 | Field | Type / notes |
 |---|---|
@@ -248,6 +248,21 @@ The latest scan state of one address (v0.2 spec §5.4), upserted by results inge
 | `agent_id` | str, nullable — the agent that last reported it. No foreign key, so deleting an agent rewrites nothing |
 
 Rules: observations exist only inside the subnet's scan scope (§3.10). Results ingest deletes every observation, in any subnet, unseen for 90 days. Deleting a subnet deletes its observations. Nothing in ingest writes `hosts` or the change log.
+
+### 3.12 FindingDismissal
+
+A scan finding the owner dismissed (v0.2 spec §5.5). Findings themselves are computed on read (§4.7) and never stored; a dismissal hides the finding at its address and type while the finding's observed value is the one dismissed, and stops hiding it once the value changes. `UNIQUE(subnet_id, ip, type)`: dismissing the same finding with a new value replaces the old one.
+
+| Field | Type / notes |
+|---|---|
+| `id` | UUID, primary key |
+| `subnet_id` | FK → Subnet |
+| `ip`, `ip_int` | the address, and its integer form (internal) |
+| `type` | a finding type (§4.7) |
+| `observed` | str(253) — the observed value that was dismissed: a MAC, a PTR name, a last-seen timestamp, `never`, or empty |
+| `created_at` | datetime — when it was dismissed, or last replaced |
+
+Rules: dismissals exist only inside the subnet's scan scope, like observations: a write that narrows the scope deletes those outside it (§3.10), and deleting a subnet deletes its dismissals. Only `POST /findings/dismiss` writes one, and only for a finding that exists as listed, so the stored value is always one the server computed. There is no un-dismiss yet; the findings panel (#19) is where it would go.
 
 ---
 
@@ -278,7 +293,7 @@ Agent-facing routes, `/api/v1/agent/*`, take an agent token instead (§3.9), as 
 | `POST /api/v1/subnets` | Create. Validate CIDR + overlap rule. |
 | `GET  /api/v1/subnets/{id}` | Detail including utilisation stats. |
 | `PUT  /api/v1/subnets/{id}` | Update. A DHCP-pool or CIDR edit deletes the observations it puts out of scan scope (§3.10). |
-| `DELETE /api/v1/subnets/{id}` | Delete only if no hosts; `?force=true` cascades, deleting all hosts and reserved ranges too. Its scan target and observations are deleted either way. |
+| `DELETE /api/v1/subnets/{id}` | Delete only if no hosts; `?force=true` cascades, deleting all hosts and reserved ranges too. Its scan target, observations and finding dismissals are deleted either way. |
 | `GET  /api/v1/subnets/{id}/free` | Return list of free IPs in the subnet (excludes reserved space, see 4.4). |
 | `GET  /api/v1/hosts` | List. Filters: `?subnet_id=` `?status=` `?q=` (search hostname/ip/mac). |
 | `POST /api/v1/hosts` | Create host. Validate IP in subnet. |
@@ -292,6 +307,9 @@ Agent-facing routes, `/api/v1/agent/*`, take an agent token instead (§3.9), as 
 | `PATCH /api/v1/subnets/{id}/reserved/{range_id}` | Set `{scan_excluded}` (required, not null). Excluding a range deletes its observations. A request that changes nothing writes no change-log entry. |
 | `DELETE /api/v1/subnets/{id}/reserved/{range_id}` | Remove a reserved range. |
 | `POST /api/v1/subnets/{id}/scan` | Request a scan ("Scan now"): sets the scan target's `scan_requested_at`, logged as a `scan_target` update. `202` with the target. The agent picks it up at its next check-in. At most one request per subnet in 15 minutes, from any caller: a second is `429 COOLDOWN`, changes nothing and does not restart the wait. No scan target, a disabled one, or one with no agent: `409`. |
+| `GET  /api/v1/subnets/{id}/findings` | The subnet's scan findings (§4.7), by address. `?type=` filters to one type (unknown: `422`); `?include_dynamic=true` adds unknown hosts inside a scanned DHCP pool. Dismissed findings are left out. Unknown subnet: `404`. |
+| `POST /api/v1/findings/accept` | Accept findings by key (`{findings: [{subnet_id, ip, type, observed}]}`, 1–1000). Per-record results: `accepted` (with `host_id`), `skipped` (`changed`), `error`. Each accepted finding is written and committed on its own through the hosts service, with its normal audit entry. |
+| `POST /api/v1/findings/dismiss` | Dismiss findings by key, same body. Per-record results: `dismissed`, `skipped` (`changed`, `already dismissed`), `error`. One transaction; one `subnet` audit entry per subnet with a dismissal. |
 | `GET  /api/v1/changes` | Recent changes, newest first. Filters: `?entity_type=` `?limit=`. |
 | `GET  /api/v1/agents` | List agents, by name, each with its tokens (prefix and timestamps only, newest first). |
 | `POST /api/v1/agents` | Create an agent (`{name}`) with its agent token. `201`; the response carries the plain token as `data.token`, the only response that ever does. Duplicate name (case-insensitive): `409`. |
@@ -389,6 +407,36 @@ An accepted result set clears both copies of the lease (§4.6). Expiry clears ne
 - **Prune.** Every ingest deletes observations, in any subnet, unseen for 90 days.
 - **The answer before the commit.** The `200` answer is built and encoded before the result set is committed, so no failure can follow a stored result set: an agent never sees an error for a job it can no longer report.
 - **Nothing else.** Ingest never writes `hosts` and writes nothing to the change log.
+
+### 4.7 Findings
+
+Where what a scan saw and what the owner recorded disagree (v0.2 spec §5.5). Computed on read in `services/findings.py` from the subnet's hosts and observations, only for addresses inside its scan scope (§3.10): a host in an excluded range, or in an unscanned DHCP pool, raises none. Nothing is stored but dismissals (§3.12), and nothing is applied until the owner accepts it.
+
+```json
+// GET /api/v1/subnets/{id}/findings
+{ "data": [{ "subnet_id": "…", "ip": "10.0.20.7", "type": "name_mismatch", "observed": "storage.home.arpa",
+             "ip_int": 167777287, "host_id": "…", "dynamic": false, "proposed": { "hostname": "storage" } }],
+  "total": 1 }
+```
+
+| Type | Raised when | `observed` | Accepting writes (`proposed`) |
+|---|---|---|---|
+| `unknown_host` | the observation is `alive` and no host is recorded at the address | the MAC, or empty | a new host: `mac`, and `hostname` from the PTR name; `status` `active`, or `dhcp` when `dynamic` |
+| `mac_missing` | the host has no MAC, the observation has one | the MAC | `mac` |
+| `mac_mismatch` | both have one, and they differ | the MAC | `mac` |
+| `name_missing` | the host has no hostname, the observation has a PTR name | the PTR name | `hostname` |
+| `name_mismatch` | the PTR name, without the effective domain, differs from `hostname`, case-insensitively | the PTR name | `hostname` |
+| `stale` | the host is `active`, the subnet has a scan target, and the host's `last_seen` (§3.4) is more than 30 days old | that `last_seen`, as an ISO-8601 UTC time, or `never` | `status` `offline` |
+
+- **The key.** A finding is identified by `(subnet_id, ip, type, observed)`, and every finding carries all four. `ip_int` is the sort key, `host_id` the host at the address (null for `unknown_host`).
+- **No MAC finding for a randomised MAC** (`mac_randomised`, §3.11).
+- **Names.** The effective domain (the host's override, else the subnet's) is stripped from the end of the PTR name before it is compared with, or written to, `hostname`. A PTR name outside that domain is compared and written whole.
+- **Stale and never seen.** `last_seen` is the rule host responses use: the later of the value set by hand and the observation's `last_seen_at`, never `alive`. A host with neither is stale (`never`) only when both the scan target and the host record are more than 30 days old, so switching scanning on does not make every host stale. A subnet without a scan target raises no `stale`.
+- **Dynamic.** An `unknown_host` inside the DHCP pool, possible only when the pool is scanned, has `dynamic: true` and is left out unless `?include_dynamic=true`.
+- **Accept** recomputes the finding under SQLite's write lock and, only if it still exists with the same `observed`, writes `proposed` through the hosts service (`create_host`/`update_host`), whose validation and audit entry apply unchanged. Otherwise the record is `skipped` with reason `changed` and nothing is written. A dismissed finding can still be accepted. The audit summary names the address and the finding type, never the hostname or MAC that came from the network: `host created at 10.0.20.7 in lab from scan finding unknown_host`, `host at 10.0.20.7 updated from scan finding name_mismatch`. The snapshots carry the values, as for any host write.
+- **Dismiss** recomputes the same way and stores the key only for a finding that exists as listed. The finding stays hidden until its observed value changes. The audit entry's summary is a count (`2 scan finding(s) dismissed in lab`); the keys are in its `after`.
+- **Observed values are data.** A MAC comes only from a job issued `arp`; a PTR name is whatever a device calls itself, kept only if it is a valid hostname (§3.11), which says nothing about what it means.
+- Not yet: `fdns_mismatch` arrives with the forward-DNS check (#20); the MCP tool `list_scan_findings` is #17; the findings panel is #19.
 
 ---
 
@@ -538,7 +586,7 @@ tlg-ipam/
 │       ├── main.py           # FastAPI app + static SPA serving + MCP mount
 │       ├── config.py         # env vars (pydantic-settings)
 │       ├── database.py       # SQLAlchemy async engine + session
-│       ├── models.py         # ORM models (Section, Subnet, ReservedRange, Host, DeviceType, Change, Agent, Token, ScanTarget, Observation)
+│       ├── models.py         # ORM models (Section, Subnet, ReservedRange, Host, DeviceType, Change, Agent, Token, ScanTarget, Observation, FindingDismissal)
 │       ├── schemas.py        # Pydantic request/response schemas
 │       ├── agent_protocol.py # the agent wire contract: check-in, job and result-set shapes, PROTOCOL_VERSION, sanitising agent text
 │       ├── auth.py           # owner-key check (REST dependency + /mcp bearer verifier); agent-token dependency
@@ -553,6 +601,7 @@ tlg-ipam/
 │       │   ├── scans.py      # scan targets; scan_scope, the one place scan scope is computed; request-scan and its cooldown; deleting observations that leave scope
 │       │   ├── jobs.py       # agent check-in, due targets, job leases
 │       │   ├── results.py    # scan results ingest: observations, clearing the lease
+│       │   ├── findings.py   # scan findings computed on read; accept (through hosts) and dismiss
 │       │   └── changes.py    # audit log writes + reads
 │       └── routers/
 │           ├── sections.py
@@ -562,6 +611,7 @@ tlg-ipam/
 │           ├── agents.py     # owner CRUD on /api/v1/agents
 │           ├── agent.py      # agent-facing /api/v1/agent/* (agent token only)
 │           ├── scan_targets.py # owner CRUD on /api/v1/scan-targets
+│           ├── findings.py   # /api/v1/subnets/{id}/findings, /api/v1/findings/accept and /dismiss
 │           └── changes.py
 └── web/
     ├── package.json
@@ -640,6 +690,7 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 - A second scan request for a subnet within 15 minutes is refused, whoever asks.
 - An agent checks in at most once every 10 seconds, and keeps at most 100 audit entries of its own; text it reports about itself never reaches an assistant through `list_changes`. A target whose jobs keep timing out does not starve the agent's other due targets.
 - Scan results: an out-of-scope address, a wrong job id and a second result set are each rejected without affecting valid records; an incomplete job adds what it saw and marks nothing dead; a hostile `rdns_name` (spaces, markup, instructions) is dropped; deleting a subnet with observations succeeds. Ingest writes no host and no change-log entry, and observations that leave scan scope are deleted with the change that narrows it.
+- Findings: each type is raised from hosts and observations inside scan scope only, with no MAC finding for a randomised MAC. Accepting one whose observed value has changed writes nothing and reports `skipped`; an accepted one is written through the host paths and appears in the change log with no network-reported value in its summary. A dismissed finding stays hidden until its observed value changes, and dismissals go when their address leaves scope or the subnet is deleted.
 
 ### Testing
 - pytest covers CIDR/IP validation, CIDR child invariants, explicit-null updates, the overlap rule, interval maths, consistent backups, MCP clearing, and next-free allocation edge cases.

@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -437,3 +437,43 @@ class ScanTargetOut(BaseModel):
     last_scan_error: str | None = None
     # the subnet's scan scope (services/scans.scan_scope): inclusive address ranges
     scope: list[ScanRange] = []
+
+
+# --- Findings ---
+
+# v0.2 spec §5.5. `fdns_mismatch` joins these with the forward-DNS check (#20).
+FindingType = Literal[
+    "unknown_host", "mac_missing", "mac_mismatch", "name_missing", "name_mismatch", "stale"
+]
+
+
+class FindingKey(BaseModel):
+    """What identifies a finding (spec §5.5): accept and dismiss take these, as listed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    subnet_id: str = Field(max_length=36)
+    ip: str = Field(max_length=39)
+    type: FindingType
+    # a MAC, a PTR name, a last-seen timestamp, `never`, or empty
+    observed: str = Field(max_length=253)
+
+
+class FindingKeysRequest(BaseModel):
+    # keys are validated one by one, a non-object included, so a bad key is reported in
+    # the per-record results instead of failing the request
+    findings: list[Any] = Field(min_length=1, max_length=1000)
+
+
+class FindingOut(FindingKey):
+    model_config = ConfigDict(extra="ignore")
+
+    # integer form of ip, the numeric sort key
+    ip_int: int
+    # the host at the address; null for `unknown_host`
+    host_id: str | None
+    # an `unknown_host` inside the DHCP pool (only when the pool is scanned): hidden
+    # unless asked for
+    dynamic: bool
+    # the host fields accepting the finding writes
+    proposed: dict

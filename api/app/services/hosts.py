@@ -15,13 +15,14 @@ from . import device_types as device_types_svc
 from .subnets import _allocated_ints, get_subnet, reserved_ranges
 
 
-def _last_seen(
+def last_seen_of(
     manual: datetime | None, scanned: datetime | None
 ) -> tuple[datetime | None, str | None]:
     """`last_seen` and `last_seen_source` (v0.2 spec §5.4): the later of the value set by
     hand and the address's observation, and which one it is. A tie is reported as `scan`.
     Both are compared as UTC: SQLite reads a stored value back without a zone, while one
-    a client has just written is still in memory with its own."""
+    a client has just written is still in memory with its own. Findings judge `stale`
+    by the same rule (`services/findings`)."""
     if scanned is not None and (manual is None or scans.utc(scanned) >= scans.utc(manual)):
         return scanned, "scan"
     if manual is not None:
@@ -32,7 +33,7 @@ def _last_seen(
 def _host_dict(host: Host, subnet_domain: str | None, scanned: datetime | None) -> dict:
     effective = host.domain or subnet_domain
     fqdn = f"{host.hostname}.{effective}" if host.hostname and effective else None
-    last_seen, source = _last_seen(host.last_seen, scanned)
+    last_seen, source = last_seen_of(host.last_seen, scanned)
     return (
         HostOut.model_validate(host)
         .model_copy(update={"fqdn": fqdn, "last_seen": last_seen, "last_seen_source": source})
@@ -144,7 +145,13 @@ async def _commit_host(session: AsyncSession, host: Host) -> None:
         raise conflict(f"IP {host.ip} is already allocated in this subnet") from None
 
 
-async def create_host(session: AsyncSession, payload: HostCreate, source: str) -> Host:
+async def create_host(
+    session: AsyncSession, payload: HostCreate, source: str, *, finding: str | None = None
+) -> Host:
+    """Create a host. `finding` is set when the owner accepts a scan finding
+    (`services/findings.accept`): a finding type, never an observed value. The summary
+    then names the address and the finding, not the hostname, which came from a device
+    on the network (spec §7.2, invariant 8)."""
     subnet = await get_subnet(session, payload.subnet_id)
     addr = ip_in_subnet(payload.ip, subnet.cidr)
     _check_not_reserved(int(addr), subnet)
@@ -158,7 +165,11 @@ async def create_host(session: AsyncSession, payload: HostCreate, source: str) -
         entity_type="host",
         entity_id=host.id,
         action="create",
-        summary=f"host {_label(host)} created at {host.ip} in {subnet.name}",
+        summary=(
+            f"host created at {host.ip} in {subnet.name} from scan finding {finding}"
+            if finding
+            else f"host {_label(host)} created at {host.ip} in {subnet.name}"
+        ),
         source=source,
         after=changes.snapshot(host),
     )
@@ -167,8 +178,15 @@ async def create_host(session: AsyncSession, payload: HostCreate, source: str) -
 
 
 async def update_host(
-    session: AsyncSession, host_id: str, payload: HostUpdate, source: str
+    session: AsyncSession,
+    host_id: str,
+    payload: HostUpdate,
+    source: str,
+    *,
+    finding: str | None = None,
 ) -> Host:
+    """Update a host. `finding` as in `create_host`: the summary names the address and
+    the finding, not the hostname, which may be the value the finding wrote."""
     host = await get_host(session, host_id)
     before = changes.snapshot(host)
     data = payload.model_dump(exclude_unset=True)
@@ -190,7 +208,11 @@ async def update_host(
         entity_type="host",
         entity_id=host.id,
         action="update",
-        summary=f"host {_label(host)} ({host.ip}) updated",
+        summary=(
+            f"host at {host.ip} updated from scan finding {finding}"
+            if finding
+            else f"host {_label(host)} ({host.ip}) updated"
+        ),
         source=source,
         before=before,
         after=changes.snapshot(host),
