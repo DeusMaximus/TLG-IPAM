@@ -21,6 +21,31 @@ jobs:
       - run: python -m pip install --require-hashes -r requirements-dev.txt
       - run: python -m pytest
 
+  # The scan agent (agent/): its tests, the end-to-end ones against the server's
+  # real routes included, and its image. The image is built and started with no
+  # network at all, so CI sends no packet anywhere.
+  agent:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: agent/requirements-dev.txt
+      - run: python -m pip install --require-hashes -r requirements-dev.txt
+      - run: python -m pytest
+      - name: Image builds and starts
+        run: |
+          docker build -f Dockerfile -t tlg-ipam-agent:ci .
+          docker run --rm --network none tlg-ipam-agent:ci --version
+          # with no configuration it refuses to start, naming the variable
+          out=$(docker run --rm --network none tlg-ipam-agent:ci 2>&1) && exit 1 || true
+          echo "$out" | grep -q "IPAM_URL is not set"
+
   # The locks are generated from the .in files (AGENTS.md → "Dependency lock").
   # Recompiling in place keeps every pin, and its hashes, that still satisfies
   # the .in files, so a newer upstream release leaves this green; only a .in
@@ -62,6 +87,33 @@ jobs:
           done
           git diff --exit-code -- requirements.txt requirements-dev.txt \
             || fail "api/requirements.txt or api/requirements-dev.txt does not match its .in file (diff above)."
+      - name: Agent locks match agent/requirements.in / requirements-dev.in
+        working-directory: agent
+        run: |
+          # The agent's regenerate commands, verbatim from AGENTS.md → "Dependency lock".
+          # Both are constrained to the server's test lock, so a change there that
+          # moves a shared package shows up here until the agent's locks follow.
+          cmds=(
+            "uv pip compile requirements.in --universal --python-version 3.11 --generate-hashes --no-header -c ../api/requirements-dev.txt -o requirements.txt"
+            "uv pip compile requirements-dev.in --universal --python-version 3.12 --generate-hashes --no-header -c requirements.txt -c ../api/requirements-dev.txt -o requirements-dev.txt"
+          )
+          for c in "${cmds[@]}"; do
+            if ! grep -qxF -- "$c" ../AGENTS.md; then
+              echo "::error file=AGENTS.md::AGENTS.md → \"Dependency lock\" no longer lists this command; keep it and the locks job in .github/workflows/ci.yml in step: $c"
+              exit 1
+            fi
+          done
+          fail() {
+            echo "::error::$1 Regenerate both agent locks from agent/ with uv 0.13.6, after the server locks, and commit them:%0A  ${cmds[0]}%0A  ${cmds[1]}"
+            printf '\n%s\nRegenerate both agent locks from agent/ with uv 0.13.6, after the server locks, and commit them:\n' "$1"
+            printf '  %s\n' "${cmds[@]}"
+            exit 1
+          }
+          for c in "${cmds[@]}"; do
+            $c >/dev/null || fail "uv could not compile the agent locks from the .in files."
+          done
+          git diff --exit-code -- requirements.txt requirements-dev.txt \
+            || fail "agent/requirements.txt or agent/requirements-dev.txt does not match its .in file or the server's lock (diff above)."
 
   frontend:
     runs-on: ubuntu-latest

@@ -24,6 +24,24 @@ CHECKIN_INTERVAL_S = 60
 # spec §5.6: the per-job timeout the agent enforces
 JOB_TIMEOUT_S = 600
 
+# How an agent answers a check-in the server refused (spec §5.7). A refused check-in
+# authorises no scan: only a `200` carries jobs, and the agent sends no packet on the
+# strength of anything else.
+# - `429 RATE_LIMITED`, `503 UNAVAILABLE`, any other 5xx and a request that got no
+#   answer are retried with a bounded back-off. Neither 429 nor 503 carries
+#   `Retry-After`. Retry n (from 0) waits a time drawn uniformly from
+#   [CHECKIN_RETRY_MIN_S, min(CHECKIN_RETRY_MAX_S, CHECKIN_RETRY_MIN_S * 2**(n+1))],
+#   so it is never shorter than the gap the server enforces between check-ins and
+#   never longer than CHECKIN_RETRY_MAX_S. An accepted check-in resets n.
+# - `401`, `403`, `409 PROTOCOL_MISMATCH`, `422` and any other 4xx are not retried in
+#   a tight loop: the agent waits a time drawn uniformly from
+#   [0.9 * CHECKIN_REFUSED_RETRY_S, CHECKIN_REFUSED_RETRY_S] before it tries again.
+#   Each needs the owner (a new token, re-enabling the agent, a matching release), and
+#   the next try is how the agent sees that it has been done.
+CHECKIN_RETRY_MIN_S = 10
+CHECKIN_RETRY_MAX_S = 300
+CHECKIN_REFUSED_RETRY_S = 900
+
 # caps on what an agent may report, matching the `agents` columns
 VERSION_MAX = 40
 PLATFORM_MAX = 120
