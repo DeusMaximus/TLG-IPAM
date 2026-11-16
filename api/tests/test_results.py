@@ -868,6 +868,147 @@ async def test_a_scope_of_many_ranges_does_not_block_edits(client, agent_api):
     assert set(await observations()) == {"10.0.0.3"}
 
 
+async def _edit_notes(client, subnet, target, block):
+    return await client.put(f"/api/v1/subnets/{subnet['id']}", json={"notes": "racked"})
+
+
+async def _edit_interval(client, subnet, target, block):
+    return await client.put(f"/api/v1/scan-targets/{target['id']}", json={"interval_minutes": 30})
+
+
+async def _exclude_a_range(client, subnet, target, block):
+    return await client.patch(
+        f"/api/v1/subnets/{subnet['id']}/reserved/{block['id']}", json={"scan_excluded": True}
+    )
+
+
+async def _add_an_excluded_range(client, subnet, target, block):
+    return await client.post(
+        f"/api/v1/subnets/{subnet['id']}/reserved",
+        json={"start_ip": "10.0.0.30", "end_ip": "10.0.0.39", "scan_excluded": True},
+    )
+
+
+async def _delete_the_target(client, subnet, target, block):
+    return await client.delete(f"/api/v1/scan-targets/{target['id']}")
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [_edit_notes, _edit_interval, _exclude_a_range, _add_an_excluded_range, _delete_the_target],
+)
+async def test_an_owner_edit_judges_scope_as_committed_under_the_write_lock(
+    client, agent_api, monkeypatch, edit
+):
+    """Each write that calls `drop_out_of_scope` loaded the subnet (and target) before
+    its first write. Another request then shrinks the DHCP pool and an ingest stores an
+    observation in the freed space. The edit must judge scope as it is committed, and
+    keep that observation."""
+    agent, token, subnet, target, job = await setup(client, agent_api, subnet=POOL)
+    res = await client.post(
+        f"/api/v1/subnets/{subnet['id']}/reserved",
+        json={"start_ip": "10.0.0.20", "end_ip": "10.0.0.29"},
+    )
+    block = res.json()["data"]
+    await _observe(agent_api, token, job, ["10.0.0.10"])
+    loaded = {"done": False}
+
+    async def another_request_meanwhile():
+        async with SessionLocal() as other:
+            await subnets.update_subnet(
+                other, subnet["id"], SubnetUpdate(dhcp_start="10.0.0.150", dhcp_end="10.0.0.199"), "api"
+            )
+        async with SessionLocal() as other:
+            other.add(Observation(subnet_id=subnet["id"], ip="10.0.0.120", ip_int=0x0A000078))
+            await other.commit()
+
+    def after(real):
+        async def loads_then_waits(*args, **kwargs):
+            result = await real(*args, **kwargs)
+            if not loaded["done"]:
+                loaded["done"] = True
+                await another_request_meanwhile()
+            return result
+
+        return loads_then_waits
+
+    # the points where each edit has read the subnet and target, before any write
+    monkeypatch.setattr(subnets, "get_subnet", after(subnets.get_subnet))
+    monkeypatch.setattr(scans, "_get_subnet", after(scans._get_subnet))
+    res = await edit(client, subnet, target, block)
+    assert res.status_code in (200, 201, 204), res.text
+    assert loaded["done"]
+    assert set(await observations()) == {"10.0.0.10", "10.0.0.120"}
+    got = (await client.get(f"/api/v1/subnets/{subnet['id']}")).json()["data"]
+    assert (got["dhcp_start"], got["dhcp_end"]) == ("10.0.0.150", "10.0.0.199")
+
+
+def _write_locked() -> bool:
+    """Whether some connection holds SQLite's write lock: a second one cannot begin a
+    write transaction at once."""
+    import sqlite3
+
+    from app.config import settings
+
+    con = sqlite3.connect(settings.db_path, timeout=0.05)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        con.rollback()
+        return False
+    except sqlite3.OperationalError:
+        return True
+    finally:
+        con.close()
+
+
+async def _same_notes(client, subnet, target, block):
+    # changes nothing, so the edit's own flush writes nothing
+    return await client.put(f"/api/v1/subnets/{subnet['id']}", json={"notes": subnet["notes"]})
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        _same_notes,
+        _edit_notes,
+        _edit_interval,
+        _exclude_a_range,
+        _add_an_excluded_range,
+        _delete_the_target,
+    ],
+)
+async def test_every_scope_a_write_relies_on_is_read_under_the_write_lock(
+    client, agent_api, monkeypatch, edit
+):
+    """Owner edits that delete by scope, ingest that stores by it, and check-in that
+    issues a job's ranges from it each compute the scope while holding the write lock,
+    so nothing can change it between that read and their commit."""
+    agent, token, subnet, target, job = await setup(client, agent_api, subnet=POOL)
+    res = await client.post(
+        f"/api/v1/subnets/{subnet['id']}/reserved",
+        json={"start_ip": "10.0.0.20", "end_ip": "10.0.0.29"},
+    )
+    block = res.json()["data"]
+    other = await lab(client, "10.0.1.0/24", name="other")
+    await make_target(client, other["id"], agent["id"])
+    seen = []
+    real = scans._scope_as_committed
+
+    async def probe(session, subnet_id):
+        seen.append(_write_locked())
+        return await real(session, subnet_id)
+
+    monkeypatch.setattr(scans, "_scope_as_committed", probe)
+    await accepted(agent_api, token, job, [obs("10.0.0.10")])  # ingest
+    assert seen == [True]
+    [second] = await jobs_for(agent_api, token)  # check-in issuing the other target
+    assert second["subnet_id"] == other["id"] and seen == [True, True]
+    res = await edit(client, subnet, target, block)
+    assert res.status_code in (200, 201, 204), res.text
+    # the edit's own; a scan-target response then renders its scope after the commit
+    assert len(seen) >= 3 and seen[2] is True
+
+
 # --- Acceptance: subnet deletion ---
 
 

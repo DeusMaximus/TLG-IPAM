@@ -228,7 +228,7 @@ A subnet the owner has chosen to scan, and how (v0.2 spec §5.3, §5.4). At most
 
 Rules: one target per subnet (`409`, also enforced by `UNIQUE(subnet_id)`). Unknown subnet or agent: `404`. A method outside the four, or a set without `icmp` or `arp`: `422`. Every create, update and delete is audit-logged as `scan_target`; an update that changes nothing writes no entry.
 
-**Leaving scope deletes observations** (§3.11). A write that can narrow the scope deletes the subnet's observations outside the scope as it then stands, in the same transaction: turning `scan_dhcp_pool` off, deleting the target (the default scope leaves the pool out), excluding a reserved range or adding one excluded, and editing the DHCP pool or the CIDR (`services/scans.drop_out_of_scope`). The write itself is logged as usual; the deleted observations are not.
+**Leaving scope deletes observations** (§3.11). A write that can narrow the scope deletes the subnet's observations outside the scope as it then stands, in the same transaction: turning `scan_dhcp_pool` off, deleting the target (the default scope leaves the pool out), excluding a reserved range or adding one excluded, and editing the DHCP pool or the CIDR (`services/scans.drop_out_of_scope`). The write itself is logged as usual; the deleted observations are not. The deletion judges the scope as committed, under SQLite's write lock, so a pool another request moved, or an observation an ingest stored, after the edit first read the subnet is not undone by it.
 
 ### 3.11 Observation
 

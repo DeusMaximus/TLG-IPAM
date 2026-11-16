@@ -141,11 +141,11 @@ async def ingest(session: AsyncSession, agent: Agent, body: object) -> dict:
     subnet = await session.get(Subnet, target.subnet_id)
     await _release(session, agent, target, report)
     # The reads above ran before this transaction took SQLite's write lock (the driver
-    # begins it at the first write), so the owner may have narrowed the scope since.
-    # Read the scope's inputs again under the lock: `scan_scope` would otherwise reuse
-    # these objects as first loaded. No other writer can commit until this one does.
+    # begins it at the first write), so the owner may have edited the subnet since.
+    # Everything below is read under the lock: `scan_scope` reads the scope as
+    # committed, and the subnet is read again for its CIDR. No other writer can commit
+    # until this one does.
     await session.refresh(subnet)
-    await session.refresh(target)
 
     now = _now()
     net = parse_cidr(subnet.cidr)

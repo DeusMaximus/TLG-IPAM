@@ -18,7 +18,7 @@ through `services/subnets`, which imports it.
 from bisect import bisect_right
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, false, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
@@ -45,37 +45,82 @@ _DELETE_BATCH = 500
 
 
 def _scope(
-    subnet: Subnet, reserved: list[ReservedRange], scan_dhcp_pool: bool
+    cidr: str,
+    pool: tuple[str | None, str | None],
+    excluded: list[tuple[int, int]],
+    scan_dhcp_pool: bool,
 ) -> list[tuple[int, int]]:
     """Usable addresses (network and broadcast already out, for /30 and shorter),
     minus the DHCP pool unless it is scanned, minus every excluded reserved range.
     A reserved range that is not excluded removes nothing, so an address in both an
     excluded and a scanned range is excluded."""
-    removed = [(b.start_int, b.end_int) for b in reserved if b.scan_excluded]
-    if not scan_dhcp_pool and subnet.dhcp_start and subnet.dhcp_end:
-        removed.append((int(parse_ip(subnet.dhcp_start)), int(parse_ip(subnet.dhcp_end))))
-    return subtract_intervals(usable_bounds(parse_cidr(subnet.cidr)), removed)
+    removed = list(excluded)
+    dhcp_start, dhcp_end = pool
+    if not scan_dhcp_pool and dhcp_start and dhcp_end:
+        removed.append((int(parse_ip(dhcp_start)), int(parse_ip(dhcp_end))))
+    return subtract_intervals(usable_bounds(parse_cidr(cidr)), removed)
+
+
+async def _scope_as_committed(
+    session: AsyncSession, subnet_id: str
+) -> tuple[str, list[tuple[int, int]]] | None:
+    """The subnet's CIDR and scan scope, from the database; None once it is deleted.
+
+    Every input is read as columns, never taken from objects the session loaded
+    earlier, and no loaded object is refreshed: check-in's lease compare-and-set relies
+    on the target as it read it. Pending changes are flushed first (autoflush), so the
+    caller's own edit is included. A caller that writes on the strength of the scope
+    holds SQLite's write lock before calling, so what it reads is what is committed and
+    nothing can change it before it commits (`drop_out_of_scope`, `results.ingest`,
+    and check-in after `jobs._claim`).
+    """
+    row = (
+        await session.execute(
+            select(Subnet.cidr, Subnet.dhcp_start, Subnet.dhcp_end).where(Subnet.id == subnet_id)
+        )
+    ).first()
+    if row is None:
+        return None
+    pool_scanned = await session.scalar(
+        select(ScanTarget.scan_dhcp_pool).where(ScanTarget.subnet_id == subnet_id)
+    )
+    excluded = (
+        await session.execute(
+            select(ReservedRange.start_int, ReservedRange.end_int).where(
+                ReservedRange.subnet_id == subnet_id, ReservedRange.scan_excluded.is_(True)
+            )
+        )
+    ).all()
+    cidr, dhcp_start, dhcp_end = row
+    scope = _scope(cidr, (dhcp_start, dhcp_end), [tuple(r) for r in excluded], bool(pool_scanned))
+    return cidr, scope
 
 
 async def scan_scope(session: AsyncSession, subnet: Subnet) -> list[tuple[int, int]]:
     """The subnet's scan scope: merged, inclusive integer address ranges, ascending.
-    A subnet without a scan target gets the default scope (DHCP pool not scanned)."""
-    target = await target_for_subnet(session, subnet.id)
-    reserved = list(
-        (
-            await session.scalars(
-                select(ReservedRange)
-                .where(ReservedRange.subnet_id == subnet.id)
-                .order_by(ReservedRange.start_int)
-            )
-        ).all()
-    )
-    return _scope(subnet, reserved, bool(target and target.scan_dhcp_pool))
+    A subnet without a scan target gets the default scope (DHCP pool not scanned).
+    Read as committed (`_scope_as_committed`): `subnet` names the subnet, and its
+    loaded attributes are not used. A deleted subnet has an empty scope."""
+    found = await _scope_as_committed(session, subnet.id)
+    return found[1] if found else []
 
 
 async def scan_scope_ranges(session: AsyncSession, subnet: Subnet) -> list[dict]:
     """`scan_scope` as `[{start, end}]` address strings, the shape of a job's ranges."""
-    return format_intervals(parse_cidr(subnet.cidr), await scan_scope(session, subnet))
+    found = await _scope_as_committed(session, subnet.id)
+    if found is None:
+        return []
+    cidr, scope = found
+    return format_intervals(parse_cidr(cidr), scope)
+
+
+async def take_write_lock(session: AsyncSession) -> None:
+    """Make sure this session's transaction holds SQLite's write lock, which a write
+    statement takes even when it touches no row. Until the caller commits, no other
+    writer can change what it reads next. A no-op when the lock is already held."""
+    await session.execute(
+        delete(Observation).where(false()).execution_options(synchronize_session=False)
+    )
 
 
 def in_scope(scope: list[tuple[int, int]], ip_int: int) -> bool:
@@ -91,10 +136,18 @@ async def drop_out_of_scope(session: AsyncSession, subnet: Subnet) -> None:
     in its own transaction, after its change (pool scanning turned off or the target
     deleted, a range excluded, the pool or the CIDR edited). Does not commit.
 
+    The caller read the subnet, and validated its change, before its transaction took
+    SQLite's write lock: the driver begins the transaction at the first write, so
+    another request may have committed since (a new pool, an ingest in the space it
+    freed). So the write lock is taken here, by a statement that changes nothing, even
+    when the caller's own change wrote nothing, and `scan_scope` then reads the scope
+    as committed. The caller's own change is flushed first and is part of it.
+
     The rows deleted are scan state, not owner records, and are not audit-logged; the
     write that narrowed the scope is. (#15 adds dismissals, which go the same way.)
     """
     await session.flush()
+    await take_write_lock(session)
     scope = await scan_scope(session, subnet)
     # Membership is decided here with `in_scope`, not in SQL: a scope can hold more
     # ranges than SQLite's expression-depth limit allows as OR branches, and a statement
