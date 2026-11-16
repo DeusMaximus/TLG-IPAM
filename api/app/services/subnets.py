@@ -239,11 +239,11 @@ async def update_subnet(
             )
         if await scans.target_for_subnet(session, subnet.id) is not None:
             scans.check_prefix(merged["cidr"])
-    # #11: a CIDR or DHCP-pool edit that puts addresses out of scan scope deletes their
-    # observations and dismissals in this transaction (spec §5.3).
     before = changes.snapshot(subnet)
     for field, value in data.items():
         setattr(subnet, field, value)
+    # a CIDR or DHCP-pool edit can put addresses out of scan scope (spec §5.3)
+    await scans.drop_out_of_scope(session, subnet)
     changes.record(
         session,
         entity_type="subnet",
@@ -313,6 +313,8 @@ async def create_reserved_range(
     )
     session.add(block)
     await session.flush()
+    if block.scan_excluded:
+        await scans.drop_out_of_scope(session, subnet)
     changes.record(
         session,
         entity_type="subnet",
@@ -350,8 +352,8 @@ async def update_reserved_range(
         return block
     before = changes.snapshot(block)
     block.scan_excluded = payload.scan_excluded
-    # #11: excluding a range deletes the observations and dismissals inside it, in this
-    # transaction (spec §5.3).
+    # excluding a range puts it out of scan scope (spec §5.3)
+    await scans.drop_out_of_scope(session, subnet)
     verb = "excluded from scanning" if payload.scan_excluded else "returned to scanning"
     changes.record(
         session,
