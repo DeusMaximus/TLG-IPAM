@@ -21,7 +21,7 @@ docker compose up --build
 
 Open http://localhost:8080, paste your API key, done.
 
-The server will not start without a real key: with `API_KEY` unset, empty, or still the `change-me` placeholder from `.env.example`, it exits with a message that names `API_KEY`.
+The server will not start without a real key: with `API_KEY` unset, empty, still the `change-me` placeholder from `.env.example`, or with a space, tab or newline at either end, it exits with a message that names `API_KEY`. A padded key is refused rather than trimmed, so check a key pasted from a file or a secret store.
 
 ## Backups and restore
 
@@ -70,7 +70,7 @@ python3 -m venv .venv && .venv/bin/pip install --require-hashes -r requirements-
 API_KEY=dev-key .venv/bin/uvicorn app.main:app --port 8080 --reload
 ```
 
-Any non-empty key other than `change-me` starts the server; without one, uvicorn exits before it serves anything (with `--reload`, the reloader waits for a file change; stop it with Ctrl+C). The test suite sets its own key.
+Any non-empty key other than `change-me`, with no whitespace at either end, starts the server; without one, uvicorn exits before it serves anything (with `--reload`, the reloader waits for a file change; stop it with Ctrl+C). The test suite sets its own key.
 
 Frontend (Node 20+), with `/api` proxied to the backend on :8080:
 
