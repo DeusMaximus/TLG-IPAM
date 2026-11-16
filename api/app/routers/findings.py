@@ -6,8 +6,8 @@ from ..database import get_session
 from ..schemas import FindingKeysRequest
 from ..services import findings as svc
 
-# Owner REST only. Over MCP, #17 adds `list_scan_findings`; there is no dismiss tool,
-# and accepting goes through `create_host`/`update_host` (spec §5.8).
+# Owner REST only. Over MCP, `list_scan_findings` reads findings; there is no accept or
+# dismiss tool, and an assistant writes hosts through `create_host`/`update_host` (spec §5.8).
 router = APIRouter(tags=["findings"])
 
 

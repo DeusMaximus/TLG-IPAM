@@ -30,9 +30,15 @@ def last_seen_of(
     return None, None
 
 
+def fqdn_of(hostname: str | None, domain: str | None, subnet_domain: str | None) -> str | None:
+    """A host's FQDN: its hostname under its domain override, else the subnet's domain.
+    None without a hostname or without any domain."""
+    effective = domain or subnet_domain
+    return f"{hostname}.{effective}" if hostname and effective else None
+
+
 def _host_dict(host: Host, subnet_domain: str | None, scanned: datetime | None) -> dict:
-    effective = host.domain or subnet_domain
-    fqdn = f"{host.hostname}.{effective}" if host.hostname and effective else None
+    fqdn = fqdn_of(host.hostname, host.domain, subnet_domain)
     last_seen, source = last_seen_of(host.last_seen, scanned)
     return (
         HostOut.model_validate(host)

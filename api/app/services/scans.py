@@ -400,8 +400,17 @@ def utc(value: datetime | None) -> datetime | None:
     return value.replace(tzinfo=timezone.utc)
 
 
+def next_request_after(asked: datetime) -> str:
+    """When the subnet can next be asked for a scan, in ISO-8601 UTC, rounded up to the
+    second: a request made at the time given is never inside the cooldown."""
+    again = asked + REQUEST_COOLDOWN
+    if again.microsecond:
+        again = again.replace(microsecond=0) + timedelta(seconds=1)
+    return again.isoformat(timespec="seconds")
+
+
 def _cooldown(subnet: Subnet, asked: datetime) -> ApiError:
-    again = (asked + REQUEST_COOLDOWN).isoformat(timespec="seconds")
+    again = next_request_after(asked)
     minutes = int(REQUEST_COOLDOWN.total_seconds() // 60)
     return ApiError(
         "COOLDOWN",
@@ -463,3 +472,15 @@ async def request_scan(session: AsyncSession, subnet_id: str, source: str) -> Sc
     )
     await session.commit()
     return target
+
+
+def scan_request_out(target: ScanTarget) -> dict:
+    """What `request_scan` reports over MCP: the request and when the next one can be
+    made. Not the target itself: its configuration (agent, methods, interval, scope)
+    stays off MCP (spec §5.8)."""
+    asked = utc(target.scan_requested_at)
+    return {
+        "subnet_id": target.subnet_id,
+        "scan_requested_at": asked.isoformat(timespec="seconds"),
+        "next_request_after": next_request_after(asked),
+    }
