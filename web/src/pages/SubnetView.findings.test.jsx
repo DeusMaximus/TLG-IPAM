@@ -393,6 +393,77 @@ describe('findings panel', () => {
     expect(ipam.listSubnets.mock.calls.length).toBe(tree)
   })
 
+  it('a reload that fails after a write says the list may be out of date', async () => {
+    const user = userEvent.setup()
+    ipam.dismissFindings.mockImplementation(async () => {
+      ipam.listFindings.mockRejectedValue(new ApiError('HTTP_502', 'Bad Gateway', 502))
+      return {
+        data: {
+          dismissed: 1,
+          skipped: 0,
+          errors: 0,
+          results: [{ index: 0, ip: '10.20.0.41', type: 'unknown_host', status: 'dismissed' }],
+        },
+      }
+    })
+    renderView()
+    const group = await within(await findPanel()).findByRole('group', { name: 'Unknown hosts' })
+    expect(within(panel()).queryByRole('alert')).toBeNull()
+    await user.click(within(group).getByRole('button', { name: 'Dismiss 10.20.0.41' }))
+    expect(await within(panel()).findByRole('alert')).toHaveTextContent(
+      'Findings could not be reloaded: Bad Gateway. The list below may be out of date.'
+    )
+    expect(within(panel()).getByRole('status')).toHaveTextContent('1 dismissed.')
+  })
+
+  it('a host list or scan target reload that fails says so', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    renderView()
+    await within(await findPanel()).findByRole('group', { name: 'MAC mismatch' })
+    await waitFor(() => expect(ipam.listScanTargets).toHaveBeenCalled())
+    ipam.listScanTargets.mockRejectedValue(new ApiError('HTTP_502', 'Bad Gateway', 502))
+    await vi.advanceTimersByTimeAsync(REFRESH_MS)
+    const scanning = screen.getByRole('region', { name: 'Scanning' })
+    expect(await within(scanning).findByRole('alert')).toHaveTextContent('Could not be reloaded: Bad Gateway')
+
+    ipam.listHosts.mockRejectedValue(new ApiError('HTTP_502', 'Bad Gateway', 502))
+    ipam.dismissFindings.mockResolvedValue({ data: { dismissed: 1, skipped: 0, errors: 0, results: [] } })
+    ipam.acceptFindings.mockResolvedValue({
+      data: { accepted: 1, skipped: 0, errors: 0, results: [{ index: 0, status: 'accepted' }] },
+    })
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    await user.click(within(panel()).getByRole('button', { name: 'Replace MAC 10.20.0.5' }))
+    expect(
+      await screen.findByText('Could not be reloaded: Bad Gateway. The list may be out of date.')
+    ).toBeInTheDocument()
+    // the last list stays
+    expect(hostRow('10.20.0.5')).toBeTruthy()
+  })
+
+  it('keeps the answer on screen when the last finding of a subnet with no scan target goes', async () => {
+    seed({
+      target: null,
+      findings: [finding('unknown_host', '10.20.0.41', '', { proposed: { status: 'active' } })],
+    })
+    ipam.acceptFindings.mockImplementation(async () => {
+      db.findings = []
+      return {
+        data: {
+          accepted: 1,
+          skipped: 0,
+          errors: 0,
+          results: [{ index: 0, ip: '10.20.0.41', type: 'unknown_host', status: 'accepted', host_id: 'h9' }],
+        },
+      }
+    })
+    const user = userEvent.setup()
+    renderView()
+    const group = await within(await findPanel()).findByRole('group', { name: 'Unknown hosts' })
+    await user.click(within(group).getByRole('button', { name: 'Create host 10.20.0.41' }))
+    expect(await within(panel()).findByText(/None: scans agree with the records/)).toBeInTheDocument()
+    expect(within(panel()).getByRole('status')).toHaveTextContent('1 accepted.')
+  })
+
   it('makes a domain override visible before it is accepted', async () => {
     seed({
       hosts: [host('h1', '10.20.0.5', { hostname: 'nas', fqdn: 'nas.home.arpa' })],

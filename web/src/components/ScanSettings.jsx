@@ -330,6 +330,12 @@ export default function ScanSettings({ subnet, targetsRes, onChanged }) {
           <Radar size={14} className="text-slate-400" />
           <h2 className="text-sm font-semibold text-slate-200">Scanning</h2>
           <span className="text-xs text-slate-400">{summary}</span>
+          {targetsRes.error && loaded && (
+            // the last target stays when a reload fails: say it is not current
+            <span role="alert" className="text-xs text-amber-400">
+              Could not be reloaded: {targetsRes.error.message}
+            </span>
+          )}
         </div>
         <div className="flex gap-2">
           {loaded && (

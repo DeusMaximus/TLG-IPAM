@@ -312,6 +312,12 @@ export default function FindingsPanel({
           </label>
         )}
       </div>
+      {error && loaded && (
+        // useFetch keeps the last list when a reload fails: say it is not current
+        <p className="mt-2 text-xs text-amber-400" role="alert">
+          Findings could not be reloaded: {error.message}. The list below may be out of date.
+        </p>
+      )}
       {outcome && <Outcome outcome={outcome} onClose={() => setOutcome(null)} />}
       {groups.map((group) => (
         <Group

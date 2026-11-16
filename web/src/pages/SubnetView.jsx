@@ -82,6 +82,15 @@ export default function SubnetView() {
   // only this subnet's: the last subnet's list stays until this one's arrives, and an
   // accept must never be sent for a subnet the owner has moved away from
   const findings = (findingsRes.data?.data || []).filter((f) => f.subnet_id === subnetId)
+  // The panel shows when the subnet is scanned or has findings, and once shown stays
+  // for this subnet: accepting the last finding of a subnet with no scan target must
+  // not take the answer off screen before the owner has read it.
+  const [panelSubnet, setPanelSubnet] = useState(null)
+  const wantsPanel = Boolean(target) || findings.length > 0
+  useEffect(() => {
+    if (wantsPanel) setPanelSubnet(subnetId)
+  }, [wantsPanel, subnetId])
+  const showFindings = wantsPanel || panelSubnet === subnetId
 
   if (subnetRes.error) {
     return <EmptyState>Subnet not found.</EmptyState>
@@ -97,7 +106,6 @@ export default function SubnetView() {
   const hostsById = Object.fromEntries(hosts.map((h) => [h.id, h]))
   // 'out' for every host when the subnet has no scan target; otherwise not known here
   const scopeOf = scopeChecker({ loaded: targetsLoaded, target })
-  const showFindings = Boolean(target) || findings.length > 0
 
   // After a write that changes what the tree holds (subnets in the tree carry their
   // reserved ranges with scan_excluded, and scan_dhcp_pool): reload the tree, and
@@ -222,6 +230,12 @@ export default function SubnetView() {
       <div className="mt-6 flex items-center justify-between">
         <h2 className="text-sm font-semibold text-slate-200">
           Hosts <span className="font-normal text-slate-500">({hosts.length})</span>
+          {hostsRes.error && hostsRes.data && (
+            // useFetch keeps the last list when a reload fails: say it is not current
+            <span role="alert" className="ml-2 text-xs font-normal text-amber-400">
+              Could not be reloaded: {hostsRes.error.message}. The list may be out of date.
+            </span>
+          )}
         </h2>
         <div className="flex gap-2">
           {selected.size > 0 &&
