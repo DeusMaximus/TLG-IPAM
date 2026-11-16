@@ -218,7 +218,7 @@ A subnet the owner has chosen to scan, and how (v0.2 spec §5.3, §5.4). At most
 | `scan_dhcp_pool` | bool, default `false` — whether the subnet's DHCP pool is in scope |
 | `interval_minutes` | int, nullable — 5 to 10080 (a week); null = manual only |
 | `scan_requested_at` | datetime, nullable, read-only — when a scan was last requested (`POST /subnets/{id}/scan`). Never cleared: it also times the cooldown |
-| `current_job_id`, `job_issued_at` | nullable, read-only — the job lease, set when check-in issues a job (§4.5) |
+| `current_job_id`, `job_issued_at`, `job_agent_id` | nullable, read-only — the job lease, set when check-in issues a job (§4.5). `job_agent_id` is the agent it was issued to, which stays put when the target is reassigned; no foreign key. Databases created before it gain the column on startup |
 | `last_scan_at`, `last_scan_duration_ms`, `last_scan_complete` | nullable, read-only — the last-scan record. `last_scan_at` is when the last completed job was issued, by the server's clock. Written by results ingest (#11); nothing writes them yet |
 | `created_at` | datetime, auto |
 
@@ -334,7 +334,7 @@ Gateway, DHCP, reserved-range, and allocated-address exclusions are represented 
 
 **When a target is due.** It is enabled, assigned to this agent, not under a live lease, and either a scan was requested after its last scan started (`scan_requested_at` > `last_scan_at`), or it has an interval and has never been scanned or its last scan started at least `interval_minutes` ago. Requested targets go first, then the one scanned longest ago.
 
-**Leases.** Issuing a job sets `current_job_id` and `job_issued_at`. The lease is live for 15 minutes (the 10-minute job timeout plus a margin); a target under a live lease is not issued again, and once it expires the target is due again. The write is a compare-and-set on the lease the check-in read, so two check-ins never lease one target twice. An agent holding any live lease gets no new job: it runs one job at a time. Results ingest (#11) clears the lease.
+**Leases.** Issuing a job sets `current_job_id` and `job_issued_at`. The lease is live for 15 minutes (the 10-minute job timeout plus a margin); a target under a live lease is not issued again, and once it expires the target is due again. The write is a compare-and-set on the lease the check-in read, so two check-ins never lease one target twice. An agent holding any live lease gets no new job: it runs one job at a time. Leases are found by `job_agent_id`, not by the target's `agent_id`, so a target reassigned mid-scan keeps its lease until it expires or its result arrives: the agent still scanning stays busy, and the new agent waits for that target only. Results ingest (#11) clears the lease.
 
 **The job.** `ranges` is the subnet's scan scope from `services/scans.scan_scope` (§3.10); a target whose scope is empty gets no job. `methods` are the target's, minus `arp` when the subnet is not on the agent's link, and minus `fdns` until the forward-DNS check exists (#20), so `fdns` is always empty. The subnet is on the agent's link when one reported IPv4 interface's network contains the whole subnet. A target left with neither `icmp` nor `arp` gets no job, and is not leased. `dns_servers` are the subnet's, or empty. `timeout_s` is 600.
 

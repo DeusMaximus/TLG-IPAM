@@ -1,9 +1,10 @@
 """Agent check-in, scheduling and job leases (v0.2 spec §5.1, §5.2, §5.7).
 
 The server is the scheduler. At each check-in it stores what the agent reports and
-hands back at most one due job. Issuing a job leases its target: `current_job_id`
-and `job_issued_at` are set, and the target is not issued again until the lease is
-cleared by an accepted result (#11) or expires.
+hands back at most one due job. Issuing a job leases its target: `current_job_id`,
+`job_issued_at` and `job_agent_id` are set, and the target is not issued again until
+the lease is cleared by an accepted result (#11) or expires. A target reassigned
+mid-scan keeps its lease, and the agent it was issued to stays busy, until then.
 
 A target is due when it is enabled, assigned to the agent, not under a live lease,
 and either
@@ -111,7 +112,9 @@ def _priority(target: ScanTarget):
     return (not requested(target), utc(target.last_scan_at) or never, utc(target.created_at))
 
 
-async def _lease(session: AsyncSession, target: ScanTarget, now: datetime) -> str | None:
+async def _lease(
+    session: AsyncSession, target: ScanTarget, agent_id: str, now: datetime
+) -> str | None:
     """Lease the target to a new job. The update only applies if the lease is still the
     one this check-in read, so two check-ins can never both issue the same target."""
     job_id = str(uuid4())
@@ -121,16 +124,28 @@ async def _lease(session: AsyncSession, target: ScanTarget, now: datetime) -> st
             ScanTarget.id == target.id,
             ScanTarget.current_job_id.is_not_distinct_from(target.current_job_id),
         )
-        .values(current_job_id=job_id, job_issued_at=now)
+        .values(current_job_id=job_id, job_issued_at=now, job_agent_id=agent_id)
         .execution_options(synchronize_session=False)
     )
     if result.rowcount != 1:
         return None
-    target.current_job_id, target.job_issued_at = job_id, now
+    target.current_job_id, target.job_issued_at, target.job_agent_id = job_id, now, agent_id
     return job_id
 
 
+async def _busy(session: AsyncSession, agent: Agent, now: datetime) -> bool:
+    """Whether the agent still holds a live lease, on any target: found by the agent
+    the lease was issued to, not by the target's assignment, which the owner may have
+    changed while the scan runs."""
+    held = await session.scalars(select(ScanTarget).where(ScanTarget.job_agent_id == agent.id))
+    return any(lease_live(target, now) for target in held)
+
+
 async def _next_job(session: AsyncSession, agent: Agent, now: datetime) -> Job | None:
+    # One job at a time: an agent still holding a live lease is still scanning, so a
+    # second job would wait in its queue while its own lease ran out.
+    if await _busy(session, agent, now):
+        return None
     rows = (
         await session.execute(
             select(ScanTarget, Subnet)
@@ -138,10 +153,6 @@ async def _next_job(session: AsyncSession, agent: Agent, now: datetime) -> Job |
             .where(ScanTarget.agent_id == agent.id)
         )
     ).all()
-    # One job at a time: an agent still holding a live lease is still scanning, so a
-    # second job would wait in its queue while its own lease ran out.
-    if any(lease_live(target, now) for target, _ in rows):
-        return None
     for target, subnet in sorted(rows, key=lambda row: _priority(row[0])):
         if not is_due(target, now):
             continue
@@ -151,7 +162,7 @@ async def _next_job(session: AsyncSession, agent: Agent, now: datetime) -> Job |
         ranges = await scans.scan_scope_ranges(session, subnet)
         if not ranges:
             continue
-        job_id = await _lease(session, target, now)
+        job_id = await _lease(session, target, agent.id, now)
         if job_id is None:
             continue
         return Job(

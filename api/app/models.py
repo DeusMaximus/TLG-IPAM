@@ -219,6 +219,10 @@ class ScanTarget(Base):
     scan_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     current_job_id: Mapped[str | None] = mapped_column(String(36))
     job_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # the agent the lease was issued to, kept apart from `agent_id` so that reassigning
+    # the target mid-scan leaves the lease with the agent that is still scanning. No FK:
+    # deleting an agent needs no rewrite, and a lease outlives nothing but its expiry.
+    job_agent_id: Mapped[str | None] = mapped_column(String(36))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     # the `job_issued_at` of the last completed job, by the server's clock
     last_scan_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

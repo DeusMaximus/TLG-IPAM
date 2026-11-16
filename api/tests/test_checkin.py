@@ -871,3 +871,59 @@ async def test_request_scan_needs_the_owner_key(client, anon_client):
     assert (await anon_client.post(path)).status_code == 401
     assert (await anon_client.post(path, headers={"Authorization": f"Bearer {token}"})).status_code == 401
     assert (await anon_client.post(path, headers={"X-API-Key": token})).status_code == 403
+
+
+async def test_reassigning_a_target_mid_scan_leaves_the_lease_with_its_agent(client, agent_api):
+    """The lease names the agent it was issued to, apart from the target's assignment:
+    the agent still scanning stays busy, and the new one is not blocked by its lease."""
+    a, a_token = await make_agent(client, "a")
+    b, b_token = await make_agent(client, "b")
+    first = await lab(client, "10.0.0.0/24", name="first")
+    second = await lab(client, "10.0.1.0/24", name="second")
+    third = await lab(client, "10.0.2.0/24", name="third")
+    moved = await make_target(client, first["id"], a["id"])
+    [job] = await jobs_for(agent_api, a_token)
+    assert job["subnet_id"] == first["id"]
+    assert (await target_row(moved["id"])).job_agent_id == a["id"]
+    # the owner moves the target to b while a is still scanning it
+    res = await client.put(f"/api/v1/scan-targets/{moved['id']}", json={"agent_id": b["id"]})
+    assert res.status_code == 200, res.text
+    assert res.json()["data"]["job_agent_id"] == a["id"]
+    await make_target(client, second["id"], a["id"])
+    await make_target(client, third["id"], b["id"])
+    # a still holds a live lease, so its other due target waits
+    assert await jobs_for(agent_api, a_token) == []
+    # b holds none, so it is served; the moved target stays leased to a's job
+    [b_job] = await jobs_for(agent_api, b_token)
+    assert b_job["subnet_id"] == third["id"]
+    # once a's lease expires, a is free and b can take the moved target
+    await set_target(moved["id"], job_issued_at=_now() - jobs.LEASE - timedelta(seconds=1))
+    [a_job] = await jobs_for(agent_api, a_token)
+    assert a_job["subnet_id"] == second["id"]
+
+
+async def test_database_from_main_gains_the_lease_agent_column(tmp_path):
+    import sqlite3
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.database import init_models
+    from app.models import Base
+
+    path = tmp_path / "old.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{path}")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            # scan_targets as main had it, before this column
+            await conn.exec_driver_sql("ALTER TABLE scan_targets DROP COLUMN job_agent_id")
+        await init_models(engine)
+        await init_models(engine)  # a second start-up adds nothing twice
+    finally:
+        await engine.dispose()
+    con = sqlite3.connect(path)
+    try:
+        columns = {r[1]: r for r in con.execute("PRAGMA table_info(scan_targets)")}
+    finally:
+        con.close()
+    assert columns["job_agent_id"][3] == 0  # nullable
