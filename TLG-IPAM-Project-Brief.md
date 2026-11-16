@@ -104,6 +104,7 @@ A block of IPs within a subnet that automatic allocation skips — e.g. addresse
 | `subnet_id` | FK → Subnet |
 | `start_ip` / `end_ip` | str — inclusive bounds, both within the subnet CIDR, start ≤ end |
 | `description` | str, nullable — e.g. `network gear` |
+| `scan_excluded` | bool, nullable — `true` takes the range out of its subnet's scan scope (§3.10). Null or `false` means scanned, and responses return `false` for null. Ranges from before the column existed gain it, null, on startup, so they read as scanned. Set on create over REST, or later with `PATCH`; never over MCP |
 
 ### 3.4 Host
 
@@ -145,7 +146,7 @@ Append-only record of every write. Because Claude can write to this system via M
 |---|---|
 | `id` | UUID, primary key |
 | `ts` | datetime, auto |
-| `entity_type` | enum: `section` \| `subnet` \| `host` \| `device_type` \| `agent` \| `token` |
+| `entity_type` | enum: `section` \| `subnet` \| `host` \| `device_type` \| `agent` \| `token` \| `scan_target`. Reserved-range writes, a range's scan exclusion included, are logged as `subnet` updates |
 | `entity_id` | UUID of the affected record |
 | `action` | enum: `create` \| `update` \| `delete` \| `revoke` (`revoke` is for tokens only) |
 | `summary` | str — human-readable one-liner, e.g. `host pbs-01 created at 10.10.20.45` |
@@ -166,7 +167,8 @@ Append-only record of every write. Because Claude can write to this system via M
 - Domain suffixes normalised to lowercase, leading/trailing dots stripped, charset-validated.
 - MAC addresses normalised to lowercase with colons on write.
 - VLAN IDs 1–4094 only.
-- Deleting a section requires no child subnets. Deleting a subnet requires no hosts, unless `force=true` is passed (cascades to hosts and reserved ranges; the UI requires explicit confirmation).
+- Deleting a section requires no child subnets. Deleting a subnet requires no hosts, unless `force=true` is passed (cascades to hosts and reserved ranges; the UI requires explicit confirmation). Either way the subnet's scan target is deleted with it, with its own change-log entry.
+- A scan target needs a subnet of `/20` or a longer prefix, and its subnet's CIDR cannot then be changed to a shorter one.
 
 ### 3.8 Agent
 
@@ -181,7 +183,7 @@ A scan agent (v0.2 spec §5.4). The owner creates it over REST; check-in, scanni
 | `version`, `platform`, `hostname`, `interfaces`, `last_checkin_at`, `last_error` | nullable; reported by the agent at check-in (M2a). Null until then |
 | `created_at` | datetime, auto |
 
-Rules: disabling an agent refuses its token without revoking it, and enabling it accepts the token again. Deleting an agent revokes its unrevoked tokens (each logged as a `token` `revoke`), then deletes the agent and its token rows.
+Rules: disabling an agent refuses its token without revoking it, and enabling it accepts the token again. Deleting an agent revokes its unrevoked tokens (each logged as a `token` `revoke`), sets `agent_id` to null on its scan targets (each logged as a `scan_target` update; their settings are kept), then deletes the agent and its token rows.
 
 ### 3.9 Token
 
@@ -199,6 +201,26 @@ A credential bound to an agent (v0.2 spec §4.2). An agent token is `tlga_` foll
 | `revoked_at` | datetime, nullable |
 
 Rules: the plain token appears in exactly one response, the one that creates it; it cannot be recovered afterwards. An agent holds at most one unrevoked `agent` token, enforced by a partial unique index. Token create and revoke are audit-logged with `entity_type="token"`; agent and token writes are owner writes, so `actor` is null.
+
+### 3.10 ScanTarget and scan scope
+
+A subnet the owner has chosen to scan, and how (v0.2 spec §5.3, §5.4). At most one per subnet. Configured over REST only; no MCP tool reads or writes it. Nothing scans yet: check-in, jobs and results arrive with v0.2 M2a (#10, #11).
+
+| Field | Type / notes |
+|---|---|
+| `id` | UUID, primary key |
+| `subnet_id` | FK → Subnet, unique. Fixed once created |
+| `agent_id` | FK → Agent, nullable. Null = unassigned: nothing is scanned until an agent is chosen |
+| `enabled` | bool, default `true` |
+| `methods` | JSON list — a subset of `icmp`, `arp`, `rdns`, `fdns` that includes `icmp` or `arp` (the liveness methods). Stored de-duplicated in that order. Default `["icmp", "arp", "rdns"]` |
+| `scan_dhcp_pool` | bool, default `false` — whether the subnet's DHCP pool is in scope |
+| `interval_minutes` | int, nullable — 5 to 10080 (a week); null = manual only |
+| `scan_requested_at`, `current_job_id`, `job_issued_at`, `last_scan_at`, `last_scan_duration_ms`, `last_scan_complete` | nullable, read-only. The request flag, job lease and last-scan record; nothing writes them until M2a |
+| `created_at` | datetime, auto |
+
+**Scan scope** is the set of addresses a scan may send packets to. It is computed in one place, `services/scans.scan_scope(subnet)`, as inclusive address ranges: the subnet's usable addresses (no network or broadcast for `/30` and shorter), minus the DHCP pool unless `scan_dhcp_pool` is set, minus every reserved range with `scan_excluded`. Exclusion wins: an address in both an excluded and a scanned reserved range is excluded. A subnet without a scan target has the default scope (pool not scanned). Scan-target responses carry it as `scope: [{start, end}]`.
+
+Rules: one target per subnet (`409`, also enforced by `UNIQUE(subnet_id)`). Unknown subnet or agent: `404`. A method outside the four, or a set without `icmp` or `arp`: `422`. Every create, update and delete is audit-logged as `scan_target`; an update that changes nothing writes no entry.
 
 ---
 
@@ -229,7 +251,7 @@ Agent-facing routes, `/api/v1/agent/*`, take an agent token instead (§3.9), as 
 | `POST /api/v1/subnets` | Create. Validate CIDR + overlap rule. |
 | `GET  /api/v1/subnets/{id}` | Detail including utilisation stats. |
 | `PUT  /api/v1/subnets/{id}` | Update. |
-| `DELETE /api/v1/subnets/{id}` | Delete only if no hosts; `?force=true` cascades, deleting all hosts and reserved ranges too. |
+| `DELETE /api/v1/subnets/{id}` | Delete only if no hosts; `?force=true` cascades, deleting all hosts and reserved ranges too. Its scan target is deleted either way. |
 | `GET  /api/v1/subnets/{id}/free` | Return list of free IPs in the subnet (excludes reserved space, see 4.4). |
 | `GET  /api/v1/hosts` | List. Filters: `?subnet_id=` `?status=` `?q=` (search hostname/ip/mac). |
 | `POST /api/v1/hosts` | Create host. Validate IP in subnet. |
@@ -239,7 +261,8 @@ Agent-facing routes, `/api/v1/agent/*`, take an agent token instead (§3.9), as 
 | `POST /api/v1/hosts/bulk-delete` | Delete up to 1000 hosts by ID. Returns deleted count + not-found IDs. One audit entry per affected subnet, with before-snapshots. |
 | `POST /api/v1/subnets/{id}/next-free` | Allocate next free IP — creates host record, returns it. |
 | `POST /api/v1/subnets/{id}/hosts/bulk` | Bulk import (max 1000). Single transaction, per-record results (`created`/`skipped`/`error` + reason) — partial failures never abort the batch. One audit entry for the whole import. |
-| `POST /api/v1/subnets/{id}/reserved` | Add a reserved range. Reserved ranges are embedded in subnet GET responses. |
+| `POST /api/v1/subnets/{id}/reserved` | Add a reserved range (`{start_ip, end_ip, description?, scan_excluded?}`; `scan_excluded` defaults to `false`). Reserved ranges are embedded in subnet GET responses, each with `scan_excluded`; subnet responses also carry `scan_dhcp_pool` from the subnet's scan target, or null when it has none. |
+| `PATCH /api/v1/subnets/{id}/reserved/{range_id}` | Set `{scan_excluded}` (required, not null). A request that changes nothing writes no change-log entry. |
 | `DELETE /api/v1/subnets/{id}/reserved/{range_id}` | Remove a reserved range. |
 | `GET  /api/v1/changes` | Recent changes, newest first. Filters: `?entity_type=` `?limit=`. |
 | `GET  /api/v1/agents` | List agents, by name, each with its tokens (prefix and timestamps only, newest first). |
@@ -247,7 +270,12 @@ Agent-facing routes, `/api/v1/agent/*`, take an agent token instead (§3.9), as 
 | `GET  /api/v1/agents/{id}` | Detail, with its tokens. |
 | `PUT  /api/v1/agents/{id}` | Update `name` and/or `enabled` (`false` → `disabled`; `true` → `active`, or `pending` for an agent that has never held an agent token). A request that changes nothing writes no change-log entry. |
 | `POST /api/v1/agents/{id}/revoke` | Revoke every unrevoked token of the agent; the agent is kept. `409` if it has none. |
-| `DELETE /api/v1/agents/{id}` | Revoke its tokens, then delete the agent and its tokens. |
+| `DELETE /api/v1/agents/{id}` | Revoke its tokens, unassign its scan targets, then delete the agent and its tokens. |
+| `GET  /api/v1/scan-targets` | List scan targets, oldest first, each with its `scope` (§3.10). |
+| `POST /api/v1/scan-targets` | Create (`{subnet_id, agent_id?, enabled?, methods?, scan_dhcp_pool?, interval_minutes?}`). `201`. Subnet shorter than `/20`, bad methods or interval: `422`; subnet already has one: `409`. |
+| `GET  /api/v1/scan-targets/{id}` | Detail, with `scope`. |
+| `PUT  /api/v1/scan-targets/{id}` | Update any of `agent_id` (null unassigns), `enabled`, `methods`, `scan_dhcp_pool`, `interval_minutes` (null = manual only). |
+| `DELETE /api/v1/scan-targets/{id}` | Delete the target; the subnet is kept. |
 | `GET/POST /api/v1/device-types` + `PUT/DELETE /api/v1/device-types/{id}` | Device type CRUD with host counts. Rename cascades to hosts; delete refused while in use or for `other`. |
 | `GET  /api/v1/backup` | Download a consistent temporary snapshot made with SQLite's online backup API (powers the Settings backup button). `docs/backup-and-restore.md` documents the scheduled pull from another host and the restore. |
 
@@ -325,7 +353,7 @@ Tool descriptions are the documentation Claude reads at runtime — write them w
 | `list_sections` | List all network sections/segments. Use to get an overview of how the network is organised before querying subnets. |
 | `list_device_types` | List defined device types with usage counts — the valid `device_type` values for host writes. |
 | `list_subnets` | List subnets, optionally filtered by section. Returns CIDR, VLAN ID, name, and utilisation (used/total) in one call. |
-| `get_subnet` | Full detail for a subnet: VLAN tag, gateway, DNS servers, DHCP pool, utilisation, and free-IP count — one call, no follow-ups needed. |
+| `get_subnet` | Full detail for a subnet: VLAN tag, gateway, DNS servers, DHCP pool, utilisation, and free-IP count — one call, no follow-ups needed. Shows each reserved range's `scan_excluded` and the subnet's `scan_dhcp_pool` (null when the subnet has no scan target), so an assistant can explain why an address is not scanned. `list_subnets` returns the same shape. |
 | `get_free_ips` | Return unallocated IPs in a subnet (respects gateway, DHCP-pool, reserved-range, and network/broadcast exclusions). Use before allocating to check availability or find a specific address. |
 | `list_hosts` | Search and filter host records across the network. Free-text search (hostname, IP, MAC) plus filtering by subnet or status. |
 | `get_host` | Full detail for a specific host record including MAC, device type, owner, and last seen. |
@@ -335,11 +363,11 @@ Tool descriptions are the documentation Claude reads at runtime — write them w
 | `update_host` | Update hostname, domain override, MAC address, status, device type, owner, or notes for an existing host record. Pass nullable field names in `clear_fields` to clear them; clearing a domain override restores subnet-domain inheritance. |
 | `delete_host` | Remove a host record, freeing the IP address for future allocation. |
 | `bulk_delete_hosts` | Delete many hosts by ID in one call (cleanup workflows). Returns deleted count + not-found IDs. |
-| `add_reserved_range` | Reserve a block of IPs in a subnet so automatic allocation skips it (manual creation inside it stays allowed). |
-| `delete_reserved_range` | Remove a reserved range, returning its addresses to the allocation pool. |
+| `add_reserved_range` | Reserve a block of IPs in a subnet so automatic allocation skips it (manual creation inside it stays allowed). Always creates a scanned range: the tool has no `scan_excluded` argument. |
+| `delete_reserved_range` | Remove a reserved range, returning its addresses to the allocation pool. Refuses a range with `scan_excluded`, because removing it would widen what is scanned; the error says to remove it in the web UI. |
 | `list_changes` | Recent changes to the IPAM (audit log), newest first, each with its `source` and `actor` (null for the owner's own writes). Use to answer "what changed recently?" or to review previous MCP-driven edits. |
 
-All MCP writes are recorded in the change log with `source = mcp`.
+All MCP writes are recorded in the change log with `source = mcp`. No tool creates, changes or lists agents, tokens or scan targets, and no tool can widen a subnet's scan scope (v0.2 spec §7.2, invariant 2).
 
 ### 5.3 Claude Desktop config
 
@@ -423,7 +451,7 @@ tlg-ipam/
 │       ├── main.py           # FastAPI app + static SPA serving + MCP mount
 │       ├── config.py         # env vars (pydantic-settings)
 │       ├── database.py       # SQLAlchemy async engine + session
-│       ├── models.py         # ORM models (Section, Subnet, ReservedRange, Host, DeviceType, Change, Agent, Token)
+│       ├── models.py         # ORM models (Section, Subnet, ReservedRange, Host, DeviceType, Change, Agent, Token, ScanTarget)
 │       ├── schemas.py        # Pydantic request/response schemas
 │       ├── auth.py           # owner-key check (REST dependency + /mcp bearer verifier); agent-token dependency
 │       ├── mcp_server.py     # FastMCP tools (thin wrappers over services)
@@ -434,6 +462,7 @@ tlg-ipam/
 │       │   ├── hosts.py
 │       │   ├── device_types.py
 │       │   ├── agents.py     # agents, agent tokens (hashed), agent-token authentication
+│       │   ├── scans.py      # scan targets; scan_scope, the one place scan scope is computed
 │       │   └── changes.py    # audit log writes + reads
 │       └── routers/
 │           ├── sections.py
@@ -441,6 +470,7 @@ tlg-ipam/
 │           ├── hosts.py
 │           ├── device_types.py
 │           ├── agents.py     # owner CRUD on /api/v1/agents
+│           ├── scan_targets.py # owner CRUD on /api/v1/scan-targets
 │           └── changes.py
 └── web/
     ├── package.json
@@ -511,6 +541,8 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 - Every write appears in the change log. MCP provenance is authoritative; UI/API attribution is advisory because REST clients share one API key and can set `X-TLG-Client`.
 - An agent's `tlga_…` token appears in exactly one response, the create response, and is stored only as its SHA-256 and display prefix. Its create and revoke each have a change-log entry.
 - The owner key is refused on agent routes; an agent token is refused on owner routes and on `/mcp`. A revoked token, and the token of a disabled agent, are refused.
+- A subnet's scan scope leaves out network and broadcast, the DHCP pool unless pool scanning is on, and every excluded reserved range; an address in both an excluded and a scanned range is excluded. Ranges from a database made before scan exclusion existed read as scanned.
+- Scan targets are refused for prefixes shorter than `/20` and for method sets without `icmp` or `arp`. Deleting a subnet deletes its scan target; deleting an agent unassigns its targets. Every scan-target and scan-exclusion change is in the change log.
 
 ### Testing
 - pytest covers CIDR/IP validation, CIDR child invariants, explicit-null updates, the overlap rule, interval maths, consistent backups, MCP clearing, and next-free allocation edge cases.
@@ -521,6 +553,7 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 - `/mcp` answers `401` to a missing or wrong bearer, and to `X-API-Key` alone.
 - All 16 MCP tools are callable from Claude Desktop.
 - Bulk import reports per-record outcomes; a batch with some bad rows still imports the good ones.
+- No MCP tool configures agents, scan targets or scan scope. `add_reserved_range` creates a scanned range; `delete_reserved_range` on an excluded range fails with a message pointing at the web UI; `get_subnet` shows `scan_excluded` and `scan_dhcp_pool`.
 - Natural-language queries resolve to correct tool calls without ambiguity.
 
 ### Operations

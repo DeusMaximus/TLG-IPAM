@@ -1,7 +1,7 @@
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..errors import conflict, not_found, validation_error
+from ..errors import ApiError, conflict, not_found, validation_error
 from ..ipnet import (
     exclusion_intervals,
     interval_size,
@@ -12,8 +12,15 @@ from ..ipnet import (
     usable_bounds,
 )
 from ..models import Host, ReservedRange, Subnet
-from ..schemas import ReservedRangeCreate, ReservedRangeOut, SubnetCreate, SubnetOut, SubnetUpdate
-from . import changes
+from ..schemas import (
+    ReservedRangeCreate,
+    ReservedRangeOut,
+    ReservedRangeUpdate,
+    SubnetCreate,
+    SubnetOut,
+    SubnetUpdate,
+)
+from . import changes, scans
 from .sections import get_section
 
 
@@ -89,28 +96,33 @@ async def _grouped_reserved(
     return grouped
 
 
-def _subnet_dict(subnet: Subnet, stats: dict, reserved: list[ReservedRange]) -> dict:
+def _subnet_dict(
+    subnet: Subnet, stats: dict, reserved: list[ReservedRange], scan_dhcp_pool: bool | None
+) -> dict:
     # build from columns, not the ORM object: the reserved_ranges relationship would
     # otherwise lazy-load (not allowed under the async session)
     columns = {c.name: getattr(subnet, c.name) for c in subnet.__table__.columns}
     ranges = [ReservedRangeOut.model_validate(r).model_dump() for r in reserved]
     return SubnetOut.model_validate(
-        {**columns, **stats, "reserved_ranges": ranges}
+        {**columns, **stats, "reserved_ranges": ranges, "scan_dhcp_pool": scan_dhcp_pool}
     ).model_dump(mode="json")
 
 
 async def subnets_out(session: AsyncSession, subnets: list[Subnet]) -> list[dict]:
-    """Serialised subnets with utilisation stats and reserved ranges — the shape
-    shared by the REST API and MCP tools. Batches the per-subnet host and
-    reserved-range lookups into two queries regardless of subnet count."""
+    """Serialised subnets with utilisation stats, reserved ranges (each with
+    `scan_excluded`) and `scan_dhcp_pool` — the shape shared by the REST API and MCP
+    tools. Batches the per-subnet host, reserved-range and scan-target lookups into
+    three queries regardless of subnet count."""
     ids = [s.id for s in subnets]
     allocated = await _grouped_allocated(session, ids) if ids else {}
     reserved = await _grouped_reserved(session, ids) if ids else {}
+    targets = await scans.targets_by_subnet(session, ids)
     return [
         _subnet_dict(
             s,
             _stats(s, allocated.get(s.id, set()), reserved.get(s.id, [])),
             reserved.get(s.id, []),
+            targets[s.id].scan_dhcp_pool if s.id in targets else None,
         )
         for s in subnets
     ]
@@ -225,6 +237,10 @@ async def update_subnet(
                 f"Cannot change CIDR to {merged['cidr']}: "
                 f"{outside_ranges} reserved range(s) would fall outside it"
             )
+        if await scans.target_for_subnet(session, subnet.id) is not None:
+            scans.check_prefix(merged["cidr"])
+    # #11: a CIDR or DHCP-pool edit that puts addresses out of scan scope deletes their
+    # observations and dismissals in this transaction (spec §5.3).
     before = changes.snapshot(subnet)
     for field, value in data.items():
         setattr(subnet, field, value)
@@ -269,6 +285,7 @@ async def delete_subnet(
     )
     for block in await reserved_ranges(session, subnet_id):
         await session.delete(block)
+    await scans.delete_for_subnet(session, subnet, source)
     await session.delete(subnet)
     await session.commit()
 
@@ -292,6 +309,7 @@ async def create_reserved_range(
         start_int=int(start),
         end_int=int(end),
         description=payload.description,
+        scan_excluded=payload.scan_excluded,
     )
     session.add(block)
     await session.flush()
@@ -303,8 +321,46 @@ async def create_reserved_range(
         summary=(
             f"reserved range {block.start_ip}-{block.end_ip} added to {subnet.name}"
             + (f" ({block.description})" if block.description else "")
+            + (", excluded from scanning" if block.scan_excluded else "")
         ),
         source=source,
+        after=changes.snapshot(block),
+    )
+    await session.commit()
+    return block
+
+
+async def _get_reserved_range(
+    session: AsyncSession, subnet_id: str, range_id: str
+) -> tuple[Subnet, ReservedRange]:
+    subnet = await get_subnet(session, subnet_id)
+    block = await session.get(ReservedRange, range_id)
+    if block is None or block.subnet_id != subnet_id:
+        raise not_found("Reserved range", range_id)
+    return subnet, block
+
+
+async def update_reserved_range(
+    session: AsyncSession, subnet_id: str, range_id: str, payload: ReservedRangeUpdate, source: str
+) -> ReservedRange:
+    """Set `scan_excluded`, the range's part in the subnet's scan scope (spec §5.3).
+    REST only: scan scope is not configurable over MCP."""
+    subnet, block = await _get_reserved_range(session, subnet_id, range_id)
+    if bool(block.scan_excluded) == payload.scan_excluded:
+        return block
+    before = changes.snapshot(block)
+    block.scan_excluded = payload.scan_excluded
+    # #11: excluding a range deletes the observations and dismissals inside it, in this
+    # transaction (spec §5.3).
+    verb = "excluded from scanning" if payload.scan_excluded else "returned to scanning"
+    changes.record(
+        session,
+        entity_type="subnet",
+        entity_id=subnet.id,
+        action="update",
+        summary=f"reserved range {block.start_ip}-{block.end_ip} in {subnet.name} {verb}",
+        source=source,
+        before=before,
         after=changes.snapshot(block),
     )
     await session.commit()
@@ -314,10 +370,17 @@ async def create_reserved_range(
 async def delete_reserved_range(
     session: AsyncSession, subnet_id: str, range_id: str, source: str
 ) -> None:
-    subnet = await get_subnet(session, subnet_id)
-    block = await session.get(ReservedRange, range_id)
-    if block is None or block.subnet_id != subnet_id:
-        raise not_found("Reserved range", range_id)
+    subnet, block = await _get_reserved_range(session, subnet_id, range_id)
+    if block.scan_excluded and source == "mcp":
+        # deleting an excluded range widens what is scanned, and no MCP call may do that
+        # (spec §7.2, invariant 2)
+        raise ApiError(
+            "FORBIDDEN",
+            f"Reserved range {block.start_ip}-{block.end_ip} is excluded from scanning, and "
+            "deleting it would widen what is scanned. Scan scope cannot be changed over "
+            "MCP: remove this range in the TLG-IPAM web UI instead.",
+            403,
+        )
     changes.record(
         session,
         entity_type="subnet",

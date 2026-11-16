@@ -8,6 +8,7 @@ from ..schemas import (
     BulkImportRequest,
     ReservedRangeCreate,
     ReservedRangeOut,
+    ReservedRangeUpdate,
     SubnetCreate,
     SubnetUpdate,
 )
@@ -105,6 +106,18 @@ async def create_reserved_range(
     source: str = Depends(request_source),
 ):
     block = await svc.create_reserved_range(session, subnet_id, payload, source)
+    return {"data": ReservedRangeOut.model_validate(block).model_dump()}
+
+
+@router.patch("/{subnet_id}/reserved/{range_id}")
+async def update_reserved_range(
+    subnet_id: str,
+    range_id: str,
+    payload: ReservedRangeUpdate,
+    session: AsyncSession = Depends(get_session),
+    source: str = Depends(request_source),
+):
+    block = await svc.update_reserved_range(session, subnet_id, range_id, payload, source)
     return {"data": ReservedRangeOut.model_validate(block).model_dump()}
 
 

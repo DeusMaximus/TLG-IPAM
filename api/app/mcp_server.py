@@ -21,6 +21,7 @@ from .schemas import (
     HostCreate,
     HostUpdate,
     ReservedRangeCreate,
+    ReservedRangeOut,
     SectionOut,
 )
 from .services import changes as changes_svc
@@ -104,24 +105,21 @@ async def add_reserved_range(
 ) -> dict:
     """Reserve a block of IPs in a subnet so automatic allocation skips it — e.g. a
     range held for network gear that is not installed yet. Hosts can still be created
-    inside the range manually with create_host."""
+    inside the range manually with create_host. A range added here is always scanned
+    (scan_excluded false) if the subnet is scanned: excluding a range from scanning is
+    done in the TLG-IPAM web UI, not over MCP."""
     payload = ReservedRangeCreate(start_ip=start_ip, end_ip=end_ip, description=description)
     async with SessionLocal() as session:
         block = await subnets_svc.create_reserved_range(session, subnet_id, payload, source="mcp")
-        return {
-            "reserved_range": {
-                "id": block.id,
-                "start_ip": block.start_ip,
-                "end_ip": block.end_ip,
-                "description": block.description,
-            }
-        }
+        return {"reserved_range": ReservedRangeOut.model_validate(block).model_dump()}
 
 
 @ipam_tool
 async def delete_reserved_range(subnet_id: str, range_id: str) -> dict:
     """Remove a reserved range from a subnet, returning its addresses to the automatic
-    allocation pool. Find range IDs via get_subnet (reserved_ranges field)."""
+    allocation pool. Find range IDs via get_subnet (reserved_ranges field). A range with
+    scan_excluded true cannot be removed here, because that would widen what the
+    network scanner probes: tell the user to remove it in the TLG-IPAM web UI."""
     async with SessionLocal() as session:
         await subnets_svc.delete_reserved_range(session, subnet_id, range_id, source="mcp")
         return {"deleted": True}
@@ -140,7 +138,12 @@ async def list_subnets(section_id: str | None = None) -> dict:
 async def get_subnet(subnet_id: str) -> dict:
     """Get full detail for a subnet: VLAN tag, gateway, DNS servers, DHCP pool,
     default domain suffix, reserved ranges, notes, and utilisation including the
-    count of free (allocatable) IPs — no follow-up calls needed for an overview."""
+    count of free (allocatable) IPs — no follow-up calls needed for an overview.
+    Scanning: scan_dhcp_pool is null when the subnet is not set up for scanning, false
+    when its DHCP pool is left out of scans (the default), true when the pool is
+    scanned. Each reserved range's scan_excluded is true when no scan probes it. Use
+    these to explain why an address has no scan data. Scan settings are changed in the
+    TLG-IPAM web UI only."""
     async with SessionLocal() as session:
         subnet = await subnets_svc.get_subnet(session, subnet_id)
         return {"subnet": await _subnet(session, subnet)}
@@ -334,7 +337,8 @@ async def list_changes(entity_type: str | None = None, limit: int = 20) -> dict:
     MCP (source). actor names who acted when that is narrower than source; it is null
     for the owner's own writes. Use to answer "what changed recently?" or to review
     earlier MCP-driven edits. entity_type filters to:
-    section|subnet|host|device_type|agent|token."""
+    section|subnet|host|device_type|agent|token|scan_target. Reserved-range writes,
+    including a range's scan exclusion, are logged under subnet."""
     async with SessionLocal() as session:
         rows = await changes_svc.list_changes(session, entity_type=entity_type, limit=limit)
         return {"changes": [ChangeOut.model_validate(c).model_dump(mode="json") for c in rows]}
