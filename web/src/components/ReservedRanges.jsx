@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Lock, Plus, X } from 'lucide-react'
 import { createReservedRange, deleteReservedRange, updateReservedRange } from '../api/ipam'
-import { useToast, useTree } from '../context'
+import { useToast } from '../context'
 import Modal, { inputCls, labelCls, primaryBtn, secondaryBtn } from './Modal'
 
 function ReserveModal({ subnet, onClose, onSaved }) {
@@ -78,15 +78,12 @@ function ReserveModal({ subnet, onClose, onSaved }) {
 
 export default function ReservedRanges({ subnet, onChanged }) {
   const toast = useToast()
-  const { refreshTree } = useTree()
   const [adding, setAdding] = useState(false)
   const [saving, setSaving] = useState(null) // id of the range whose Scan box is saving
 
-  // subnets in the tree carry their reserved ranges, scan_excluded included
-  const changed = async () => {
-    await refreshTree()
-    onChanged()
-  }
+  // onChanged reloads the tree (its subnets carry their reserved ranges, scan_excluded
+  // included) and this view; it reports its own failures, so it never throws here
+  const changed = onChanged
 
   const remove = async (block) => {
     try {

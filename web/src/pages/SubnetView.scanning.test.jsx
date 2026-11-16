@@ -1,9 +1,10 @@
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { MemoryRouter, Route, Routes } from 'react-router-dom'
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../api/client'
 import * as ipam from '../api/ipam'
+import { REFRESH_MS } from '../components/ScanSettings'
 import { ToastProvider, TreeProvider, useTree } from '../context'
 import SubnetView from './SubnetView'
 
@@ -140,12 +141,19 @@ function TreeProbe() {
   )
 }
 
+// Moves between subnets the way the sidebar does: SubnetView stays mounted
+function GoTo() {
+  const navigate = useNavigate()
+  return <button onClick={() => navigate('/subnets/sub-2')}>go to sub-2</button>
+}
+
 function renderView() {
   return render(
     <MemoryRouter initialEntries={['/subnets/sub-1']}>
       <ToastProvider>
         <TreeProvider>
           <TreeProbe />
+          <GoTo />
           <Routes>
             <Route path="/subnets/:subnetId" element={<SubnetView />} />
           </Routes>
@@ -170,6 +178,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.clearAllMocks()
   localStorage.clear()
 })
@@ -399,5 +408,86 @@ describe('scanning settings', () => {
     renderView()
     expect(await within(await findScanning()).findByText(/job issued/)).toBeInTheDocument()
     expect(screen.queryByText(/MAC collection unavailable/)).not.toBeInTheDocument()
+  })
+})
+
+describe('review fixes', () => {
+  it('an unsaved draft does not follow the view to another subnet with the same settings', async () => {
+    const user = userEvent.setup()
+    // a second subnet whose target has the same settings as the first
+    ipam.getSubnet.mockImplementation(async (id) => ({
+      data: id === 'sub-2' ? { ...subnetOut(), id: 'sub-2', name: 'Lab 2' } : subnetOut(),
+    }))
+    ipam.listScanTargets.mockImplementation(async () => ({
+      data: [clone(db.target), { ...clone(db.target), id: 'tgt-2', subnet_id: 'sub-2' }],
+    }))
+    renderView()
+    await openSettings(user)
+    await user.clear(within(scanning()).getByLabelText('Interval (minutes)'))
+    await user.type(within(scanning()).getByLabelText('Interval (minutes)'), '999')
+
+    await user.click(screen.getByRole('button', { name: 'go to sub-2' }))
+    await screen.findByRole('heading', { name: 'Lab 2' })
+    // the form closed with the subnet; reopened, it shows the server's values
+    expect(within(scanning()).queryByRole('button', { name: 'Save scanning settings' })).toBeNull()
+    await openSettings(user)
+    expect(within(scanning()).getByLabelText('Interval (minutes)')).toHaveValue(60)
+    expect(ipam.updateScanTarget).not.toHaveBeenCalled()
+  })
+
+  it('a failed tree reload after a range change still reloads the view, and says so', async () => {
+    const user = userEvent.setup()
+    renderView()
+    const box = await screen.findByRole('checkbox', { name: 'Scan 10.20.0.2–10.20.0.9' })
+    await waitFor(() => expect(screen.getByTestId('tree')).toBeInTheDocument())
+    ipam.listSubnets.mockRejectedValue(new ApiError('HTTP_502', 'Bad Gateway', 502))
+
+    await user.click(box)
+
+    expect(ipam.updateReservedRange).toHaveBeenCalledWith('sub-1', 'rr-1', { scan_excluded: true })
+    expect(
+      await screen.findByText('Saved, but the subnet list could not be reloaded: Bad Gateway')
+    ).toBeInTheDocument()
+    await waitFor(() =>
+      expect(screen.getByRole('checkbox', { name: 'Scan 10.20.0.2–10.20.0.9' })).not.toBeChecked()
+    )
+    expect(screen.queryByText('Bad Gateway')).toBeNull() // not reported as the write failing
+  })
+
+  it('a failed tree reload after saving settings closes the form and reloads the view', async () => {
+    const user = userEvent.setup()
+    renderView()
+    await openSettings(user)
+    await waitFor(() => expect(screen.getByTestId('tree')).toBeInTheDocument())
+    ipam.listSubnets.mockRejectedValue(new ApiError('HTTP_502', 'Bad Gateway', 502))
+    await user.click(within(scanning()).getByRole('checkbox', { name: /Scan DHCP pool/ }))
+    await user.click(within(scanning()).getByRole('button', { name: 'Save scanning settings' }))
+
+    expect(
+      await screen.findByText('Saved, but the subnet list could not be reloaded: Bad Gateway')
+    ).toBeInTheDocument()
+    expect(within(scanning()).queryByRole('alert')).toBeNull()
+    await waitFor(() =>
+      expect(within(scanning()).queryByText(/DHCP pool included/)).not.toBeInTheDocument()
+    )
+  })
+
+  it('reloads the target while open, so a job the agent picked up shows', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    renderView()
+    expect(await within(await findScanning()).findByText('idle')).toBeInTheDocument()
+
+    // the agent checks in and is issued a job without arp
+    Object.assign(db.target, {
+      current_job_id: 'job-1',
+      job_issued_at: new Date().toISOString().replace('Z', ''),
+      job_methods: ['icmp', 'rdns'],
+    })
+    await vi.advanceTimersByTimeAsync(REFRESH_MS)
+
+    expect(await within(scanning()).findByText(/job issued/)).toBeInTheDocument()
+    expect(
+      within(scanning()).getByText('MAC collection unavailable — agent is not on this subnet')
+    ).toBeInTheDocument()
   })
 })

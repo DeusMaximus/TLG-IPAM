@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Radar } from 'lucide-react'
 import {
   createScanTarget,
@@ -25,6 +25,9 @@ import { inputCls, labelCls, primaryBtn, secondaryBtn } from './Modal'
 
 // Scope ranges listed before the rest are summarised as "+N more"
 const SCOPE_SHOWN = 6
+// How often the target is reloaded while the view is open: an agent's check-in
+// changes it (a job issued, a scan finished) without anything happening here
+export const REFRESH_MS = 30 * 1000
 
 function When({ value }) {
   const date = parseServerTime(value)
@@ -268,6 +271,12 @@ export default function ScanSettings({ subnet, onChanged }) {
   const [asking, setAsking] = useState(false)
   const targetsRes = useFetch(() => listScanTargets(), [subnet])
   const agentsRes = useFetch(() => listAgents(), [])
+  const reloadTargets = targetsRes.refresh
+
+  useEffect(() => {
+    const timer = setInterval(reloadTargets, REFRESH_MS)
+    return () => clearInterval(timer)
+  }, [reloadTargets])
 
   const loaded = targetsRes.data != null
   const target = targetForSubnet(targetsRes.data?.data, subnet.id)
@@ -288,7 +297,8 @@ export default function ScanSettings({ subnet, onChanged }) {
   }
 
   const saved = async () => {
-    // the subnet record carries scan_dhcp_pool, so the tree and the view reload too
+    // the subnet record carries scan_dhcp_pool, so the tree and the view reload too;
+    // onChanged reports its own failures and never throws
     await onChanged()
     targetsRes.refresh()
     setOpen(false)
@@ -332,8 +342,9 @@ export default function ScanSettings({ subnet, onChanged }) {
       {target && <Status target={target} />}
       {open && loaded && (
         <SettingsForm
-          // remount with the server's values whenever they change
-          key={JSON.stringify(settingsForm(target))}
+          // remount with the server's values whenever they change; the subnet id too,
+          // so a draft can never be saved to another subnet with the same settings
+          key={`${subnet.id}:${JSON.stringify(settingsForm(target))}`}
           subnet={subnet}
           target={target}
           agents={agents}
