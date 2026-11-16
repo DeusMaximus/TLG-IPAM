@@ -27,6 +27,44 @@ Template:
 
 ---
 
+## 2026-11-16 — Claude Code (Opus 5.5) — #11: scan results ingest and observations (PR #64)
+- **Done:** [PR #64](https://github.com/DeusMaximus/TLG-IPAM/pull/64) closes #11, head `69a9b77` (merges `main` at `a7f96d6`; earlier merge `c51b8a1` brought in #51). CI green. Codex: one P2 on `9a427eb` fixed; clean on `373f94d`, `cb83075` and `69a9b77`. Greptile: three findings on `9a427eb`/`373f94d`, all fixed and answered on their threads; 5/5 on `cb83075`; needs a retrigger on `69a9b77`. Briefed round 1 (GPT-6.1 Sol) NO-GO at `cb83075`: P2 fixed and both review P3s handled in `c6d8acc` (the lock-during-ingest 500 → #59). Round 2 not started. The owner merges.
+  - `services/results.py` (new): `POST /api/v1/agent/results`.
+    - Refuses the whole set with `409 JOB_NOT_CURRENT` unless `job_id` is both the agent's and a target's `current_job_id`.
+    - Clears both lease copies in one transaction, each a compare-and-set. `last_scan_at` = `job_issued_at`.
+    - Rejects records one by one, judged by `job_methods` and by the scope read under the write lock.
+    - Only a `complete` job issued a liveness method marks addresses dead. The 90-day prune covers every subnet.
+    - The answer is built and encoded before the commit. Nothing is written to `hosts` or the change log.
+  - `agent_protocol.py`: results shapes; `rdns_name` (a hostname, or dropped whole); `scan_error`; `echo_ip` (only short, ASCII, printable strings, otherwise null); `RESULTS_BODY_MAX` (2 MiB, read after auth, `413`).
+  - `services/scans.py`:
+    - `scan_scope` reads the subnet, the target's `scan_dhcp_pool` and the excluded ranges as committed columns, never from loaded objects and never refreshing them.
+    - `drop_out_of_scope` takes the write lock (`take_write_lock`), decides membership in Python, and deletes by id in batches of 500.
+    - Every scope-narrowing write calls `drop_out_of_scope`; subnet deletion deletes the subnet's observations.
+  - Schema, additive: table `observations`; nullable `scan_targets.last_scan_error`, kept out of audit snapshots.
+  - Docs:
+    - Brief: §2.3, §3.6, §3.8, §3.10, new §3.11, §4.1 (one sentence), §4.2, §4.5, new §4.6, §7, §10.
+    - Spec: §5.3, §5.4, §5.7.
+    - `AGENTS.md`: audit bullet (four exceptions), scan-scope bullet (deletion on scope change, write-lock rule), wire-contract bullet, new bullets for invariants 3 and 8.
+  - Tests: 559 on `69a9b77` (425 + 134). Every mutant in the PR's tables is killed; the barrier race test kills the both-predicates mutant 10/10.
+  - **Merged:** `f720f88`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #11 closed. Before the merge, the second briefed round by GPT-6.1 Sol returned GO on `69a9b77` with two P3s, posted on the PR: it replayed its reproduction against a real server (200, the valid record stored, both lease copies cleared) and sent the same input through every other agent string on both routes with no further 500. Greptile did not re-review `69a9b77`; under the rule adopted the same day that is optional after a GO at the current head. The orchestrator re-measured 559 on the head and on `main` after the merge, confirmed the fix's mutation red, and confirmed the merge commit `69a9b77` identical to a mechanical merge. The P3s went into existing issues on the owner's say-so: #59 now also owns the 503 for a lock during results persistence, tests for each half of the `echo_ip` rule, and the wording of the pre-commit guarantee in spec §5.7 and the brief (it promises response construction and encoding, not delivery); #13 carries a note that a rejection has no record index. Live state after this merge: no PR is open.
+- **Decisions:** 14 under Deliberate calls in the PR; round 1 accepted all of them. The main ones:
+  - `error` lives in `scan_targets.last_scan_error`, made printable and capped.
+  - A record carrying a field its job was not issued to collect is rejected whole.
+  - An address named in a rejected record is not marked dead.
+  - A refusal of a whole result set is not recorded on the agent.
+  - A late result for an expired lease is accepted until either lease copy is overwritten.
+  - `fdns` entries are checked for shape and not stored until #20.
+  - The PR body has a table of every scope caller and whether it runs under the write lock.
+- **State:** green, nothing half-finished. No route reads observations yet. #15 must add dismissals to `drop_out_of_scope`. Any new caller that writes on the strength of the scope must hold the write lock first (`AGENTS.md`). `_capped_json` is route-specific until #60. A database lock during results persistence is still a bare 500 (#59). Round 1 noted that `ip_int` as BIGINT cannot hold IPv6, on hosts as on observations; this is inherited, and IPv6 support needs an additive representation change.
+- **Waiting on the owner:** retrigger Greptile on `69a9b77`; the second briefed round; merge.
+- **Next:**
+  - #12: `last_seen` from observation timestamps, not `alive`.
+  - #15: findings and dismissals. Dismissals join `drop_out_of_scope`. Treat `rdns_name` and `last_scan_error` as data.
+  - #20: `fdns` address validity, issued-host membership and `fdns_results`.
+  - #59: the 503 for a lock during results and check-in persistence.
+  - #60: one shared body cap.
+  - #13: the agent, against `agent_protocol.ResultsRequest`.
+
 ## 2026-11-16 — Claude Code (Opus 5.5) — #18: subnet scanning settings and reserved-range Scan checkbox (PR #67)
 - **Done:** [PR #67](https://github.com/DeusMaximus/TLG-IPAM/pull/67) closes #18. Merged at head `f8d7cf1` (squash `31d9e44`). Frontend and brief §6.2/§7 only; no `api/` change, no schema change.
   - New: `web/src/components/ScanSettings.jsx`, a Scanning section on the subnet view.
@@ -112,30 +150,3 @@ Template:
 - **State:** green, nothing half-finished. No schema, dependency or `auth.py` change, so the `test_auth.py` mutation anchors are untouched. A lock held past the busy timeout after authentication, in `jobs.checkin`, is still a bare 500 (#11's file). No file owned by another issue was touched.
 - **Waiting on the owner:** start the briefed round on `b01cd1a` (reviewer outside the Claude family); merge PR #62.
 - **Next:** #59 moves the token-use write into the check-in claim's transaction and makes it conditional in SQL. It must keep this PR's three acceptance tests green: `test_failed_last_used_write_is_a_structured_503`, `test_refused_token_is_403_and_never_reaches_the_write`, `test_agent_token_is_refused_on_mcp`. #59 must not start until #62 merges. Whichever of #11 and this PR merges second rebases; expected overlap is the `AGENTS.md` bullets and brief §4.1/§4.3 only.
-
-## 2026-11-16 — Claude Code (Opus 5.5) — #10: agent check-in, job leasing, request-scan (PR #56)
-- **Done:** [PR #56](https://github.com/DeusMaximus/TLG-IPAM/pull/56) closes #10, head `af66ca4` (`main` at `dc8924d` merged into the reviewed `c0b58d5` with a merge commit; the one conflict was `AGENTS.md`'s invariant bullets: `main`'s owner-key bullet, this branch's agent-token and wire-contract bullets). Nothing under `api/` differs from `c0b58d5` but `main`'s `config.py` and `test_startup.py`; the brief and spec merged cleanly with both sides intact. CI green. Codex: no issues on `af66ca4` (four P2s fixed on earlier heads). Greptile: reviewed `b0a507f` only and needs the owner's retrigger. Briefed review: round 1 NO-GO on `fe216d8` (six findings, all fixed in `b2a6254`); round 2 GO on `c0b58d5` with three P3s for a follow-up issue. Merge is the owner's.
-  - `api/app/agent_protocol.py`: the wire contract (`PROTOCOL_VERSION = 1`; check-in request, interface, job and response shapes; caps on agent-reported fields, with `fullmatch` for capability tokens and MACs).
-  - `services/jobs.py`: `checkin` runs the rate limit first (`_claim`: one per agent every 10 s, a check on the loaded row then a compare-and-set, `429` before any agent-row write), then the protocol check (`409`), then validation (`422`, recorded in `last_error` by field name only), then stores the fields and returns at most one job. Fair ordering by last attempt; `arp` dropped off-link, `fdns` held back until #20; the lease is a compare-and-set on the target keeping `job_methods`, with a copy on the agent that `agent_busy` reads; each agent keeps its newest 100 `source="agent"` audit entries.
-  - `services/agents.authenticate` writes `last_used_at` at most every 10 s per token. This is throttled, not a compare-and-set, and can still write on a refused check-in (round 2 finding 1).
-  - `services/changes.assistant_view`: MCP's `list_changes` withholds agent-reported values in `agent` snapshots.
-  - `services/scans.request_scan`: 15-minute cooldown per subnet, as a compare-and-set.
-  - Routes: `POST /api/v1/agent/checkin` (`require_agent` on the router, mounted outside the owner-key loop) and `POST /api/v1/subnets/{id}/scan` (`202`).
-  - Schema, additive: `agents.current_job_id`, `agents.job_issued_at`, `scan_targets.job_methods`, all nullable.
-  - Docs: brief §2.3, §3.6, §3.8–3.10, §4.1 (second paragraph), §4.2, the new §4.5, §5.2, §7, §10; spec §5.1, the §5.4 tables, §5.7 (including the results contract); `AGENTS.md` audit invariant, agent-token bullet and the new wire-contract bullet.
-  - Tests: 399 passed on `af66ca4` (296 on `main` + 103 in `test_checkin.py`).
-  - **Merged:** `57fcd94`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #10 closed. Before the merge, Greptile re-reviewed `af66ca4` after the owner's retrigger (5/5, no new findings). The orchestrator checked the merge commit `af66ca4` against both parents (identical to a mechanical merge outside `AGENTS.md`) and ran no third briefed round on it, since it carries no hand-written code. Follow-ups filed, on the owner's say-so: #59 (M2a, `briefed-review`) for round 2's three P3s and the wording, and #60 (M2a, `briefed-review`) for the shared body-size cap; both listed under **Next** below as still to file. With #50 also on `main`, the suite is 420. Live state after this merge: no PR is open and no worker is in flight. Ready to start: #11 (results ingest), #51, #16, #61; #59 and #51 change the same function and must not run together, and #60 should follow #11 or #11 should use its cap. The `owner` issues #5 and #25 still wait on the owner.
-- **Decisions:** 19 under Deliberate calls in the PR. Since the first round: the agent holds its own copy of the lease (14); the audit is bounded by a rate limit and a retention cap (8, 16); the lease keeps the issued methods and the results contract checks both lease copies (17); agent text is withheld over MCP rather than narrowed on the wire (18); fair rotation without backoff (19); the cooldown lives on the target (15). The PR body states what a `429` actually guarantees: no agent-row write and no audit entry, while the token-use write is throttled, not eliminated.
-- **State:** green, nothing half-finished. `conftest.py` lifts the check-in rate limit for every test, and the rate-limit tests restore it. No body-size cap on any route (JSON is parsed before auth, as on `main`). A scan request on a target whose agent is disabled waits until the agent is enabled.
-- **Waiting on the owner:** retrigger Greptile on `af66ca4`, then merge.
-- **Next:**
-  - File the follow-up for round 2's three P3s:
-    - Write the token heartbeat in the same transaction as a successful claim, conditional in SQL elsewhere, and cover the out-of-phase and concurrent cases.
-    - Refresh every agent column after `_claim`, so audit snapshots and the actor do not carry a stale name or state.
-    - Make the race test for the claim deterministic.
-    - Fix the brief wording: §3.6 still says "append-only", and §3.8 says refused check-ins advance `last_checkin_at`.
-  - File a follow-up for a body-size cap shared by every route.
-  - #11: accept a result only when its `job_id` equals both the target's and the agent's `current_job_id`; check addresses against scope at ingest; judge liveness and MACs by `job_methods`; clear both lease copies in one transaction; set `last_scan_at` to `job_issued_at` and leave `scan_requested_at` alone; add the body cap; decide where a results `error` lives.
-  - #17: wrap `scans.request_scan`.
-  - #20: fill `fdns` and remove the drop in `jobs.job_methods`.
-  - #51: test the `503` on the real check-in route.
