@@ -201,22 +201,32 @@ def test_uvicorn_starts_and_serves_with_a_real_key(tmp_path, monkeypatch):
     try:
         port = _wait_until_serving(lines, deadline)
         base = f"http://127.0.0.1:{port}"
-        assert httpx.get(f"{base}/api/v1/sections", headers={"X-API-Key": key}).status_code == 200
-        assert httpx.get(f"{base}/api/v1/sections", headers={"X-API-Key": ""}).status_code == 403
-        mcp = httpx.post(
-            f"{base}/mcp",
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": {"name": "test", "version": "0"},
+        # The server is up and has its environment. Now give this process settings that
+        # would break an httpx client built from the environment, though the requests are
+        # plain HTTP to the loopback address: an unreadable certificate bundle, and a
+        # proxy that nothing listens on with no exemption for the loopback address
+        monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "no-such-bundle.pem"))
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+        monkeypatch.setenv("NO_PROXY", "")
+        monkeypatch.setenv("no_proxy", "")
+        # `trust_env=False`: the client reads neither proxy nor certificate settings
+        with httpx.Client(trust_env=False) as client:
+            assert client.get(f"{base}/api/v1/sections", headers={"X-API-Key": key}).status_code == 200
+            assert client.get(f"{base}/api/v1/sections", headers={"X-API-Key": ""}).status_code == 403
+            mcp = client.post(
+                f"{base}/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "test", "version": "0"},
+                    },
                 },
-            },
-            headers={"Authorization": f"Bearer {key}", "Accept": "application/json, text/event-stream"},
-        )
+                headers={"Authorization": f"Bearer {key}", "Accept": "application/json, text/event-stream"},
+            )
         assert mcp.status_code == 200, mcp.text
     finally:
         _stop(proc, reader)
