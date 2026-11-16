@@ -9,6 +9,7 @@ import HostTable from '../components/HostTable'
 import ImportModal from '../components/ImportModal'
 import Modal, { dangerBtn, primaryBtn, secondaryBtn } from '../components/Modal'
 import ReservedRanges from '../components/ReservedRanges'
+import ScanSettings from '../components/ScanSettings'
 import SubnetFormModal from '../components/SubnetFormModal'
 import UtilPill from '../components/UtilPill'
 import { useToast, useTree } from '../context'
@@ -136,6 +137,14 @@ export default function SubnetView() {
       </dl>
       <ReservedRanges subnet={subnet} onChanged={refreshAll} />
       {subnet.notes && <p className="mt-2 text-sm text-slate-400">{subnet.notes}</p>}
+      <ScanSettings
+        subnet={subnet}
+        onChanged={async () => {
+          // subnets in the tree carry scan_dhcp_pool from their scan target
+          await refreshTree()
+          refreshAll()
+        }}
+      />
 
       <div className="mt-6 flex items-center justify-between">
         <h2 className="text-sm font-semibold text-slate-200">
