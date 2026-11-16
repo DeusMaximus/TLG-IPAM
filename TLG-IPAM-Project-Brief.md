@@ -469,6 +469,7 @@ Clean, data-dense, dark-mode-first. Reference aesthetic: linear.app sidebar dens
 - **Host drawer** — slide-over on row click; all fields editable (domain field shows the inherited subnet default as placeholder; blank = inherit); delete button with confirmation
 - **Allocate modal** — triggered by "Allocate next free IP" button; prefills next IP; hostname required
 - **CSV import modal** — on the subnet view; file picker or paste, header-mapped columns, per-row results shown after import (same bulk endpoint as MCP)
+- **Agents** (`/agents`, v0.2 spec §5.8) — one row per scan agent: a status dot from `last_checkin_at` (online within three check-in intervals, late within 15 minutes, then offline; "never checked in" and "disabled" show as such), the reported version, hostname, platform and interfaces, the subnets its scan targets cover, and its token by display prefix (or "revoked"). A refused check-in shows the agent's `last_error`. Agent-reported text is rendered as text only. The list refreshes every 30 seconds. **Add agent** names the agent and then shows its `tlga_…` token once, with the container command to run it (`docker run … --network host --cap-add NET_RAW -e IPAM_URL=<this origin> -e IPAM_AGENT_TOKEN=<token> ghcr.io/deusmaximus/tlg-ipam-agent:<server version>`, spec §5.6). The token lives only in that dialog: a backdrop click does not close it, the list reloads from `GET /agents` (which never carries a token), and once the dialog closes nothing on the page can show the token again. Row actions: Disable / Enable (`PUT` `enabled`), Revoke (with a confirmation that says a revoked token cannot be reissued, so the agent must be deleted and added again), Delete (with a confirmation naming how many subnets are left unassigned)
 - **Settings** — API key display (masked), device type management (add/rename/re-icon/delete with a curated icon picker), SQLite backup download, app version
 
 When no API key is stored in the browser, the SPA shows an in-app API-key connection gate. The key is stored only in that browser. A reverse proxy / Cloudflare Access layer may provide an additional outer access-control boundary.
@@ -520,8 +521,9 @@ tlg-ipam/
     └── src/
         ├── main.jsx
         ├── api/             # fetch wrappers per resource
-        ├── components/      # Sidebar, HostTable, HostDrawer, AllocateModal, etc.
-        └── pages/           # Dashboard, SectionView, SubnetView, Settings
+        ├── components/      # Sidebar, HostTable, HostDrawer, AllocateModal, AddAgentModal, etc.
+        ├── utils/           # csv.js; agents.js (status dot, server-time parsing, agent container command)
+        └── pages/           # Dashboard, SectionView, SubnetView, Agents, Settings
 ```
 
 ---

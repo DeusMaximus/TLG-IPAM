@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Route, Routes } from 'react-router-dom'
 import { getApiKey, setApiKey } from './api/client'
 import Layout from './components/Layout'
+import Agents from './pages/Agents'
 import Dashboard from './pages/Dashboard'
 import SectionView from './pages/SectionView'
 import Settings from './pages/Settings'
@@ -69,6 +70,7 @@ export default function App() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/sections/:sectionId" element={<SectionView />} />
             <Route path="/subnets/:subnetId" element={<SubnetView />} />
+            <Route path="/agents" element={<Agents />} />
             <Route path="/settings" element={<Settings />} />
           </Route>
         </Routes>
