@@ -35,6 +35,7 @@ class Responder(asyncio.DatagramProtocol):
         self.script = list(script)
         self.arrivals: list[float] = []
         self.questions = []
+        self.queries: list[dns.message.Message] = []
 
     def connection_made(self, transport):
         self.transport = transport
@@ -42,6 +43,7 @@ class Responder(asyncio.DatagramProtocol):
     def datagram_received(self, data, addr):
         self.arrivals.append(time.monotonic())
         query = dns.message.from_wire(data)
+        self.queries.append(query)
         question = query.question[0]
         self.questions.append((question.name.to_text(), dns.rdatatype.to_text(question.rdtype)))
         action = self.script.pop(0) if len(self.script) > 1 else self.script[0]
@@ -52,6 +54,17 @@ class Responder(asyncio.DatagramProtocol):
             reply.set_rcode(dns.rcode.SERVFAIL)
         elif action == "truncated":
             reply.flags |= dns.flags.TC
+        elif action in ("wrong-source", "wrong-id"):
+            target = ANSWERS[question.name.to_text()]
+            reply.answer.append(dns.rrset.from_text(question.name, 60, "IN", "PTR", target))
+            if action == "wrong-source":
+                # a forged reply from another port first, then the real one
+                forged = dns.message.make_response(query)
+                forged.answer.append(dns.rrset.from_text(question.name, 60, "IN", "PTR", "forged.example.com."))
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as other:
+                    other.sendto(forged.to_wire(), addr)
+            else:
+                reply.id ^= 0x5A5A  # the right source, the wrong id
         elif action == "truncated-ptr":
             # TC set, yet carrying a complete, usable PTR RRset
             reply.flags |= dns.flags.TC
@@ -222,3 +235,47 @@ async def test_a_truncated_reply_is_not_used_even_with_a_ptr_record():
     finally:
         transport.close()
         tcp.close()
+
+
+async def test_what_a_query_carries_on_the_wire():
+    """Set explicitly, and pinned here: EDNS(0) advertising a 1232-byte UDP payload (so
+    a resolver can send a PTR answer whole rather than truncate it, which the agent
+    would not use), recursion desired, no DNSSEC. The advertised payload is not a limit
+    on what the agent reads: dnspython receives up to 65,535 bytes."""
+    transport, proto, port = await responder()
+    try:
+        await DnsResolver(port=port).ptr(ipaddress.ip_address("10.0.0.9"), ("127.0.0.1",), unpaced())
+        [query] = proto.queries
+        assert query.edns == 0 and query.payload == 1232
+        assert query.flags & dns.flags.RD
+        assert not query.ednsflags & dns.flags.DO
+        assert len(query.to_wire()) == 50
+    finally:
+        transport.close()
+
+
+async def test_a_reply_from_another_port_is_waited_out():
+    """`ignore_unexpected=True`: a reply from the wrong source address or port is not
+    taken as the answer; the query keeps waiting for the server's own."""
+    transport, proto, port = await responder(script=("wrong-source",))
+    try:
+        name = await DnsResolver(port=port).ptr(ipaddress.ip_address("10.0.0.9"), ("127.0.0.1",), unpaced())
+        assert name == "nas.home.arpa."
+        assert len(proto.arrivals) == 1
+    finally:
+        transport.close()
+
+
+async def test_a_reply_with_the_wrong_id_moves_to_the_next_server():
+    """From the right source but the wrong id, a reply is a bad response
+    (`ignore_errors` is off): it is not used, and the next server is asked."""
+    transport, proto, port = await responder(script=("wrong-id", "answer"))
+    try:
+        resolver = DnsResolver(port=port)
+        address = ipaddress.ip_address("10.0.0.9")
+        assert await resolver.ptr(address, ("127.0.0.1", "127.0.0.1"), unpaced()) == "nas.home.arpa."
+        assert len(proto.arrivals) == 2
+        proto.script = ["wrong-id"]
+        assert await resolver.ptr(address, ("127.0.0.1",), unpaced(0.5)) is None
+    finally:
+        transport.close()

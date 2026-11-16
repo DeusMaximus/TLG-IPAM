@@ -114,13 +114,27 @@ def test_discover_survives_a_kernel_that_refuses(monkeypatch):
     assert nl.discover() == []
 
 
-def test_the_dump_stops_holding_addresses_past_its_bound(monkeypatch):
-    """A host with a huge address list: the dump keeps DUMP_MAX, not all of them."""
+def test_one_read_is_trimmed_before_it_is_held():
+    """2,000 records in one read: the parse keeps the limit it is given, so the dump never
+    holds more than DUMP_MAX addresses (briefed review round 3 of PR #70)."""
     one = _addr(socket.AF_INET, 24, 0, 2, _attr(nl.IFA_LOCAL, V4))
+    found, done = nl.parse_addresses(one * 2000)
+    assert len(found) == nl.DUMP_MAX and not done
+    assert len(nl.parse_addresses(one * 2000, limit=10)[0]) == 10
+
+
+def test_the_dump_stops_holding_addresses_past_its_bound(monkeypatch):
+    """A host with a huge address list: the dump keeps DUMP_MAX, read by read, and stops
+    reading once it has them. The fake kernel ends its dump after ten reads, so a
+    missing bound fails the count rather than hanging."""
+    one = _addr(socket.AF_INET, 24, 0, 2, _attr(nl.IFA_LOCAL, V4))
+    held = []
 
     class Sock:
+        reads = 0
+
         def __init__(self, *args):
-            self.reads = 0
+            pass
 
         def __enter__(self):
             return self
@@ -138,10 +152,20 @@ def test_the_dump_stops_holding_addresses_past_its_bound(monkeypatch):
             pass
 
         def recv(self, n):
-            self.reads += 1
-            return one * 100  # never DONE
+            Sock.reads += 1
+            return one * 100 + (_done() if Sock.reads >= 10 else b"")
+
+    real = nl.parse_addresses
+
+    def recording(data, limit=nl.DUMP_MAX):
+        part, done = real(data, limit)
+        held.append(len(part))
+        return part, done
 
     monkeypatch.setattr(nl.socket, "socket", Sock)
     monkeypatch.setattr(nl.socket, "AF_NETLINK", 16, raising=False)
+    monkeypatch.setattr(nl, "parse_addresses", recording)
     found = nl._dump()
     assert len(found) == nl.DUMP_MAX
+    assert sum(held) == nl.DUMP_MAX  # nothing parsed past the bound was kept
+    assert Sock.reads == 3  # 100 + 100 + 56, then no further read

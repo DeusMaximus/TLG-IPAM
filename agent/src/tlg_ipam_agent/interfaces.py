@@ -37,12 +37,13 @@ def _align(n: int) -> int:
     return (n + 3) & ~3
 
 
-def parse_addresses(data: bytes) -> tuple[list[tuple[int, str]], bool]:
+def parse_addresses(data: bytes, limit: int = DUMP_MAX) -> tuple[list[tuple[int, str]], bool]:
     """`(interface index, "address/prefix")` for each global-scope address in one
-    netlink read, and whether the dump is done. Malformed input ends the parse."""
+    netlink read, at most `limit` of them, and whether the dump is done. Malformed
+    input ends the parse."""
     found = []
     offset = 0
-    while offset + _NLMSGHDR.size <= len(data):
+    while offset + _NLMSGHDR.size <= len(data) and len(found) < limit:
         length, kind, _flags, _seq, _pid = _NLMSGHDR.unpack_from(data, offset)
         if length < _NLMSGHDR.size or offset + length > len(data):
             return found, True
@@ -82,12 +83,13 @@ def _dump() -> list[tuple[int, str]]:
         sock.send(header + _IFADDRMSG.pack(socket.AF_UNSPEC, 0, 0, 0, 0))
         found: list[tuple[int, str]] = []
         while True:
-            part, done = parse_addresses(sock.recv(65536))
+            # never more than DUMP_MAX addresses held, plus the one 64 KiB read being
+            # parsed: enough to fill INTERFACES_MAX after loopback and vanished
+            # interfaces are dropped, and the rest of the dump is not read
+            part, done = parse_addresses(sock.recv(65536), limit=DUMP_MAX - len(found))
             found += part
-            # enough to fill INTERFACES_MAX after loopback and vanished interfaces are
-            # dropped; the rest of the dump is not held
             if done or len(found) >= DUMP_MAX:
-                return found[:DUMP_MAX]
+                return found
 
 
 def _mac(name: str) -> str | None:

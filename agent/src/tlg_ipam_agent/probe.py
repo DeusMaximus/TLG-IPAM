@@ -97,8 +97,12 @@ class DnsResolver:
             left = await slot()
             if left <= 0:
                 return None
-            # a fresh query, so a fresh id, for every datagram; recursion desired, EDNS
-            # with the common 1232-byte payload, set here rather than left to defaults
+            # A fresh query, so a fresh id, for every datagram. It carries EDNS(0)
+            # advertising a 1232-byte UDP payload, so a resolver can send a PTR answer
+            # whole instead of truncating it (a truncated reply is not used); without
+            # EDNS a plain query allows only 512 bytes. Recursion desired, no DNSSEC.
+            # The advertised payload is not a limit on what is read: dnspython
+            # receives up to 65,535 bytes.
             query = dns.message.make_query(
                 name, dns.rdatatype.PTR, use_edns=0, payload=1232, want_dnssec=False,
                 flags=dns.flags.RD,
@@ -109,12 +113,15 @@ class DnsResolver:
                     server,
                     timeout=left,
                     port=self.port,
-                    # wait out a reply from another source, port or id until `left`
+                    # a reply from another source address or port is waited out until
+                    # `left`; one from the server with the wrong id is a bad response
+                    # (ignore_errors is off), so the next server is asked
                     ignore_unexpected=True,
                     # a truncated reply is not used, PTR record or not, and there is
                     # no TCP retry: it is treated as no answer, and the next server
                     # is asked
                     raise_on_truncation=True,
+                    # dnspython's default, stated: trailing bytes make a reply bad
                     ignore_trailing=False,
                 )
             except (dns.exception.DNSException, OSError, ValueError):

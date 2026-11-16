@@ -524,6 +524,60 @@ async def test_an_rdns_answer_without_a_name_clears_the_old_one(client, agent_ap
     assert (await observations())["10.0.0.10"].rdns_name is None
 
 
+async def _named_then_rescanned(client, agent_api):
+    """A stored name for 10.0.0.10 and 10.0.0.11 from a complete scan, and the next job."""
+    agent, token, subnet, target, job = await setup(client, agent_api)
+    await accepted(
+        agent_api,
+        token,
+        job,
+        [obs("10.0.0.10", rdns_name="nas.home.arpa"), obs("10.0.0.11", rdns_name="tv.home.arpa")],
+    )
+    await set_target(target["id"], last_scan_at=_now() - timedelta(hours=2))
+    [job] = await jobs_for(agent_api, token)
+    assert "rdns" in job["methods"]
+    return token, job
+
+
+async def test_an_incomplete_result_set_never_clears_a_stored_name(client, agent_api):
+    """Spec §5.7, changed by #13 (briefed review round 3 of PR #70): an interrupted scan
+    may report an address whose lookup never ran, so no name leaves the stored one; a
+    name still sets it."""
+    token, job = await _named_then_rescanned(client, agent_api)
+    await accepted(
+        agent_api,
+        token,
+        job,
+        [obs("10.0.0.10"), obs("10.0.0.11", rdns_name="tv-2.home.arpa"), obs("10.0.0.12")],
+        complete=False,
+    )
+    seen = await observations()
+    assert seen["10.0.0.10"].rdns_name == "nas.home.arpa"  # not asked, or not answered: kept
+    assert seen["10.0.0.11"].rdns_name == "tv-2.home.arpa"  # a new name replaces the old
+    assert seen["10.0.0.12"].rdns_name is None  # a new address simply has none
+    assert all(o.alive for o in seen.values())
+
+
+async def test_a_name_dropped_by_sanitising_in_an_incomplete_set_keeps_the_stored_one(
+    client, agent_api
+):
+    token, job = await _named_then_rescanned(client, agent_api)
+    await accepted(agent_api, token, job, [obs("10.0.0.10", rdns_name="<b>x</b>")], complete=False)
+    assert (await observations())["10.0.0.10"].rdns_name == "nas.home.arpa"
+
+
+async def test_a_complete_result_set_still_clears_a_name_its_lookup_did_not_return(
+    client, agent_api
+):
+    token, job = await _named_then_rescanned(client, agent_api)
+    await accepted(
+        agent_api, token, job, [obs("10.0.0.10"), obs("10.0.0.11", rdns_name="tv.home.arpa")]
+    )
+    seen = await observations()
+    assert seen["10.0.0.10"].rdns_name is None
+    assert seen["10.0.0.11"].rdns_name == "tv.home.arpa"
+
+
 async def test_an_answer_without_a_mac_keeps_the_known_one(client, agent_api):
     agent, token, subnet, target, job = await setup(client, agent_api)
     await accepted(agent_api, token, job, [obs("10.0.0.10", mac="aa:bb:cc:dd:ee:ff")])

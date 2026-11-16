@@ -346,3 +346,31 @@ async def test_a_plain_answer_far_over_the_cap_never_fills_memory():
             answer, peak = await _peak_during(AgentClient(http).checkin({}))
     assert peak < 2 * RESPONSE_MAX, f"held {peak} bytes"
     assert answer.kind is Kind.RETRY and str(RESPONSE_MAX) in answer.message
+
+
+class Chunks(httpx.AsyncByteStream):
+    """Raw chunks allocated before tracing starts, so what is measured is only what
+    the agent holds of them."""
+
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+    async def __aiter__(self):
+        for chunk in self.chunks:
+            yield chunk
+
+
+@pytest.mark.parametrize(
+    "sizes",
+    [[32 * 1024 * 1024], [600 * 1024, 600 * 1024]],
+    ids=["one 32 MiB chunk", "a chunk that would cross the cap"],
+)
+async def test_a_raw_chunk_is_checked_before_it_is_appended(sizes):
+    """The buffer never passes RESPONSE_MAX: a chunk that would take it past is not
+    appended (briefed review round 3 of PR #70; real network reads are at most 64 KiB,
+    so only a transport that hands over larger chunks shows the order of the check)."""
+    chunks = [b"x" * n for n in sizes]
+    client = _client(lambda request: httpx.Response(200, stream=Chunks(chunks)))
+    answer, peak = await _peak_during(client.checkin({}))
+    assert peak < RESPONSE_MAX, f"held {peak} bytes"
+    assert answer.kind is Kind.RETRY and str(RESPONSE_MAX) in answer.message

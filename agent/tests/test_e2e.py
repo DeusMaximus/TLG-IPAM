@@ -3,7 +3,10 @@ in process (acceptance for #13). The prober and resolver are still fakes: no pac
 is sent. The server's check-in gap is its real one here (10 s), unlike in the
 server's own tests."""
 
+import asyncio
+import ipaddress
 import random
+import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -16,6 +19,7 @@ from sqlalchemy import select, update
 
 from conftest import FakeClock, FakeProber, FakeResolver, make_config
 from tlg_ipam_agent import loop as agent_loop
+from tlg_ipam_agent import scan
 from tlg_ipam_agent.backoff import Backoff
 from tlg_ipam_agent.client import AgentClient
 from tlg_ipam_agent.loop import Agent
@@ -79,7 +83,18 @@ async def setup(owner, *, cidr="10.0.0.0/28", methods=("icmp", "rdns"), **subnet
     return agent, made, target
 
 
-def make_agent(token, *, prober, resolver=None, interfaces=LINK, **config):
+def fast_clock(scale: float = 10.0) -> scan.Clock:
+    """The real event-loop clock, run `scale` times fast: concurrent waits overlap as
+    they do in production (the fake clock adds them up), and a 600-second budget is
+    not waited out in full."""
+    origin = time.monotonic()
+    return scan.Clock(
+        monotonic=lambda: 1000.0 + (time.monotonic() - origin) * scale,
+        sleep=lambda seconds: asyncio.sleep(max(seconds, 0) / scale),
+    )
+
+
+def make_agent(token, *, prober, resolver=None, interfaces=LINK, clock=None, **config):
     http = httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="https://test",
@@ -91,14 +106,19 @@ def make_agent(token, *, prober, resolver=None, interfaces=LINK, **config):
         prober=prober,
         resolver=resolver or FakeResolver(),
         interfaces=lambda: interfaces,
-        clock=FakeClock(),
+        clock=clock or FakeClock(),
         rng=random.Random(7),
     )
 
 
-async def run_queued(agent: Agent) -> None:
+async def run_queued(agent: Agent, timeout_s: int | None = None) -> None:
+    """Run what the check-in queued. `timeout_s` stands in for a job the deadline cuts
+    short, without a test waiting the server's 600 s: the rest of the job is as issued."""
     while not agent.queue.empty():
-        await agent.run_job(agent.queue.get_nowait())
+        raw = agent.queue.get_nowait()
+        if timeout_s is not None:
+            raw = {**raw, "timeout_s": timeout_s}
+        await agent.run_job(raw)
 
 
 async def observations(subnet_id) -> dict[str, Observation]:
@@ -325,3 +345,86 @@ async def test_names_already_stored_survive_a_scan_at_one_packet_a_second(owner)
         transport.close()
         for ip in live:
             ANSWERS.pop(f"{ip.split('.')[-1]}.0.0.10.in-addr.arpa.", None)
+
+
+# --- names across an interrupted scan (briefed review round 3 of PR #70) ---
+
+LIVE = ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"]
+OLD = {ip: f"old{ip.split('.')[-1]}.home.arpa" for ip in LIVE}
+NEW = {ip: f"new{ip.split('.')[-1]}.home.arpa" for ip in LIVE}
+
+
+async def _named_subnet(owner, methods=("icmp", "rdns")):
+    """A /29 whose four live addresses have OLD names stored by a complete scan, and an
+    agent at MAX_PPS=1 (one packet a second on the fake clock), ready for the next."""
+    agent_row, subnet, target = await setup(owner, cidr="10.0.0.0/29", methods=methods)
+    resolver = FakeResolver(OLD)
+    agent = make_agent(
+        agent_row["token"],
+        prober=FakeProber(alive=LIVE),
+        resolver=resolver,
+        interfaces=[{"name": "eth0", "cidr": "10.0.0.5/29", "mac": None}],
+        clock=fast_clock(),
+        max_pps=1,
+    )
+    await agent.checkin_once()
+    await run_queued(agent)
+    assert {ip: o.rdns_name for ip, o in (await observations(subnet["id"])).items()} == OLD
+    await _ok(await owner.post(f"/api/v1/subnets/{subnet['id']}/scan"), 202)
+    await past_the_checkin_gap(agent_row["id"])
+    resolver.names = {ipaddress.ip_address(k): v for k, v in NEW.items()}
+    resolver.asked.clear()
+    return agent, resolver, subnet, target
+
+
+async def _names(subnet) -> dict:
+    return {ip: o.rdns_name for ip, o in (await observations(subnet["id"])).items()}
+
+
+async def test_a_scan_cut_off_during_the_ptr_lookups_keeps_the_names_it_did_not_ask(owner):
+    """Six pings take six seconds at 1 pps; of an 8 s job, the lookups get two slots
+    (the clock runs ten times fast: 0.8 s of real time).
+    The two asked get their new names; the two never asked keep their old ones."""
+    agent, resolver, subnet, target = await _named_subnet(owner)
+    await agent.checkin_once()
+    await run_queued(agent, timeout_s=8)
+    asked = sorted(str(a) for a, _ in resolver.asked)
+    assert asked == ["10.0.0.1", "10.0.0.2"]
+    assert await _names(subnet) == {
+        "10.0.0.1": NEW["10.0.0.1"], "10.0.0.2": NEW["10.0.0.2"],
+        "10.0.0.3": OLD["10.0.0.3"], "10.0.0.4": OLD["10.0.0.4"],
+    }
+    shown = await target_of(owner, target["id"])
+    assert shown["last_scan_complete"] is False
+    assert all(o.alive for o in (await observations(subnet["id"])).values())
+
+
+async def test_a_scan_whose_icmp_sweep_uses_the_whole_deadline_keeps_every_name(owner):
+    agent, resolver, subnet, target = await _named_subnet(owner)
+    await agent.checkin_once()
+    await run_queued(agent, timeout_s=4)
+    assert resolver.asked == []
+    assert await _names(subnet) == OLD
+    assert (await target_of(owner, target["id"]))["last_scan_complete"] is False
+
+
+async def test_a_complete_scan_still_clears_a_name_its_lookup_did_not_return(owner):
+    agent, resolver, subnet, target = await _named_subnet(owner)
+    del resolver.names[ipaddress.ip_address("10.0.0.3")]
+    await agent.checkin_once()
+    await run_queued(agent)
+    assert len(resolver.asked) == 4
+    assert await _names(subnet) == {**NEW, "10.0.0.3": None}
+    assert (await target_of(owner, target["id"]))["last_scan_complete"] is True
+
+
+async def test_on_its_own_link_until_arp_names_are_only_set_or_replaced(owner):
+    """Deliberate call 17: a job issued `arp` is always incomplete from this release
+    (call 4), so a lookup that returns no name leaves the stored one."""
+    agent, resolver, subnet, target = await _named_subnet(owner, methods=("icmp", "arp", "rdns"))
+    del resolver.names[ipaddress.ip_address("10.0.0.3")]
+    await agent.checkin_once()
+    await run_queued(agent)
+    assert len(resolver.asked) == 4
+    assert await _names(subnet) == {**NEW, "10.0.0.3": OLD["10.0.0.3"]}
+    assert (await target_of(owner, target["id"]))["last_scan_complete"] is False
