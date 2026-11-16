@@ -219,3 +219,35 @@ async def test_a_scan_well_inside_its_timeout_is_complete():
     result = await sweep(parsed, addresses, prober=prober, resolver=resolver, clock=clock)
     assert result["complete"] is True and result["error"] is None
     assert set(resolver.timeouts) == {scan.RDNS_TIMEOUT_S}
+
+
+@pytest.mark.parametrize("pps", [1, 2])
+async def test_lookups_waiting_for_a_slot_do_not_use_up_their_own_timeout(pps):
+    """At a low MAX_PPS most lookups queue for a packet slot longer than their 2 s
+    timeout. That wait is not theirs to lose: every live address is still asked, and
+    the result is complete (Codex on ce60198, PR #70)."""
+    clock = FakeClock()
+    live = [f"10.0.0.{i}" for i in range(1, 9)]
+    prober = FakeProber(alive=live, clock=clock)
+    resolver = FakeResolver({a: f"h{a.split('.')[-1]}.home.arpa" for a in live}, clock=clock)
+    parsed, addresses = planned(ranges=[{"start": "10.0.0.1", "end": "10.0.0.8"}])
+    result = await sweep(parsed, addresses, prober=prober, resolver=resolver, clock=clock, max_pps=pps)
+    assert sorted(str(a) for a, _ in resolver.asked) == sorted(live)
+    assert all("rdns_name" in o for o in result["observations"])
+    assert result["complete"] is True
+    # and still paced: the queries are a slot apart
+    gaps = [b - a for a, b in zip(resolver.times, resolver.times[1:], strict=False)]
+    assert all(g >= 1 / pps - 1e-9 for g in gaps)
+
+
+async def test_a_lookup_still_ends_at_the_jobs_deadline():
+    clock = FakeClock()
+    live = [f"10.0.0.{i}" for i in range(1, 9)]
+    prober = FakeProber(alive=live, clock=clock)
+    resolver = FakeResolver({a: "x.home.arpa" for a in live}, clock=clock)
+    # 8 pings and 8 queries at 1 a second need 16 s; the job has 12
+    parsed, addresses = planned(ranges=[{"start": "10.0.0.1", "end": "10.0.0.8"}], timeout_s=12)
+    result = await sweep(parsed, addresses, prober=prober, resolver=resolver, clock=clock, max_pps=1)
+    assert len(resolver.asked) < 8
+    assert all(t <= 1000 + 12 for t in resolver.times)
+    assert result["complete"] is False

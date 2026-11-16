@@ -175,13 +175,20 @@ async def run(
     names: dict[Address, str] = {}
     if "rdns" in job.methods and alive and not timed_out:
 
-        async def lookup(address: Address, timeout: float) -> None:
-            end = clock.monotonic() + timeout
+        async def lookup(address: Address, _timeout: float) -> None:
+            end: float | None = None
 
             async def slot() -> float:
                 # one packet from the budget the ICMP sweep drew on, before each query
+                nonlocal end
                 await pacer.wait()
-                return end - clock.monotonic()
+                now = clock.monotonic()
+                if end is None:
+                    # the lookup's own time starts once its first query may go, not
+                    # while it queues behind other lookups for a slot; the job's
+                    # deadline still holds
+                    end = min(now + RDNS_TIMEOUT_S, deadline)
+                return end - now
 
             name = rdns_name(await resolver.ptr(address, job.dns_servers, slot))
             if name is not None:
