@@ -27,6 +27,44 @@ Template:
 
 ---
 
+## 2026-11-16 — Claude Code (Opus 5.5) — #18: subnet scanning settings and reserved-range Scan checkbox (PR #67)
+- **Done:** [PR #67](https://github.com/DeusMaximus/TLG-IPAM/pull/67) closes #18. Merged at head `f8d7cf1` (squash `31d9e44`). Frontend and brief §6.2/§7 only; no `api/` change, no schema change.
+  - New: `web/src/components/ScanSettings.jsx`, a Scanning section on the subnet view.
+    - Summary of the target. Last scan time (read as UTC) and duration, marked "incomplete" when the job did not finish. Whether a scan was requested or a job is out. The server's `scope`.
+    - Settings form: agent, methods, interval (blank = manual only), enabled, "Scan DHCP pool" (off by default, disabled with no pool). It sends `PUT`, or `POST` for a new target, and shows the server's refusal inline.
+    - Scan now (`POST /subnets/{id}/scan`) shows the server's 202, 409 or 429 message.
+    - "MAC collection unavailable — agent is not on this subnet" shows while an issued job's `job_methods` lacks `arp`.
+    - The target reloads every 30 s.
+  - New: `web/src/utils/scans.js`: form ↔ body, the `ScanTargetCreate` defaults, `macUnavailable`, formatting.
+  - Changed: `ReservedRanges.jsx`. Each chip has a "Scan" `.tlg-check` box that sends `PATCH scan_excluded`; an excluded chip reads "not scanned". The Reserve range dialog has "Scan this range", ticked by default.
+  - Changed: `SubnetView.jsx`.
+    - Both sections are keyed by subnet id, so a draft or an open dialog never carries over to another subnet.
+    - Their writes go through one `refreshTreeAndView`. It reloads the view even when `refreshTree()` fails, and reports that failure apart from the write.
+  - Tests: frontend 29 → 51 (16 in `SubnetView.scanning.test.jsx` against a stateful stand-in server and the real `TreeProvider`; 6 in `scans.test.js`).
+    - Removing `refreshTree()` fails both acceptance tests.
+    - The four review-fix tests each fail against `688b53e`'s sources.
+  - Checked by hand on `688b53e` with headless Chromium against `API_KEY=dev-key`; details in the PR body.
+  - **Merged:** `31d9e44`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #18 closed. CI was green on `f8d7cf1`, Codex found nothing there, and Greptile re-reviewed it at 5/5 after the owner's retrigger. The orchestrator re-ran lint, the 51 tests and the build on the head and on `main` after the merge, and confirmed the draft-across-subnets test goes red with the subnet-id keys removed. The hand run against a real backend is the worker's alone. Follow-up filed on the owner's say-so: #68 (M2a), the scan-target response says what its agent can run, for the two messages under **Next**. Process change the same day, approved by the owner and written into `.agents/orchestration.md`: a briefed round starts once CI is green and the first automatic pass is answered, without waiting for a Greptile re-review of a fix commit, and after a GO at the current head a Greptile re-review is optional. Live state after this merge: one PR is open, #64 (#11), at `cb83075` with CI green, Codex clean, Greptile 5/5 and 533 passing; its briefed round by GPT-6.1 Sol is running (brief at `.dev/11/review-brief-1.md`, report to `.dev/11/review-1.md`). No worker is building. Waiting for #64 to merge: #59, #60, #65, #68 (each touches a file it changes), then #12 and #15. The `owner` issues #5 and #25 still wait on the owner.
+- **Decisions:** 7 under Deliberate calls in the PR. The main ones:
+  - The UI never validates or works out scope; it shows the server's `scope` and its refusal text.
+  - The settings form saves with a button; the range box saves on click.
+  - Scan now is shown whenever a target exists; the server's 409 says why it cannot run.
+  - No confirmation dialog for scope-narrowing changes, only help text that says data is deleted.
+  - No delete of a scan target from the UI; it is out of #18's scope, and disabling the target stops scanning.
+- **State:** green; nothing half-finished.
+  - Codex: 2 P2s on `688b53e`, fixed. The orchestrator reports no findings on `f8d7cf1`.
+  - Greptile: P1 and P2, P2 on `688b53e`, fixed and answered on their threads. The orchestrator reports 5/5 on `f8d7cf1` after a re-review.
+  - Not seen against a real backend: the MAC warning (needs an agent, #13), last scan time and duration (needs ingest, #11 / PR #64).
+  - The PR is not linked to a T3 thread (the link tool needed a thread id).
+- **Waiting on the owner:** nothing for #18.
+- **Next:**
+  - Two things #18's third Scope bullet wanted that the server does not report. One field fixes both: e.g. `arp_available` / `scannable_by_agent` on `ScanTargetOut`, computed with `jobs.job_methods` against the agent's last-reported interfaces. The UI's `macUnavailable` in `web/src/utils/scans.js` would then read that field.
+    1. **"MAC collection unavailable" between jobs.** `ScanTargetOut` has no field saying whether the target's agent is on the subnet's link. The UI can only read it from `job_methods` while a job is out, and ingest clears `job_methods`.
+    2. **"Cannot be scanned by this agent".** Nothing reports it: for an `arp`-only target on a routed agent, check-in issues no job and stores nothing.
+  - Once PR #64 merges, show `last_scan_error` (agent-originated text, render as text only) in the Scanning section's status.
+  - #19 (findings panel, badge, last-seen, "show dynamic") builds on the Scanning section in `ScanSettings.jsx` and on `SubnetView`.
+  - #65: offset-less datetimes; this PR reads them with `parseServerTime`.
+
 ## 2026-11-16 — Claude Code (Sonnet 5.5) — #61: start-up test ignores proxy and certificate settings (PR #66)
 - **Done:** [PR #66](https://github.com/DeusMaximus/TLG-IPAM/pull/66) closes #61, head `de48ed8` (one commit on `main` at `8f02697`). Tests only: `api/tests/test_startup.py`; no file under `api/app/`, no document, no schema change.
   - The three loopback requests in `test_uvicorn_starts_and_serves_with_a_real_key` share one `httpx.Client(trust_env=False)`.
@@ -101,14 +139,3 @@ Template:
   - #17: wrap `scans.request_scan`.
   - #20: fill `fdns` and remove the drop in `jobs.job_methods`.
   - #51: test the `503` on the real check-in route.
-
-## 2026-11-16 — Claude Code (Opus 5.5) — #50: widen the owner-key source guard (PR #57)
-- **Done:** [PR #57](https://github.com/DeusMaximus/TLG-IPAM/pull/57) closes #50, head `05e0a65`. CI green on `600b379` and `05e0a65`. Codex: no findings on either. Greptile: 4/5 on `600b379` with two P2s (keyword callers not followed; a name kept only the first key kind, so the configured key could reach `AccessToken(token=…)`), both fixed in `05e0a65` and answered on their threads; not re-run on `05e0a65`. Automatic reviews only. Merge is the owner's.
-  - `api/tests/test_auth.py` only. `test_is_owner_key_has_no_equality_shortcut` is replaced by `OwnerKeyUses`, an allow-list source check over all of `app.auth`. It follows the configured key (`.api_key` reads) and the presented key (`is_owner_key`'s parameter plus every name passed to it, positionally or by keyword) through locals and module functions. Allowed: `hmac.compare_digest` arguments (direct or `.encode()`), `not x`/`if x:`, `is None`/`is not None`, assignment to a local, a call into another module function, and `AccessToken(token=…)` for the presented key only. A read outside any function is always reported.
-  - Tests: auth 67 → 88, backend 275 → 296 (Python 3.13). 16 named-comparison cases (the three kinds from PR #48's briefed review, plus guard-evasion cases), 4 allowed-change controls, a live-module check and a surfaces check.
-  - Nine mutations of `auth.py` in a scratch copy each pass `main`'s 67 auth tests and fail `test_owner_key_reaches_only_the_digest` here; table and messages in the PR body.
-  - **Merged:** `4f2b84d`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #50 closed. Before the merge, Greptile re-reviewed `05e0a65` after the owner's retrigger (5/5, both findings fixed), and the orchestrator re-measured 296 on the head with two mutations red. With #55 also on `main`, the suite is 317. Live state after this merge: one PR is open, #56 (#10), at `af66ca4`, a merge of `main` at `dc8924d` into the reviewed `c0b58d5`. It is ready and waits on the owner's merge: CI green, Codex clean and Greptile 5/5 on `af66ca4`, and the second briefed round by GPT-6.1 Sol returned GO at `c0b58d5` with three P3s, filed as #59. The orchestrator checked the merge commit (no file under `api/` differs from `c0b58d5` except the two #58 brought; `AGENTS.md` takes `main`'s owner-key bullet and the branch's agent bullets) and ran no further round on it. Merged onto this `main` in a scratch tree it has no conflict and 420 pass; it does not touch `auth.py`, so the mutation anchors here are unaffected. Open follow-ups from this wave: #59, #60 (request body-size cap), #61 (start-up test's HTTP client), and #51. The `owner` issues #5 and #25 still wait on the owner.
-- **Decisions:** the configured key may go into a local and be tested for emptiness or None; the PR body records this as how the issue's "limit reads to the compare_digest call" was read against #54's early return. Allow-list, not deny-list. Surfaces derived from `is_owner_key` calls. Mutation cases edit the live `inspect.getsource(auth)` at anchors, so a refactor of `is_owner_key`/`require_api_key`/`verify_token` must update the anchors in the same PR. No `AGENTS.md` or docs change: invariant unchanged, and #55 owns that text.
-- **State:** tests only; no schema, dependency or `api/app/` change. Not caught, and stated in the PR: the key read under a computed attribute name, uses outside `app.auth`, actual timing. If #55 or #10 edits `auth.py` and removes an anchor line (the digest line, `if not is_owner_key(token):`, `if not is_owner_key(x_api_key):`, `expected = settings.api_key`), those cases fail with "mutation anchor is not in app/auth.py exactly once"; update the anchors when rebasing.
-- **Waiting on the owner:** retrigger Greptile on `05e0a65`; merge PR #57. The PR is not linked to a T3 thread (the link tool needed a thread id).
-- **Next:** #51 (structured 503 on a failed `last_used_at` write; lifespan in the `/mcp` refusal tests) once #10 lands. Whichever of #55 and this PR merges second rebases `test_auth.py`, which is not expected to conflict.

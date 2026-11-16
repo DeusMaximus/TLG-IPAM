@@ -71,7 +71,7 @@ A worker's report is a claim. Before telling the owner a PR is ready:
 
 - [ ] CI is green at the head sha the worker named, and that sha is still the head.
 - [ ] Codex and Greptile have both finished, and every finding has a fix or a reply on its thread.
-- [ ] Both reviews cover the current head. Neither re-runs after a fix commit: comment `@codex review` on the PR, and ask the owner to retrigger Greptile. The Codex summary comment names the commit it reviewed.
+- [ ] The reviews cover the current head. Neither automatic review re-runs after a fix commit: comment `@codex review` on the PR (the Codex summary comment names the commit it reviewed), and ask the owner to retrigger Greptile. A PR that owes no briefed round needs both on its final head, because they are its only read from outside the author's model family. A PR with a briefed GO at its current head needs Codex there; a Greptile re-review of that head is optional.
 - [ ] Each acceptance line in the issue maps to evidence in the PR body.
 - [ ] **One claim CI does not cover is re-measured by you**: a Docker build, a count, a command from the documentation run from scratch. Pick the claim the acceptance list leans on most.
 - [ ] When another PR has merged since the branch was cut, the suite is run on the PR merged with `main`. The count on the PR head alone is then out of date.
@@ -88,9 +88,10 @@ For an issue labelled `briefed-review`, after the automatic reviews are answered
 
 1. Fill the template in `.agents/review-brief.md` and save it as `.dev/<issue>/review-brief-<round>.md` in the main checkout.
 2. Start the reviewer from the roster in a worktree, with the one line: *"Follow the review brief at `<absolute path>`"*. A reviewer started as a delegated task gets a worktree cut from `main`, not from the PR head: the brief's Environment paragraph tells it to fetch and check out the head sha detached.
-3. The round does not need the worker's final message. Start it as soon as both automatic reviews cover the current head and their findings are answered.
-4. A P1 or P2 goes back to the worker's thread to fix. A fix means a new head, so both automatic reviews and the round repeat until the verdict is GO at the current head.
-5. P3s on a GO become follow-up issues you propose to the owner. Folding one into the PR moves the head and restarts all three reviews.
+3. The round does not need the worker's final message. Start it as soon as CI is green and the findings of the first automatic pass are answered. Do not wait for a Greptile re-review of a fix commit: it needs the owner's hand, and it raises one instance of a problem per pass where the briefed reviewer probes the whole class in one. (On PR #64 three passes moved the head three times before the round began.)
+4. A P1 or P2 goes back to the worker's thread to fix. A fix means a new head: comment `@codex review`, and run the next round on that head. The verdict has to be GO at the current head.
+5. When the head moves after a GO for another reason (an automatic finding fixed, `main` merged in), run a short round briefed on the new commits only. When the new commits carry no hand-written code (a merge of `main` whose tree equals a mechanical merge outside the conflicted documents), check that yourself instead, and say in your report that you did and how.
+6. P3s on a GO become follow-up issues you propose to the owner. Folding one into the PR moves the head, so the round and Codex's review repeat.
 
 The briefs used so far are in `.dev/6/`, `.dev/45/` and `.dev/8/` in the main checkout. They are not committed; where they are present, read one before writing the next.
 
