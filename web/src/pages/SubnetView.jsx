@@ -9,6 +9,7 @@ import HostTable from '../components/HostTable'
 import ImportModal from '../components/ImportModal'
 import Modal, { dangerBtn, primaryBtn, secondaryBtn } from '../components/Modal'
 import ReservedRanges from '../components/ReservedRanges'
+import ScanSettings from '../components/ScanSettings'
 import SubnetFormModal from '../components/SubnetFormModal'
 import UtilPill from '../components/UtilPill'
 import { useToast, useTree } from '../context'
@@ -55,6 +56,20 @@ export default function SubnetView() {
   const refreshAll = () => {
     subnetRes.refresh()
     hostsRes.refresh()
+  }
+
+  // After a write that changes what the tree holds (subnets in the tree carry their
+  // reserved ranges with scan_excluded, and scan_dhcp_pool): reload the tree, and
+  // reload this view whether or not that worked. A failed tree reload is reported on
+  // its own, not as a failure of the write, which has already succeeded.
+  const refreshTreeAndView = async () => {
+    try {
+      await refreshTree()
+    } catch (err) {
+      toast.error(`Saved, but the subnet list could not be reloaded: ${err.message}`)
+    } finally {
+      refreshAll()
+    }
   }
 
   const removeSubnet = async (force) => {
@@ -134,8 +149,11 @@ export default function SubnetView() {
         </Fact>
         <Fact label="Free IPs">{subnet.free}</Fact>
       </dl>
-      <ReservedRanges subnet={subnet} onChanged={refreshAll} />
+      {/* keyed by subnet: the view is reused when moving between subnets, and an open
+          dialog or unsaved form must not carry over to the next one */}
+      <ReservedRanges key={`rr-${subnet.id}`} subnet={subnet} onChanged={refreshTreeAndView} />
       {subnet.notes && <p className="mt-2 text-sm text-slate-400">{subnet.notes}</p>}
+      <ScanSettings key={`scan-${subnet.id}`} subnet={subnet} onChanged={refreshTreeAndView} />
 
       <div className="mt-6 flex items-center justify-between">
         <h2 className="text-sm font-semibold text-slate-200">

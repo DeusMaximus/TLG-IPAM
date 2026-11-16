@@ -28,8 +28,13 @@ export const bulkCreateHosts = (subnetId, hosts) =>
   api(`/api/v1/subnets/${subnetId}/hosts/bulk`, { method: 'POST', body: { hosts } })
 export const createReservedRange = (subnetId, body) =>
   api(`/api/v1/subnets/${subnetId}/reserved`, { method: 'POST', body })
+export const updateReservedRange = (subnetId, rangeId, body) =>
+  api(`/api/v1/subnets/${subnetId}/reserved/${rangeId}`, { method: 'PATCH', body })
 export const deleteReservedRange = (subnetId, rangeId) =>
   api(`/api/v1/subnets/${subnetId}/reserved/${rangeId}`, { method: 'DELETE' })
+// "Scan now": 202 with the target, 429 COOLDOWN, 409 when nothing can scan it
+export const requestScan = (subnetId) =>
+  api(`/api/v1/subnets/${subnetId}/scan`, { method: 'POST' })
 
 // hosts
 export const listHosts = (params) => api(`/api/v1/hosts${qs(params)}`)
@@ -55,6 +60,9 @@ export const deleteAgent = (id) => api(`/api/v1/agents/${id}`, { method: 'DELETE
 
 // scan targets
 export const listScanTargets = () => api('/api/v1/scan-targets')
+export const createScanTarget = (body) => api('/api/v1/scan-targets', { method: 'POST', body })
+export const updateScanTarget = (id, body) =>
+  api(`/api/v1/scan-targets/${id}`, { method: 'PUT', body })
 
 // changes / misc
 export const listChanges = (params) => api(`/api/v1/changes${qs(params)}`)
