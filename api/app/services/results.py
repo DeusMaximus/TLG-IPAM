@@ -208,8 +208,11 @@ async def _accept(session: AsyncSession, agent: Agent, report: ResultsRequest) -
         row.agent_id = agent.id
         if record.mac is not None:
             row.mac, row.mac_randomised = record.mac, mac_randomised(record.mac)
-        if "rdns" in methods:
-            # the latest answer: no name, or one dropped by sanitising, clears it
+        if "rdns" in methods and (report.complete or record.rdns_name is not None):
+            # A name always sets it. No name (or one dropped by sanitising) clears it
+            # only in a complete result set: an incomplete one may report an address
+            # whose lookup never ran, so there it leaves the stored name alone and
+            # only adds what it saw.
             row.rdns_name = record.rdns_name
         accepted += 1
 

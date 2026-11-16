@@ -50,6 +50,8 @@ volumes:
   ipam-data:
 ```
 
+**The scan agent is a second image** (`agent/`, v0.2 spec §5.6), run on a Linux host on the VLAN it sweeps with host networking and `CAP_NET_RAW`, not beside the server in this compose file. It connects out to the server's `/api/v1/agent/*` over HTTPS with TLS always verified (plain `http` only to its own loopback), checks in every minute, and runs the jobs it is given one at a time: an ICMP echo sweep of the job's ranges, then PTR lookups for the addresses that answered (one UDP query per DNS server, at most three servers, no retransmission or TCP, truncated replies unused), every datagram of both paced together at up to `MAX_PPS` (default 200) a second, inside a 10-minute timeout after which it reports what it saw as incomplete. Before any packet it refuses a job whose subnet is outside its own `ALLOWED_CIDRS` (default RFC 1918 and CGNAT), whose ranges leave the subnet, or that holds more than 4,096 addresses, and reports the refusal, which the server keeps as the target's `last_scan_error` (§3.10). A job issued `arp` (not yet run by the agent, #14) runs the rest and is reported incomplete, so it marks nothing dead. A refused check-in starts no scan: `429`/`503`/5xx are retried after 10 s to 5 min of jittered back-off, `401`/`403`/`409`/`422` every 13.5–15 min (spec §5.7). Every request to the server has a 30-second deadline covering the whole answer, which is read undecoded into at most 1 MiB, never holding more, and acted on only in its route's shape; the agent logs status codes and validated counts, never the server's text, and redacts its own token from its log. The agent never runs, downloads or installs anything the server sends (spec §7.2, invariant 1). Running it: the README's "Scan agent" section.
+
 ### 2.3 URL layout
 
 | Path | Purpose |
@@ -242,7 +244,7 @@ The latest scan state of one address (v0.2 spec §5.4), upserted by results inge
 | `ip`, `ip_int` | the address, and its integer form (internal, as on hosts) |
 | `mac` | str(17), nullable — normalised as `Host.mac`. Only from a job issued `arp`; a later answer without one keeps it |
 | `mac_randomised` | bool — the locally-administered bit of `mac` is set |
-| `rdns_name` | str(253), nullable — the PTR name, only from a job issued `rdns`, and only if it is a DNS hostname: ASCII letters, digits and hyphens in dot-separated labels of 1–63 characters that neither start nor end with a hyphen, at most 253 characters, one trailing dot dropped, lowercased. Anything else is dropped whole, never repaired. Each `rdns` answer replaces it, so no name, or a dropped one, clears it |
+| `rdns_name` | str(253), nullable — the PTR name, only from a job issued `rdns`, and only if it is a DNS hostname: ASCII letters, digits and hyphens in dot-separated labels of 1–63 characters that neither start nor end with a hyphen, at most 253 characters, one trailing dot dropped, lowercased. Anything else is dropped whole, never repaired. A name from an `rdns` answer replaces it. No name, or a dropped one, clears it only in a `complete` result set; an incomplete one leaves it (§4.6) |
 | `alive` | bool — answered in the last scan that could tell (§4.6) |
 | `first_seen_at`, `last_seen_at` | datetime — `last_seen_at` only moves when the address answers |
 | `agent_id` | str, nullable — the agent that last reported it. No foreign key, so deleting an agent rewrites nothing |
@@ -404,6 +406,7 @@ An accepted result set clears both copies of the lease (§4.6). Expiry clears ne
 - **The job.** Accepted only while it is current on both copies of the lease: `job_id` equals the reporting agent's `current_job_id` and a target's `current_job_id`, whatever the target is assigned to now. Otherwise `409 JOB_NOT_CURRENT` and nothing is stored: the job was re-issued after expiry, the agent was given another, the target or its subnet was deleted, the token is another agent's, or a result set for the job was already accepted. A `subnet_id` that is not the job's is `422`. Accepting clears the target's `current_job_id`, `job_issued_at` and `job_methods` and the agent's `current_job_id` and `job_issued_at` in one transaction, each a compare-and-set on this job, so of two racing result sets one is accepted. It sets `last_scan_at` to the job's `job_issued_at`, records the duration, `complete` and `error` (§3.10), and leaves `scan_requested_at` alone, so a scan requested while the job ran is still due. The agent can be issued its next job at its next check-in.
 - **Each record** is judged on its own and a bad one never costs the others. A record is rejected, with its `ip` quoted back when that is a short, ASCII, printable string (null otherwise: JSON can carry a lone surrogate that UTF-8 cannot), for: `invalid` (not an object), `invalid_ip`, `invalid_mac`, `out_of_scope` (outside the subnet's scan scope at ingest, another address family included), `duplicate` (already in this result set), `mac_not_issued` (a MAC from a job not issued `arp`), `rdns_not_issued` (a name from a job not issued `rdns`). What a job could collect is `job_methods`, the methods the server issued, not what the agent says it ran or a later check-in's interfaces. A rejected record is not stored. An `rdns_name` that is not a hostname is not a rejection: it is dropped, and the address is stored without it (§3.11).
 - **Alive and dead.** Each accepted record is upserted `alive=true` with `last_seen_at` now. Only a result set with `complete: true` from a job issued `icmp` or `arp` marks every other observation in the subnet's scope `alive=false`; an address the result set named, even in a rejected record, is not marked. An incomplete job only adds what it saw.
+- **Names.** From a job issued `rdns`, a record's name (after sanitising) replaces the stored one. A record with none clears it only when the result set is `complete`; an incomplete result set may report an address whose lookup never ran, so it leaves the stored name. Until the agent runs `arp` (#14), a job issued `arp` is always reported incomplete, so on the agent's own subnet names are only set or replaced, never cleared.
 - **`fdns`** is checked for shape and not stored: no job names a host until the forward-DNS check (#20), so no answer can be for one the job sent.
 - **Prune.** Every ingest deletes observations, in any subnet, unseen for 90 days.
 - **The answer before the commit.** The `200` answer is built and UTF-8-encoded before the result set is committed, so neither step can fail for a stored result set. That covers the answer's construction and encoding, not its delivery: rendering and sending the response come after the commit, and an agent that loses the response gets `409` on a retry. Should the encoding fail, the transaction is rolled back and the answer is `500 INTERNAL_ERROR` in the error shape, logged server-side.
@@ -617,6 +620,23 @@ tlg-ipam/
 │           ├── scan_targets.py # owner CRUD on /api/v1/scan-targets
 │           ├── findings.py   # /api/v1/subnets/{id}/findings, /api/v1/findings/accept and /dismiss
 │           └── changes.py
+├── agent/                   # the scan agent (v0.2 spec §5.6): its own package, image and tests
+│   ├── pyproject.toml       # package `tlg-ipam-agent`, entry point `tlg-ipam-agent`
+│   ├── Dockerfile           # the agent image: host networking, CAP_NET_RAW
+│   ├── requirements.in / requirements-dev.in    # httpx, icmplib, dnspython; tests add the server's set
+│   ├── requirements.txt / requirements-dev.txt  # generated locks, constrained to api/requirements-dev.txt
+│   ├── tests/               # fake server and prober; end-to-end against the real routes; contract checks against agent_protocol
+│   └── src/tlg_ipam_agent/
+│       ├── cli.py           # entry point: configuration, signals, the loop
+│       ├── config.py        # IPAM_URL (https), IPAM_AGENT_TOKEN, ALLOWED_CIDRS, MAX_PPS
+│       ├── protocol.py      # the agent's copy of the wire contract; parse_job
+│       ├── client.py        # HTTP to /api/v1/agent/*, TLS always verified; answers sorted OK / RETRY / REFUSED
+│       ├── backoff.py       # the refusal rule of spec §5.7
+│       ├── loop.py          # check-in loop, the one-at-a-time job worker, reporting results
+│       ├── guard.py         # ALLOWED_CIDRS and range checks, before any packet
+│       ├── scan.py          # one job: paced ICMP sweep, PTR lookups, the timeout
+│       ├── probe.py         # the only code that sends packets: ICMP echo (icmplib), PTR (dnspython)
+│       └── interfaces.py    # the host's addresses from rtnetlink, for the check-in
 └── web/
     ├── package.json
     ├── eslint.config.js
@@ -693,12 +713,13 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 - A check-in on another protocol gets no jobs and a `409 PROTOCOL_MISMATCH`, recorded in the agent's `last_error`. Agent-reported fields are length-capped and printable-only; a check-in that breaks either is refused and recorded the same way.
 - A second scan request for a subnet within 15 minutes is refused, whoever asks.
 - An agent checks in at most once every 10 seconds, and keeps at most 100 audit entries of its own; text it reports about itself never reaches an assistant through `list_changes`. A target whose jobs keep timing out does not starve the agent's other due targets.
-- Scan results: an out-of-scope address, a wrong job id and a second result set are each rejected without affecting valid records; an incomplete job adds what it saw and marks nothing dead; a hostile `rdns_name` (spaces, markup, instructions) is dropped; deleting a subnet with observations succeeds. Ingest writes no host and no change-log entry, and observations that leave scan scope are deleted with the change that narrows it.
+- Scan results: an out-of-scope address, a wrong job id and a second result set are each rejected without affecting valid records; an incomplete job adds what it saw, marks nothing dead and clears no stored name; a hostile `rdns_name` (spaces, markup, instructions) is dropped; deleting a subnet with observations succeeds. Ingest writes no host and no change-log entry, and observations that leave scan scope are deleted with the change that narrows it.
 - Findings: each type is raised from hosts and observations inside scan scope only, with no MAC finding for a randomised MAC. Accepting one whose observed value has changed writes nothing and reports `skipped`; an accepted one is written through the host paths and appears in the change log with no network-reported value in its summary. A dismissed finding stays hidden until its observed value changes, and dismissals go when their address leaves scope or the subnet is deleted.
 
 ### Testing
 - pytest covers CIDR/IP validation, CIDR child invariants, explicit-null updates, the overlap rule, interval maths, consistent backups, MCP clearing, and next-free allocation edge cases.
 - ESLint, Vitest component tests, and the production frontend build run in CI alongside pytest, with a check that the dependency locks match their `.in` files.
+- The scan agent's tests run in CI with no packet sent: a fake server and a fake prober drive the loop (refusals, back-off bounds, the allowlist, the timeout), its client runs against the real check-in and results routes in process, a loopback TLS server checks that verification cannot be skipped, loopback DNS responders check the arrival times of real queries against `MAX_PPS`, a loopback HTTP server that drips its answer checks the request deadline, and the image is built and started with no network.
 
 ### MCP integration
 - Claude Desktop connects via `mcp-remote` with the owner key as a bearer and lists all available tools.
