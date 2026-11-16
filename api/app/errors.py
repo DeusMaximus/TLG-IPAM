@@ -18,3 +18,9 @@ def not_found(entity: str, entity_id: str) -> ApiError:
 
 def conflict(message: str) -> ApiError:
     return ApiError("CONFLICT", message, 409)
+
+
+def unavailable(message: str) -> ApiError:
+    """The server could not complete the request for now (the database is busy, say);
+    the same request may succeed if retried."""
+    return ApiError("UNAVAILABLE", message, 503)
