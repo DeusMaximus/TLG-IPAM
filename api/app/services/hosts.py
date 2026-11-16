@@ -1,23 +1,43 @@
 from collections import Counter
+from datetime import datetime
 
 from pydantic import ValidationError
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..errors import ApiError, conflict, not_found, validation_error
 from ..ipnet import ip_in_subnet, iter_free, parse_cidr
-from ..models import Host, Subnet
+from ..models import Host, Observation, Subnet
 from ..schemas import AllocateRequest, BulkHostItem, HostCreate, HostOut, HostUpdate
-from . import changes
+from . import changes, scans
 from . import device_types as device_types_svc
 from .subnets import _allocated_ints, get_subnet, reserved_ranges
 
 
-def _host_dict(host: Host, subnet_domain: str | None) -> dict:
+def _last_seen(
+    manual: datetime | None, scanned: datetime | None
+) -> tuple[datetime | None, str | None]:
+    """`last_seen` and `last_seen_source` (v0.2 spec §5.4): the later of the value set by
+    hand and the address's observation, and which one it is. A tie is reported as `scan`.
+    Both are compared as UTC: SQLite reads a stored value back without a zone, while one
+    a client has just written is still in memory with its own."""
+    if scanned is not None and (manual is None or scans.utc(scanned) >= scans.utc(manual)):
+        return scanned, "scan"
+    if manual is not None:
+        return manual, "manual"
+    return None, None
+
+
+def _host_dict(host: Host, subnet_domain: str | None, scanned: datetime | None) -> dict:
     effective = host.domain or subnet_domain
     fqdn = f"{host.hostname}.{effective}" if host.hostname and effective else None
-    return HostOut.model_validate(host).model_copy(update={"fqdn": fqdn}).model_dump(mode="json")
+    last_seen, source = _last_seen(host.last_seen, scanned)
+    return (
+        HostOut.model_validate(host)
+        .model_copy(update={"fqdn": fqdn, "last_seen": last_seen, "last_seen_source": source})
+        .model_dump(mode="json")
+    )
 
 
 async def _subnet_domains(session: AsyncSession, subnet_ids: set[str]) -> dict[str, str | None]:
@@ -29,10 +49,40 @@ async def _subnet_domains(session: AsyncSession, subnet_ids: set[str]) -> dict[s
     return dict(rows.all())
 
 
+# Up to this many hosts, the observation query names each address (two bound values
+# apiece); a larger batch reads its subnets' observations whole and matches them here,
+# so the statement stays inside SQLite's limit on bound values however many hosts there are.
+EXACT_LOOKUP_MAX = 500
+
+
+async def _observed(
+    session: AsyncSession, hosts: list[Host]
+) -> dict[tuple[str, int], datetime]:
+    """When each host's address last answered a scan, keyed by `(subnet_id, ip_int)`:
+    one query for the whole batch. Taken from `last_seen_at`, which only moves when the
+    address answers, and never from `alive`."""
+    keys = {(h.subnet_id, h.ip_int) for h in hosts}
+    if not keys:
+        return {}
+    query = select(Observation.subnet_id, Observation.ip_int, Observation.last_seen_at).where(
+        Observation.subnet_id.in_({subnet_id for subnet_id, _ in keys})
+    )
+    if len(keys) <= EXACT_LOOKUP_MAX:
+        query = query.where(tuple_(Observation.subnet_id, Observation.ip_int).in_(keys))
+    rows = await session.execute(query)
+    return {(subnet_id, ip_int): seen for subnet_id, ip_int, seen in rows.all()}
+
+
 async def hosts_out(session: AsyncSession, hosts: list[Host]) -> list[dict]:
-    """Serialised hosts with computed FQDNs — the shape shared by REST and MCP."""
+    """Serialised hosts with computed FQDNs and scan-derived `last_seen` — the shape
+    shared by REST and MCP. Two queries for any number of hosts. Scan ingest never
+    writes `hosts` (spec §7.2, invariant 3), so the scan time is joined in here, on read."""
     domains = await _subnet_domains(session, {h.subnet_id for h in hosts})
-    return [_host_dict(h, domains.get(h.subnet_id)) for h in hosts]
+    observed = await _observed(session, hosts)
+    return [
+        _host_dict(h, domains.get(h.subnet_id), observed.get((h.subnet_id, h.ip_int)))
+        for h in hosts
+    ]
 
 
 async def host_out(session: AsyncSession, host: Host) -> dict:
