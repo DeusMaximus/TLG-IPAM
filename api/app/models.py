@@ -268,3 +268,31 @@ class Observation(Base):
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     # the agent that reported it; no foreign key, so deleting an agent rewrites nothing
     agent_id: Mapped[str | None] = mapped_column(String(36))
+
+
+class FindingDismissal(Base):
+    """A finding the owner dismissed (v0.2 spec §5.4, §5.5). Findings themselves are
+    computed at read time (`services/findings`) and never stored; a dismissal hides the
+    one at its `(subnet_id, ip, type)` while that finding's observed value is still
+    `observed`, and stops hiding it once the value changes.
+
+    Like observations, rows exist only inside the subnet's scan scope: a change that puts
+    the address out of scope deletes them (`services/scans.drop_out_of_scope`), and so
+    does deleting the subnet.
+    """
+
+    __tablename__ = "finding_dismissals"
+    __table_args__ = (
+        UniqueConstraint("subnet_id", "ip", "type", name="uq_finding_dismissals_subnet_ip_type"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    subnet_id: Mapped[str] = mapped_column(ForeignKey("subnets.id"), index=True)
+    ip: Mapped[str] = mapped_column(String(39))
+    # integer form of ip, so the scope check needs no parsing
+    ip_int: Mapped[int] = mapped_column(BigInteger)
+    type: Mapped[str] = mapped_column(String(16))
+    # the finding's observed value when it was dismissed: a MAC, a PTR name, a
+    # timestamp, `never`, or empty
+    observed: Mapped[str] = mapped_column(String(253))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
