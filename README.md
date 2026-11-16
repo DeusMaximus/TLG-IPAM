@@ -105,7 +105,7 @@ A server certificate from a private CA: mount the CA's bundle and point `SSL_CER
 - A refused check-in never starts a scan. A scan that runs out of time (10 minutes) reports what it found as incomplete, which only adds to what the server knows.
 - Every request to the server is abandoned after 30 seconds, however slowly the answer arrives, and is retried as above.
 
-The log shows each refusal as its HTTP status and error code (`HTTP 409 PROTOCOL_MISMATCH`), never the server's message: the Agents page shows the full reason. The agent's token is replaced with `tlga_[redacted]` in anything it logs.
+The log shows each refusal as its HTTP status and error code (`HTTP 409 PROTOCOL_MISMATCH`), never the server's message. For a check-in the server refused after accepting the token (a protocol mismatch, a report it could not read), the Agents page shows the full reason as the agent's last error. A refused token (`401`/`403`) and a refused result set leave no reason there: the status and code in the log are what there is. The agent's token is replaced with `tlga_[redacted]` in anything it logs.
 
 ## Development
 

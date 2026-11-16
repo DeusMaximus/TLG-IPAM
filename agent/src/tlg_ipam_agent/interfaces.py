@@ -29,6 +29,8 @@ _NLMSGHDR = struct.Struct("=IHHII")  # len, type, flags, seq, pid
 _IFADDRMSG = struct.Struct("=BBBBI")  # family, prefixlen, flags, scope, index
 _RTATTR = struct.Struct("=HH")  # len, type
 _SYSFS = Path("/sys/class/net")
+# addresses kept from the kernel's dump, before the check-in's own cap
+DUMP_MAX = 4 * INTERFACES_MAX
 
 
 def _align(n: int) -> int:
@@ -82,8 +84,10 @@ def _dump() -> list[tuple[int, str]]:
         while True:
             part, done = parse_addresses(sock.recv(65536))
             found += part
-            if done:
-                return found
+            # enough to fill INTERFACES_MAX after loopback and vanished interfaces are
+            # dropped; the rest of the dump is not held
+            if done or len(found) >= DUMP_MAX:
+                return found[:DUMP_MAX]
 
 
 def _mac(name: str) -> str | None:

@@ -284,3 +284,44 @@ def test_the_server_under_test_uses_this_sessions_own_database():
     from conftest import _SESSION_DIR
 
     assert str(engine.url.database).startswith(_SESSION_DIR)
+
+
+async def test_names_already_stored_survive_a_scan_at_one_packet_a_second(owner):
+    """The consequence the second briefed round measured at ce60198: at MAX_PPS=1 the
+    later PTR lookups ran out of time queueing for a slot, the result still said
+    complete, and ingest cleared the names they never looked up. Real check-ins and
+    results, the real resolver, a DNS responder on loopback."""
+    from test_probe import ANSWERS, responder
+
+    from tlg_ipam_agent.probe import DnsResolver
+
+    live = [f"10.0.0.{i}" for i in range(1, 5)]
+    for ip in live:
+        ANSWERS[f"{ip.split('.')[-1]}.0.0.10.in-addr.arpa."] = f"host{ip.split('.')[-1]}.home.arpa."
+    transport, dns_responder, port = await responder()
+    try:
+        agent_row, subnet, target = await setup(owner, cidr="10.0.0.0/29", dns_servers=["127.0.0.1"])
+        agent = make_agent(
+            agent_row["token"],
+            prober=FakeProber(alive=live),
+            resolver=DnsResolver(port=port),
+            interfaces=[{"name": "eth0", "cidr": "10.0.0.5/29", "mac": None}],
+            max_pps=1,
+        )
+        for scan_number in (1, 2):
+            if scan_number == 2:
+                await _ok(await owner.post(f"/api/v1/subnets/{subnet['id']}/scan"), 202)
+                await past_the_checkin_gap(agent_row["id"])
+            await agent.checkin_once()
+            await run_queued(agent)
+            seen = await observations(subnet["id"])
+            assert {ip: seen[ip].rdns_name for ip in live} == {
+                ip: f"host{ip.split('.')[-1]}.home.arpa" for ip in live
+            }, f"scan {scan_number}"
+            assert (await target_of(owner, target["id"]))["last_scan_complete"] is True
+        # every live address asked in each scan
+        assert len(dns_responder.arrivals) == 2 * len(live)
+    finally:
+        transport.close()
+        for ip in live:
+            ANSWERS.pop(f"{ip.split('.')[-1]}.0.0.10.in-addr.arpa.", None)

@@ -1,13 +1,14 @@
 """Spec §7.2 invariant 1, held in the agent's source: it never executes, downloads or
 updates from anything the server sends.
 
-What this proves: the agent's own modules import only the modules listed here, and
-none of them names (as a call, an attribute, a bare name, or a string that could be
-handed to `getattr` or an importer) a way to start a process, load or evaluate code,
-reach an object's attributes by computed name, or write a file. What it does not
-prove: how the three dependencies behave inside, that a future change cannot reach
-the same effect through an allowed module in a way not listed, or anything about
-logic errors. It is a tripwire for review, not a proof of the invariant.
+What this shows, and no more: the agent's own modules import only the modules listed
+here, and contain none of the names listed here (as a call, an attribute, a bare name,
+or a string that could be handed to `getattr` or an importer). The names are ways to
+start a process, load or evaluate code, reach an object's attributes by computed name,
+or write a file. It proves the absence of those names, not the invariant: code that
+reaches the same effect without one of them passes (an uncalled
+`os.__getattribute__("sy" + "stem")(command)` does), and so would anything inside the
+three dependencies. It is a tripwire for review; review holds the invariant.
 """
 
 import ast
@@ -25,7 +26,7 @@ ALLOWED_IMPORTS = {
     "ipaddress", "json", "logging", "os", "pathlib", "platform", "random", "re",
     "signal", "socket", "ssl", "struct", "sys", "time", "typing", "urllib.parse",
     "httpx", "icmplib",
-    "dns.asyncquery", "dns.exception", "dns.message", "dns.rcode", "dns.rdatatype",
+    "dns.asyncquery", "dns.exception", "dns.flags", "dns.message", "dns.rcode", "dns.rdatatype",
     "dns.resolver", "dns.reversename",
 }
 # names that start a process, load or evaluate code, reach attributes by a computed

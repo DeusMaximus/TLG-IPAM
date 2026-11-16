@@ -13,6 +13,7 @@ from collections.abc import Awaitable, Callable
 
 import dns.asyncquery
 import dns.exception
+import dns.flags
 import dns.message
 import dns.rcode
 import dns.rdatatype
@@ -72,7 +73,8 @@ class DnsResolver:
     The agent sends each query itself rather than through dnspython's resolver, whose
     failover, retransmission and TCP fallback would put datagrams on the wire that the
     packet budget never saw. Here a lookup is one UDP query per server, to at most
-    MAX_DNS_SERVERS servers in turn, with no retransmission and no TCP. Before each
+    MAX_DNS_SERVERS servers in turn, with no retransmission and no TCP; a truncated
+    reply is not used. Before each
     query it awaits `slot()`, which takes one packet from the job's budget (`MAX_PPS`,
     shared with the ICMP sweep) and returns the seconds the lookup has left."""
 
@@ -95,14 +97,29 @@ class DnsResolver:
             left = await slot()
             if left <= 0:
                 return None
-            # a fresh query, so a fresh id, for every datagram
-            query = dns.message.make_query(name, dns.rdatatype.PTR)
+            # a fresh query, so a fresh id, for every datagram; recursion desired, EDNS
+            # with the common 1232-byte payload, set here rather than left to defaults
+            query = dns.message.make_query(
+                name, dns.rdatatype.PTR, use_edns=0, payload=1232, want_dnssec=False,
+                flags=dns.flags.RD,
+            )
             try:
                 reply = await dns.asyncquery.udp(
-                    query, server, timeout=left, port=self.port, ignore_unexpected=True
+                    query,
+                    server,
+                    timeout=left,
+                    port=self.port,
+                    # wait out a reply from another source, port or id until `left`
+                    ignore_unexpected=True,
+                    # a truncated reply is not used, PTR record or not, and there is
+                    # no TCP retry: it is treated as no answer, and the next server
+                    # is asked
+                    raise_on_truncation=True,
+                    ignore_trailing=False,
                 )
             except (dns.exception.DNSException, OSError, ValueError):
-                continue  # no answer in time, or a broken one: the next server
+                # no answer in time, a truncated or broken one: the next server
+                continue
             rcode = reply.rcode()
             if rcode == dns.rcode.NXDOMAIN:
                 return None

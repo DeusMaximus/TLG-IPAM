@@ -52,6 +52,10 @@ class Responder(asyncio.DatagramProtocol):
             reply.set_rcode(dns.rcode.SERVFAIL)
         elif action == "truncated":
             reply.flags |= dns.flags.TC
+        elif action == "truncated-ptr":
+            # TC set, yet carrying a complete, usable PTR RRset
+            reply.flags |= dns.flags.TC
+            reply.answer.append(dns.rrset.from_text(question.name, 60, "IN", "PTR", ANSWERS[question.name.to_text()]))
         else:
             target = ANSWERS.get(question.name.to_text())
             if target is None:
@@ -193,3 +197,28 @@ async def test_no_query_once_the_lookup_has_no_time_left():
         assert proto.arrivals == []
     finally:
         transport.close()
+
+
+async def test_a_truncated_reply_is_not_used_even_with_a_ptr_record():
+    """TC=1 with a usable PTR RRset gives no name, and no TCP: only the next server's
+    reply counts (briefed round 2, finding 3)."""
+    transport, proto, port = await responder(script=("truncated-ptr", "answer"))
+    connections = []
+
+    async def accept(reader, writer):
+        connections.append(1)
+        writer.close()
+
+    tcp = await asyncio.start_server(accept, "127.0.0.1", port)
+    try:
+        resolver = DnsResolver(port=port)
+        address = ipaddress.ip_address("10.0.0.9")
+        assert await resolver.ptr(address, ("127.0.0.1",), unpaced()) is None
+        # the same server listed twice: the second query gets a whole answer
+        proto.script = ["truncated-ptr", "answer"]
+        assert await resolver.ptr(address, ("127.0.0.1", "127.0.0.1"), unpaced()) == "nas.home.arpa."
+        await asyncio.sleep(0.1)
+        assert connections == [] and len(proto.arrivals) == 3
+    finally:
+        transport.close()
+        tcp.close()

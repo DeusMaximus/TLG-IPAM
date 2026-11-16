@@ -112,3 +112,36 @@ def test_discover_survives_a_kernel_that_refuses(monkeypatch):
 
     monkeypatch.setattr(nl, "_dump", refuse)
     assert nl.discover() == []
+
+
+def test_the_dump_stops_holding_addresses_past_its_bound(monkeypatch):
+    """A host with a huge address list: the dump keeps DUMP_MAX, not all of them."""
+    one = _addr(socket.AF_INET, 24, 0, 2, _attr(nl.IFA_LOCAL, V4))
+
+    class Sock:
+        def __init__(self, *args):
+            self.reads = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def settimeout(self, t):
+            pass
+
+        def bind(self, addr):
+            pass
+
+        def send(self, data):
+            pass
+
+        def recv(self, n):
+            self.reads += 1
+            return one * 100  # never DONE
+
+    monkeypatch.setattr(nl.socket, "socket", Sock)
+    monkeypatch.setattr(nl.socket, "AF_NETLINK", 16, raising=False)
+    found = nl._dump()
+    assert len(found) == nl.DUMP_MAX

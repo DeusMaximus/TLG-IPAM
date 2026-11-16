@@ -70,6 +70,8 @@ def make_http(config: Config) -> httpx.AsyncClient:
         headers={
             "Authorization": f"Bearer {config.token}",
             "User-Agent": f"tlg-ipam-agent/{__version__}",
+            # nothing is decompressed (`_bounded_body`), so nothing compressed is asked for
+            "Accept-Encoding": "identity",
         },
         verify=tls_context(),
         timeout=httpx.Timeout(30.0, connect=10.0),
@@ -143,7 +145,7 @@ class AgentClient:
     Every request has one deadline for all of it, connection, headers and body:
     httpx's own timeouts are per phase and its read timeout is per chunk, so a server
     that drips its answer would otherwise hold the request for ever. The body is read
-    into a buffer of at most RESPONSE_MAX bytes."""
+    undecoded into a buffer that never passes RESPONSE_MAX bytes (`_bounded_body`)."""
 
     def __init__(self, http: httpx.AsyncClient, request_timeout: float = REQUEST_TIMEOUT_S):
         self.http = http
@@ -164,7 +166,10 @@ class AgentClient:
             async with asyncio.timeout(timeout):
                 async with self.http.stream("POST", path, json=body) as res:
                     status = res.status_code
-                    raw = await _bounded_body(res)
+                    try:
+                        raw, unreadable = await _bounded_body(res), None
+                    except _Unreadable as exc:
+                        raw, unreadable = None, str(exc)
         except TimeoutError:
             return Answer(Kind.RETRY, None, None, f"no complete answer within {timeout:.0f} s")
         except httpx.HTTPError as exc:
@@ -172,7 +177,7 @@ class AgentClient:
             return Answer(Kind.RETRY, None, None, f"no answer ({_transport_reason(exc)})")
         if status == 200:
             if raw is None:
-                return Answer(Kind.RETRY, status, None, f"HTTP 200 answer over {RESPONSE_MAX} bytes")
+                return Answer(Kind.RETRY, status, None, f"HTTP 200 {unreadable}")
             try:
                 data = json.loads(raw)["data"]
             except (ValueError, KeyError, TypeError, RecursionError):
@@ -186,15 +191,31 @@ class AgentClient:
         return Answer(kind, status, code, f"HTTP {status} {code}" if code else f"HTTP {status}")
 
 
-async def _bounded_body(res: httpx.Response) -> bytes | None:
-    """The body, or None once it passes RESPONSE_MAX (declared or as read; counted
-    after decompression, so a compressed answer cannot expand past it)."""
+class _Unreadable(Exception):
+    """An answer the agent does not read: its reason is logged, its bytes are not."""
+
+
+async def _bounded_body(res: httpx.Response) -> bytes:
+    """The body as sent, never more than RESPONSE_MAX bytes of it held.
+
+    The agent asks for `identity` and refuses any other content encoding, so nothing
+    is decompressed: a small compressed answer cannot expand in memory. The raw
+    stream arrives in reads of at most 64 KiB (httpcore), and each is checked before
+    it is appended, so the buffer never passes the cap. Raises _Unreadable."""
+    encoding = res.headers.get("content-encoding", "").strip().lower()
+    if encoding not in ("", "identity"):
+        raise _Unreadable("answer with a content encoding")
     declared = res.headers.get("content-length", "")
     if declared.isascii() and declared.isdigit() and int(declared) > RESPONSE_MAX:
-        return None
+        raise _Unreadable(f"answer over {RESPONSE_MAX} bytes")
+    if res.is_stream_consumed:
+        # a response built whole in memory (a test transport): nothing left to stream
+        if len(res.content) > RESPONSE_MAX:
+            raise _Unreadable(f"answer over {RESPONSE_MAX} bytes")
+        return res.content
     body = bytearray()
-    async for chunk in res.aiter_bytes():
+    async for chunk in res.aiter_raw():
+        if len(body) + len(chunk) > RESPONSE_MAX:
+            raise _Unreadable(f"answer over {RESPONSE_MAX} bytes")
         body += chunk
-        if len(body) > RESPONSE_MAX:
-            return None
     return bytes(body)

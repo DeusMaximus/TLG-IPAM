@@ -274,3 +274,75 @@ def test_every_request_has_a_thirty_second_deadline():
 
     assert REQUEST_TIMEOUT_S == 30.0
     assert AgentClient(httpx.AsyncClient()).request_timeout == 30.0
+
+
+# --- the cap holds in memory, not only in the verdict (briefed round 2, finding 2) ---
+
+
+async def _serving(head: bytes, body_chunks):
+    """Plain HTTP on 127.0.0.1 answering every request with `head` and then each
+    chunk of `body_chunks` (an iterable of bytes), then closing. Records the request
+    headers it saw."""
+    seen = []
+
+    async def handle(reader, writer):
+        try:
+            seen.append(await reader.readuntil(b"\r\n\r\n"))
+            writer.write(head)
+            for chunk in body_chunks():
+                writer.write(chunk)
+                await writer.drain()
+        except (ConnectionError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    return server, server.sockets[0].getsockname()[1], seen
+
+
+async def _peak_during(coro) -> tuple[object, int]:
+    import tracemalloc
+
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        base = tracemalloc.get_traced_memory()[0]
+        result = await coro
+        peak = tracemalloc.get_traced_memory()[1] - base
+    finally:
+        tracemalloc.stop()
+    return result, peak
+
+
+async def test_a_compressed_answer_is_refused_undecoded():
+    """32 KiB of gzip that would decode to 32 MiB: the agent asks for identity, refuses
+    the encoding, and never holds more than a fraction of the cap."""
+    import gzip
+
+    payload = gzip.compress(b'{"data": {"checkin_interval_s": 60, "jobs": [' + b" " * (32 * 1024 * 1024) + b"]}}")
+    assert len(payload) < 64 * 1024
+    head = (
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\n"
+        + f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode()
+    )
+    server, port, seen = await _serving(head, lambda: [payload])
+    async with server:
+        async with make_http(make_config(url=f"http://127.0.0.1:{port}")) as http:
+            answer, peak = await _peak_during(AgentClient(http).checkin({}))
+    assert peak < RESPONSE_MAX, f"held {peak} bytes"
+    assert answer.kind is Kind.RETRY and "content encoding" in answer.message
+    assert b"accept-encoding: identity" in seen[0].lower()
+
+
+async def test_a_plain_answer_far_over_the_cap_never_fills_memory():
+    """32 MiB with no declared length, streamed: reads stop at the cap, and what is
+    held never passes it by more than one network read."""
+    chunk = b" " * 65536
+    head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+    server, port, _ = await _serving(head, lambda: (chunk for _ in range(512)))
+    async with server:
+        async with make_http(make_config(url=f"http://127.0.0.1:{port}")) as http:
+            answer, peak = await _peak_during(AgentClient(http).checkin({}))
+    assert peak < 2 * RESPONSE_MAX, f"held {peak} bytes"
+    assert answer.kind is Kind.RETRY and str(RESPONSE_MAX) in answer.message
