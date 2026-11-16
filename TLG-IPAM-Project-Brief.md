@@ -234,7 +234,7 @@ Single static API key passed as a header:
 X-API-Key: <value from API_KEY env var>
 ```
 
-All endpoints except `GET /health` and the agent-facing `/api/v1/agent/*` require this header. Return `401` if missing, `403` if wrong. The key is compared in constant time (`hmac.compare_digest`, in `auth.is_owner_key`). Key is set at container start — no key rotation UI needed in v1. REST does not accept the key as a bearer, and `/mcp` does not accept `X-API-Key` (§5.1).
+All endpoints except `GET /health` and the agent-facing `/api/v1/agent/*` require this header. Return `401` if missing, `403` if wrong. The key is compared in constant time (`hmac.compare_digest`, in `auth.is_owner_key`). Key is set at container start — no key rotation UI needed in v1. The server refuses to start unless `API_KEY` is set, non-empty (not only whitespace) and not `change-me`, the placeholder `.env.example` ships: `config.load_settings` runs when `app.config` is imported, so uvicorn exits with a message that names `API_KEY` and says how to generate a key, before it serves anything (under `--reload`, the reloader stays up and its server process exits). Separately, `is_owner_key` never matches an empty value, so an empty `X-API-Key` is refused (`403`) whatever the setting holds. REST does not accept the key as a bearer, and `/mcp` does not accept `X-API-Key` (§5.1).
 
 Agent-facing routes, `/api/v1/agent/*`, take an agent token instead (§3.9), as `Authorization: Bearer tlga_…`, through the `auth.require_agent` dependency and nothing else. It accepts only an unrevoked `agent` token of an `active` agent and records `last_used_at`. The token is found by the SHA-256 of the presented value, so the stored secret is never compared. Refusals use the REST error shape: `401 UNAUTHORIZED` when no bearer is sent (including `X-API-Key` alone), `403 FORBIDDEN` "Invalid agent token" for any bearer that is not a usable agent token — the owner key, an unknown, revoked or `enrol` token, or the token of a disabled or deleted agent. The owner routes refuse an agent token (`403` as `X-API-Key`, `401` as a bearer), and so does `/mcp` (`401 invalid_token`). No route is mounted under `/api/v1/agent/` yet; check-in and results arrive with v0.2 M2a.
 
@@ -333,7 +333,7 @@ app = FastAPI(lifespan=mcp_app.lifespan, ...)
 app.mount("/mcp", mcp_app)
 ```
 
-Auth for `/mcp` is the same owner key (`API_KEY`), sent as a bearer token: `Authorization: Bearer <API_KEY>`. FastMCP enforces it through its own `auth=`: `OwnerKeyVerifier` in `auth.py` compares the token in constant time and grants the scopes `ipam:read` and `ipam:write`. No tool checks the scopes yet. `X-API-Key` is not accepted on `/mcp`.
+Auth for `/mcp` is the same owner key (`API_KEY`), sent as a bearer token: `Authorization: Bearer <API_KEY>`. FastMCP enforces it through its own `auth=`: `OwnerKeyVerifier` in `auth.py` compares the token in constant time and grants the scopes `ipam:read` and `ipam:write`. No tool checks the scopes yet. `X-API-Key` is not accepted on `/mcp`, and an empty bearer is never the owner key (§4.1).
 
 A refused request gets FastMCP's RFC 6750 response, not the REST error envelope:
 
@@ -559,7 +559,7 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 ### Operations
 - `docker compose up --build` produces a running stack with no manual steps.
 - All data persists across container restarts (named volume).
-- API key changeable via env var without rebuild.
+- API key changeable via env var without rebuild. The server refuses to start with `API_KEY` unset, empty, or `change-me` (§4.1).
 - Settings exposes a SQLite backup download created through the online backup API rather than streaming the active database file.
 - `docs/backup-and-restore.md` describes a scheduled pull of `GET /api/v1/backup` from another host (dated files, retention) and a restore procedure; following it against a running instance produces a dated snapshot and a working restore from it. Its examples use placeholder domains only.
 - The container runs one uvicorn worker, pinned by `--workers 1` in the image's `CMD` (§2.2).

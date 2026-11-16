@@ -20,8 +20,15 @@ def is_owner_key(presented: str) -> bool:
 
     Compared as UTF-8 bytes: `hmac.compare_digest` raises on a non-ASCII `str`,
     and a header value can be any Latin-1 text.
+
+    An empty value is never the owner key, on either side. `config.load_settings`
+    refuses to start with an empty `API_KEY`; this holds without it, so an empty
+    `X-API-Key` or `Authorization: Bearer ` cannot match an empty setting.
     """
-    return hmac.compare_digest(presented.encode(), settings.api_key.encode())
+    expected = settings.api_key
+    if not presented or not expected:
+        return False
+    return hmac.compare_digest(presented.encode(), expected.encode())
 
 
 async def require_api_key(x_api_key: str | None = Header(default=None)):

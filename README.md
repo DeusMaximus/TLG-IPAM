@@ -15,11 +15,13 @@ See [TLG-IPAM-Project-Brief.md](TLG-IPAM-Project-Brief.md) for the full specific
 ## Quick start
 
 ```sh
-cp .env.example .env          # then set a strong API_KEY, e.g. openssl rand -hex 32
+cp .env.example .env          # then replace API_KEY with a real key, e.g. openssl rand -hex 32
 docker compose up --build
 ```
 
 Open http://localhost:8080, paste your API key, done.
+
+The server will not start without a real key: with `API_KEY` unset, empty, or still the `change-me` placeholder from `.env.example`, it exits with a message that names `API_KEY`.
 
 ## Backups and restore
 
@@ -67,6 +69,8 @@ python3 -m venv .venv && .venv/bin/pip install --require-hashes -r requirements-
 .venv/bin/python -m pytest                  # test suite
 API_KEY=dev-key .venv/bin/uvicorn app.main:app --port 8080 --reload
 ```
+
+Any non-empty key other than `change-me` starts the server; without one, uvicorn exits before it serves anything (with `--reload`, the reloader waits for a file change; stop it with Ctrl+C). The test suite sets its own key.
 
 Frontend (Node 20+), with `/api` proxied to the backend on :8080:
 
