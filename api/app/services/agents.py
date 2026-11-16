@@ -10,12 +10,12 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy import or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from ..errors import conflict, not_found, unavailable
+from ..errors import ApiError, conflict, not_found
 from ..models import Agent, Token
 from ..schemas import AgentCreate, AgentUpdate
 from . import changes, scans
@@ -23,8 +23,9 @@ from . import changes, scans
 AGENT_TOKEN_PREFIX = "tlga_"
 # characters of the token kept for display: the kind prefix plus 8 of the 43 random ones
 _DISPLAY_LENGTH = len(AGENT_TOKEN_PREFIX) + 8
-# `last_used_at` is written at most this often per token, so a token used at request
-# rate (a check-in refused by its rate limit, say) drives reads, not database writes
+# `last_used_at` is written at most this often per token, and only by a request the
+# route serves (`record_token_use`): a token used at request rate drives reads, not
+# database writes
 LAST_USED_GRANULARITY = timedelta(seconds=10)
 
 
@@ -221,19 +222,20 @@ async def delete_agent(session: AsyncSession, agent_id: str, source: str) -> Non
     await session.commit()
 
 
+# where `authenticate` leaves the id of the token it accepted, for the route's own
+# transaction to record its use (`record_token_use`); a session serves one request
+_TOKEN_IN_USE = "agent_token_id"
+
+
 async def authenticate(session: AsyncSession, presented: str) -> Agent | None:
     """The agent a presented bearer belongs to, or None. Accepts only an unrevoked
-    `agent` token of an `active` agent, and records its use in `last_used_at` when the
-    stored time is LAST_USED_GRANULARITY old or more (or unset). Inside that interval
-    it only reads.
+    `agent` token of an `active` agent. It only reads: the token's use is recorded by
+    the route that serves the request, in that route's own transaction
+    (`record_token_use`), so a request that is refused (a check-in inside its rate
+    limit, say) writes nothing.
 
     The lookup is by SHA-256 of the presented value, so no comparison ever touches
     the stored secret: timing reveals at most where an attacker's own hash sorts.
-
-    The write comes after every credential and state check, so a refused bearer never
-    reaches it. If it fails (the database stays locked past its busy timeout, say), it
-    is rolled back and the request is refused with a retryable `503 UNAVAILABLE`: the
-    token was valid, but the request is not served without its use being recorded.
     """
     row = (
         await session.execute(
@@ -247,15 +249,37 @@ async def authenticate(session: AsyncSession, presented: str) -> Agent | None:
     token, agent = row
     if token.kind != "agent" or token.revoked_at is not None or agent.state != "active":
         return None
-    now = _now()
-    used = token.last_used_at
-    if used is not None and used.tzinfo is None:
-        used = used.replace(tzinfo=timezone.utc)  # SQLite hands it back without a zone
-    if used is None or now - used >= LAST_USED_GRANULARITY:
-        token.last_used_at = now
-        try:
-            await session.commit()
-        except OperationalError:
-            await session.rollback()
-            raise unavailable("Database busy; retry the request") from None
+    session.info[_TOKEN_IN_USE] = token.id
     return agent
+
+
+def token_in_use(session: AsyncSession) -> str:
+    """The id of the token `authenticate` accepted for this session's request."""
+    try:
+        return session.info[_TOKEN_IN_USE]
+    except KeyError:
+        raise RuntimeError("no agent token was authenticated in this session") from None
+
+
+def token_refused() -> ApiError:
+    """The refusal `auth.require_agent` gives a bearer that is not a usable agent token,
+    for a check that is repeated later in the request."""
+    return ApiError("FORBIDDEN", "Invalid agent token", 403)
+
+
+async def record_token_use(session: AsyncSession, now: datetime) -> None:
+    """Record the use of the token that authenticated this request, as part of the
+    caller's transaction; does not commit. The update is conditional in SQL: it
+    applies only while the stored time is unset or LAST_USED_GRANULARITY old, so
+    requests that race, or arrive at request rate, write it at most once per interval.
+    """
+    stale = now - LAST_USED_GRANULARITY
+    await session.execute(
+        update(Token)
+        .where(
+            Token.id == token_in_use(session),
+            or_(Token.last_used_at.is_(None), Token.last_used_at <= stale),
+        )
+        .values(last_used_at=now)
+        .execution_options(synchronize_session=False)
+    )

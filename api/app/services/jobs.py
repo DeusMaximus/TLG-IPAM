@@ -32,7 +32,8 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from pydantic import ValidationError
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, exists, or_, select, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
@@ -44,9 +45,9 @@ from ..agent_protocol import (
     CheckinResponse,
     Job,
 )
-from ..errors import ApiError, validation_error
+from ..errors import ApiError, database_unavailable, validation_error
 from ..ipnet import on_link, parse_cidr
-from ..models import Agent, Change, ScanTarget, Subnet
+from ..models import Agent, Change, ScanTarget, Subnet, Token
 from . import agents, changes, scans
 from .scans import utc
 
@@ -56,8 +57,9 @@ LEASE = timedelta(minutes=15)
 REPORTED_FIELDS = changes.AGENT_REPORTED_FIELDS
 _AGENT_LEASE = ("current_job_id", "job_issued_at")
 # At most one check-in per agent in this time (the agent's own interval is 60 s). A
-# refused check-in writes nothing: with `agents.LAST_USED_GRANULARITY`, a token used at
-# request rate drives reads only, not writes or audit entries.
+# refused check-in writes nothing, the token's use included (it is recorded only by a
+# check-in that takes its slot), so a token used at request rate drives reads only,
+# not writes or audit entries.
 DEFAULT_CHECKIN_GAP = timedelta(seconds=10)
 MIN_CHECKIN_GAP = DEFAULT_CHECKIN_GAP
 # the newest audit entries an agent's own check-ins keep (`_prune_agent_audit`)
@@ -246,11 +248,17 @@ def _rate_limited() -> ApiError:
 
 
 async def _claim(session: AsyncSession, agent: Agent, now: datetime) -> None:
-    """Take this agent's check-in slot, or refuse with 429 before anything else is
-    written. This is a compare-and-set on `last_checkin_at`, so racing check-ins of one
-    agent cannot both pass. It is also the check-in's first write, so SQLite's one
-    writer serialises everything after it; the agent was loaded at authentication,
-    before that, so its state is read again here.
+    """Take this agent's check-in slot, or refuse before anything is written: 429 inside
+    the rate limit, 403 when the owner disabled or deleted the agent, or revoked the
+    token, after it authenticated.
+
+    This is a compare-and-set on `last_checkin_at` that also requires the agent to be
+    `active` and the token unrevoked, so racing check-ins of one agent cannot both pass
+    and an owner's disable takes effect from the moment it commits. It is the
+    check-in's first write, so SQLite's one writer serialises everything after it until
+    the commit: the token's use is recorded here, in the same transaction, and the
+    agent row is then read again whole, so what the check-in stores and logs starts
+    from the row as committed, never from the one loaded at authentication.
 
     The check against the row loaded at authentication comes first and needs no write
     statement at all; that row can only be older than the database's, never newer, so
@@ -258,19 +266,28 @@ async def _claim(session: AsyncSession, agent: Agent, now: datetime) -> None:
     last = utc(agent.last_checkin_at)
     if last is not None and last > now - MIN_CHECKIN_GAP:
         raise _rate_limited()
+    token_id = agents.token_in_use(session)
+    token_live = exists().where(Token.id == token_id, Token.revoked_at.is_(None))
     result = await session.execute(
         update(Agent)
         .where(
             Agent.id == agent.id,
+            Agent.state == "active",
+            token_live,
             or_(Agent.last_checkin_at.is_(None), Agent.last_checkin_at <= now - MIN_CHECKIN_GAP),
         )
         .values(last_checkin_at=now)
         .execution_options(synchronize_session=False)
     )
     if result.rowcount != 1:
+        # which condition failed, read under the write lock this statement took
+        accepted = await session.scalar(
+            select(Agent.id).where(Agent.id == agent.id, Agent.state == "active", token_live)
+        )
         await session.rollback()
-        raise _rate_limited()
-    await session.refresh(agent, [*REPORTED_FIELDS, "last_error", *_AGENT_LEASE])
+        raise _rate_limited() if accepted else agents.token_refused()
+    await agents.record_token_use(session, now)
+    await session.refresh(agent)
     set_committed_value(agent, "last_checkin_at", now)
 
 
@@ -320,28 +337,40 @@ async def checkin(session: AsyncSession, agent: Agent, body: dict) -> dict:
     """Handle `POST /api/v1/agent/checkin` for an authenticated agent.
 
     A check-in inside MIN_CHECKIN_GAP of the last is refused (429) before anything is
-    written. The protocol is then checked before the rest of the body, which another
-    protocol may shape differently. A mismatch, or a body that fails validation, is
-    recorded in `last_error`, leaves the reported fields as they were, and gets no job.
+    written, and so is one from an agent disabled since it authenticated (403). The
+    protocol is then checked before the rest of the body, which another protocol may
+    shape differently. A mismatch, or a body that fails validation, is recorded in
+    `last_error`, leaves the reported fields as they were, and gets no job.
+
+    Everything the check-in writes, the token's use included, is one transaction. If
+    the database refuses a write (locked past its busy timeout, say), it is rolled back
+    and the request is refused with `503 UNAVAILABLE`: nothing of it is written, and
+    the same check-in may be sent again. A failure of the rollback itself is not
+    caught and is a bare 500.
     """
     now = _now()
-    await _claim(session, agent, now)
-    error = _protocol_error(body)
-    if error is not None:
-        await _store(session, agent, {"last_error": error})
-        await session.commit()
-        raise ApiError("PROTOCOL_MISMATCH", error, 409)
     try:
-        report = CheckinRequest.model_validate(body)
-    except ValidationError as exc:
-        error = _validation_message(exc)
-        await _store(session, agent, {"last_error": error})
-        await session.commit()
-        raise validation_error(error) from None
+        await _claim(session, agent, now)
+        error = _protocol_error(body)
+        if error is not None:
+            await _store(session, agent, {"last_error": error})
+            await session.commit()
+            raise ApiError("PROTOCOL_MISMATCH", error, 409)
+        try:
+            report = CheckinRequest.model_validate(body)
+        except ValidationError as exc:
+            error = _validation_message(exc)
+            await _store(session, agent, {"last_error": error})
+            await session.commit()
+            raise validation_error(error) from None
 
-    data = report.model_dump()
-    await _store(session, agent, {**{f: data[f] for f in REPORTED_FIELDS}, "last_error": None})
-    job = await _next_job(session, agent, now)
-    await session.commit()
+        data = report.model_dump()
+        reported = {f: data[f] for f in REPORTED_FIELDS}
+        await _store(session, agent, {**reported, "last_error": None})
+        job = await _next_job(session, agent, now)
+        await session.commit()
+    except OperationalError as exc:
+        await session.rollback()
+        raise database_unavailable("check-in", exc) from exc
     response = CheckinResponse(checkin_interval_s=CHECKIN_INTERVAL_S, jobs=[job] if job else [])
     return response.model_dump(mode="json")

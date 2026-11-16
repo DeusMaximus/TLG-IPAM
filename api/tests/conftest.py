@@ -1,6 +1,8 @@
 import os
 import shutil
+import sqlite3
 import tempfile
+from contextlib import asynccontextmanager, contextmanager
 from datetime import timedelta
 
 # Each pytest session gets its own directory, so two sessions on one machine
@@ -14,8 +16,11 @@ os.environ["STATIC_DIR"] = os.path.join(_SESSION_DIR, "no-static")
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import event
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.database import SessionLocal, engine
+from app.config import settings
+from app.database import SessionLocal, _configure_connection, engine, get_session
 from app.main import app
 from app.models import Base
 from app.services import jobs
@@ -42,6 +47,49 @@ def unlimited_checkins(monkeypatch):
     gap is never inside); `test_checkin.py` restores `jobs.DEFAULT_CHECKIN_GAP` where it
     tests the limit itself."""
     monkeypatch.setattr(jobs, "MIN_CHECKIN_GAP", -timedelta(hours=1))
+
+
+@contextmanager
+def write_lock():
+    """Another connection holding SQLite's write lock (`BEGIN IMMEDIATE`) until the block
+    ends. Readers carry on (WAL); a writer waits out its busy timeout, then fails."""
+    con = sqlite3.connect(settings.db_path, isolation_level=None)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        yield
+    finally:
+        con.rollback()
+        con.close()
+
+
+@asynccontextmanager
+async def app_database(*, busy_timeout_ms: int = 5000, read_only: bool = False):
+    """The app's requests served from their own engine on the same database file,
+    configured as the app's (`database._configure_connection`) except for a shorter
+    busy timeout, or opened read-only. A real SQLite refusal, without waiting out the
+    app's 5-second timeout in every test that needs one."""
+    path = f"file:{settings.db_path}?mode=ro&uri=true" if read_only else settings.db_path
+    other = create_async_engine(f"sqlite+aiosqlite:///{path}")
+
+    @event.listens_for(other.sync_engine, "connect")
+    def _configure(dbapi_connection, record):
+        _configure_connection(dbapi_connection, record)
+        cursor = dbapi_connection.cursor()
+        cursor.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+        cursor.close()
+
+    sessions = async_sessionmaker(other, expire_on_commit=False)
+
+    async def session():
+        async with sessions() as s:
+            yield s
+
+    app.dependency_overrides[get_session] = session
+    try:
+        yield sessions
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        await other.dispose()
 
 
 @pytest.fixture
