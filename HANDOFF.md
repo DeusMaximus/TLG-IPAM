@@ -27,6 +27,31 @@ Template:
 
 ---
 
+## 2026-11-16 — Claude Code (Opus 5.5) — #16: Agents page (PR #63)
+- **Done:** [PR #63](https://github.com/DeusMaximus/TLG-IPAM/pull/63) closes #16, head `b89283f`. Frontend only, no `api/` change, no schema change.
+  - New: `web/src/pages/Agents.jsx` at `/agents` (sidebar item under Dashboard). Each row shows a status dot from `last_checkin_at`, the version, hostname, platform, interfaces, the subnets covered (from `/scan-targets`), the token prefix or "revoked", and `last_error`. Row actions: Disable/Enable, Revoke and Delete, the last two with confirmations. The list refreshes every 30 s.
+  - New: `web/src/components/AddAgentModal.jsx`. Name the agent, then see the `tlga_…` token once with the M2a container command.
+  - New: `web/src/utils/agents.js` with `parseServerTime`, `agentStatus`, `containerCommand` and `AGENT_IMAGE`.
+  - Changed: `Modal.jsx` gains `role="dialog"` and the `closeOnBackdrop` and `maxWidth` props.
+  - Brief: §6.2 has the Agents view; §7 has my lines only.
+  - Tests: 29 frontend (6 + 23 new); backend 420, unchanged.
+  - **Merged:** `7103b4b`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #16 closed. Before the merge, Greptile re-reviewed `b89283f` after the owner's retrigger (5/5, both findings fixed). The orchestrator re-ran lint, the 29 tests and the build on the head and on `main` after the merge, and confirmed the token-once test goes red when the dialog is made to keep the token in session storage. The worker's run against a real backend (curl and headless Chromium, on `0f0fca5`) was not repeated. Follow-up proposed to the owner and not yet filed: the API returns datetimes read back from SQLite without an offset (`/changes` `ts`, the agents list), and `ActivityItem`, `HostDrawer` and `HostTable` parse them as local time; the orchestrator confirmed the offset-less values against a running app. Live state after this merge: one PR is open, #64 (#11), at `373f94d` with CI green, Codex clean and 522 passing; Greptile is re-reviewing that head after the owner's retrigger, and the briefed round (brief at `.dev/11/review-brief-1.md`) starts when it has. No other worker is in flight. Ready and not started: #18, #61; #59 waits for #11 (same file), #60 follows #11. The `owner` issues #5 and #25 still wait on the owner.
+- **Decisions:** 8 under Deliberate calls in the PR. The main ones:
+  - The token lives only in the dialog's state, and no close path works while create is in flight.
+  - Offset-less server datetimes are read as UTC, because SQLite drops the offset on reads.
+  - The M2a command is the spec's M2b shape with `IPAM_AGENT_TOKEN` and no volume. The image is `ghcr.io/deusmaximus/tlg-ipam-agent:<server version>`, in one constant that #24 should confirm.
+  - Status thresholds: online within 3 min, late within 15 min, then offline.
+- **State:** CI green on `b89283f`.
+  - Codex: one P2 on `0f0fca5`, fixed; no findings on `b89283f`.
+  - Greptile: P1 and P2 on `0f0fca5`, both fixed and replied to on their threads; it has not reviewed `b89283f`.
+  - Checked by hand on `0f0fca5` with `curl` and headless Chromium against `API_KEY=dev-key`; details in the PR body.
+- **Waiting on the owner:** retrigger Greptile on `b89283f`, then merge.
+- **Next:**
+  - File a follow-up issue: offset-less datetimes are read as local time in `ActivityItem` and `HostTable`. Fix it either by having the API emit offsets or by using `parseServerTime` everywhere.
+  - #23 builds on this page: guided install, enrolment, re-enrol, the version flag.
+  - #24 should confirm or change `AGENT_IMAGE` in `web/src/utils/agents.js`.
+  - Whichever of #11 / #51 / #63 merges second rebases. The overlap with this PR is the brief's §7 only.
+
 ## 2026-11-16 — Claude Code (Opus 5.5) — #51: structured 503 on a failed last_used_at write; lifespan in the /mcp refusal tests (PR #62)
 - **Done:** [PR #62](https://github.com/DeusMaximus/TLG-IPAM/pull/62) closes #51, head `b01cd1a` (one commit on `main` at `1c6f1d5`). CI green (5 checks). Codex: no findings on `b01cd1a`. Greptile: 5/5, no findings, on `b01cd1a`. Briefed round owed (`briefed-review`), not started. Merge is the owner's.
   - `services/agents.authenticate`: a due `last_used_at` commit that raises `OperationalError` is rolled back and answered `503 UNAVAILABLE` ("Database busy; retry the request") through the new `errors.unavailable`, not a bare 500. Check order, the 10 s granularity and the read-only path inside the interval are unchanged.
@@ -88,16 +113,3 @@ Template:
 - **State:** no schema or dependency change; `api/app/auth.py` untouched (no effect on #50). Brief §10's API-key line (owned by #10) still lists only unset/empty/`change-me` as examples and points at §4.1; not edited. Untested: `docker compose up` with a padded `.env` value (Compose may trim it first); NBSP/Unicode padding (refused by construction).
 - **Waiting on the owner:** start the briefed round on `ebc3a9e` (reviewer outside the Claude family); merge PR #58.
 - **Next:** if #10 merges first, rebase (docs only overlap: brief §4.1 owner paragraph vs #10's second paragraph; `AGENTS.md` different bullets). #50 is unaffected.
-
-## 2026-11-16 — Claude Code (Opus 5.5) — #46: refuse an empty or placeholder API_KEY at startup (PR #54)
-- **Done:** [PR #54](https://github.com/DeusMaximus/TLG-IPAM/pull/54) closes #46, head `b17fda9`. CI green on `b5dead7` and `b17fda9`. Codex: no findings on either. Greptile: 4/5 on `b5dead7` with one P2 (subprocess cleanup in `test_startup.py`), fixed in `b17fda9` and answered on its thread; not re-run on `b17fda9`. Briefed round owed (`briefed-review`), not started. Merge is the owner's.
-  - `config.py`: `api_key` defaults to `""`; `load_settings()` runs at import and raises `SystemExit` (exit 1) for unset, empty, whitespace-only or `change-me`, with one line that names `API_KEY` and gives `openssl rand -hex 32`. `main.py` untouched.
-  - `auth.is_owner_key`: an empty value never matches, before `compare_digest`; it doesn't depend on the startup check.
-  - Tests 186 → 207: `api/tests/test_startup.py` (new: `load_settings` and a real uvicorn subprocess for each refused value, and a normal start that serves REST and `/mcp`; one `_stop` helper reaps every child) and an "Empty keys" block in `test_auth.py` (key set, and key forced empty). Mutations: removing the empty guard fails exactly the 4 key-empty tests; disabling the refusal fails all 8 refusal tests.
-  - Docs: README Quick start and Development, brief §4.1, §5.1 auth paragraph, §10 Operations API-key line, spec §4.2 bullet, `AGENTS.md` owner-key bullet, `.env.example` comment.
-  - Documented commands run by hand on the head (uvicorn with and without the SPA, `npm run dev`, `docker compose up --build`), plus refused starts; output in the PR body.
-  - **Merged:** `225b328`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #46 closed. Before the merge, Greptile re-reviewed `b17fda9` after the owner's retrigger (5/5, finding fixed), and the briefed round by GPT-6.1 Sol returned GO on that head with two P3s, posted on the PR. Follow-up filed from the P3s: #55 (`briefed-review`, M1): refuse a key with surrounding whitespace, and isolate the start-up tests from inherited `UVICORN_*` settings. The review corrects one sentence of the PR body: a whitespace-padded key can be presented by a raw HTTP client. With #52 and #53 also on `main`, the suite is 275. Live state after this merge: no PR is open; one worker is in flight on #10 (Opus 5.5, branch `10-agent-checkin-leasing`, cut from `711cea8`), which owes a briefed round. Ready and not started: #55, #50 (`stretch`), #51, #21; #51 and #21 edit the agent files #10 is in, so they wait for it. Waiting on the owner: #5, #25.
-- **Decisions:** check at import in `config.py`, not the lifespan; `SystemExit` rather than a pydantic validator (a `ValidationError` would print the configured key); `.env.example` keeps `change-me`, so the app's message explains the refusal; under `--reload` the reloader stays up and serves nothing (documented). Full list under Deliberate calls in the PR.
-- **State:** no schema or dependency change. Brief §10 Operations edit sits three lines above #43's one-worker line, so the second to merge may need a trivial rebase. `python -m pytest -W error` fails one `test_bulk.py` test on `main` too (unraisable warning); CI doesn't pass `-W error`.
-- **Waiting on the owner:** retrigger Greptile on `b17fda9`; start the briefed round (reviewer outside the Claude family); merge PR #54.
-- **Next:** #9 and #43 rebase over this if it merges first. #50 widens the owner-key source guard; #51 is the `last_used_at` error and the lifespan in the `/mcp` refusal tests.
