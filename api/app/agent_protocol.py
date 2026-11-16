@@ -11,8 +11,9 @@ length-capped and restricted to printable characters (spec §5.4, §7.2 invarian
 
 import ipaddress
 import re
+from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, Field, StrictBool, field_validator, model_validator
 
 # The protocol this server speaks. A check-in with any other value gets no jobs and
 # `409 PROTOCOL_MISMATCH`, and the error is recorded on the agent (spec §5.6).
@@ -36,6 +37,19 @@ _MAC_HEX = re.compile(r"[0-9a-f]{12}")
 _CAPABILITY = re.compile(r"[a-z0-9_-]{1,32}")
 # longest IPv6 address with a prefix length, plus slack for a dotted netmask
 _INTERFACE_CIDR_MAX = 64
+
+
+def mac_address(value: str | None) -> str | None:
+    """A MAC address as `aa:bb:cc:dd:ee:ff`, from colon, dash, dot or bare hex forms;
+    the same form as `Host.mac`."""
+    if value is None:
+        return None
+    if len(value) > 32:
+        raise ValueError("must be a MAC address")
+    stripped = re.sub(r"[:.-]", "", value.strip()).lower()
+    if not _MAC_HEX.fullmatch(stripped):
+        raise ValueError("must be a MAC address")
+    return ":".join(stripped[i : i + 2] for i in range(0, 12, 2))
 
 
 def printable(value: str, cap: int) -> str:
@@ -91,14 +105,7 @@ class Interface(BaseModel):
     @field_validator("mac")
     @classmethod
     def _mac(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
-        if len(v) > 32:
-            raise ValueError("must be a MAC address")
-        stripped = re.sub(r"[:.-]", "", v.strip()).lower()
-        if not _MAC_HEX.fullmatch(stripped):
-            raise ValueError("must be a MAC address")
-        return ":".join(stripped[i : i + 2] for i in range(0, 12, 2))
+        return mac_address(v)
 
 
 class CheckinRequest(BaseModel):
@@ -182,3 +189,183 @@ class CheckinResponse(BaseModel):
     checkin_interval_s: int
     # at most one: the agent runs jobs one at a time, and holds no second lease
     jobs: list[Job]
+
+
+# --- Results ---
+
+# The largest results body the server reads, in bytes; a larger one is refused with
+# `413` before it is parsed. A /20, the largest subnet with a scan target, has 4,094
+# usable addresses, and a record with a MAC and a 253-character name is under 330
+# bytes. (#60 replaces this with one cap applied to every route.)
+RESULTS_BODY_MAX = 2 * 1024 * 1024
+# records in one result set: every address of a /20
+OBSERVATIONS_MAX = 4096
+FDNS_MAX = 4096
+FDNS_ADDRESSES_MAX = 32
+RDNS_NAME_MAX = 253
+SCAN_ERROR_MAX = 500
+# the job and subnet ids the server sends are UUIDs
+_ID_MAX = 36
+# the longest textual IPv6 address, with an embedded IPv4 tail
+_IP_MAX = 45
+_HOST_LABEL = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+
+# Why a record was rejected, as `rejected[].reason`. The record is not stored, and its
+# address is neither marked alive nor dead by this result set.
+REJECT_INVALID = "invalid"  # not an object, or a field of the wrong type
+REJECT_INVALID_IP = "invalid_ip"
+REJECT_INVALID_MAC = "invalid_mac"
+REJECT_OUT_OF_SCOPE = "out_of_scope"  # outside the subnet's scan scope at ingest
+REJECT_DUPLICATE = "duplicate"  # the address was already reported in this result set
+REJECT_MAC_NOT_ISSUED = "mac_not_issued"  # a MAC from a job not issued `arp`
+REJECT_RDNS_NOT_ISSUED = "rdns_not_issued"  # a PTR name from a job not issued `rdns`
+
+
+def rdns_name(value: Any) -> str | None:
+    """A PTR name as the server stores it, or None (spec §5.7).
+
+    `rdns_name` is untrusted: any device can name itself, and the name is later read by
+    an assistant over MCP. It is kept only when it is a DNS hostname: ASCII letters,
+    digits and hyphens in dot-separated labels of 1-63 characters that neither start
+    nor end with a hyphen, at most 253 characters, one trailing dot allowed. It is
+    lowercased. Anything else (spaces, markup, underscores, other scripts, a sentence)
+    is dropped whole, never repaired into something that looks like a name.
+    """
+    if not isinstance(value, str) or not value.isascii():
+        return None
+    name = value.lower()
+    if name.endswith("."):
+        name = name[:-1]
+    if not name or len(name) > RDNS_NAME_MAX:
+        return None
+    if all(_HOST_LABEL.fullmatch(label) for label in name.split(".")):
+        return name
+    return None
+
+
+def scan_error(value: str | None) -> str | None:
+    """The error an agent reports with a result set, as stored: every character that is
+    not printable (line breaks, controls, bidirectional overrides) becomes a space,
+    runs of whitespace collapse to one, and the text is cut to SCAN_ERROR_MAX. A long
+    or multi-line error is kept, shortened, rather than costing the results with it."""
+    if value is None:
+        return None
+    text = "".join(c if c.isprintable() else " " for c in value)
+    text = " ".join(text.split())[:SCAN_ERROR_MAX].strip()
+    return text or None
+
+
+class Observation(BaseModel):
+    """One live address in a result set. The server validates each record on its own,
+    so one bad record is rejected without the rest (`parse_observation`)."""
+
+    ip: str
+    # only from a job issued `arp`; any other job's record carrying one is rejected
+    mac: str | None = None
+    # the PTR name; only from a job issued `rdns`. Not a hostname: dropped (`rdns_name`)
+    rdns_name: str | None = None
+
+    @field_validator("ip", mode="before")
+    @classmethod
+    def _ip(cls, v: Any) -> str:
+        if not isinstance(v, str) or len(v) > _IP_MAX:
+            raise ValueError("must be an IP address")
+        try:
+            return str(ipaddress.ip_address(v))
+        except ValueError:
+            raise ValueError("must be an IP address") from None
+
+    @field_validator("mac", mode="before")
+    @classmethod
+    def _mac(cls, v: Any) -> str | None:
+        if v is not None and not isinstance(v, str):
+            raise ValueError("must be a MAC address")
+        return mac_address(v)
+
+    @field_validator("rdns_name", mode="before")
+    @classmethod
+    def _rdns_name(cls, v: Any) -> str | None:
+        return rdns_name(v)
+
+
+def parse_observation(raw: Any) -> tuple[Observation | None, str | None]:
+    """One record of `observations`: the parsed record, or None and a REJECT_ reason."""
+    if not isinstance(raw, dict):
+        return None, REJECT_INVALID
+    try:
+        return Observation.model_validate(raw), None
+    except ValueError as exc:  # pydantic's ValidationError is a ValueError
+        field = next((e["loc"][0] for e in exc.errors() if e["loc"]), None)
+        reason = {"ip": REJECT_INVALID_IP, "mac": REJECT_INVALID_MAC}.get(field, REJECT_INVALID)
+        return None, reason
+
+
+def address_of(raw: Any) -> str | None:
+    """The `ip` of a raw record, normalised, when it is an IP address; else None. The
+    server reads it even from a record it rejects, so that an address the agent named
+    in a complete job is not marked dead because another field was bad."""
+    ip = raw.get("ip") if isinstance(raw, dict) else None
+    try:
+        return Observation._ip(ip)
+    except ValueError:
+        return None
+
+
+def echo_ip(raw: Any) -> str | None:
+    """The `ip` of a raw record as quoted back in `rejected`: the agent's own string,
+    when it is a short one, else null."""
+    ip = raw.get("ip") if isinstance(raw, dict) else None
+    return ip if isinstance(ip, str) and len(ip) <= _IP_MAX else None
+
+
+class FdnsAnswer(BaseModel):
+    """The forward-DNS answer for one host the job named (`fdns`, spec §5.2). No job
+    names a host until the forward-DNS check exists (#20), so none is accepted yet."""
+
+    host_id: str = Field(max_length=_ID_MAX)
+    # the IPv4 addresses the name resolved to; empty when it did not resolve
+    addresses: list[str] = Field(max_length=FDNS_ADDRESSES_MAX)
+
+
+class ResultsRequest(BaseModel):
+    """`POST /api/v1/agent/results`: what one job found. Unknown fields are ignored."""
+
+    # the job's id from the check-in answer; it must still be this agent's current job
+    job_id: str = Field(max_length=_ID_MAX)
+    subnet_id: str = Field(max_length=_ID_MAX)
+    # by the agent's clock; used only for the scan's duration
+    started_at: AwareDatetime
+    finished_at: AwareDatetime
+    # true only when every range of the job was swept before the timeout
+    complete: StrictBool
+    # live addresses only; each record is checked on its own (`parse_observation`)
+    observations: list[Any] = Field(max_length=OBSERVATIONS_MAX)
+    fdns: list[FdnsAnswer] = Field(default=[], max_length=FDNS_MAX)
+    # what went wrong, if anything; sanitised (`scan_error`) and kept on the target
+    error: str | None = None
+
+    @field_validator("error")
+    @classmethod
+    def _error(cls, v: str | None) -> str | None:
+        return scan_error(v)
+
+    @model_validator(mode="after")
+    def _times(self):
+        if self.finished_at < self.started_at:
+            raise ValueError("finished_at must not be earlier than started_at")
+        return self
+
+
+class Rejected(BaseModel):
+    # the record's `ip` as the agent sent it (`echo_ip`)
+    ip: str | None
+    # one of the REJECT_ values
+    reason: str
+
+
+class ResultsResponse(BaseModel):
+    """The results answer, inside the usual `{"data": ...}` envelope."""
+
+    # how many records were stored
+    accepted: int
+    rejected: list[Rejected]

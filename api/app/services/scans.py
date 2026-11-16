@@ -8,20 +8,24 @@ Scan targets and scan scope are configured by the owner over REST only. No MCP t
 creates, changes or lists a scan target, and no MCP call can widen the scope
 (spec §7.2, invariant 2); `list_changes` still shows their audit entries.
 
+Observations exist only inside the scope. Every write that can narrow it calls
+`drop_out_of_scope` in its own transaction (spec §5.3, "leaving scope deletes data").
+
 This module reads subnets and reserved ranges straight from the models rather than
 through `services/subnets`, which imports it.
 """
 
+from bisect import bisect_right
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import delete, false, not_, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
 from ..errors import ApiError, conflict, not_found, validation_error
 from ..ipnet import format_intervals, parse_cidr, parse_ip, subtract_intervals, usable_bounds
-from ..models import Agent, ReservedRange, ScanTarget, Subnet
+from ..models import Agent, Observation, ReservedRange, ScanTarget, Subnet
 from ..schemas import ScanTargetCreate, ScanTargetOut, ScanTargetUpdate
 from . import changes
 
@@ -70,6 +74,42 @@ async def scan_scope(session: AsyncSession, subnet: Subnet) -> list[tuple[int, i
 async def scan_scope_ranges(session: AsyncSession, subnet: Subnet) -> list[dict]:
     """`scan_scope` as `[{start, end}]` address strings, the shape of a job's ranges."""
     return format_intervals(parse_cidr(subnet.cidr), await scan_scope(session, subnet))
+
+
+def in_scope(scope: list[tuple[int, int]], ip_int: int) -> bool:
+    """Whether an address, as an integer of the subnet's family, lies in a scope that
+    `scan_scope` returned."""
+    i = bisect_right(scope, (ip_int, float("inf"))) - 1
+    return i >= 0 and scope[i][0] <= ip_int <= scope[i][1]
+
+
+async def drop_out_of_scope(session: AsyncSession, subnet: Subnet) -> None:
+    """Delete the subnet's observations outside its scan scope as it now stands: the
+    "leaving scope" rule (spec §5.3). Every write that can narrow the scope calls this
+    in its own transaction, after its change (pool scanning turned off or the target
+    deleted, a range excluded, the pool or the CIDR edited). Does not commit.
+
+    The rows deleted are scan state, not owner records, and are not audit-logged; the
+    write that narrowed the scope is. (#15 adds dismissals, which go the same way.)
+    """
+    await session.flush()
+    scope = await scan_scope(session, subnet)
+    # an empty scope keeps nothing
+    inside = or_(false(), *(Observation.ip_int.between(start, end) for start, end in scope))
+    await session.execute(
+        delete(Observation)
+        .where(Observation.subnet_id == subnet.id, not_(inside))
+        .execution_options(synchronize_session="fetch")
+    )
+
+
+async def delete_observations(session: AsyncSession, subnet: Subnet) -> None:
+    """Delete every observation of the subnet, as part of deleting it. Does not commit."""
+    await session.execute(
+        delete(Observation)
+        .where(Observation.subnet_id == subnet.id)
+        .execution_options(synchronize_session="fetch")
+    )
 
 
 # --- Validation ---
@@ -204,8 +244,8 @@ async def update_target(
     before = changes.snapshot(target)
     for field in changed:
         setattr(target, field, data[field])
-    # #11: when a change puts addresses out of scope (scan_dhcp_pool turned off), their
-    # observations and dismissals are deleted here, in this transaction (spec §5.3).
+    # turning pool scanning off puts the pool out of scope (spec §5.3)
+    await drop_out_of_scope(session, subnet)
     changes.record(
         session,
         entity_type="scan_target",
@@ -237,12 +277,17 @@ async def delete_target(session: AsyncSession, target_id: str, source: str) -> N
     subnet = await _get_subnet(session, target.subnet_id)
     _record_delete(session, target, subnet, source)
     await session.delete(target)
+    # without a target the subnet has the default scope, which leaves the pool out
+    await drop_out_of_scope(session, subnet)
     await session.commit()
 
 
 async def delete_for_subnet(session: AsyncSession, subnet: Subnet, source: str) -> None:
-    """Delete the subnet's scan target, if any, as part of deleting the subnet. Does not
-    commit: `subnets.delete_subnet` does, after deleting the subnet itself."""
+    """Delete the subnet's observations and its scan target, if any, as part of deleting
+    the subnet. Does not commit: `subnets.delete_subnet` does, after deleting the subnet
+    itself."""
+    # first, and whether or not a target is left: they reference the subnet
+    await delete_observations(session, subnet)
     target = await target_for_subnet(session, subnet.id)
     if target is None:
         return

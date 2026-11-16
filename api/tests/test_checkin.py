@@ -1,8 +1,8 @@
 """Agent check-in, job leasing and request-scan (#10; v0.2 spec §5.1, §5.2, §5.7, §5.8).
 
-Results ingest (#11) does not exist yet, so nothing clears a lease or writes
-`last_scan_at` through the API. Tests that need a finished scan or the passage of time
-write those columns straight to the database (`set_target`).
+Tests here that need a finished scan or the passage of time write the lease and
+last-scan columns straight to the database (`set_target`); `test_results.py` clears
+them through results ingest, as an agent does.
 """
 
 import asyncio
@@ -140,7 +140,7 @@ async def test_agent_routes_take_the_agent_token_and_never_the_owner_key(client,
     _, token = await make_agent(client)
     agent_bearer = {"Authorization": f"Bearer {token}"}
     agent_ops = [(m, p) for m, p in _operations() if p.startswith("/api/v1/agent/")]
-    assert ("POST", "/api/v1/agent/checkin") in agent_ops
+    assert {("POST", "/api/v1/agent/checkin"), ("POST", "/api/v1/agent/results")} <= set(agent_ops)
     for method, path in agent_ops:
         # the owner key alone is refused, and the agent token alone is enough
         res = await agent_api.request(method, path, json=CHECKIN, headers={"X-API-Key": "test-key"})

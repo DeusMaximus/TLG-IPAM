@@ -3,7 +3,7 @@
 The server is the scheduler. At each check-in it stores what the agent reports and
 hands back at most one due job. Issuing a job leases its target: `current_job_id`
 and `job_issued_at` are set, and the target is not issued again until the lease is
-cleared by an accepted result (#11) or expires.
+cleared by an accepted result (`services/results`) or expires.
 
 The same two columns on the agent record the job it was issued. An agent is busy, and
 gets no new job, while that lease is live. It is kept on the agent so that the owner
@@ -16,8 +16,8 @@ and either
   `interval_minutes` ago.
 
 `last_scan_at` is when the last completed job was issued, by the server's clock
-(written by results ingest, #11). Until a result clears a lease, the target stays
-due, so an expired lease makes it due again.
+(written by results ingest, `services/results`). Until a result clears a lease, the
+target stays due, so an expired lease makes it due again.
 
 Check-in's own writes are not audit-logged, as `tokens.last_used_at` is not: an
 agent checks in every minute. A check-in that changes what the agent reports, or
@@ -147,7 +147,7 @@ async def _lease(
 ) -> str | None:
     """Lease the target to a new job. The update only applies if the lease is still the
     one this check-in read, so two check-ins can never both issue the same target.
-    The lease keeps the methods issued: results ingest (#11) judges a result by what
+    The lease keeps the methods issued: results ingest judges a result by what
     the server sent (liveness, `arp` and so MACs), never by what the agent claims."""
     job_id = str(uuid4())
     result = await session.execute(

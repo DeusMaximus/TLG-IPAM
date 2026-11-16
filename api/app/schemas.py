@@ -422,5 +422,7 @@ class ScanTargetOut(BaseModel):
     last_scan_at: datetime | None
     last_scan_duration_ms: int | None
     last_scan_complete: bool | None
+    # the error the agent reported with its last result set, sanitised at ingest
+    last_scan_error: str | None = None
     # the subnet's scan scope (services/scans.scan_scope): inclusive address ranges
     scope: list[ScanRange] = []

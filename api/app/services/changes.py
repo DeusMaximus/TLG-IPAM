@@ -6,8 +6,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..models import Change
 
 # internal columns kept out of audit snapshots; the audit log is readable over MCP,
-# so a token's hash never goes in it
-_SNAPSHOT_EXCLUDE = {"ip_int", "start_int", "end_int", "name_key", "token_hash"}
+# so a token's hash never goes in it, nor the error text an agent reported with its
+# last result set (`scan_targets.last_scan_error`, spec §7.2 invariant 8)
+_SNAPSHOT_EXCLUDE = {
+    "ip_int",
+    "start_int",
+    "end_int",
+    "name_key",
+    "token_hash",
+    "last_scan_error",
+}
 
 # What an agent reports about itself at check-in: free text from a credential the
 # owner does not type, kept in `agent` snapshots. Over MCP the audit log reaches an

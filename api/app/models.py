@@ -201,8 +201,8 @@ class ScanTarget(Base):
 
     What is scanned is the subnet's scan scope, computed only by
     `services/scans.scan_scope`. Check-in writes the lease (`services/jobs`) and
-    request-scan writes `scan_requested_at`; results ingest (#11) will clear the lease
-    and write the last-scan columns.
+    request-scan writes `scan_requested_at`; results ingest (`services/results`) clears
+    the lease and writes the last-scan columns.
     """
 
     __tablename__ = "scan_targets"
@@ -225,10 +225,46 @@ class ScanTarget(Base):
     current_job_id: Mapped[str | None] = mapped_column(String(36))
     job_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # the methods the leased job was issued with (`arp` only when L2-local): results
-    # ingest (#11) trusts these, not what the agent says it ran
+    # ingest trusts these, not what the agent says it ran
     job_methods: Mapped[list | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     # the `job_issued_at` of the last completed job, by the server's clock
     last_scan_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_scan_duration_ms: Mapped[int | None] = mapped_column(Integer)
     last_scan_complete: Mapped[bool | None] = mapped_column(Boolean)
+    # The error the agent reported with its last result set, sanitised at ingest
+    # (`agent_protocol.scan_error`). Agent text: kept out of audit snapshots, which MCP
+    # can read (`changes._SNAPSHOT_EXCLUDE`).
+    last_scan_error: Mapped[str | None] = mapped_column(Text)
+
+
+class Observation(Base):
+    """The latest scan state of one address (v0.2 spec §5.4), upserted by results
+    ingest (`services/results`). No history: an address that stops answering keeps its
+    row with `alive=false`, and rows unseen for 90 days are pruned at ingest.
+
+    Rows exist only inside the subnet's scan scope. A change that puts addresses out of
+    scope deletes theirs (`services/scans.drop_out_of_scope`), and deleting the subnet
+    deletes all of them. Ingest never writes `hosts` (spec §7.2, invariant 3).
+    """
+
+    __tablename__ = "observations"
+    __table_args__ = (UniqueConstraint("subnet_id", "ip", name="uq_observations_subnet_ip"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    subnet_id: Mapped[str] = mapped_column(ForeignKey("subnets.id"), index=True)
+    ip: Mapped[str] = mapped_column(String(39))
+    ip_int: Mapped[int] = mapped_column(BigInteger)
+    # normalised like `Host.mac`; only from a job issued `arp`
+    mac: Mapped[str | None] = mapped_column(String(17))
+    # the locally-administered bit of `mac` is set
+    mac_randomised: Mapped[bool] = mapped_column(Boolean, default=False)
+    # the PTR name, sanitised to the hostname character set (`agent_protocol.rdns_name`)
+    rdns_name: Mapped[str | None] = mapped_column(String(253))
+    # answered in the most recent scan that could tell
+    alive: Mapped[bool] = mapped_column(Boolean, default=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    # only moves when the address answers
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    # the agent that reported it; no foreign key, so deleting an agent rewrites nothing
+    agent_id: Mapped[str | None] = mapped_column(String(36))
