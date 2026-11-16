@@ -1,0 +1,6 @@
+# The agent's test environment: the agent's runtime set, and the server's test set
+# for the end-to-end test against the real check-in and results routes.
+-r requirements.in
+-r ../api/requirements-dev.in
+# test_tls.py makes a private CA and a server certificate for its loopback server
+cryptography

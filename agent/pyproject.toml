@@ -1,0 +1,30 @@
+[build-system]
+requires = ["flit_core>=3.12,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "tlg-ipam-agent"
+description = "Scan agent for TLG-IPAM: ICMP sweeps and reverse DNS of the subnets its server assigns, inside an allowlist set on the agent"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dynamic = ["version"]
+# spec §5.6: an HTTP client, icmplib and dnspython. The image installs the hashed
+# lock (requirements.txt) instead; keep these ranges and requirements.in in step.
+dependencies = [
+    "httpx>=0.27,<1",
+    "icmplib>=3.0,<4",
+    "dnspython>=2.6,<3",
+]
+
+[project.scripts]
+tlg-ipam-agent = "tlg_ipam_agent.cli:main"
+
+[tool.flit.module]
+name = "tlg_ipam_agent"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

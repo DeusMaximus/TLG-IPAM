@@ -50,6 +50,8 @@ volumes:
   ipam-data:
 ```
 
+**The scan agent is a second image** (`agent/`, v0.2 spec §5.6), run on a Linux host on the VLAN it sweeps with host networking and `CAP_NET_RAW`, not beside the server in this compose file. It connects out to the server's `/api/v1/agent/*` over HTTPS with TLS always verified (plain `http` only to its own loopback), checks in every minute, and runs the jobs it is given one at a time: an ICMP echo sweep of the job's ranges at up to `MAX_PPS` (default 200) packets a second, then PTR lookups for the addresses that answered, inside a 10-minute timeout after which it reports what it saw as incomplete. Before any packet it refuses a job whose subnet is outside its own `ALLOWED_CIDRS` (default RFC 1918 and CGNAT), whose ranges leave the subnet, or that holds more than 4,096 addresses, and reports the refusal, which the server keeps as the target's `last_scan_error` (§3.10). A job issued `arp` (not yet run by the agent, #14) runs the rest and is reported incomplete, so it marks nothing dead. A refused check-in starts no scan: `429`/`503`/5xx are retried after 10 s to 5 min of jittered back-off, `401`/`403`/`409`/`422` every 13.5–15 min (spec §5.7). The agent never runs, downloads or installs anything the server sends (spec §7.2, invariant 1). Running it: the README's "Scan agent" section.
+
 ### 2.3 URL layout
 
 | Path | Purpose |
@@ -562,6 +564,23 @@ tlg-ipam/
 │           ├── agent.py      # agent-facing /api/v1/agent/* (agent token only)
 │           ├── scan_targets.py # owner CRUD on /api/v1/scan-targets
 │           └── changes.py
+├── agent/                   # the scan agent (v0.2 spec §5.6): its own package, image and tests
+│   ├── pyproject.toml       # package `tlg-ipam-agent`, entry point `tlg-ipam-agent`
+│   ├── Dockerfile           # the agent image: host networking, CAP_NET_RAW
+│   ├── requirements.in / requirements-dev.in    # httpx, icmplib, dnspython; tests add the server's set
+│   ├── requirements.txt / requirements-dev.txt  # generated locks, constrained to api/requirements-dev.txt
+│   ├── tests/               # fake server and prober; end-to-end against the real routes; contract checks against agent_protocol
+│   └── src/tlg_ipam_agent/
+│       ├── cli.py           # entry point: configuration, signals, the loop
+│       ├── config.py        # IPAM_URL (https), IPAM_AGENT_TOKEN, ALLOWED_CIDRS, MAX_PPS
+│       ├── protocol.py      # the agent's copy of the wire contract; parse_job
+│       ├── client.py        # HTTP to /api/v1/agent/*, TLS always verified; answers sorted OK / RETRY / REFUSED
+│       ├── backoff.py       # the refusal rule of spec §5.7
+│       ├── loop.py          # check-in loop, the one-at-a-time job worker, reporting results
+│       ├── guard.py         # ALLOWED_CIDRS and range checks, before any packet
+│       ├── scan.py          # one job: paced ICMP sweep, PTR lookups, the timeout
+│       ├── probe.py         # the only code that sends packets: ICMP echo (icmplib), PTR (dnspython)
+│       └── interfaces.py    # the host's addresses from rtnetlink, for the check-in
 └── web/
     ├── package.json
     ├── eslint.config.js
@@ -643,6 +662,7 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 ### Testing
 - pytest covers CIDR/IP validation, CIDR child invariants, explicit-null updates, the overlap rule, interval maths, consistent backups, MCP clearing, and next-free allocation edge cases.
 - ESLint, Vitest component tests, and the production frontend build run in CI alongside pytest, with a check that the dependency locks match their `.in` files.
+- The scan agent's tests run in CI with no packet sent: a fake server and a fake prober drive the loop (refusals, back-off bounds, the allowlist, the timeout), its client runs against the real check-in and results routes in process, a loopback TLS server checks that verification cannot be skipped, and the image is built and started with no network.
 
 ### MCP integration
 - Claude Desktop connects via `mcp-remote` with the owner key as a bearer and lists all available tools.
