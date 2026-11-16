@@ -27,6 +27,60 @@ Template:
 
 ---
 
+## 2026-11-16 — Claude Code (Fable 5.2), orchestrator — session end: fifteen PRs merged, no work in flight, next wave named
+- **Done:** fifteen PRs squash-merged on the owner's go-ahead, each with its worker's entry in this log or the archive (`grep -n '^## ' .agents/handoff/2026-11.md`): #55, #50, #10, #51, #16, #61, #18, #11, #12, #59, #73, #15, #13, #19, #17.
+  - `main` is at `2e25e32` plus hand-off commits. CI is green on `2e25e32`. Measured on `main` after the last merge: 687 server tests, 85 web tests, lint and build pass. The agent suite was 374 at `de13ee9`; nothing under `agent/` has changed since.
+  - What M2a now ships: agents and tokens, scan targets, check-in and job leasing, results ingest, last-seen from observations, the scan agent (ICMP and reverse DNS), findings with accept and dismiss, the Agents page, subnet scanning and findings in the UI, and the MCP tools `list_scan_findings` and `request_scan`.
+  - Issues filed this session: #59, #60, #61, #65, #68, #73, #75, #78, #79. #59, #61 and #73 are closed.
+  - `.agents/orchestration.md` changed (`a7f96d6`): a briefed round starts once CI is green and the first automatic pass is answered; after a GO at the current head a Greptile re-review is optional; a head that moves after a GO gets a short round on the new commits, or the orchestrator's own check when they carry no hand-written code.
+- **Decisions (the owner's):**
+  - An incomplete result set never clears a stored PTR name (`services/results`, PR #70). On a subnet whose agent sits on its own link, scans stay incomplete until #14 ships ARP, so names there are set or replaced and not cleared.
+  - Hostnames stay in the change summaries of MCP host writes; #79 qualifies the invariant's wording to say so.
+  - No OAuth grant may be issued before #28's write-scope checks are in force (noted on #26 and #28).
+- **State:** green. No PR is open, no worker is running, no review is running. Open in M2a, all ready (every dependency closed): #14, #60, #65, #68, #75, #78, #79, and #20 (stretch). 44 worktrees of merged branches and finished reviews remain under the T3 worktree directory on this machine; none was removed.
+- **Waiting on the owner:**
+  - The go-ahead for the next wave below.
+  - The five checks on the scan agent that need a real network (listed in PR #70's body): a real VLAN sweep, PTR lookups against the owner's DNS, TLS against the deployed certificate, the packet rate measured on the wire, and Python 3.11. No agent session may run them.
+  - #5 and #25, which carry the `owner` label.
+  - Three optional follow-ups the #13 worker raised, not filed: a warning in the Add agent dialog when the UI is open over plain HTTP; a resolver allowlist on the agent's host; pinning the agent's base image by digest.
+  - Greptile re-reviews are still retriggered by hand. Its MCP server's tools, `trigger_code_review` among them, were listed in the orchestrator's session at the end of this day but have not been tried: try one on the next PR that needs a re-review before asking the owner.
+- **Next:**
+  - Wave 1, four lanes with no file in common: #14 (ARP sweep, `agent/`, briefed round), #60 (request body cap: `main.py`, `routers/agent.py`, briefed round), #65 (datetime offsets in responses), #79 (`mcp_server.py`, `services/findings.py`, briefed round).
+  - Wave 2, once those merge: #78 (same `agent/` files as #14, briefed round), then #75 and #68, which both edit `schemas.py` as #65 does; #68 also touches `web/`. Give each brief its files, and have the second to merge take `main` in with a merge commit.
+  - #20 (forward-DNS check) last; it is a stretch issue.
+  - After M2a: M2b (#21–#24), then M3 (#26–#32). #21 carries notes from the review of #59; #26 and #28 carry the ordering note above.
+
+## 2026-11-16 — Claude Code (Opus 5.5) — #17: MCP scan tools (PR #76)
+- **Done:** [PR #76](https://github.com/DeusMaximus/TLG-IPAM/pull/76) closes #17, head `e9ca0b8` (= reviewed `4ed7465` + merge of `main` at `de13ee9`). CI green (5 checks). Codex clean on `e9ca0b8` and on `4ed7465`; Greptile 5/5 on `4ed7465` (not re-run on the merge, by the orchestrator's call). Briefed round (Codex GPT-6.1 Sol): GO at `4ed7465`, three P3s for a follow-up issue. Tests: 687 on the head (677 on `main` measured + 10).
+  - `list_scan_findings(subnet_id?, type?)` wraps new `findings.list_named`: one subnet's findings or every subnet's (by subnet name, then address), each the REST finding unchanged plus `subnet_name`, `subnet_cidr`, `host_name`, `host_fqdn`; `dynamic` left out; returns `{findings, total, note}` with `findings.NETWORK_REPORTED_NOTE`. `type` is the `FindingType` enum in the schema.
+  - `request_scan(subnet_id)` wraps `scans.request_scan` with source `mcp`; returns `scans.scan_request_out` (`subnet_id`, `scan_requested_at`, `next_request_after`), never the target. A cooldown refusal is a tool error naming the time; `scans.next_request_after` rounds up to the second (REST 429 too).
+  - `hosts.fqdn_of` factored out of `_host_dict`. `test_scans.py`'s MCP scan-config guard allows exactly these two tool names; its argument check is unchanged.
+  - Docs: brief §4.7 line, §5.2 rows + closing line, §5.4 examples, §10 (18 tools, acceptance line); spec §5.8 four MCP bullets; `AGENTS.md` MCP-tools bullet and one phrase in the wire-contract bullet.
+  - Merge of #70: one conflict, `AGENTS.md`; resolved as `main`'s file plus this branch's two edits. `api/` is unchanged from `4ed7465` apart from `main`'s changes.
+  - **Merged:** `2e25e32`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #17 closed. The issue asked for automatic reviews only; the orchestrator added the briefed round because one tool hands network-reported text to a model and the other lets one ask for packets. The merge commit `e9ca0b8` carries no hand-written code, so the orchestrator checked it in place of a second round: a re-merge shows `AGENTS.md` as the only hand-resolved file, its wire-contract bullet differs from `main`'s by the one phrase, and every other file's diff against `main` is the reviewed one. It re-measured 687 on the head and on `main` after the merge. Greptile did not see `e9ca0b8`, which is optional after a GO. Follow-ups on the owner's say-so: #79 (M2a, `briefed-review`) for a test that `request_scan` changes only the request time, paging for `list_scan_findings`, and wording that says an MCP host write's summary may name a hostname an assistant copied from a finding (the owner chose to keep hostnames in those summaries); and a note on #26 and #28 that no grant may be issued before #28's write-scope checks are in force.
+- **Decisions:** nine in the PR. Main ones: no `require_scopes` yet (#28 does every write tool at once; FastMCP hides a scoped tool from the in-process test client); network values marked as data, not withheld; `dynamic` left out with no argument to include them; the result is the request, not the target.
+- **State:** green; no schema change; nothing under `web/`; nothing half-finished.
+- **Waiting on the owner:** the merge (approved once rebased, now done). Filing the follow-up issue for the round's three P3s. Whether to also file one for the change summary that names a PTR hostname an assistant copies into `create_host`/`update_host`.
+- **Next:** #28 adds `ipam:write` to every write tool, `request_scan` included, and picks a test path for scoped tools. #19 may show `next_request_after` beside Scan now. #60 is unblocked now that #70 has merged.
+
+## 2026-11-16 — Claude Code (Opus 5.5) — #19: findings panel, badge, and last-seen (PR #77)
+- **Done:** [PR #77](https://github.com/DeusMaximus/TLG-IPAM/pull/77) closes #19, head `1873ee8`, against `main` at `9f47b28`; commits `bbcf065`, `a631d58`, `1873ee8`. Frontend and the brief only (§6.1, §6.2, my §7 lines). CI green. Codex: P1 and P2 on `bbcf065`, both fixed; clean on `1873ee8`. Greptile: 4/5 on `bbcf065`, three P2s, all fixed and answered; not re-reviewed since.
+  - `FindingsPanel.jsx` (new): count badge, and a panel grouped by type with accept and dismiss per row and confirmed "Accept all N" per type. Accept sends the key with its `fingerprint`, at most 1,000 keys a request.
+  - The per-record answer stays on screen until closed: each skipped or error record with the server's reason. A 4xx-refused request reads "not sent"; any other failure reads "unknown", and the view reloads.
+  - A proposal that sets a domain override says so before it is accepted. "Show dynamic" shows only while pool scanning is on. Once shown, the panel stays for that subnet.
+  - `SubnetView.jsx`: shows findings for the current subnet only. It holds the scan-target fetch (`useScanTargets`, moved out of `ScanSettings`). A new `last_scan_at` reloads hosts and findings; an accept reloads hosts, subnet and tree.
+  - Failed reloads of the findings, the host list and the scan target each say so.
+  - `HostTable`/`HostDrawer`: last seen read as UTC (was `new Date()`), with its source. "not scanned" only for a subnet with no scan target.
+  - 85 tests (51 + 34). Every hand mutation in the PR's table goes red. Hand run against a real server on `bbcf065`: a real skipped accept showed `skipped, changed`.
+  - **Merged:** `8087594`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #19 closed. Before the merge Greptile re-reviewed `1873ee8` after the owner's retrigger: 5/5, all three findings fixed. The issue asked for automatic reviews only, so no briefed round ran. The orchestrator re-measured lint, 85 tests and the build on the head and on `main` after the merge, and confirmed that hiding a skipped record's reason turns two tests red. The hand run against a real backend is the worker's claim alone. The "not scanned" gap below went into #68 on the owner's say-so: the server is to report whether a host is inside the scan scope, so the browser never works with addresses.
+- **Decisions:** ten under Deliberate calls. After Codex's P1, the UI does no address arithmetic and does not compare hosts with the scope ranges. Bulk accept is per type; there is no bulk dismiss.
+- **State:** green, nothing half-finished, no schema change, nothing under `api/` changed. Not built: "not scanned" for hosts outside a scanned subnet's ranges, because `ScanTargetOut.scope` carries address strings only.
+- **Waiting on the owner:** retrigger Greptile on `1873ee8`; the merge. Whether to file the backend follow-up below.
+- **Next:**
+  - Backend follow-up: `start_int`/`end_int` on each `scope` range, or per-host scope membership on host responses. Then `utils/findings.scopeChecker` can answer `out` for every host outside scope.
+  - #68: `ScanSettings` now takes `targetsRes` from `SubnetView`, and shows a failed reload of the target.
+  - #17 and #13: whichever merges after this rebases on its brief §7 lines.
+
 ## 2026-11-16 — Claude Code (Opus 5.5) — #13: scan agent package, through three briefed rounds (PR #70)
 - **Done:** [PR #70](https://github.com/DeusMaximus/TLG-IPAM/pull/70) closes #13, head `214fb82` (merges `main` at `9f47b28`: #59, #12, #15, #73). CI green. Agent 374, server 677 (674 on `main` + 3 new), Python 3.13.
   - `agent/`, package `tlg-ipam-agent`, httpx + icmplib + dnspython, hashed locks constrained to `api/requirements-dev.txt`:
@@ -80,76 +134,3 @@ Template:
   - #17: `list_scan_findings` returns `fingerprint` and `proposed`. Accepting over MCP goes through `create_host`/`update_host`, so it is not bound by the fingerprint.
   - #19: the UI sends `fingerprint` with accept.
   - #20: adds `fdns_mismatch` to `FindingType` and to `_evaluate`.
-
-## 2026-11-16 — Claude Code (Sonnet 5.5) — #73: agent-token documents (PR #74)
-- **Done:** [PR #74](https://github.com/DeusMaximus/TLG-IPAM/pull/74) closes #73, head `9e759f0` (against `main` at `688f987`). CI green (5 checks). Codex: no findings. Greptile: 5/5, no comments. 597 backend tests pass (594 + 3). Documents and one test only; the one `api/app/` change is a docstring in `services/jobs._claim`.
-  - The order of refusals is written down in spec §5.7, brief §4.5 and the wire-contract bullet of `AGENTS.md`. A loaded row inside the gap gets 429 with no statement, whatever the owner committed since, and the next request gets 403. A row the gap lets through reaches the claim, which answers 403 when the owner's change has landed and 429 when only the slot is gone.
-  - New test `test_a_recent_slot_is_refused_with_429_before_the_owner_refusal_is_read` (disable, revoke, delete) in `api/tests/test_checkin.py`. Removing the early check in `_claim` fails all three variants.
-  - "A refused request never writes `last_used_at`" is now "refused before its check-in slot, or a refused result set" in brief §3.9, §4.1, spec §4.2, §5.1 and the agent-token bullet; `409`/`422` check-ins are named as writing it. Brief §3.8 points at §4.5 for which of 429/403 applies.
-  - The agent-token bullet says "authenticated" through `require_agent`, and that the check-in claim revalidates state and revocation in SQL. Bare 500s now include a database error that is not an `OperationalError` (spec §4.2, brief §4.1, `AGENTS.md`).
-  - Ingest source guard renamed `test_the_ingest_module_binds_neither_hosts_nor_the_change_log`. Its docstring and the `AGENTS.md` sentence say it checks names bound in `services/results` and does not follow imports.
-  - **Merged:** `c6e579e`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #73 closed. Both automatic reviews covered `9e759f0`, the only commit, with no findings. The orchestrator re-measured 597 on the head and on `main` after the merge, confirmed the `api/app/` diff is the one docstring, and confirmed all three cases of the new test go red with the early refusal removed. Live state after this merge: two PRs are open, both with a worker fixing review findings. #70 (#13, the agent package) is at `9ea136b`: round 1 NO-GO fixed in `dbb2f1c`, `main` merged in `ce60198`, then a Codex P2 on that head (a PTR lookup's timeout ran out while it queued for a packet slot) fixed in `9ea136b`; CI green and Codex clean there, 359 agent tests in the orchestrator's run. Its second briefed round is running on `ce60198`, so the one commit after it owes a short round of its own. #72 (#15, findings) is at `f962a58`: round 1 NO-GO with one P2 (an `unknown_host` key does not identify the hostname and status an accept writes) and two P3s; the worker is fixing them and has to merge this `main`, with which it conflicts in `AGENTS.md`. Waiting for a free lane: #60 (shares `main.py` with #72), #65 and #68 (share `schemas.py` with #72). The `owner` issues #5 and #25 still wait on the owner.
-- **Decisions:**
-  - Documented the early 429; did not change it so a disable always answers 403.
-  - Chose to reword the guard rather than follow imports: `results` reaches `changes` through `scans` and `agents`, so a closure check cannot pass. `test_ingest_writes_no_host_and_no_change_entry` carries the runtime fact.
-  - Fixed the same absolute wording in brief §4.1 and spec §5.1, outside the three sentences the issue listed, because the acceptance line covers every document.
-- **State:** green; nothing half-finished; no schema change. Python 3.13.12. Wording acceptance lines (2 and 3) are checked by reading, not by a test.
-- **Waiting on the owner:** the merge. Automatic reviews only, no briefed round (documents and a test).
-- **Next:** whichever of #70 (#13) and #72 (#15) merges after #74 rebases onto it. `AGENTS.md` bullets are single long lines, so expect a conflict in the wire-contract bullet (#70) or the scan-scope bullet (#72) against this edit, which changed the claim sentence, the agent-token bullet and the "Scan ingest never writes `hosts`" bullet. #13 owns spec §5.7's paragraph on how an agent handles each refusal; the order paragraph I added to the §5.7 claim bullet is separate from it.
-
-## 2026-11-16 — Claude Code (Opus 5.5) — #59: check-in and results follow-ups (PR #71)
-- **Done:** [PR #71](https://github.com/DeusMaximus/TLG-IPAM/pull/71) closes #59, head `3e612bb` (merges `main` at `1525a91`). CI green. Codex: no findings on `3e612bb`. Greptile: 5/5, no comments. 594 tests pass (571 + 23).
-  - `services/agents.authenticate` only reads. It leaves the accepted token's id in `session.info`.
-  - New `agents.record_token_use`: a SQL-conditional `UPDATE` that runs inside the serving request's transaction. Check-in calls it after its claim; results ingest calls it after `_release`. A refused request never writes token use.
-  - `jobs._claim`: the compare-and-set also requires the agent `active` and the token unrevoked. If it loses, it answers 429 or 403. If it wins, it refreshes the whole agent row before the audit entry is built.
-  - `jobs.checkin` and `results.ingest`: on `OperationalError`, roll back and answer 503 UNAVAILABLE via `errors.database_unavailable`. That logs the SQLite error name, never SQL, parameters or the bearer. The message says "busy" only for a lock.
-  - Results ingest: a failure of the pre-commit encoding is rolled back and answered `500 INTERNAL_ERROR` in the error shape, via `errors.internal_error`.
-  - Tests:
-    - a barrier race test at `_claim` that catches the time-condition mutant 10/10;
-    - the prune `entity_type` case;
-    - `echo_ip` tests for each half of the rule, at the helper and through the route;
-    - same-session rollback tests for check-in and ingest;
-    - lock tests at a 50 ms busy timeout and real read-only-database tests (`conftest.app_database`), plus `write_lock` moved into `conftest.py`.
-  - Docs:
-    - Brief: §3.6, §3.8, §3.9, §4.1, §4.3, §4.5 (new **The claim** bullet), §4.6.
-    - Spec: §4.2, §5.1 (new bullet), §5.7.
-    - `AGENTS.md`: the agent-token and wire-contract bullets.
-  - **Merged:** `072dc73`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #59 closed. Before the merge, the briefed round by GPT-6.1 Sol returned GO on `3e612bb` with two documentation P3s, posted on the PR: it replayed all eleven earlier findings against a real server and caught all 21 of its mutants. The orchestrator re-measured 594 on the head and on `main` after the merge, and confirmed the claim's state condition is guarded. Follow-ups on the owner's say-so: #73 (M2a, `documentation`) for the 429-before-403 order, the three too-absolute sentences and the ingest source guard's wording; and a note on #21 that enrolment must not reuse the per-request token context and that every new agent route records token use itself. Live state after this merge: two PRs are open. #70 (#13, the agent package) is at `797e249`: its first briefed round returned NO-GO with two P2s (DNS packets escape `MAX_PPS`; a slow response defeats the retry and lease bounds) and one P3, posted on the PR by the orchestrator because the reviewer's own clean-up was refused; the worker is fixing them and has to merge this `main` in. #72 (#15, findings) is at `f962a58` with CI green, Codex and Greptile clean and 614 passing; its briefed round is running (brief at `.dev/15/review-brief-1.md`). Waiting for a free lane: #60 (shares `main.py` with #72), #65 and #68 (share `schemas.py` with #72). The `owner` issues #5 and #25 still wait on the owner.
-- **Decisions:** ten under Deliberate calls in the PR. The main ones:
-  - An owner disable, revoke or delete after authentication refuses the in-flight check-in (403). Results ingest does not repeat that check.
-  - Token use is recorded by served requests only: a check-in that takes its slot, or an accepted result set.
-  - There are two 503 messages under one code, chosen by SQLite's error code.
-  - A failed rollback, a failed authentication `SELECT`, and non-`OperationalError` database errors stay a bare 500.
-  - The token id travels in `session.info`, so `auth.py` and its source-guard anchors are unchanged.
-- **State:** green; nothing half-finished; no schema change. `api/tests/conftest.py` changed: it gained `write_lock` and `app_database`. Not verified: a real full disk or I/O failure (injected in the same-session tests), losing the response after a results commit, and Python 3.12.
-- **Waiting on the owner:** the briefed round (author is Claude, so the reviewer should come from another model family), then the merge.
-- **Next:**
-  - #13 (agent): `last_used_at` now means "last served use".
-  - The agent should treat these responses as follows:
-    - 403 after an owner disable: stop.
-    - 503 "busy": back off and retry.
-    - 503 "unavailable": back off longer; the owner needs to look at the server.
-    - 500 `INTERNAL_ERROR` on results: a server bug, so don't retry tightly.
-  - #60: shared body cap.
-  - #15: unaffected beyond its `main.py` line.
-
-## 2026-11-16 — Claude Code (Opus 5.5) — #12: last_seen derived from observations (PR #69)
-- **Done:** [PR #69](https://github.com/DeusMaximus/TLG-IPAM/pull/69) closes #12, head `47caa6d`, against `main` at `6845664`. CI green. Codex: no findings on `039837e` or `47caa6d`. Greptile: 4/5 on `039837e`, one P2 (test helper parsed the IP by hand), fixed in `47caa6d` and answered on its thread; not re-reviewed since. Automatic reviews only; the owner merges.
-  - `services/hosts.py`: `hosts_out` joins in each host's observation (`(subnet_id, ip_int)`, `last_seen_at`, never `alive`) in one statement; `last_seen` is the later of the stored and the scan value, and the new `last_seen_source` (`manual`/`scan`/null) says which; a tie is reported as `scan`. Two statements per batch of any size.
-  - `schemas.py`: `HostOut.last_seen_source`; a `last_seen` sent with an offset is converted to UTC before storage (SQLite was storing the wall-clock time and dropping the zone).
-  - `mcp_server.py`: `get_host`, `list_hosts`, `update_host` docstrings (what clearing `last_seen` does). `EXPECTED_TOOLS` unchanged.
-  - Docs: brief §3.4, §3.11, §5.2; spec §5.4 (three bullets under `Host.last_seen`); `AGENTS.md` invariant-3 bullet, one sentence.
-  - Tests: new `api/tests/test_last_seen.py` (12). 571 passed (559 + 12). Mutation table in the PR body.
-  - **Merged:** `272564a`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #12 closed. Before the merge, Greptile re-reviewed `47caa6d` after the owner's retrigger (5/5, finding fixed). The orchestrator re-measured 571 on `039837e` and on `main` after the merge, and confirmed both one-query tests go red when observations are queried once per host. Live state after this merge: no PR is open. Two workers are building, both Opus 5.5: #13 (the agent package, branch `13-agent-package`, `briefed-review`) and #59 (check-in and results follow-ups, branch `59-checkin-results-followups`, `briefed-review`); #59 has to pick up this PR's one-line change to `test_results.py` when it merges `main`. #15 (findings) is now ready and is the next to start. Waiting for a free lane: #60 (shares `main.py` and `test_results.py` with #59), #65 and #68 (share `schemas.py` with #15). The `owner` issues #5 and #25 still wait on the owner.
-- **Decisions:** six under Deliberate calls in the PR. The main ones:
-  - The match key is `(subnet_id, ip_int)`, because subnets may overlap across sections.
-  - A tie counts as `scan`.
-  - Offset input is converted to UTC.
-  - Above `EXACT_LOOKUP_MAX` (500) hosts, the query reads the batch's subnets whole, to stay under SQLite's 32766 bound-value limit.
-  - One line of #59's `test_results.py` changed: it asserted the response's `last_seen` stays null after ingest.
-- **State:** green, nothing half-finished. No schema change, nothing under `web/`. Read-back datetimes still carry no offset (#65). Whichever of #59 and #69 merges second rebases `test_results.py`.
-- **Waiting on the owner:** retrigger Greptile on `47caa6d`; merge.
-- **Next:**
-  - #19 shows `last_seen_source` in the UI.
-  - #15 reads observations for findings; its `stale` finding should use the same `last_seen` rule (`hosts._last_seen`).
-  - #65 can rely on stored host `last_seen` being UTC.
