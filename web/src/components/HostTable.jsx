@@ -2,12 +2,31 @@ import { useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import DeviceIcon from './DeviceIcon'
 import StatusBadge from './StatusBadge'
+import { lastSeenCell } from '../utils/findings'
 
 const VIRTUALIZE_ABOVE = 200
 
 // ip_int is the API's numeric sort key — string comparison would mis-sort IPv6
 function compareIp(left, right) {
   return left.ip_int - right.ip_int
+}
+
+function LastSeen({ host, scope }) {
+  const cell = lastSeenCell(host, scope)
+  return (
+    <div role="cell" className="py-2 text-slate-500" title={cell.title || undefined}>
+      {cell.notScanned && cell.source ? (
+        <>
+          {cell.text} <span className="text-amber-400/80">· not scanned</span>
+        </>
+      ) : (
+        <span className={cell.notScanned ? 'text-amber-400/80' : undefined}>{cell.text}</span>
+      )}
+      {cell.source === 'manual' && !cell.notScanned && (
+        <span className="text-slate-600"> · manual</span>
+      )}
+    </div>
+  )
 }
 
 export default function HostTable({
@@ -18,6 +37,9 @@ export default function HostTable({
   selected,
   onToggle,
   onToggleAll,
+  // (host) => 'in' | 'out' | null: whether the host is inside its subnet's scan scope,
+  // as the server reports the scope. Without it the column shows the date alone.
+  scopeOf = null,
 }) {
   const [sortDirection, setSortDirection] = useState('asc')
   const scrollRef = useRef(null)
@@ -173,9 +195,7 @@ export default function HostTable({
                     {subnetNames[host.subnet_id] || '—'}
                   </div>
                 )}
-                <div role="cell" className="py-2 text-slate-500">
-                  {host.last_seen ? new Date(host.last_seen).toLocaleDateString() : '—'}
-                </div>
+                <LastSeen host={host} scope={scopeOf ? scopeOf(host) : null} />
               </div>
             )
           })}

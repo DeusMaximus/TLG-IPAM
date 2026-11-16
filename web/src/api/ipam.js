@@ -36,6 +36,17 @@ export const deleteReservedRange = (subnetId, rangeId) =>
 export const requestScan = (subnetId) =>
   api(`/api/v1/subnets/${subnetId}/scan`, { method: 'POST' })
 
+// scan findings (spec §5.5): accept and dismiss take at most 1,000 keys, and answer
+// per record (accepted/dismissed, skipped with a reason, or error with a reason)
+export const listFindings = (subnetId, { type, includeDynamic } = {}) =>
+  api(
+    `/api/v1/subnets/${subnetId}/findings${qs({ type, include_dynamic: includeDynamic ? 'true' : undefined })}`
+  )
+export const acceptFindings = (findings) =>
+  api('/api/v1/findings/accept', { method: 'POST', body: { findings } })
+export const dismissFindings = (findings) =>
+  api('/api/v1/findings/dismiss', { method: 'POST', body: { findings } })
+
 // hosts
 export const listHosts = (params) => api(`/api/v1/hosts${qs(params)}`)
 export const createHost = (body) => api('/api/v1/hosts', { method: 'POST', body })

@@ -24,6 +24,9 @@ vi.mock('../api/ipam', () => ({
   updateScanTarget: vi.fn(),
   requestScan: vi.fn(),
   listAgents: vi.fn(),
+  listFindings: vi.fn(),
+  acceptFindings: vi.fn(),
+  dismissFindings: vi.fn(),
   HOST_STATUSES: ['active', 'reserved', 'dhcp', 'offline'],
 }))
 
@@ -102,6 +105,7 @@ function wireServer() {
   ipam.listSubnets.mockImplementation(async () => ({ data: [subnetOut()] }))
   ipam.getSubnet.mockImplementation(async () => ({ data: subnetOut() }))
   ipam.listHosts.mockImplementation(async () => ({ data: [], total: 0 }))
+  ipam.listFindings.mockImplementation(async () => ({ data: [], total: 0 }))
   ipam.listAgents.mockImplementation(async () => ({
     data: [
       { id: 'agent-1', name: 'lab-vlan20', state: 'active' },

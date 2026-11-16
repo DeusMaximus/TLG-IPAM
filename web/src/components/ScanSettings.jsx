@@ -262,21 +262,26 @@ function SettingsForm({ subnet, target, agents, agentsFailed, onSaved }) {
   )
 }
 
-// The scanning section of the subnet view (spec §5.8). `subnet` is the subnet as the
-// server last returned it; a new object (after any refresh) reloads the target, whose
-// scope may have changed with it.
-export default function ScanSettings({ subnet, onChanged }) {
-  const toast = useToast()
-  const [open, setOpen] = useState(false)
-  const [asking, setAsking] = useState(false)
+// The scan targets, reloaded whenever `subnet` is a new object (after any refresh: its
+// scope may have changed with it) and every REFRESH_MS while the view is open.
+export function useScanTargets(subnet) {
   const targetsRes = useFetch(() => listScanTargets(), [subnet])
-  const agentsRes = useFetch(() => listAgents(), [])
   const reloadTargets = targetsRes.refresh
-
   useEffect(() => {
     const timer = setInterval(reloadTargets, REFRESH_MS)
     return () => clearInterval(timer)
   }, [reloadTargets])
+  return targetsRes
+}
+
+// The scanning section of the subnet view (spec §5.8). `subnet` is the subnet as the
+// server last returned it. `targetsRes` is `useScanTargets(subnet)`, held by the subnet
+// view, which also reads the target's scope for the host table's last-seen column.
+export default function ScanSettings({ subnet, targetsRes, onChanged }) {
+  const toast = useToast()
+  const [open, setOpen] = useState(false)
+  const [asking, setAsking] = useState(false)
+  const agentsRes = useFetch(() => listAgents(), [])
 
   const loaded = targetsRes.data != null
   const target = targetForSubnet(targetsRes.data?.data, subnet.id)
