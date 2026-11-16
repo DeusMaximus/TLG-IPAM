@@ -3,6 +3,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .agent_protocol import ScanRange
 from .ipnet import normalise_domain, normalise_mac, parse_ip
 
 HostStatus = Literal["active", "reserved", "dhcp", "offline"]
@@ -398,11 +399,6 @@ class ScanTargetUpdate(BaseModel):
         if v is None:
             raise ValueError("must not be null")
         return v
-
-
-class ScanRange(BaseModel):
-    start: str
-    end: str
 
 
 class ScanTargetOut(BaseModel):
