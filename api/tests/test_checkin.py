@@ -1082,6 +1082,29 @@ async def test_checkins_inside_the_gap_are_refused_before_any_write(
     assert (await checkin(agent_api, token, hostname="other")).status_code == 200
 
 
+async def test_refused_checkins_write_nothing_at_all(client, agent_api, checkin_limit):
+    """Not even the token's `last_used_at`: a token used at request rate drives reads."""
+    from sqlalchemy import event
+
+    from app.database import engine
+
+    _, token = await make_agent(client)
+    assert (await checkin(agent_api, token)).status_code == 200
+    writes = []
+
+    def count(_conn, _cursor, statement, *_):
+        if statement.lstrip().split(None, 1)[0].upper() in ("INSERT", "UPDATE", "DELETE"):
+            writes.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count)
+    try:
+        for _ in range(20):
+            assert (await checkin(agent_api, token, hostname="churn")).status_code == 429
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count)
+    assert writes == []
+
+
 async def test_the_gap_is_per_agent(client, agent_api, checkin_limit):
     _, first = await make_agent(client, "a")
     _, second = await make_agent(client, "b")

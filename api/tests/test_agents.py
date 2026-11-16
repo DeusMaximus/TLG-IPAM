@@ -6,13 +6,14 @@ tested in `test_checkin.py`.
 """
 
 import hashlib
+from datetime import timedelta
 import sqlite3
 from pathlib import Path
 
 import pytest
 from fastmcp import Client
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -180,7 +181,16 @@ async def test_agent_token_is_accepted_and_last_used_at_recorded(client, agent_a
     listed = (await client.get(f"/api/v1/agents/{agent['id']}")).json()["data"]["tokens"][0]
     assert listed["last_used_at"] is not None
 
+    # a use inside LAST_USED_GRANULARITY writes nothing; a later one moves it on
     first_use = row.last_used_at
+    assert agents_svc.LAST_USED_GRANULARITY == timedelta(seconds=10)
+    assert (await checkin(agent_api, token)).status_code == 200
+    [row] = await token_rows(agent["id"])
+    assert row.last_used_at == first_use
+    async with SessionLocal() as session:
+        stale = first_use - timedelta(seconds=10)
+        await session.execute(update(Token).where(Token.id == row.id).values(last_used_at=stale))
+        await session.commit()
     assert (await checkin(agent_api, token)).status_code == 200
     [row] = await token_rows(agent["id"])
     assert row.last_used_at > first_use

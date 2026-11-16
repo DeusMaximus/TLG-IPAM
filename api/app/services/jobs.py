@@ -55,8 +55,9 @@ LEASE = timedelta(minutes=15)
 # the fields an agent reports at check-in
 REPORTED_FIELDS = changes.AGENT_REPORTED_FIELDS
 _AGENT_LEASE = ("current_job_id", "job_issued_at")
-# At most one check-in per agent in this time (the agent's own interval is 60 s), so
-# one token cannot drive writes, or audit entries, at request rate.
+# At most one check-in per agent in this time (the agent's own interval is 60 s). A
+# refused check-in writes nothing: with `agents.LAST_USED_GRANULARITY`, a token used at
+# request rate drives reads only, not writes or audit entries.
 DEFAULT_CHECKIN_GAP = timedelta(seconds=10)
 MIN_CHECKIN_GAP = DEFAULT_CHECKIN_GAP
 # the newest audit entries an agent's own check-ins keep (`_prune_agent_audit`)
@@ -234,12 +235,29 @@ def _validation_message(exc: ValidationError) -> str:
     return f"Check-in refused: {loc}: {first['msg']}" if loc else f"Check-in refused: {first['msg']}"
 
 
+def _rate_limited() -> ApiError:
+    gap = int(MIN_CHECKIN_GAP.total_seconds())
+    return ApiError(
+        "RATE_LIMITED",
+        f"An agent may check in at most once every {gap} seconds; check in again in "
+        f"{CHECKIN_INTERVAL_S} seconds",
+        429,
+    )
+
+
 async def _claim(session: AsyncSession, agent: Agent, now: datetime) -> None:
     """Take this agent's check-in slot, or refuse with 429 before anything else is
     written. This is a compare-and-set on `last_checkin_at`, so racing check-ins of one
     agent cannot both pass. It is also the check-in's first write, so SQLite's one
     writer serialises everything after it; the agent was loaded at authentication,
-    before that, so its state is read again here."""
+    before that, so its state is read again here.
+
+    The check against the row loaded at authentication comes first and needs no write
+    statement at all; that row can only be older than the database's, never newer, so
+    the compare-and-set remains the guard for check-ins that race."""
+    last = utc(agent.last_checkin_at)
+    if last is not None and last > now - MIN_CHECKIN_GAP:
+        raise _rate_limited()
     result = await session.execute(
         update(Agent)
         .where(
@@ -251,13 +269,7 @@ async def _claim(session: AsyncSession, agent: Agent, now: datetime) -> None:
     )
     if result.rowcount != 1:
         await session.rollback()
-        gap = int(MIN_CHECKIN_GAP.total_seconds())
-        raise ApiError(
-            "RATE_LIMITED",
-            f"An agent may check in at most once every {gap} seconds; check in again in "
-            f"{CHECKIN_INTERVAL_S} seconds",
-            429,
-        )
+        raise _rate_limited()
     await session.refresh(agent, [*REPORTED_FIELDS, "last_error", *_AGENT_LEASE])
     set_committed_value(agent, "last_checkin_at", now)
 
