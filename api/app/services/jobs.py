@@ -262,7 +262,12 @@ async def _claim(session: AsyncSession, agent: Agent, now: datetime) -> None:
 
     The check against the row loaded at authentication comes first and needs no write
     statement at all; that row can only be older than the database's, never newer, so
-    the compare-and-set remains the guard for check-ins that race."""
+    the compare-and-set remains the guard for check-ins that race.
+
+    That order is the contract (spec §5.7): a loaded row inside the gap is 429 whatever
+    the owner committed since, and only a check-in the loaded row lets through reaches
+    the compare-and-set, which answers 403 when the owner's change has landed (even if
+    another check-in also took the slot) and 429 when only the slot is gone."""
     last = utc(agent.last_checkin_at)
     if last is not None and last > now - MIN_CHECKIN_GAP:
         raise _rate_limited()
