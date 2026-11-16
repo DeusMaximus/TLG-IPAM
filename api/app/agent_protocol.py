@@ -32,8 +32,8 @@ INTERFACE_NAME_MAX = 15
 INTERFACES_MAX = 64
 CAPABILITIES_MAX = 16
 
-_MAC_HEX = re.compile(r"^[0-9a-f]{12}$")
-_CAPABILITY = re.compile(r"^[a-z0-9_-]{1,32}$")
+_MAC_HEX = re.compile(r"[0-9a-f]{12}")
+_CAPABILITY = re.compile(r"[a-z0-9_-]{1,32}")
 # longest IPv6 address with a prefix length, plus slack for a dotted netmask
 _INTERFACE_CIDR_MAX = 64
 
@@ -96,7 +96,7 @@ class Interface(BaseModel):
         if len(v) > 32:
             raise ValueError("must be a MAC address")
         stripped = re.sub(r"[:.-]", "", v.strip()).lower()
-        if not _MAC_HEX.match(stripped):
+        if not _MAC_HEX.fullmatch(stripped):
             raise ValueError("must be a MAC address")
         return ":".join(stripped[i : i + 2] for i in range(0, 12, 2))
 
@@ -134,7 +134,8 @@ class CheckinRequest(BaseModel):
     @classmethod
     def _capabilities(cls, v: list[str]) -> list[str]:
         for item in v:
-            if not _CAPABILITY.match(item):
+            # fullmatch: `$` would also match before a trailing newline
+            if not _CAPABILITY.fullmatch(item):
                 raise ValueError(
                     "each capability must be 1-32 characters of a-z, 0-9, _ and -"
                 )

@@ -333,12 +333,22 @@ async def delete_host(host_id: str) -> dict:
 @ipam_tool
 async def list_changes(entity_type: str | None = None, limit: int = 20) -> dict:
     """Recent changes to the IPAM (audit log), newest first. Each entry records what
-    changed, before/after snapshots, and whether it came from the UI, the REST API, or
-    MCP (source). actor names who acted when that is narrower than source; it is null
-    for the owner's own writes. Use to answer "what changed recently?" or to review
-    earlier MCP-driven edits. entity_type filters to:
+    changed, before/after snapshots, and where it came from (source): the UI, the REST
+    API, MCP, or a scan agent's own check-in (agent). actor names who acted when that
+    is narrower than source: null for the owner's own writes, agent:<name> for an
+    agent. Use to answer "what changed recently?" or to review earlier MCP-driven
+    edits. entity_type filters to:
     section|subnet|host|device_type|agent|token|scan_target. Reserved-range writes,
-    including a range's scan exclusion, are logged under subnet."""
+    including a range's scan exclusion, are logged under subnet. In agent snapshots,
+    the values an agent reports about itself (version, platform, hostname,
+    interfaces) are withheld; the summary still names the fields that changed.
+    Heartbeats (check-in and token-use times) and job scheduling are not logged, and
+    an agent keeps only its newest 100 entries of its own."""
     async with SessionLocal() as session:
         rows = await changes_svc.list_changes(session, entity_type=entity_type, limit=limit)
-        return {"changes": [ChangeOut.model_validate(c).model_dump(mode="json") for c in rows]}
+        return {
+            "changes": [
+                changes_svc.assistant_view(ChangeOut.model_validate(c).model_dump(mode="json"))
+                for c in rows
+            ]
+        }

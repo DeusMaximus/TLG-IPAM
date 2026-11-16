@@ -417,6 +417,7 @@ class ScanTargetOut(BaseModel):
     scan_requested_at: datetime | None
     current_job_id: str | None
     job_issued_at: datetime | None
+    job_methods: list[str] | None
     created_at: datetime
     last_scan_at: datetime | None
     last_scan_duration_ms: int | None

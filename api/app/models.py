@@ -224,6 +224,9 @@ class ScanTarget(Base):
     scan_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     current_job_id: Mapped[str | None] = mapped_column(String(36))
     job_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # the methods the leased job was issued with (`arp` only when L2-local): results
+    # ingest (#11) trusts these, not what the agent says it ran
+    job_methods: Mapped[list | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     # the `job_issued_at` of the last completed job, by the server's clock
     last_scan_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
