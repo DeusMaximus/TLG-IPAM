@@ -153,6 +153,11 @@ class Agent(Base):
     interfaces: Mapped[list | None] = mapped_column(JSON)
     last_checkin_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
+    # The job the agent was last issued, and when (`services/jobs`). The agent is busy
+    # while this is live. Kept here, not only on the target, so that reassigning or
+    # deleting the target mid-scan does not free an agent that is still scanning.
+    current_job_id: Mapped[str | None] = mapped_column(String(36))
+    job_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
     tokens: Mapped[list["Token"]] = relationship(
@@ -195,8 +200,9 @@ class ScanTarget(Base):
     """A subnet the owner has chosen to scan, and how (v0.2 spec §5.4). One per subnet.
 
     What is scanned is the subnet's scan scope, computed only by
-    `services/scans.scan_scope`. The lease and last-scan columns are written by
-    check-in and ingest (#10, #11); nothing writes them yet.
+    `services/scans.scan_scope`. Check-in writes the lease (`services/jobs`) and
+    request-scan writes `scan_requested_at`; results ingest (#11) will clear the lease
+    and write the last-scan columns.
     """
 
     __tablename__ = "scan_targets"
@@ -214,10 +220,15 @@ class ScanTarget(Base):
     scan_dhcp_pool: Mapped[bool] = mapped_column(Boolean, default=False)
     # null = manual only
     interval_minutes: Mapped[int | None] = mapped_column(Integer)
+    # the last "Scan now"; never cleared, since it also times the cooldown
     scan_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     current_job_id: Mapped[str | None] = mapped_column(String(36))
     job_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # the methods the leased job was issued with (`arp` only when L2-local): results
+    # ingest (#11) trusts these, not what the agent says it ran
+    job_methods: Mapped[list | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    # the `job_issued_at` of the last completed job, by the server's clock
     last_scan_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_scan_duration_ms: Mapped[int | None] = mapped_column(Integer)
     last_scan_complete: Mapped[bool | None] = mapped_column(Boolean)

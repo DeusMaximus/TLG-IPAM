@@ -1,6 +1,7 @@
 import os
 import shutil
 import tempfile
+from datetime import timedelta
 
 # Each pytest session gets its own directory, so two sessions on one machine
 # (agents in separate worktrees, say) never share a database. The environment
@@ -17,6 +18,7 @@ from httpx import ASGITransport, AsyncClient
 from app.database import SessionLocal, engine
 from app.main import app
 from app.models import Base
+from app.services import jobs
 from app.services.device_types import seed_defaults
 
 
@@ -32,6 +34,14 @@ async def fresh_db():
     async with SessionLocal() as session:
         await seed_defaults(session)
     yield
+
+
+@pytest.fixture(autouse=True)
+def unlimited_checkins(monkeypatch):
+    """Tests check in back to back. The check-in rate limit is lifted here (a negative
+    gap is never inside); `test_checkin.py` restores `jobs.DEFAULT_CHECKIN_GAP` where it
+    tests the limit itself."""
+    monkeypatch.setattr(jobs, "MIN_CHECKIN_GAP", -timedelta(hours=1))
 
 
 @pytest.fixture

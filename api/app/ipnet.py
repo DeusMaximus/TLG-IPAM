@@ -61,6 +61,20 @@ def usable_bounds(net: ipaddress.IPv4Network) -> tuple[int, int]:
     return first, last
 
 
+def on_link(net: ipaddress.IPv4Network, interface_cidrs: list[str]) -> bool:
+    """Whether every address of `net` is on the link of one of the interfaces, given as
+    `address/prefix` strings: the interface's network contains the whole of `net`.
+    An interface of the other address family, or one that does not parse, never is."""
+    for cidr in interface_cidrs:
+        try:
+            link = ipaddress.ip_interface(cidr).network
+        except ValueError:
+            continue
+        if link.version == net.version and net.subnet_of(link):
+            return True
+    return False
+
+
 def total_usable(net: ipaddress.IPv4Network) -> int:
     first, last = usable_bounds(net)
     return last - first + 1

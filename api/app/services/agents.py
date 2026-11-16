@@ -8,7 +8,7 @@ creates, changes or lists them (spec §7.2, invariant 2).
 
 import hashlib
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -23,6 +23,9 @@ from . import changes, scans
 AGENT_TOKEN_PREFIX = "tlga_"
 # characters of the token kept for display: the kind prefix plus 8 of the 43 random ones
 _DISPLAY_LENGTH = len(AGENT_TOKEN_PREFIX) + 8
+# `last_used_at` is written at most this often per token, so a token used at request
+# rate (a check-in refused by its rate limit, say) drives reads, not database writes
+LAST_USED_GRANULARITY = timedelta(seconds=10)
 
 
 def _now() -> datetime:
@@ -220,7 +223,8 @@ async def delete_agent(session: AsyncSession, agent_id: str, source: str) -> Non
 
 async def authenticate(session: AsyncSession, presented: str) -> Agent | None:
     """The agent a presented bearer belongs to, or None. Accepts only an unrevoked
-    `agent` token of an `active` agent, and records its use in `last_used_at`.
+    `agent` token of an `active` agent, and records its use in `last_used_at` when the
+    stored time is LAST_USED_GRANULARITY old or more (or unset).
 
     The lookup is by SHA-256 of the presented value, so no comparison ever touches
     the stored secret: timing reveals at most where an attacker's own hash sorts.
@@ -237,6 +241,11 @@ async def authenticate(session: AsyncSession, presented: str) -> Agent | None:
     token, agent = row
     if token.kind != "agent" or token.revoked_at is not None or agent.state != "active":
         return None
-    token.last_used_at = _now()
-    await session.commit()
+    now = _now()
+    used = token.last_used_at
+    if used is not None and used.tzinfo is None:
+        used = used.replace(tzinfo=timezone.utc)  # SQLite hands it back without a zone
+    if used is None or now - used >= LAST_USED_GRANULARITY:
+        token.last_used_at = now
+        await session.commit()
     return agent

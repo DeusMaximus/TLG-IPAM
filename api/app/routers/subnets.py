@@ -13,6 +13,7 @@ from ..schemas import (
     SubnetUpdate,
 )
 from ..services import hosts as hosts_svc
+from ..services import scans as scans_svc
 from ..services import subnets as svc
 
 router = APIRouter(prefix="/subnets", tags=["subnets"])
@@ -129,3 +130,13 @@ async def delete_reserved_range(
     source: str = Depends(request_source),
 ):
     await svc.delete_reserved_range(session, subnet_id, range_id, source)
+
+
+@router.post("/{subnet_id}/scan", status_code=202)
+async def request_scan(
+    subnet_id: str,
+    session: AsyncSession = Depends(get_session),
+    source: str = Depends(request_source),
+):
+    target = await scans_svc.request_scan(session, subnet_id, source)
+    return {"data": await scans_svc.target_out(session, target)}

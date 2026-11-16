@@ -12,11 +12,14 @@ This module reads subnets and reserved ranges straight from the models rather th
 through `services/subnets`, which imports it.
 """
 
-from sqlalchemy import select
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
-from ..errors import conflict, not_found, validation_error
+from ..errors import ApiError, conflict, not_found, validation_error
 from ..ipnet import format_intervals, parse_cidr, parse_ip, subtract_intervals, usable_bounds
 from ..models import Agent, ReservedRange, ScanTarget, Subnet
 from ..schemas import ScanTargetCreate, ScanTargetOut, ScanTargetUpdate
@@ -28,6 +31,8 @@ SCAN_METHODS = ("icmp", "arp", "rdns", "fdns")
 LIVENESS_METHODS = frozenset({"icmp", "arp"})
 # spec §5.6: no scan target for a prefix shorter than this
 MIN_PREFIX = 20
+# spec §5.8, §9: at most one requested scan per subnet in this time, from any caller
+REQUEST_COOLDOWN = timedelta(minutes=15)
 
 
 # --- Scope ---
@@ -271,3 +276,78 @@ async def unassign_agent(session: AsyncSession, agent: Agent, source: str) -> No
         )
     # the agent row goes next; do not leave the order to the unit of work
     await session.flush()
+
+
+# --- Requested scans ---
+
+
+def utc(value: datetime | None) -> datetime | None:
+    """SQLite hands datetimes back without a zone; every one stored here is UTC."""
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=timezone.utc)
+
+
+def _cooldown(subnet: Subnet, asked: datetime) -> ApiError:
+    again = (asked + REQUEST_COOLDOWN).isoformat(timespec="seconds")
+    minutes = int(REQUEST_COOLDOWN.total_seconds() // 60)
+    return ApiError(
+        "COOLDOWN",
+        f"A scan of subnet {subnet.name} was requested less than {minutes} minutes ago; "
+        f"request another after {again}",
+        429,
+    )
+
+
+async def request_scan(session: AsyncSession, subnet_id: str, source: str) -> ScanTarget:
+    """Mark the subnet's scan target due ("Scan now"). The agent picks it up at its
+    next check-in (`services/jobs`).
+
+    The cooldown is per subnet and applies to every caller, the UI included: repeated
+    scans would turn the latest state into a presence timeline (spec §5.8). A refused
+    request changes nothing and does not restart the cooldown.
+    """
+    subnet = await _get_subnet(session, subnet_id)
+    target = await target_for_subnet(session, subnet.id)
+    if target is None:
+        raise conflict(f"Subnet {subnet.name} has no scan target: set up scanning first")
+    if not target.enabled:
+        raise conflict(f"Scanning of subnet {subnet.name} is disabled")
+    if target.agent_id is None:
+        raise conflict(f"Subnet {subnet.name} has no agent assigned to scan it")
+    now = datetime.now(timezone.utc)
+    cutoff = now - REQUEST_COOLDOWN
+    asked = utc(target.scan_requested_at)
+    if asked is not None and asked > cutoff:
+        raise _cooldown(subnet, asked)
+    before = changes.snapshot(target)
+    # Conditional, so two racing requests cannot both pass the check above.
+    result = await session.execute(
+        update(ScanTarget)
+        .where(
+            ScanTarget.id == target.id,
+            or_(ScanTarget.scan_requested_at.is_(None), ScanTarget.scan_requested_at <= cutoff),
+        )
+        .values(scan_requested_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        asked = await session.scalar(
+            select(ScanTarget.scan_requested_at).where(ScanTarget.id == target.id)
+        )
+        error = _cooldown(subnet, utc(asked) or now)
+        await session.rollback()
+        raise error
+    set_committed_value(target, "scan_requested_at", now)
+    changes.record(
+        session,
+        entity_type="scan_target",
+        entity_id=target.id,
+        action="update",
+        summary=f"{_label(subnet)}: scan requested",
+        source=source,
+        before=before,
+        after=changes.snapshot(target),
+    )
+    await session.commit()
+    return target

@@ -1,27 +1,26 @@
 """Agents and agent tokens (#8; v0.2 spec §4.2, §4.3, §5.4).
 
-No route under `/api/v1/agent/` exists yet (check-in is #10), so `require_agent` is
-exercised through a probe app that mounts it the way #10 will: a router under that
-prefix guarded by the dependency alone. Owner routes and `/mcp` are the real app.
+`require_agent` is exercised on the real check-in route, `/api/v1/agent/checkin`
+(#10), which is guarded by that dependency alone. What check-in does with the body is
+tested in `test_checkin.py`.
 """
 
 import hashlib
+from datetime import timedelta
 import sqlite3
 from pathlib import Path
 
 import pytest
-from fastapi import APIRouter, Depends, FastAPI
 from fastmcp import Client
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.auth import require_agent
+from app.agent_protocol import PROTOCOL_VERSION
 from app.config import settings
 from app.database import SessionLocal, init_models
-from app.errors import ApiError
-from app.main import api_error_handler
+from app.main import app
 from app.models import Agent, Token
 from app.mcp_server import mcp
 from app.schemas import AGENT_NAME_MAX, AgentCreate
@@ -42,24 +41,21 @@ INITIALIZE = {
 MCP_ACCEPT = "application/json, text/event-stream"
 
 
-def _probe_app() -> FastAPI:
-    probe = FastAPI()
-    probe.add_exception_handler(ApiError, api_error_handler)
-    router = APIRouter(prefix="/api/v1/agent")
-
-    @router.post("/checkin")
-    async def checkin(agent: Agent = Depends(require_agent)):
-        return {"data": {"agent_id": agent.id, "name": agent.name}}
-
-    probe.include_router(router)
-    return probe
-
-
 @pytest.fixture
 async def agent_api():
-    transport = ASGITransport(app=_probe_app())
+    """The real app, with no owner key sent."""
+    transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+
+
+CHECKIN = {
+    "version": "0.2.0",
+    "protocol": PROTOCOL_VERSION,
+    "hostname": "scanner-20",
+    "platform": "linux",
+    "interfaces": [],
+}
 
 
 async def make_agent(client, name="vlan20-scanner") -> tuple[dict, str]:
@@ -73,8 +69,14 @@ def bearer(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
-async def checkin(agent_api, token: str):
-    return await agent_api.post("/api/v1/agent/checkin", headers=bearer(token))
+async def checkin(agent_api, token: str, **body):
+    return await agent_api.post(
+        "/api/v1/agent/checkin", json={**CHECKIN, **body}, headers=bearer(token)
+    )
+
+
+async def agent_hostname(client, agent_id: str) -> str | None:
+    return (await client.get(f"/api/v1/agents/{agent_id}")).json()["data"]["hostname"]
 
 
 async def token_rows(agent_id: str) -> list[Token]:
@@ -173,13 +175,22 @@ async def test_agent_token_is_accepted_and_last_used_at_recorded(client, agent_a
     agent, token = await make_agent(client)
     res = await checkin(agent_api, token)
     assert res.status_code == 200, res.text
-    assert res.json()["data"] == {"agent_id": agent["id"], "name": "vlan20-scanner"}
+    assert await agent_hostname(client, agent["id"]) == "scanner-20"
     [row] = await token_rows(agent["id"])
     assert row.last_used_at is not None
     listed = (await client.get(f"/api/v1/agents/{agent['id']}")).json()["data"]["tokens"][0]
     assert listed["last_used_at"] is not None
 
+    # a use inside LAST_USED_GRANULARITY writes nothing; a later one moves it on
     first_use = row.last_used_at
+    assert agents_svc.LAST_USED_GRANULARITY == timedelta(seconds=10)
+    assert (await checkin(agent_api, token)).status_code == 200
+    [row] = await token_rows(agent["id"])
+    assert row.last_used_at == first_use
+    async with SessionLocal() as session:
+        stale = first_use - timedelta(seconds=10)
+        await session.execute(update(Token).where(Token.id == row.id).values(last_used_at=stale))
+        await session.commit()
     assert (await checkin(agent_api, token)).status_code == 200
     [row] = await token_rows(agent["id"])
     assert row.last_used_at > first_use
@@ -188,7 +199,7 @@ async def test_agent_token_is_accepted_and_last_used_at_recorded(client, agent_a
 async def test_bearer_scheme_is_case_insensitive(client, agent_api):
     _, token = await make_agent(client)
     res = await agent_api.post(
-        "/api/v1/agent/checkin", headers={"Authorization": f"bearer {token}"}
+        "/api/v1/agent/checkin", json=CHECKIN, headers={"Authorization": f"bearer {token}"}
     )
     assert res.status_code == 200
 
@@ -196,8 +207,10 @@ async def test_bearer_scheme_is_case_insensitive(client, agent_api):
 async def test_each_agent_token_names_its_own_agent(client, agent_api):
     first, first_token = await make_agent(client, "a")
     second, second_token = await make_agent(client, "b")
-    assert (await checkin(agent_api, first_token)).json()["data"]["agent_id"] == first["id"]
-    assert (await checkin(agent_api, second_token)).json()["data"]["agent_id"] == second["id"]
+    assert (await checkin(agent_api, first_token, hostname="host-a")).status_code == 200
+    assert (await checkin(agent_api, second_token, hostname="host-b")).status_code == 200
+    assert await agent_hostname(client, first["id"]) == "host-a"
+    assert await agent_hostname(client, second["id"]) == "host-b"
 
 
 @pytest.mark.parametrize(
@@ -212,7 +225,8 @@ async def test_each_agent_token_names_its_own_agent(client, agent_api):
     ids=["none", "basic", "scheme-only", "blank-token", "owner-x-api-key"],
 )
 async def test_agent_route_without_bearer_is_401(agent_api, headers):
-    res = await agent_api.post("/api/v1/agent/checkin", headers=headers)
+    # a valid body: the refusal is the credential's, not the body's
+    res = await agent_api.post("/api/v1/agent/checkin", json=CHECKIN, headers=headers)
     assert res.status_code == 401
     assert res.json()["error"]["code"] == "UNAUTHORIZED"
 
@@ -228,7 +242,9 @@ async def test_agent_route_without_bearer_is_401(agent_api, headers):
 )
 async def test_agent_route_refuses_other_bearers(client, agent_api, authorization):
     await make_agent(client)  # a live token exists, and is not this one
-    res = await agent_api.post("/api/v1/agent/checkin", headers={"Authorization": authorization})
+    res = await agent_api.post(
+        "/api/v1/agent/checkin", json=CHECKIN, headers={"Authorization": authorization}
+    )
     assert res.status_code == 403
     assert res.json()["error"] == {"code": "FORBIDDEN", "message": "Invalid agent token"}
 
@@ -237,11 +253,13 @@ async def test_owner_key_with_valid_agent_bearer_still_needs_the_bearer(client, 
     # X-API-Key is ignored on agent routes: it neither helps nor replaces the bearer
     _, token = await make_agent(client)
     res = await agent_api.post(
-        "/api/v1/agent/checkin", headers={"X-API-Key": "test-key", **bearer("tlga_wrong")}
+        "/api/v1/agent/checkin",
+        json=CHECKIN,
+        headers={"X-API-Key": "test-key", **bearer("tlga_wrong")},
     )
     assert res.status_code == 403
     res = await agent_api.post(
-        "/api/v1/agent/checkin", headers={"X-API-Key": "test-key", **bearer(token)}
+        "/api/v1/agent/checkin", json=CHECKIN, headers={"X-API-Key": "test-key", **bearer(token)}
     )
     assert res.status_code == 200
 

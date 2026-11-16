@@ -56,7 +56,7 @@ volumes:
 |---|---|
 | `/` | React SPA (static files + SPA fallback, served by FastAPI) |
 | `/api/v1/...` | REST API (owner key) |
-| `/api/v1/agent/...` | Agent-facing REST API (agent token; §4.1). No route is served here yet: check-in and results arrive with v0.2 M2a |
+| `/api/v1/agent/...` | Agent-facing REST API (agent token; §4.1): check-in (§4.5). Results ingest arrives with v0.2 M2a (#11) |
 | `/mcp` | Streamable HTTP MCP endpoint |
 | `/api/v1/docs` | OpenAPI / Swagger (FastAPI auto-generated) |
 
@@ -151,8 +151,8 @@ Append-only record of every write. Because Claude can write to this system via M
 | `action` | enum: `create` \| `update` \| `delete` \| `revoke` (`revoke` is for tokens only) |
 | `summary` | str — human-readable one-liner, e.g. `host pbs-01 created at 10.10.20.45` |
 | `before` / `after` | JSON snapshots, nullable |
-| `source` | enum: `ui` \| `api` \| `mcp` — MCP is server-assigned; REST uses the advisory `X-TLG-Client: ui` hint, so `ui` versus `api` is a UX label rather than trusted provenance |
-| `actor` | str(80), nullable — who acted, when that is narrower than `source`. Every write path today records null: that is the owner key, whether over REST or MCP. Later values are `agent:<agent name>` and `grant:<client name>` (v0.2 spec §4.3). It is a field of its own and never part of `summary`. Databases created before it gain the column, null in existing rows, on startup. |
+| `source` | enum: `ui` \| `api` \| `mcp` \| `agent` — MCP and `agent` are server-assigned; REST uses the advisory `X-TLG-Client: ui` hint, so `ui` versus `api` is a UX label rather than trusted provenance. `agent` is a check-in that changed what the agent reports (§4.5); each agent keeps its newest 100 of those, and over MCP the reported values in `agent` snapshots are withheld. Not logged: heartbeats (`tokens.last_used_at`, `agents.last_checkin_at`) and job scheduling (the lease columns) |
+| `actor` | str(80), nullable — who acted, when that is narrower than `source`. Null is the owner key, whether over REST or MCP. An agent's own write records `agent:<agent name>`; `grant:<client name>` arrives with OAuth (v0.2 spec §4.3). It is a field of its own and never part of `summary`. Databases created before it gain the column, null in existing rows, on startup. |
 
 ### 3.7 Validation constraints
 
@@ -172,7 +172,7 @@ Append-only record of every write. Because Claude can write to this system via M
 
 ### 3.8 Agent
 
-A scan agent (v0.2 spec §5.4). The owner creates it over REST; check-in, scanning and the Agents page arrive with v0.2 M2a.
+A scan agent (v0.2 spec §5.4). The owner creates it over REST; the agent checks in over `/api/v1/agent/checkin` (§4.5). Results ingest and the Agents page arrive with v0.2 M2a.
 
 | Field | Type / notes |
 |---|---|
@@ -180,7 +180,10 @@ A scan agent (v0.2 spec §5.4). The owner creates it over REST; check-in, scanni
 | `name` | str. 1–74 printable characters, trimmed: `agent:<name>` is the audit `actor` for the agent's own writes and must fit `changes.actor` (80). Unique case-insensitively (`409`) |
 | `name_key` | str, unique — `name.casefold()`, so the database itself refuses two names that differ only in case, even from racing requests. Internal: not returned, not in audit snapshots |
 | `state` | enum: `pending` (has never held an agent token; enrolment, v0.2 M2b) \| `active` \| `disabled`. An agent created over REST gets its token at once, so it starts `active` |
-| `version`, `platform`, `hostname`, `interfaces`, `last_checkin_at`, `last_error` | nullable; reported by the agent at check-in (M2a). Null until then |
+| `version`, `platform`, `hostname`, `interfaces` | nullable; reported by the agent at check-in, and null until its first. Trimmed, printable characters only, at most 40, 120 and 253 characters; `interfaces` is up to 64 `{name, cidr, mac}` (name at most 15 characters; `cidr` an address with its prefix length, normalised, no IPv6 scope id; `mac` normalised or null). A check-in that fails these checks changes none of them |
+| `last_checkin_at` | datetime, nullable — set by every authenticated check-in, refused ones included |
+| `current_job_id`, `job_issued_at` | nullable, read-only — the job the agent was last issued, and when (§4.5). The agent is busy while that lease is live, whatever has since happened to the target. Databases created before them gain the columns on startup |
+| `last_error` | text, nullable — why the last check-in was refused (protocol mismatch, or the first field that failed validation, by name and never by value). Cleared by a check-in that succeeds |
 | `created_at` | datetime, auto |
 
 Rules: disabling an agent refuses its token without revoking it, and enabling it accepts the token again. Deleting an agent revokes its unrevoked tokens (each logged as a `token` `revoke`), sets `agent_id` to null on its scan targets (each logged as a `scan_target` update; their settings are kept), then deletes the agent and its token rows.
@@ -196,7 +199,7 @@ A credential bound to an agent (v0.2 spec §4.2). An agent token is `tlga_` foll
 | `agent_id` | FK → Agent |
 | `token_hash` | SHA-256 of the token, hex, unique. Never returned and never in an audit snapshot |
 | `token_prefix` | the first 13 characters (`tlga_` + 8), for display |
-| `created_at`, `last_used_at` | `last_used_at` is set each time the token authenticates |
+| `created_at`, `last_used_at` | `last_used_at` is set when the token authenticates and the stored time is at least 10 seconds old (`agents.LAST_USED_GRANULARITY`), so a token used at request rate drives no writes |
 | `expires_at`, `used_at` | enrolment tokens only; null for agent tokens |
 | `revoked_at` | datetime, nullable |
 
@@ -204,7 +207,7 @@ Rules: the plain token appears in exactly one response, the one that creates it;
 
 ### 3.10 ScanTarget and scan scope
 
-A subnet the owner has chosen to scan, and how (v0.2 spec §5.3, §5.4). At most one per subnet. Configured over REST only; no MCP tool reads or writes it. Nothing scans yet: check-in, jobs and results arrive with v0.2 M2a (#10, #11).
+A subnet the owner has chosen to scan, and how (v0.2 spec §5.3, §5.4). At most one per subnet. Configured over REST only; no MCP tool reads or writes it. Check-in hands out jobs for it (§4.5); results ingest arrives with v0.2 M2a (#11).
 
 | Field | Type / notes |
 |---|---|
@@ -215,7 +218,9 @@ A subnet the owner has chosen to scan, and how (v0.2 spec §5.3, §5.4). At most
 | `methods` | JSON list — a subset of `icmp`, `arp`, `rdns`, `fdns` that includes `icmp` or `arp` (the liveness methods). Stored de-duplicated in that order. Default `["icmp", "arp", "rdns"]` |
 | `scan_dhcp_pool` | bool, default `false` — whether the subnet's DHCP pool is in scope |
 | `interval_minutes` | int, nullable — 5 to 10080 (a week); null = manual only |
-| `scan_requested_at`, `current_job_id`, `job_issued_at`, `last_scan_at`, `last_scan_duration_ms`, `last_scan_complete` | nullable, read-only. The request flag, job lease and last-scan record; nothing writes them until M2a |
+| `scan_requested_at` | datetime, nullable, read-only — when a scan was last requested (`POST /subnets/{id}/scan`). Never cleared: it also times the cooldown |
+| `current_job_id`, `job_issued_at`, `job_methods` | nullable, read-only — the job lease, set when check-in issues a job (§4.5); `job_methods` is what the job was issued with. Databases created before `job_methods` gain it on startup |
+| `last_scan_at`, `last_scan_duration_ms`, `last_scan_complete` | nullable, read-only — the last-scan record. `last_scan_at` is when the last completed job was issued, by the server's clock. Written by results ingest (#11); nothing writes them yet |
 | `created_at` | datetime, auto |
 
 **Scan scope** is the set of addresses a scan may send packets to. It is computed in one place, `services/scans.scan_scope(subnet)`, as inclusive address ranges: the subnet's usable addresses (no network or broadcast for `/30` and shorter), minus the DHCP pool unless `scan_dhcp_pool` is set, minus every reserved range with `scan_excluded`. Exclusion wins: an address in both an excluded and a scanned reserved range is excluded. A subnet without a scan target has the default scope (pool not scanned). Scan-target responses carry it as `scope: [{start, end}]`.
@@ -236,7 +241,7 @@ X-API-Key: <value from API_KEY env var>
 
 All endpoints except `GET /health` and the agent-facing `/api/v1/agent/*` require this header. Return `401` if missing, `403` if wrong. The key is compared in constant time (`hmac.compare_digest`, in `auth.is_owner_key`). Key is set at container start — no key rotation UI needed in v1. The server refuses to start unless `API_KEY` is set, non-empty (not only whitespace), free of whitespace at either end and not `change-me`, the placeholder `.env.example` ships: `config.load_settings` runs when `app.config` is imported, so uvicorn exits with a message that names `API_KEY` and says how to generate a key, before it serves anything (under `--reload`, the reloader stays up and its server process exits). A key with a leading or trailing space, tab or newline is refused, not trimmed: most HTTP clients cannot send such a header value, a raw one can, and trimming would leave two candidate keys. The message is fixed and never contains the key. Separately, `is_owner_key` never matches an empty value, so an empty `X-API-Key` is refused (`403`) whatever the setting holds. REST does not accept the key as a bearer, and `/mcp` does not accept `X-API-Key` (§5.1).
 
-Agent-facing routes, `/api/v1/agent/*`, take an agent token instead (§3.9), as `Authorization: Bearer tlga_…`, through the `auth.require_agent` dependency and nothing else. It accepts only an unrevoked `agent` token of an `active` agent and records `last_used_at`. The token is found by the SHA-256 of the presented value, so the stored secret is never compared. Refusals use the REST error shape: `401 UNAUTHORIZED` when no bearer is sent (including `X-API-Key` alone), `403 FORBIDDEN` "Invalid agent token" for any bearer that is not a usable agent token — the owner key, an unknown, revoked or `enrol` token, or the token of a disabled or deleted agent. The owner routes refuse an agent token (`403` as `X-API-Key`, `401` as a bearer), and so does `/mcp` (`401 invalid_token`). No route is mounted under `/api/v1/agent/` yet; check-in and results arrive with v0.2 M2a.
+Agent-facing routes, `/api/v1/agent/*`, take an agent token instead (§3.9), as `Authorization: Bearer tlga_…`, through the `auth.require_agent` dependency and nothing else. It accepts only an unrevoked `agent` token of an `active` agent and records `last_used_at`, at most once every 10 seconds per token. The token is found by the SHA-256 of the presented value, so the stored secret is never compared. Refusals use the REST error shape: `401 UNAUTHORIZED` when no bearer is sent (including `X-API-Key` alone), `403 FORBIDDEN` "Invalid agent token" for any bearer that is not a usable agent token — the owner key, an unknown, revoked or `enrol` token, or the token of a disabled or deleted agent. The owner routes refuse an agent token (`403` as `X-API-Key`, `401` as a bearer), and so does `/mcp` (`401 invalid_token`). The router for `/api/v1/agent/*` carries `require_agent` itself, so a route added to it is guarded too, and it is mounted apart from the owner routers, so the owner key never reaches it. The one route today is check-in (§4.5); results ingest arrives with v0.2 M2a (#11).
 
 ### 4.2 Endpoints
 
@@ -264,6 +269,7 @@ Agent-facing routes, `/api/v1/agent/*`, take an agent token instead (§3.9), as 
 | `POST /api/v1/subnets/{id}/reserved` | Add a reserved range (`{start_ip, end_ip, description?, scan_excluded?}`; `scan_excluded` defaults to `false`). Reserved ranges are embedded in subnet GET responses, each with `scan_excluded`; subnet responses also carry `scan_dhcp_pool` from the subnet's scan target, or null when it has none. |
 | `PATCH /api/v1/subnets/{id}/reserved/{range_id}` | Set `{scan_excluded}` (required, not null). A request that changes nothing writes no change-log entry. |
 | `DELETE /api/v1/subnets/{id}/reserved/{range_id}` | Remove a reserved range. |
+| `POST /api/v1/subnets/{id}/scan` | Request a scan ("Scan now"): sets the scan target's `scan_requested_at`, logged as a `scan_target` update. `202` with the target. The agent picks it up at its next check-in. At most one request per subnet in 15 minutes, from any caller: a second is `429 COOLDOWN`, changes nothing and does not restart the wait. No scan target, a disabled one, or one with no agent: `409`. |
 | `GET  /api/v1/changes` | Recent changes, newest first. Filters: `?entity_type=` `?limit=`. |
 | `GET  /api/v1/agents` | List agents, by name, each with its tokens (prefix and timestamps only, newest first). |
 | `POST /api/v1/agents` | Create an agent (`{name}`) with its agent token. `201`; the response carries the plain token as `data.token`, the only response that ever does. Duplicate name (case-insensitive): `409`. |
@@ -304,6 +310,38 @@ Manual host creation (`POST /hosts`) only rejects the network/broadcast addresse
 `next-free` allocates the lowest free IP and creates the host record in a single transaction. The `UNIQUE(subnet_id, ip)` constraint is the backstop against races: if a concurrent writer claims the chosen IP first, allocation re-reads the free list and rolls to the next candidate (up to 5 attempts) rather than surfacing a conflict.
 
 Gateway, DHCP, reserved-range, and allocated-address exclusions are represented as clipped, merged integer intervals. Utilisation counts interval lengths, and free-IP iteration skips blocked spans rather than materialising every address in a range.
+
+### 4.5 Agent check-in and jobs
+
+`POST /api/v1/agent/checkin` (agent token, §4.1). The request and response shapes live in `api/app/agent_protocol.py`, the contract the agent package is built against (v0.2 spec §5.7). It depends on the standard library and pydantic only.
+
+```json
+// request
+{ "version": "0.2.0", "protocol": 1, "hostname": "scanner-20", "platform": "linux",
+  "interfaces": [{ "name": "eth0", "cidr": "10.0.20.5/24", "mac": "02:00:00:00:00:05" }],
+  "capabilities": [] }
+// 200
+{ "data": { "checkin_interval_s": 60,
+            "jobs": [{ "job_id": "…", "subnet_id": "…", "cidr": "10.0.20.0/24",
+                       "ranges": [{ "start": "10.0.20.1", "end": "10.0.20.99" }],
+                       "methods": ["icmp", "arp", "rdns"], "dns_servers": ["10.0.20.1"],
+                       "timeout_s": 600, "fdns": [] }] } }
+```
+
+- **Rate limit first.** An agent may check in once every 10 seconds (`jobs.MIN_CHECKIN_GAP`; its own interval is 60). A check-in inside that gap is `429 RATE_LIMITED`, written as a compare-and-set on `last_checkin_at`, before any other write and before the body is looked at: it changes nothing and is not recorded. Inside the gap it is refused from the agent row loaded at authentication, so with `last_used_at`'s 10-second granularity (§3.9) a refused check-in issues no write statement at all; the compare-and-set catches check-ins that race. The agent waits `checkin_interval_s` and tries again.
+- **Protocol first.** `protocol` is checked before anything else in the body, since another protocol may shape the rest differently. Anything but the integer `PROTOCOL_VERSION` (1) is `409 PROTOCOL_MISMATCH` with a message naming both protocols; it issues no job, stores none of the body, and is recorded in the agent's `last_error`.
+- **Then the fields** (§3.8). The first that fails is `422 VALIDATION_ERROR` "Check-in refused: <field>: <reason>", recorded in `last_error` the same way; the reported fields keep their earlier values. Unknown fields are ignored. `capabilities` (up to 16 tokens of `a-z0-9_-`) is checked and not yet used.
+- **A good check-in** stores the reported fields and `last_checkin_at`, clears `last_error`, and returns at most one job.
+- **Audit.** A check-in that changes `version`, `platform`, `hostname`, `interfaces` or `last_error` writes one `agent` update with `source="agent"` and `actor="agent:<name>"`, naming the changed fields in the summary and their values only in the snapshots. A check-in that changes nothing else is not logged (as `last_used_at` is not), and neither is issuing a job. An agent keeps only its newest 100 entries of its own (`source="agent"`); older ones are deleted when a new one is written, and the owner's entries are never touched. Together with the rate limit, that bounds what one agent token can add to the log.
+- **Agent text stays out of assistant context.** `list_changes` over MCP replaces the values of `version`, `platform`, `hostname` and `interfaces` in every `agent` snapshot with a placeholder (`changes.assistant_view`), whoever wrote the entry; the field names, summary, source and actor stay. Owner REST (`GET /api/v1/changes`) shows them.
+
+**When a target is due.** It is enabled, assigned to this agent, not under a live lease, and either a scan was requested after its last scan started (`scan_requested_at` > `last_scan_at`), or it has an interval and has never been scanned or its last scan started at least `interval_minutes` ago. Among due targets, a request no job has been issued for since it was made goes first; every other due target, a request already tried once included, goes by when a job for it last started (`last_scan_at` or `job_issued_at`, whichever is later), oldest or never first. A target whose jobs keep timing out therefore goes to the back each time and cannot starve the agent's others; a request still stands until a completed scan serves it.
+
+**Leases.** Issuing a job sets `current_job_id`, `job_issued_at` and `job_methods` (the methods issued). The lease is live for 15 minutes (the 10-minute job timeout plus a margin); a target under a live lease is not issued again, and once it expires the target is due again. The write is a compare-and-set on the lease the check-in read, so two check-ins never lease one target twice. The same lease is recorded on the agent (`agents.current_job_id`, `job_issued_at`), and an agent whose lease is live gets no new job: it runs one job at a time. Because the record is on the agent, reassigning, disabling or deleting the target (or its subnet) mid-scan does not free an agent that is still scanning; nothing is sent to cancel a job. A reassigned target keeps its lease until it expires or its result arrives, so the new agent waits for that target only.
+
+**What results ingest (#11) must do with a lease.** A result is accepted only for a job that is still current on both copies: its `job_id` equals the target's `current_job_id` and the reporting agent's `current_job_id`, whatever the target is assigned to now. A superseded job (re-issued after expiry, or the agent given another) or a second result for one job is refused. Addresses are checked against the subnet's scan scope at ingest, so a range excluded mid-scan stays absolute. Liveness and MACs follow `job_methods`, the methods the server issued, not what the agent says it ran or a later check-in's interfaces. Accepting clears both copies of the lease in one transaction, sets `last_scan_at` to the job's `job_issued_at`, and leaves `scan_requested_at` alone.
+
+**The job.** `ranges` is the subnet's scan scope from `services/scans.scan_scope` (§3.10); a target whose scope is empty gets no job. `methods` are the target's, minus `arp` when the subnet is not on the agent's link, and minus `fdns` until the forward-DNS check exists (#20), so `fdns` is always empty. The subnet is on the agent's link when one reported IPv4 interface's network contains the whole subnet. A target left with neither `icmp` nor `arp` gets no job, and is not leased. `dns_servers` are the subnet's, or empty. `timeout_s` is 600.
 
 ---
 
@@ -365,7 +403,7 @@ Tool descriptions are the documentation Claude reads at runtime — write them w
 | `bulk_delete_hosts` | Delete many hosts by ID in one call (cleanup workflows). Returns deleted count + not-found IDs. |
 | `add_reserved_range` | Reserve a block of IPs in a subnet so automatic allocation skips it (manual creation inside it stays allowed). Always creates a scanned range: the tool has no `scan_excluded` argument. |
 | `delete_reserved_range` | Remove a reserved range, returning its addresses to the allocation pool. Refuses a range with `scan_excluded`, because removing it would widen what is scanned; the error says to remove it in the web UI. |
-| `list_changes` | Recent changes to the IPAM (audit log), newest first, each with its `source` and `actor` (null for the owner's own writes). Use to answer "what changed recently?" or to review previous MCP-driven edits. |
+| `list_changes` | Recent changes to the IPAM (audit log), newest first, each with its `source` (`ui`, `api`, `mcp` or `agent`) and `actor` (null for the owner's own writes, `agent:<name>` for an agent). In `agent` snapshots the values the agent reports about itself are withheld (§4.5). Use to answer "what changed recently?" or to review previous MCP-driven edits. |
 
 All MCP writes are recorded in the change log with `source = mcp`. No tool creates, changes or lists agents, tokens or scan targets, and no tool can widen a subnet's scan scope (v0.2 spec §7.2, invariant 2).
 
@@ -453,6 +491,7 @@ tlg-ipam/
 │       ├── database.py       # SQLAlchemy async engine + session
 │       ├── models.py         # ORM models (Section, Subnet, ReservedRange, Host, DeviceType, Change, Agent, Token, ScanTarget)
 │       ├── schemas.py        # Pydantic request/response schemas
+│       ├── agent_protocol.py # the agent wire contract: check-in request and job shapes, PROTOCOL_VERSION
 │       ├── auth.py           # owner-key check (REST dependency + /mcp bearer verifier); agent-token dependency
 │       ├── mcp_server.py     # FastMCP tools (thin wrappers over services)
 │       ├── services/         # business logic — single source of truth
@@ -462,7 +501,8 @@ tlg-ipam/
 │       │   ├── hosts.py
 │       │   ├── device_types.py
 │       │   ├── agents.py     # agents, agent tokens (hashed), agent-token authentication
-│       │   ├── scans.py      # scan targets; scan_scope, the one place scan scope is computed
+│       │   ├── scans.py      # scan targets; scan_scope, the one place scan scope is computed; request-scan and its cooldown
+│       │   ├── jobs.py       # agent check-in, due targets, job leases
 │       │   └── changes.py    # audit log writes + reads
 │       └── routers/
 │           ├── sections.py
@@ -470,6 +510,7 @@ tlg-ipam/
 │           ├── hosts.py
 │           ├── device_types.py
 │           ├── agents.py     # owner CRUD on /api/v1/agents
+│           ├── agent.py      # agent-facing /api/v1/agent/* (agent token only)
 │           ├── scan_targets.py # owner CRUD on /api/v1/scan-targets
 │           └── changes.py
 └── web/
@@ -543,6 +584,10 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 - The owner key is refused on agent routes; an agent token is refused on owner routes and on `/mcp`. A revoked token, and the token of a disabled agent, are refused.
 - A subnet's scan scope leaves out network and broadcast, the DHCP pool unless pool scanning is on, and every excluded reserved range; an address in both an excluded and a scanned range is excluded. Ranges from a database made before scan exclusion existed read as scanned.
 - Scan targets are refused for prefixes shorter than `/20` and for method sets without `icmp` or `arp`. Deleting a subnet deletes its scan target; deleting an agent unassigns its targets. Every scan-target and scan-exclusion change is in the change log.
+- A scan target is issued to its agent at check-in when its interval has passed or a scan was requested, and is not issued again while its lease is live; an expired lease makes it due again. A job's ranges are the scan scope, and `arp` is dropped for a subnet that is not on the agent's link; a target with no liveness method left gets no job.
+- A check-in on another protocol gets no jobs and a `409 PROTOCOL_MISMATCH`, recorded in the agent's `last_error`. Agent-reported fields are length-capped and printable-only; a check-in that breaks either is refused and recorded the same way.
+- A second scan request for a subnet within 15 minutes is refused, whoever asks.
+- An agent checks in at most once every 10 seconds, and keeps at most 100 audit entries of its own; text it reports about itself never reaches an assistant through `list_changes`. A target whose jobs keep timing out does not starve the agent's other due targets.
 
 ### Testing
 - pytest covers CIDR/IP validation, CIDR child invariants, explicit-null updates, the overlap rule, interval maths, consistent backups, MCP clearing, and next-free allocation edge cases.

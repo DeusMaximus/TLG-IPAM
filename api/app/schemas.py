@@ -3,6 +3,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .agent_protocol import ScanRange
 from .ipnet import normalise_domain, normalise_mac, parse_ip
 
 HostStatus = Literal["active", "reserved", "dhcp", "offline"]
@@ -352,6 +353,9 @@ class AgentOut(BaseModel):
     interfaces: list | None
     last_checkin_at: datetime | None
     last_error: str | None
+    # the agent's own record of its last job; it is busy while that is live
+    current_job_id: str | None
+    job_issued_at: datetime | None
     created_at: datetime
     tokens: list[TokenOut]
 
@@ -400,11 +404,6 @@ class ScanTargetUpdate(BaseModel):
         return v
 
 
-class ScanRange(BaseModel):
-    start: str
-    end: str
-
-
 class ScanTargetOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -418,6 +417,7 @@ class ScanTargetOut(BaseModel):
     scan_requested_at: datetime | None
     current_job_id: str | None
     job_issued_at: datetime | None
+    job_methods: list[str] | None
     created_at: datetime
     last_scan_at: datetime | None
     last_scan_duration_ms: int | None

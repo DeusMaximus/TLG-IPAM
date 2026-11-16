@@ -14,7 +14,7 @@ from .config import settings
 from .database import SessionLocal, init_models
 from .errors import ApiError
 from .mcp_server import mcp
-from .routers import agents, changes, device_types, hosts, scan_targets, sections, subnets
+from .routers import agent, agents, changes, device_types, hosts, scan_targets, sections, subnets
 from .services.backups import create_snapshot
 from .services.device_types import seed_defaults
 
@@ -101,8 +101,9 @@ for router in (
 ):
     app.include_router(router, prefix="/api/v1", dependencies=[Depends(require_api_key)])
 
-# `/api/v1/agent/*` (check-in, results: #10) will be its own router guarded by
-# `auth.require_agent` alone, never `require_api_key`.
+# `/api/v1/agent/*` is guarded by `auth.require_agent` alone (on the router itself),
+# never `require_api_key`: it must not join the loop above.
+app.include_router(agent.router, prefix="/api/v1")
 
 # Bearer auth for /mcp is the FastMCP server's own `auth=` (mcp_server.py).
 app.mount("/mcp", mcp_app)
