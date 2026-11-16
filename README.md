@@ -78,7 +78,7 @@ This release does ICMP and reverse DNS. MAC collection (`arp`) comes in a later 
      ghcr.io/deusmaximus/tlg-ipam-agent:<version>
    ```
 
-   Host networking puts the agent on the VLAN itself, and `NET_RAW` lets it send ICMP echo requests. Rootless container runtimes cannot grant a usable `NET_RAW` on the host network and are not supported.
+   Host networking puts the agent on the VLAN itself, and `NET_RAW` lets it send ICMP echo requests. `--cap-add NET_RAW` adds that capability to Docker's default set rather than leaving the container with it alone; add `--cap-drop ALL` before it if you want only that one. Rootless container runtimes cannot grant a usable `NET_RAW` on the host network and are not supported.
 3. Assign the subnet to the agent in the subnet's **Scanning** section, and save. `docker logs tlg-ipam-agent` shows each check-in refusal, each job and how it ended.
 
 The image is not published yet. Until it is, build it from this repository and tag it with the version in the command:
@@ -94,7 +94,7 @@ docker build -f agent/Dockerfile -t ghcr.io/deusmaximus/tlg-ipam-agent:<version>
 | `IPAM_URL` | (required) | The server's URL. Must be `https://`: the token is a credential, and the server's certificate is always verified, with no setting to turn that off. Plain `http://` is accepted only for a server on the agent host's own loopback address (`http://127.0.0.1:8080`). |
 | `IPAM_AGENT_TOKEN` | (required) | The `tlga_…` token from the Agents page. |
 | `ALLOWED_CIDRS` | `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10` | The agent's own limit on what it will scan, whatever the server asks. A job for a subnet outside it is refused without a packet being sent, and the subnet's Scanning section shows why. Set it to your own networks if they use other ranges. |
-| `MAX_PPS` | `200` | The most packets a second a scan sends (1–1000). |
+| `MAX_PPS` | `200` | The most packets a second a scan sends (1–1000): echo requests and DNS queries together, each failover to another DNS server counted. |
 
 A server certificate from a private CA: mount the CA's bundle and point `SSL_CERT_FILE` at it, for example `-v /etc/ipam-ca.pem:/etc/ipam-ca.pem:ro -e SSL_CERT_FILE=/etc/ipam-ca.pem`. The bundle replaces the system's trusted CAs for the agent, so it has to contain the CA that signed the server's certificate.
 
@@ -103,6 +103,9 @@ A server certificate from a private CA: mount the CA's bundle and point `SSL_CER
 - **Rate limited (`429`) or unavailable (`503`, other 5xx), or no answer:** it tries again after 10 seconds, then waits up to twice as long each time, never more than 5 minutes, with random jitter.
 - **Token refused (`401`/`403`), protocol mismatch (`409`), or a check-in the server could not read (`422`):** each needs you (a new token, re-enabling the agent, the agent release that matches the server), so it tries again every 15 minutes rather than hammering the server. The Agents page shows a protocol mismatch.
 - A refused check-in never starts a scan. A scan that runs out of time (10 minutes) reports what it found as incomplete, which only adds to what the server knows.
+- Every request to the server is abandoned after 30 seconds, however slowly the answer arrives, and is retried as above.
+
+The log shows each refusal as its HTTP status and error code (`HTTP 409 PROTOCOL_MISMATCH`), never the server's message: the Agents page shows the full reason. The agent's token is replaced with `tlga_[redacted]` in anything it logs.
 
 ## Development
 

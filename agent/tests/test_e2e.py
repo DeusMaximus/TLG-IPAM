@@ -262,8 +262,8 @@ async def test_a_superseded_result_set_is_not_retried(owner):
     posted = []
     real = agent.client.results
 
-    async def counting(body):
-        answer = await real(body)
+    async def counting(body, **kwargs):
+        answer = await real(body, **kwargs)
         posted.append(answer)
         return answer
 

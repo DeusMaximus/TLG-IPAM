@@ -9,7 +9,7 @@ import sys
 
 from . import __version__, config, interfaces
 from .client import AgentClient, make_http
-from .loop import Agent, log
+from .loop import Agent, Redact, log
 from .probe import DnsResolver, IcmpProber
 
 
@@ -29,6 +29,16 @@ async def _run(cfg: config.Config) -> None:
         await agent.run(stop)
 
 
+def configure_logging(token: str | None) -> None:
+    """Log to stderr; once the token is known, every handler redacts it, so the agent's
+    own records and every library's are covered."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    if token:
+        for handler in logging.getLogger().handlers:
+            if not any(isinstance(f, Redact) for f in handler.filters):
+                handler.addFilter(Redact(token))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="tlg-ipam-agent",
@@ -37,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--version", action="version", version=__version__)
     parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    configure_logging(None)
     if sys.platform != "linux":
         log.error("the agent runs on Linux only (spec §5.6)")
         return 2
@@ -46,6 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     except config.ConfigError as exc:
         log.error("%s", exc)
         return 2
+    configure_logging(cfg.token)
     log.info(
         "tlg-ipam-agent %s: server %s, ALLOWED_CIDRS %s, MAX_PPS %d",
         __version__,

@@ -55,7 +55,7 @@ def _client(status, body=None, *, content=None):
      (413, Kind.REFUSED), (422, Kind.REFUSED), (301, Kind.REFUSED)],
 )
 async def test_answers_are_sorted(status, kind):
-    body = {"data": {}} if status == 200 else {"error": {"code": "X", "message": "m"}}
+    body = {"data": {"checkin_interval_s": 60, "jobs": []}} if status == 200 else {"error": {"code": "X", "message": "m"}}
     answer = await _client(status, body).checkin({})
     assert answer.kind is kind
     assert answer.status == status

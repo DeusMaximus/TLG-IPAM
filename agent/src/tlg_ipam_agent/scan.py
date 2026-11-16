@@ -2,7 +2,8 @@
 answered, inside the job's timeout (spec §5.2, §5.6).
 
 Every packet goes to an address `guard.plan` returned, or, for a PTR lookup, to one of
-the job's DNS servers. Sends are paced at `MAX_PPS` across the whole job. The result
+the job's DNS servers. Every packet is paced at `MAX_PPS` across the whole job: each
+echo request, and each DNS query, a failover to the next server included. The result
 set is `complete` only when every issued method ran over every address before the
 timeout; otherwise it reports what it saw, which the server only adds (spec §5.7).
 """
@@ -57,7 +58,15 @@ class _Pool:
     paced, none started after `deadline`, and none given longer than what is left
     before it. Returns whether every item started and finished before the deadline."""
 
-    def __init__(self, limit: int, item_timeout: float, pacer: Pacer, clock: Clock, deadline: float):
+    def __init__(
+        self,
+        limit: int,
+        item_timeout: float,
+        pacer: Pacer | None,
+        clock: Clock,
+        deadline: float,
+    ):
+        """`pacer` paces each start; None when the work paces its own sends."""
         self._sem = asyncio.Semaphore(limit)
         self._item_timeout = item_timeout
         self._pacer, self._clock, self._deadline = pacer, clock, deadline
@@ -83,7 +92,8 @@ class _Pool:
                 if failed:
                     break
                 await self._sem.acquire()
-                await self._pacer.wait()
+                if self._pacer is not None:
+                    await self._pacer.wait()
                 if failed:
                     self._sem.release()
                     break
@@ -166,11 +176,19 @@ async def run(
     if "rdns" in job.methods and alive and not timed_out:
 
         async def lookup(address: Address, timeout: float) -> None:
-            name = rdns_name(await resolver.ptr(address, job.dns_servers, timeout))
+            end = clock.monotonic() + timeout
+
+            async def slot() -> float:
+                # one packet from the budget the ICMP sweep drew on, before each query
+                await pacer.wait()
+                return end - clock.monotonic()
+
+            name = rdns_name(await resolver.ptr(address, job.dns_servers, slot))
             if name is not None:
                 names[address] = name
 
-        if not await _Pool(RDNS_CONCURRENCY, RDNS_TIMEOUT_S, pacer, clock, deadline).run(sorted(alive), lookup):
+        # unpaced here: the resolver takes a slot for every query it sends
+        if not await _Pool(RDNS_CONCURRENCY, RDNS_TIMEOUT_S, None, clock, deadline).run(sorted(alive), lookup):
             timed_out = True
             errors.append(f"timed out after {job.timeout_s} s during the PTR lookups")
     if timed_out:

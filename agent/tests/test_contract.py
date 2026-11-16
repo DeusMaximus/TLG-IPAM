@@ -87,11 +87,23 @@ def test_a_refusal_is_a_result_set_the_server_accepts():
     assert request.complete is False and request.observations == [] and request.error
 
 
+# names of exactly the cap and one past it, with and without the trailing dot the
+# rule removes first: a cut-off moved by one either way fails here
+_253 = ".".join(["a" * 63] * 3 + ["b" * 61])
+_254 = ".".join(["a" * 63] * 3 + ["b" * 62])
+assert (len(_253), len(_254)) == (253, 254)
 NAMES = [
     "nas.home.arpa", "NAS.Home.Arpa.", "a", "a-b.c", "-a.b", "a-.b", "a..b", "", ".", "..",
     "a" * 63, "a" * 64, ".".join(["a" * 63] * 4), "x_y.home.arpa", "é.home.arpa",
     "xn--bcher-kva.example", "a b", "a\n", "<b>", None, 5, ["a"],
+    _253, _253 + ".", _253 + "..", _254, _254 + ".", "a" * 63 + "." + "b" * 63,
+    "0", "9.9", "a-" * 31 + "a", "-", "a.-", "A" * 63, "a.b.", ".a", "a\u00a0b",
 ]
+
+
+def test_the_boundary_names_sit_either_side_of_the_cap():
+    assert server.rdns_name(_253) == _253 and server.rdns_name(_253 + ".") == _253
+    assert server.rdns_name(_254) is None and server.rdns_name(_254 + ".") is None
 
 
 @pytest.mark.parametrize("value", NAMES)
@@ -100,7 +112,12 @@ def test_rdns_rule_matches_the_server(value):
 
 
 @pytest.mark.parametrize(
-    "value", [None, "", "  ", "a\nb", "x" * 900, "tab\there", "‮evil", "ok", "a\x00b  c"]
+    "value",
+    [
+        None, "", "  ", "a\nb", "x" * 900, "tab\there", "\u202eevil", "ok", "a\x00b  c",
+        # the 500-character cut, at it and either side, and a cut that lands on a space
+        "x" * 499, "x" * 500, "x" * 501, "x" * 499 + " y", " " * 600 + "z", "é" * 501,
+    ],
 )
 def test_scan_error_rule_matches_the_server(value):
     assert protocol.scan_error(value) == server.scan_error(value)

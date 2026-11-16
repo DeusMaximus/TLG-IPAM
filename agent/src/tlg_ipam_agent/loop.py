@@ -39,6 +39,30 @@ from .protocol import (
 
 log = logging.getLogger("tlg_ipam_agent")
 
+REDACTED = "tlga_[redacted]"
+
+
+class Redact(logging.Filter):
+    """Takes the agent's token out of every record a handler emits, traceback included.
+    A backstop: the agent logs no text the server wrote (`client.Answer.message`), but
+    an exception or a library's own log line could still carry the token."""
+
+    def __init__(self, token: str):
+        super().__init__()
+        self.token = token
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if self.token in message:
+            record.msg, record.args = message.replace(self.token, REDACTED), None
+        if record.exc_info and not record.exc_text:
+            record.exc_text = logging.Formatter().formatException(record.exc_info)
+        if record.exc_text and self.token in record.exc_text:
+            record.exc_text = record.exc_text.replace(self.token, REDACTED)
+        if record.stack_info and self.token in record.stack_info:
+            record.stack_info = record.stack_info.replace(self.token, REDACTED)
+        return True
+
 # the server's interval is honoured inside these bounds
 INTERVAL_MIN_S = 10
 INTERVAL_MAX_S = 3600
@@ -89,10 +113,9 @@ class Agent:
         answer = await self.client.checkin(checkin_body(self.interfaces()))
         if answer.kind is Kind.OK:
             self.backoff.reset()
-            self._queue_jobs(answer.data.get("jobs"))
-            interval = answer.data.get("checkin_interval_s")
-            if type(interval) is not int:
-                interval = INTERVAL_MIN_S * 6
+            # `data` has the check-in shape: an integer interval and a list of jobs
+            self._queue_jobs(answer.data["jobs"])
+            interval = answer.data["checkin_interval_s"]
             return float(min(max(interval, INTERVAL_MIN_S), INTERVAL_MAX_S))
         if answer.kind is Kind.RETRY:
             wait = self.backoff.next()
@@ -146,24 +169,32 @@ class Agent:
 
     async def report(self, body: dict, received: float) -> None:
         """Post a result set, retrying on the back-off while the job's lease could still
-        be live. Any refusal of it (409 JOB_NOT_CURRENT, 413, 422, 401, 403) is final."""
+        be live. Each request is cut off when the lease runs out, so a server that
+        drips its answer cannot hold the worker past it. An acknowledgment that is not
+        the results shape is retried like a 503. Any refusal of the result set (409
+        JOB_NOT_CURRENT, 413, 422, 401, 403) is final."""
         backoff = Backoff(self.rng)
+        end = received + LEASE_S
         while True:
-            answer = await self.client.results(body)
+            left = end - self.clock.monotonic()
+            if left <= 0:
+                log.error("results of job %s not delivered before its lease ran out", body["job_id"])
+                return
+            answer = await self.client.results(body, budget=left)
             if answer.kind is Kind.OK:
-                rejected = answer.data.get("rejected") or []
+                # validated counts only (`client.results_data`)
                 log.info(
-                    "job %s reported: %s accepted, %d rejected",
+                    "job %s reported: %d accepted, %d rejected",
                     body["job_id"],
-                    answer.data.get("accepted"),
-                    len(rejected) if isinstance(rejected, list) else 0,
+                    answer.data["accepted"],
+                    answer.data["rejected"],
                 )
                 return
             if answer.kind is Kind.REFUSED:
                 log.error("results of job %s refused (%s)", body["job_id"], answer.message)
                 return
             wait = backoff.next()
-            if self.clock.monotonic() + wait > received + LEASE_S:
+            if self.clock.monotonic() + wait > end:
                 log.error(
                     "results of job %s not delivered before its lease ran out (%s)",
                     body["job_id"],

@@ -169,7 +169,7 @@ async def test_accepted_checkin_resets_the_backoff():
     assert await agent.checkin_once() <= 2 * CHECKIN_RETRY_MIN_S
 
 
-@pytest.mark.parametrize("interval,expected", [(60, 60), (1, 10), (0, 10), (10**9, 3600), ("60", 60)])
+@pytest.mark.parametrize("interval,expected", [(60, 60), (1, 10), (0, 10), (10**9, 3600)])
 async def test_server_interval_is_honoured_within_bounds(interval, expected):
     server = FakeServer(checkins=[(200, {"data": {"checkin_interval_s": interval, "jobs": []}})])
     agent, _ = make_agent(server)
@@ -348,11 +348,11 @@ async def test_a_failure_while_reporting_does_not_stop_the_next_job():
     real = agent.client.results
     calls = []
 
-    async def flaky(body):
+    async def flaky(body, **kwargs):
         calls.append(body["job_id"])
         if len(calls) == 1:
             raise RuntimeError("bug")
-        return await real(body)
+        return await real(body, **kwargs)
 
     agent.client.results = flaky
     await agent.checkin_once()

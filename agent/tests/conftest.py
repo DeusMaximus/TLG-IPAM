@@ -7,6 +7,7 @@ import ipaddress
 import json
 import os
 import random
+import shutil
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -25,6 +26,13 @@ _SESSION_DIR = tempfile.mkdtemp(prefix="tlg-ipam-agent-test-")
 os.environ["API_KEY"] = "test-key"
 os.environ["DB_PATH"] = os.path.join(_SESSION_DIR, "ipam.db")
 os.environ["STATIC_DIR"] = os.path.join(_SESSION_DIR, "no-static")
+
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """The session's database goes with the session."""
+    shutil.rmtree(_SESSION_DIR, ignore_errors=True)
+
 
 from tlg_ipam_agent import scan  # noqa: E402
 from tlg_ipam_agent.client import AgentClient  # noqa: E402
@@ -91,11 +99,18 @@ class FakeResolver:
         self.names = {ipaddress.ip_address(k): v for k, v in (names or {}).items()}
         self.asked: list = []
         self.timeouts: list[float] = []
+        self.times: list[float] = []
         self.clock, self.delay = clock, delay
 
-    async def ptr(self, address, servers, timeout):
+    async def ptr(self, address, servers, slot):
+        # one query, so one packet from the budget, as the real resolver takes per server
+        timeout = await slot()
+        if timeout <= 0:
+            return None
         self.asked.append((address, servers))
         self.timeouts.append(timeout)
+        if self.clock is not None:
+            self.times.append(self.clock.t)
         if self.delay and self.clock is not None:
             await self.clock.sleep(self.delay)
         else:
