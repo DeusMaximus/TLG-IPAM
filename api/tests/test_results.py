@@ -20,7 +20,8 @@ from app.agent_protocol import (
 )
 from app.database import SessionLocal
 from app.models import Agent, Change, Host, Observation, ScanTarget
-from app.services import jobs, results, scans
+from app.schemas import ScanTargetUpdate, SubnetUpdate
+from app.services import jobs, results, scans, subnets
 
 from .conftest import make_host
 from .test_checkin import (  # noqa: F401 (agent_api is a fixture)
@@ -289,6 +290,47 @@ async def test_each_lease_copy_is_cleared_by_compare_and_set(client, agent_api, 
     row, me = await target_row(target["id"]), await agent_row(agent["id"])
     assert row.current_job_id == job["job_id"] and me.current_job_id == job["job_id"]
     assert row.last_scan_at is None and row.job_methods == job["methods"]
+
+
+async def _narrow_pool_scanning(target_id, subnet_id):
+    async with SessionLocal() as session:
+        await scans.update_target(session, target_id, ScanTargetUpdate(scan_dhcp_pool=False), "api")
+
+
+async def _move_the_pool(target_id, subnet_id):
+    async with SessionLocal() as session:
+        update_ = SubnetUpdate(dhcp_start="10.0.0.140", dhcp_end="10.0.0.199")
+        await subnets.update_subnet(session, subnet_id, update_, "api")
+
+
+@pytest.mark.parametrize(
+    "narrow, pool, scan_pool",
+    [
+        # the pool holds 10.0.0.145 and is scanned, then pool scanning is turned off
+        (_narrow_pool_scanning, "10.0.0.140", True),
+        # the pool is not scanned and starts above 10.0.0.145, then grows over it
+        (_move_the_pool, "10.0.0.150", False),
+    ],
+)
+async def test_a_scope_edit_committed_mid_ingest_is_the_scope_judged(
+    client, agent_api, monkeypatch, narrow, pool, scan_pool
+):
+    """The owner narrows the scope after ingest first read the target and subnet, but
+    before it takes the write lock: the records are judged by the scope as committed,
+    so an address the edit put out of scope is not stored."""
+    agent, token, subnet, target, job = await setup(
+        client, agent_api, subnet={**POOL, "dhcp_start": pool}, scan_dhcp_pool=scan_pool
+    )
+    real = results._release
+
+    async def owner_edits_meanwhile(session, agent_obj, target_obj, report):
+        await narrow(target["id"], subnet["id"])
+        return await real(session, agent_obj, target_obj, report)
+
+    monkeypatch.setattr(results, "_release", owner_edits_meanwhile)
+    data = await accepted(agent_api, token, job, [obs("10.0.0.10"), obs("10.0.0.145")])
+    assert data["rejected"] == [{"ip": "10.0.0.145", "reason": "out_of_scope"}]
+    assert set(await observations()) == {"10.0.0.10"}
 
 
 async def test_a_subnet_id_other_than_the_jobs_is_refused(client, agent_api):
