@@ -81,13 +81,28 @@ def _uvicorn(tmp_path, api_key):
     )
 
 
+def _stop(proc, reader=None):
+    """Stop the server if it still runs, reap it, and close its pipe, so a
+    failing test leaves no process behind."""
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    if reader is not None:
+        reader.join(timeout=10)
+    proc.stderr.close()
+
+
 @pytest.mark.parametrize(("value", "reason"), REFUSED.values(), ids=REFUSED.keys())
 def test_uvicorn_refuses_to_start(tmp_path, value, reason):
     proc = _uvicorn(tmp_path, value)
     try:
         _, stderr = proc.communicate(timeout=60)
     finally:
-        proc.kill()
+        _stop(proc)
     assert proc.returncode == 1, stderr
     assert reason in stderr
     assert "openssl rand -hex 32" in stderr
@@ -133,7 +148,4 @@ def test_uvicorn_starts_and_serves_with_a_real_key(tmp_path):
         )
         assert mcp.status_code == 200, mcp.text
     finally:
-        proc.terminate()
-        proc.wait(timeout=30)
-        reader.join(timeout=30)
-        proc.stderr.close()
+        _stop(proc, reader)
