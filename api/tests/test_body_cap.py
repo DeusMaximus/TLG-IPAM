@@ -14,6 +14,10 @@ from app.main import REQUEST_BODY_MAX
 
 from .conftest import make_section, make_subnet
 
+# The CSV columns the UI's import dialog sends (web/src/components/ImportModal.jsx),
+# read by `csvToHosts` (web/src/utils/csv.js).
+HOST_COLUMNS = ("ip", "hostname", "domain", "mac", "device_type", "status", "owner", "notes")
+
 
 def _over_cap() -> bytes:
     return b" " * (REQUEST_BODY_MAX + 1)
@@ -158,10 +162,9 @@ async def test_a_streamed_body_under_the_cap_is_read(client):
 
 
 async def test_the_largest_bulk_host_create_body_is_served(client):
-    """The largest the UI sends: 1,000 hosts (the `BulkImportRequest.hosts` cap) at
-    schema maxima — `hostname` 253, `owner` 120, `device_type` 40, `mac` — with the
-    schema-unbounded `domain` and `notes` at 100 and 500 bytes, as the import CSV
-    columns carry them."""
+    """A large UI batch at the schema's bounded maxima — 1,000 hosts (the
+    `BulkImportRequest.hosts` cap), `hostname` 253 — served; `notes` and `domain` are
+    unbounded in the schema, so the bounded-max body is the schema-derived largest."""
     subnet = await make_subnet(client, (await make_section(client))["id"])
     hosts = [
         {
@@ -177,13 +180,45 @@ async def test_the_largest_bulk_host_create_body_is_served(client):
         for i in range(1, 1001)
     ]
     body = json.dumps({"hosts": hosts}).encode()
-    assert len(body) < REQUEST_BODY_MAX  # the largest legitimate bulk body
+    assert len(body) < REQUEST_BODY_MAX
     res = await client.post(
         f"/api/v1/subnets/{subnet['id']}/hosts/bulk",
         content=body,
         headers={"Content-Type": "application/json"},
     )
     assert res.status_code == 200, res.text
+
+
+async def test_the_largest_import_csv_the_ui_sends_is_served(client):
+    """The bulk-import regression (the briefed round's P2): the UI's own converter
+    (`web/src/utils/csv.js::csvToHosts`) produces a 1,000-row CSV with 2,300-character
+    notes — `JSON.stringify({hosts})` measures 2,352,466 bytes — and the route serves
+    it, the per-record outcome included (asserted, not only the 200). `notes` and
+    `domain` are unbounded in the schema, so the default cap is a supported budget
+    above this (`main.REQUEST_BODY_MAX`)."""
+    # the CSV the UI's import dialog sends: header row + one row per host; only the
+    # `ip` column is required, and the `notes` column is long (2,300 chars).
+    csv = "ip,hostname,notes\n" + "\n".join(
+        f"10.20.{i // 256}.{i % 256},host{i},{'n' * 2300}" for i in range(1, 1001)
+    )
+    # `csvToHosts`' shape: the non-blank cells of each row, per the CSV columns.
+    rows = [line.split(",") for line in csv.splitlines()]
+    headers = [h.strip().lower() for h in rows[0]]
+    hosts = [
+        {h: v for h, v in zip(headers, row) if h in HOST_COLUMNS and v != ""} for row in rows[1:]
+    ]
+    body = json.dumps({"hosts": hosts}).encode()
+    assert len(body) > 2 * 1024 * 1024  # the old 2 MiB cap would refuse this body
+    subnet = await make_subnet(client, (await make_section(client))["id"], "10.20.0.0/20")
+    res = await client.post(
+        f"/api/v1/subnets/{subnet['id']}/hosts/bulk",
+        content=body,
+        headers={"Content-Type": "application/json"},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert data["created"] == 1000, data
+    assert data["errors"] == 0, data
 
 
 async def test_an_over_cap_body_on_the_mcp_mount_is_refused(anon_client):

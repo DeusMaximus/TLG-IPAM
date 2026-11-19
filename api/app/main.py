@@ -56,12 +56,15 @@ class MCPPathRewriteMiddleware:
 
 
 # The one limit on the size of a request body, applied before the body is buffered and
-# before any route or dependency runs (`RequestBodyCapMiddleware`). 2 MiB: the largest
-# legitimate bodies are the bulk host create — measured at 1,123,579 bytes, the largest
-# the UI sends (1,000 hosts, the `BulkImportRequest.hosts` cap, at schema maxima) — and
-# the 2 MiB results body #11 capped `POST /api/v1/agent/results` with
-# (`agent_protocol.RESULTS_BODY_MAX`, replaced by this shared cap).
-REQUEST_BODY_MAX = 2 * 1024 * 1024
+# before any route or dependency runs (`RequestBodyCapMiddleware`). 4 MiB: the largest
+# legitimate bodies are the bulk host create — measured through the UI's own
+# `csvToHosts` (web/src/utils/csv.js): a 1,000-row import (the `BulkImportRequest.hosts`
+# cap, `api/app/schemas.py:275`) with 2,300-character notes measures 2,352,466 bytes —
+# `notes` and `domain` are unbounded in the schema, so the default is the supported
+# budget, measured from the largest the UI sends — and the 2 MiB results body #11
+# capped `POST /api/v1/agent/results` with (`agent_protocol.RESULTS_BODY_MAX`, replaced
+# by this shared cap; the largest legitimate results body measures 1,429,733 bytes).
+REQUEST_BODY_MAX = 4 * 1024 * 1024
 
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
@@ -100,7 +103,8 @@ class RequestBodyCapMiddleware:
     the cap. Either way the answer is 413 in the `{"error": {"code", "message"}}`
     shape, and neither the authentication dependency nor the JSON parser runs. One cap
     for every route, the `/mcp` mount included: a tool call carries its arguments in
-    the body. A body at the cap is served.
+    the body. The cap limits one payload, not aggregate anonymous memory or upload
+    duration. A body at the cap is served.
     """
 
     def __init__(self, app):
