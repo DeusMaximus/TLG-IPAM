@@ -143,6 +143,20 @@ async def test_a_body_at_the_cap_is_served_on_an_owner_route(client):
     assert res.status_code == 200, res.text
 
 
+async def test_a_streamed_body_under_the_cap_is_read(client):
+    """A chunked body under the cap is replayed to the app, which reads the one
+    coalesced message (`api/app/main.py` — the streaming path's read side)."""
+
+    async def chunks():
+        yield b'{"host_ids": ["'
+        yield b'nope"]}'
+
+    res = await client.post(
+        "/api/v1/hosts/bulk-delete", content=chunks(), headers={"Content-Type": "application/json"}
+    )
+    assert res.status_code == 200, res.text
+
+
 async def test_the_largest_bulk_host_create_body_is_served(client):
     """The largest the UI sends: 1,000 hosts (the `BulkImportRequest.hosts` cap) at
     schema maxima — `hostname` 253, `owner` 120, `device_type` 40, `mac` — with the

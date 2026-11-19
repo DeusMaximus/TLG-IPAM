@@ -127,20 +127,24 @@ class RequestBodyCapMiddleware:
             # method without one is read by the app as before.
             await self.app(scope, receive, send)
             return
-        messages = []
         body = bytearray()
+        end = None  # the one message the app reads: the payload, or the disconnect
         while True:
             message = await receive()
-            messages.append(message)
             if message["type"] != "http.request":
-                break  # http.disconnect: pass it on; the app sees the same disconnect
+                end = message  # http.disconnect: the app reads it, as before
+                break
             body += message.get("body", b"")
             if len(body) > REQUEST_BODY_MAX:
                 await self._refuse(send)
                 return
             if not message.get("more_body", False):
                 break
-        await self.app(scope, _replays(messages, receive), send)
+        if end is None:
+            # One message for the app: the whole payload, or nothing when the body
+            # was empty. Every read is gone but the payload bytes.
+            end = {"type": "http.request", "body": bytes(body), "more_body": False}
+        await self.app(scope, _replays([end], receive), send)
 
     async def _refuse(self, send):
         body = json.dumps(
