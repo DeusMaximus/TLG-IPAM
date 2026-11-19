@@ -27,21 +27,41 @@ Template:
 
 ---
 
-## 2026-11-19 — Claude Code (Fable 5.2), orchestrator — #60 model trial: two PRs open, one ready, the owner picks
-- **Done:** a one-off trial the owner authorised: #60 (request-body cap) implemented twice, at once, from `main` at `8b14013`, by two workers given the same brief. No other issue ran. Nothing is merged.
-  - **Lane A, Claude Opus 5.5:** [PR #80](https://github.com/DeusMaximus/TLG-IPAM/pull/80), branch `60-body-cap-opus`, head `ee8ef97`. New `api/app/body_limit.py` (`BODY_MAX`, 2 MiB; `BodyLimitMiddleware`, outermost, covers `/mcp`). CI green. Codex: one P1 on the first head (a small `Content-Length` beside `Transfer-Encoding: chunked` passed the cap under uvicorn's h11), fixed; clean on `ee8ef97`. Briefed round (Codex, GPT-6.1 Sol): **GO at `ee8ef97`**, two P3s. Measured by the orchestrator at that head: 726 server tests; raw-socket probes against a running uvicorn on both HTTP parsers.
-  - **Lane B, Tidepool Alpha (through OpenCode, runtime mode `auto`):** [PR #81](https://github.com/DeusMaximus/TLG-IPAM/pull/81), branch `60-body-cap-tidepool`, head `e3c7827`, four commits. Codex: a P2 on each of the first two heads (non-body methods uncapped; every streamed message retained), both fixed; clean on the last two. Briefed round: **NO-GO at `2b1e7e2`** (P2: the PR called a 1.12 MB sample "the largest the UI sends" while `notes` and `domain` are unbounded, and a valid 2.35 MB import that `main` serves got 413). The worker answered by raising the cap to 4 MiB (`e3c7827`). The owner stopped the lane there: no second round ran, and the PR body still describes `2b1e7e2`.
-  - Greptile reviewed neither PR: its monthly cap is reached until 2026-11-22. Its MCP `trigger_code_review` is still untried.
-- **Decisions (the owner's):** the trial was called once lane A had a GO and lane B had a NO-GO. The roster in `.agents/orchestration.md` is unchanged.
-- **State:** `main` is `8b14013` plus this entry; CI was green on it. Both PRs are open, both say they close #60, and #60 is open. Both remote branches exist. No worker and no review is running.
-  - Lane B changed two things outside its worktree's remit, both undone: it wrote a `[user]` identity into the repository's shared git config (removed; its first two commits carry that identity), and it edited `HANDOFF.md` and the archive and asked to commit them on `main` (stopped at the approval prompt by the owner; files restored). Check `git config --local --get-regexp user` prints nothing before committing here.
-  - Both heads refuse an import over the cap that `main` serves today. PR #80 states this as Deliberate call 7 and in the brief; whether it ships as is, or with a follow-up (UI batching, or field limits on `notes` and `domain`), is the owner's call.
+## 2026-11-19 — Claude Code (Fable 5.2), orchestrator — #60 merged after a two-model trial; no work in flight
+- **Done:** a one-off trial the owner authorised: #60 (request-body cap) implemented twice, at once, from `main` at `8b14013`, by two workers given the same brief. No other issue ran.
+  - **Lane A, Claude Opus 5.5:** PR #80, merged as `2526705` on the owner's go-ahead; #60 closed. Its entry is below.
+  - **Lane B, Tidepool Alpha (through OpenCode, runtime mode `auto`):** [PR #81](https://github.com/DeusMaximus/TLG-IPAM/pull/81), closed unmerged as the comparison lane, last head `e3c7827`, four commits. Codex raised a P2 on each of its first two heads (non-body methods uncapped; every streamed message retained), both fixed. Briefed round (Codex, GPT-6.1 Sol): NO-GO at `2b1e7e2`: the PR called a 1.12 MB sample "the largest the UI sends" while `notes` and `domain` are unbounded, and a valid 2.35 MB import that `main` served got 413. The worker answered by raising the cap to 4 MiB; the owner stopped the lane there, before a second round.
+  - What the trial showed, for whoever seats a model next. Lane A: PR open in 17 minutes, handed back in 33, one briefed round to GO; its first head had the only real cap bypass (found by the orchestrator's probe and by Codex). Lane B: PR open in 35 minutes, handed back in 68; its counts matched every re-measurement and its first commit handled the framing case lane A missed, but it wrote a `[user]` identity into the repository's shared git config (removed; its commits are not on `main`), edited `HANDOFF.md` and asked to commit it on `main` (stopped at the approval prompt), and twice waited on Codex with a shell loop that could not end. One provider error (a 500 on a streamed response, recovered by itself), no rate limit, no refusal.
+  - Both remote branches are deleted. Greptile reviewed neither PR: its monthly cap is reached until 2026-11-22, so its MCP `trigger_code_review` is still untried.
+- **Decisions (the owner's):** #80 merges; the trial was called once lane A had a GO and lane B a NO-GO. The roster in `.agents/orchestration.md` is unchanged.
+- **State:** green. `main` is `2526705` plus this commit; CI is green on `2526705`. Measured on `main` after the merge: 726 server tests. `agent/` and `web/` are unchanged since the 2026-11-16 entry (374 and 85). No PR is open, no worker and no review is running.
+  - A clean Codex result is an issue comment ("Didn't find any major issues", naming the commit); only a result with findings is a review object. A worker that polls `pulls/<n>/reviews` never sees a clean one.
 - **Waiting on the owner:**
-  - Which PR merges. The orchestrator's recommendation is #80. On the owner's word: squash-merge it, close the other unmerged with a one-line comment that it was the comparison lane, delete both remote branches, and commit only the merged lane's hand-off entry (lane A's is in its thread's final message and in `.dev/60/` on the orchestrator's machine).
-  - Whether to file PR #80's two P3s: a `Content-Length` padded with thousands of zeroes answers 500 with a traceback before authentication under httptools (`body_limit._declared_length`), and the owner-key line in `AGENTS.md` still says every `/mcp` refusal is an RFC 6750 401.
-  - Whether to file a follow-up for what the cap does not bound: aggregate memory and upload duration for unauthenticated chunked bodies, before `/mcp` goes internet-facing in M3 (#26).
-  - Everything the 2026-11-16 orchestrator entry listed is still waiting: the five real-network checks on the scan agent (PR #70's body), #5 and #25 (`owner` label), and the three optional follow-ups from #13.
-- **Next:** once #60 is merged, the rest of wave 1 from the 2026-11-16 entry, unchanged: #14 (ARP sweep, `agent/`, briefed round), #65 (datetime offsets), #79 (`mcp_server.py`, `services/findings.py`, briefed round). Then wave 2: #78, #75, #68; #20 last. After M2a: M2b (#21–#24), then M3 (#26–#32). Open in M2a, all ready: #14, #60, #65, #68, #75, #78, #79, #20 (stretch).
+  - Whether to file three follow-ups from #80, none filed: (1) a `Content-Length` padded with thousands of zeroes answers 500 with a traceback before authentication under httptools, and one with trailing whitespace misses the unread refusal (`body_limit._declared_length`); (2) the owner-key line in `AGENTS.md` still says every `/mcp` refusal is an RFC 6750 401, and a 413 is not; (3) the cap bounds one body, not aggregate memory or upload duration for unauthenticated chunked bodies, which matters before `/mcp` is internet-facing (#26).
+  - Whether the new 2 MiB bound on a bulk import is acceptable as shipped. An import with long `notes` that `main` served before #80 is now 413 with the limit in the message (the round measured one at 2.22 MB). A follow-up could batch in the UI or bound `notes` and `domain` per field.
+  - Two lines proposed for the worker brief in `.agents/orchestration.md`, not added: how a clean Codex result arrives, and that a worker never changes git config.
+  - Everything the 2026-11-16 orchestrator entry listed: the five real-network checks on the scan agent (PR #70's body), #5 and #25 (`owner` label), and the three optional follow-ups from #13.
+- **Next:** the rest of wave 1 from the 2026-11-16 entry: #14 (ARP sweep, `agent/`, briefed round), #65 (datetime offsets in responses), #79 (`mcp_server.py`, `services/findings.py`, briefed round); no file in common. Wave 2 once those merge: #78 (same `agent/` files as #14, briefed round), then #75 and #68, which both edit `schemas.py` as #65 does. #20 (stretch) last; it must measure its largest `fdns` result set against `body_limit.BODY_MAX`. Then M2b (#21–#24) and M3 (#26–#32); the OAuth routes sit under the cap as mounted.
+
+## 2026-11-19 — Claude Code (Opus 5.5) — #60: one request-body cap (PR #80)
+- **Done:** [PR #80](https://github.com/DeusMaximus/TLG-IPAM/pull/80) closes #60, head `ee8ef97`.
+  - New `api/app/body_limit.py`: `BODY_MAX` (2 MiB), the only definition, and `BodyLimitMiddleware`, added last in `main.py` so it wraps the whole app.
+  - A declared `Content-Length` over the cap is `413 PAYLOAD_TOO_LARGE`, refused unread. A declared length is trusted only on a request with no `Transfer-Encoding`; any other body is counted and refused at the chunk that crosses the cap. The refusal sends `Connection: close`.
+  - It covers every route, `/mcp` included. `routers/agent.py` `_capped_json` and `agent_protocol.RESULTS_BODY_MAX` are removed.
+  - Docs: brief §4.3, §4.6, §5.1, §7 and §10; spec §5.7 and §6.6; an `AGENTS.md` invariant line.
+  - Tests: 726 server (687 + 39), 374 agent, 85 web; lint and build pass. No schema or lock change.
+  - **Merged:** `2526705`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #60 closed. The briefed round (Codex, GPT-6.1 Sol) ran after this entry was written: GO at `ee8ef97`, with two P3s the owner has not yet decided to file (a zero-padded `Content-Length` that answers 500 under httptools, and the `AGENTS.md` line that still calls every `/mcp` refusal an RFC 6750 401). Codex was clean on `ee8ef97`; Greptile did not review this PR (monthly cap). The orchestrator re-measured: 726 server tests on the head and on `main` after the merge, and raw-socket probes against a running uvicorn on both HTTP parsers, which found the `h11` bypass on the first head and pass on `ee8ef97`. #60 was also implemented by a second worker as a comparison (PR #81, closed unmerged); the orchestrator's entry above records it.
+- **Decisions:**
+  - 2 MiB on every route, measured: a full result set is 1,302,386 B; the UI's 1,000-row import with fields at their maximum is 785,571 B (ASCII) to 1,145,571 B (4-byte owner).
+  - `/mcp` is capped: its largest call, `bulk_create_hosts` with 1,000 rows, fits.
+  - A chunked body is buffered (at most the cap) before auth, so an over-cap one never reaches auth. This changes spec §5.7 and is listed under Deliberate calls.
+  - No `PROTOCOL_VERSION` bump.
+- **State:** CI green on `ee8ef97`. Codex: one P1 on `09a69a4` (`Content-Length` beside `Transfer-Encoding` under h11), the same as the orchestrator's P2. Fixed in `ee8ef97` and answered on both; Codex clean on `ee8ef97`. Greptile not run (monthly cap until 2026-11-22). The briefed round is owed and not yet run.
+- **Waiting on the owner:** the briefed round and the merge.
+- **Next:**
+  - #20 must measure its largest `fdns` result set against the cap: the schema allows 4,096 × 32 addresses, which would not fit.
+  - `notes` and `domain` have no per-field length limit, and the body cap is now their only bound. A per-field limit is a possible follow-up, not filed.
+  - #26 and #29 (the OAuth routes) sit under the cap automatically.
 
 ## 2026-11-16 — Claude Code (Fable 5.2), orchestrator — session end: fifteen PRs merged, no work in flight, next wave named
 - **Done:** fifteen PRs squash-merged on the owner's go-ahead, each with its worker's entry in this log or the archive (`grep -n '^## ' .agents/handoff/2026-11.md`): #55, #50, #10, #51, #16, #61, #18, #11, #12, #59, #73, #15, #13, #19, #17.
@@ -96,41 +116,3 @@ Template:
   - Backend follow-up: `start_int`/`end_int` on each `scope` range, or per-host scope membership on host responses. Then `utils/findings.scopeChecker` can answer `out` for every host outside scope.
   - #68: `ScanSettings` now takes `targetsRes` from `SubnetView`, and shows a failed reload of the target.
   - #17 and #13: whichever merges after this rebases on its brief §7 lines.
-
-## 2026-11-16 — Claude Code (Opus 5.5) — #13: scan agent package, through three briefed rounds (PR #70)
-- **Done:** [PR #70](https://github.com/DeusMaximus/TLG-IPAM/pull/70) closes #13, head `214fb82` (merges `main` at `9f47b28`: #59, #12, #15, #73). CI green. Agent 374, server 677 (674 on `main` + 3 new), Python 3.13.
-  - `agent/`, package `tlg-ipam-agent`, httpx + icmplib + dnspython, hashed locks constrained to `api/requirements-dev.txt`:
-    - Check-in loop with the spec §5.7 refusal rule (`agent_protocol.CHECKIN_RETRY_*`: 10–300 s jittered back-off; 13.5–15 min for refusals only the owner can clear). Only a 200 in the check-in shape queues a job.
-    - Jobs one at a time. `guard.plan` refuses before any packet a job outside `ALLOWED_CIDRS`, with ranges outside its subnet, or over 4,096 addresses, and reports the refusal.
-    - Paced ICMP sweep. PTR lookups sent query by query: one UDP query per server, at most 3 servers, EDNS(0)/1232, no retransmission, no TCP, truncated replies unused. Every datagram is paced by `MAX_PPS`; a lookup's 2 s start at its first slot.
-    - 10-minute timeout gives `complete: false`; `arp`/`fdns` not run here also give `complete: false`.
-    - HTTP: TLS always verified, https except to loopback; one 30 s deadline per request; results also capped by the lease; undecoded reads checked against 1 MiB before they are held.
-    - Logs: no server text (status, code, validated counts); the token is redacted.
-    - rtnetlink interfaces, at most `DUMP_MAX` held. Dockerfile: root in the container, `python -m`.
-  - CI: `agent` job (pytest; image built and started with `--network none`); `locks` job checks the agent locks.
-  - The one server rule change (`api/app/services/results.py`, round 3, owner's decision): an incomplete result set never clears a stored `rdns_name`; a name still replaces it. The wire is unchanged, so `PROTOCOL_VERSION` stays 1.
-  - Docs: `AGENTS.md` (invariant 1 bullet, agent commands and locks, ingest rule); README "Scan agent"; brief §2.2, §3.11, §4.6, §7, §10; spec §5.4, §5.6, §5.7.
-  - **Merged:** `de13ee9`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #13 closed. The fourth briefed round by GPT-6.1 Sol returned GO on `214fb82` with one P3, posted on the PR; it accepted the owner's server rule and confirmed with its own replays that names an incomplete scan never asked about now survive. Codex was clean on `214fb82`; Greptile last saw `cf65345`, which is optional after a GO at the current head. The orchestrator re-measured 374 agent and 677 server tests on the head and 677 on `main` after the merge, and confirmed the rule is guarded (two server and three agent end-to-end tests red without it). How the rounds went, since the order mattered: round 2 reviewed a head that moved under it, and its only blocker was already fixed; that second NO-GO went to the owner, who kept the worker on the issue. Round 3 found that an incomplete scan still cleared names it never looked up, because of an ingest rule from #11; the owner chose a server rule over leaving addresses out of the result set, which would have cost hosts their last-seen update on slow scans. The first round's review was posted by the orchestrator because the reviewer's own clean-up was refused by its sandbox; later briefs tell the reviewer to post first. Follow-ups filed on the owner's say-so: #75 (M2a) bounds a subnet's `dns_servers` and what a job carries; #78 (M2a, `briefed-review`) makes "no resolver to ask" an incomplete scan, not a complete one. Stated by the last review and worth carrying: a name kept by an incomplete scan can be stale, can raise a name finding, and can be accepted into a host; until #14, scans on an agent's own link are always incomplete. Not run, and the owner's to run: a real VLAN sweep, PTR lookups against the owner's DNS, TLS against the owner's certificate, the packet rate on the wire, and Python 3.11; commands are in the PR body. Live state after this merge: two PRs are open. #76 (#17, MCP tools) has a GO at `4ed7465` with three P3s (filed as #79) and the owner's approval to merge once its worker has merged this `main` in (one conflicted bullet in `AGENTS.md`). #77 (#19, findings UI) is at `1873ee8` with CI green and Codex clean, waiting on Greptile's re-review after the owner's retrigger. Also done the same day: #68 gained a scope-membership bullet from #19, and #26 and #28 a note on the order they ship in. Ready and not started: #14, #60, #65, #68, #75, #78, #79, #20. The `owner` issues #5 and #25 still wait on the owner.
-- **Reviews:**
-  - Codex: clean on `214fb82`; all Codex threads answered.
-  - Greptile: last reviewed `cf65345`, both findings fixed and answered; no re-review needed.
-  - Briefed rounds:
-    - Round 1 (NO-GO `797e249`): DNS pacing, HTTP deadline, acknowledgments and logs; fixed in `dbb2f1c`.
-    - Round 2 (NO-GO `ce60198`): low-rate PTR, the answer cap, truncated DNS replies; fixed in `9ea136b` and `e70d298`.
-    - Round 3 (NO-GO `cfe8208`): incomplete scans clearing names, plus the no-append test; fixed in `214fb82`.
-    - Round 4: can start now.
-- **Decisions:** 17 Deliberate calls in the PR body. Rewritten: 12 (DNS, with which dnspython settings are tested and which are belt and braces) and 15 (deadline and bounded read). New: 16 (logs) and 17 (the name rule, replacing call 3 of PR #64). Consequence of 17: until #14, on an agent's own subnet names are only set or replaced, never cleared.
-- **State:**
-  - No schema change.
-  - Server changes: the `agent_protocol.py` constants block and the one ingest rule.
-  - Agent locks are reproducible with uv 0.13.6.
-  - The agent test session deletes its temp directory.
-- **Waiting on the owner:**
-  - Briefed round 4.
-  - #75 (a server-side limit on `dns_servers`).
-  - Follow-ups to decide: an http-origin warning in the Add agent dialog; a resolver allowlist on the agent's host; pinning `python:3.13-slim` by digest.
-  - The five not-run network checks in the PR body.
-  - Merge.
-- **Next:**
-  - #14: ARP. Add `arp` to `protocol.SUPPORTED`, so complete scans mark addresses dead and clear names again. ARP requests take slots from the same `MAX_PPS` budget; report MACs.
-  - #22 and #24: the wheel, publishing the image, aligning versions.
