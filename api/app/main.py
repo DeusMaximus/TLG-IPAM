@@ -10,6 +10,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .auth import require_api_key
+from .body_limit import BodyLimitMiddleware
 from .config import settings
 from .database import SessionLocal, init_models
 from .errors import ApiError
@@ -55,6 +56,10 @@ class MCPPathRewriteMiddleware:
 
 
 app.add_middleware(MCPPathRewriteMiddleware)
+# Added last, so it wraps everything above: the body cap runs before routing, before any
+# route dependency (authentication included) and before any body is parsed, on every
+# route, `/mcp` included.
+app.add_middleware(BodyLimitMiddleware)
 
 
 @app.exception_handler(ApiError)

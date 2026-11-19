@@ -338,6 +338,13 @@ Agent-facing routes, `/api/v1/agent/*`, take an agent token instead (§3.9), as 
 { "error": { "code": "VALIDATION_ERROR", "message": "IP 10.10.30.300 is invalid" } }
 ```
 
+**Request bodies are capped at 2 MiB** (2,097,152 bytes, `body_limit.BODY_MAX`, the one place the limit is defined), on every route: owner, agent, and `/mcp` (§5.1). `BodyLimitMiddleware` wraps the whole app, so the cap runs before routing, before any authentication check and before any body is parsed. A larger body is `413 PAYLOAD_TOO_LARGE` "The request body may be at most 2097152 bytes", with `Connection: close`, whatever credentials it carries or lacks:
+
+- a declared `Content-Length` over the cap is refused with nothing read; one within it is left to the route to read, and the HTTP server delivers no byte past it;
+- any other body is read and counted, and refused at the chunk that would pass the cap: one sent without a `Content-Length` (chunked), and any request with a `Transfer-Encoding` header whatever its `Content-Length` says, since a server that accepts both frames the body by the chunks (uvicorn's h11 does; httptools refuses such a request with `400`). One that fits is handed to the route whole, so up to 2 MiB of such a body is held before authentication refuses it.
+
+The limit was chosen from the largest legitimate requests (#60): an agent's result set for a full /20, 4,094 records each with a MAC and a 253-character PTR name, is about 1.3 MB (§4.6); a bulk import of 1,000 hosts, the most one import takes, with every length-bounded field at its maximum (253-character hostname and domain, 120-character owner of 4-byte characters) is about 1.15 MB as the UI encodes it. `notes` has no length limit of its own: on a full 1,000-row import the cap leaves at least 940 bytes of notes per row (about 1,300 with an ASCII owner), and an import past it is refused whole with the `413`, to be split. A client that escapes non-ASCII as `\uXXXX` (Python's `json` by default) spends 12 bytes on a 4-byte character, so its worst case is larger than the UI's.
+
 `503 UNAVAILABLE` means the request was not served and wrote nothing, and the same request may succeed if retried. Today only agent routes return it, when the database refuses a write (§4.1): "Database busy; retry the request" for a lock, "Database unavailable; retry later" for anything else, which needs the owner. `500 INTERNAL_ERROR` is a failure the server caught before committing anything (§4.6).
 
 ### 4.4 Free-IP and allocation semantics
@@ -402,7 +409,7 @@ An accepted result set clears both copies of the lease (§4.6). Expiry clears ne
 { "data": { "accepted": 1, "rejected": [{ "ip": "10.0.20.150", "reason": "out_of_scope" }] } }
 ```
 
-- **Body.** Read only after the agent token is checked, and at most 2 MiB (`agent_protocol.RESULTS_BODY_MAX`): a larger declared or streamed body is `413 PAYLOAD_TOO_LARGE`, unparsed. Not JSON, not an object, or a field that fails validation is `422` "Result set refused: <field>: <reason>", never quoting the value: `complete` must be a JSON boolean, both times must carry a zone and `finished_at` must not precede `started_at`, `observations` holds at most 4,096 records, `fdns` entries are `{host_id, addresses}`. Unknown fields are ignored. Refusals are not recorded on the agent: the agent logs them, and the lease runs out.
+- **Body.** At most 2 MiB, the cap on every request body (§4.3): a larger declared or streamed body is `413 PAYLOAD_TOO_LARGE`, refused before the agent token is checked and unparsed. A body with a declared length is read only after the token is checked. Not JSON, not an object, or a field that fails validation is `422` "Result set refused: <field>: <reason>", never quoting the value: `complete` must be a JSON boolean, both times must carry a zone and `finished_at` must not precede `started_at`, `observations` holds at most 4,096 records, `fdns` entries are `{host_id, addresses}`. Unknown fields are ignored. Refusals are not recorded on the agent: the agent logs them, and the lease runs out.
 - **The job.** Accepted only while it is current on both copies of the lease: `job_id` equals the reporting agent's `current_job_id` and a target's `current_job_id`, whatever the target is assigned to now. Otherwise `409 JOB_NOT_CURRENT` and nothing is stored: the job was re-issued after expiry, the agent was given another, the target or its subnet was deleted, the token is another agent's, or a result set for the job was already accepted. A `subnet_id` that is not the job's is `422`. Accepting clears the target's `current_job_id`, `job_issued_at` and `job_methods` and the agent's `current_job_id` and `job_issued_at` in one transaction, each a compare-and-set on this job, so of two racing result sets one is accepted. It sets `last_scan_at` to the job's `job_issued_at`, records the duration, `complete` and `error` (§3.10), and leaves `scan_requested_at` alone, so a scan requested while the job ran is still due. The agent can be issued its next job at its next check-in.
 - **Each record** is judged on its own and a bad one never costs the others. A record is rejected, with its `ip` quoted back when that is a short, ASCII, printable string (null otherwise: JSON can carry a lone surrogate that UTF-8 cannot), for: `invalid` (not an object), `invalid_ip`, `invalid_mac`, `out_of_scope` (outside the subnet's scan scope at ingest, another address family included), `duplicate` (already in this result set), `mac_not_issued` (a MAC from a job not issued `arp`), `rdns_not_issued` (a name from a job not issued `rdns`). What a job could collect is `job_methods`, the methods the server issued, not what the agent says it ran or a later check-in's interfaces. A rejected record is not stored. An `rdns_name` that is not a hostname is not a rejection: it is dropped, and the address is stored without it (§3.11).
 - **Alive and dead.** Each accepted record is upserted `alive=true` with `last_seen_at` now. Only a result set with `complete: true` from a job issued `icmp` or `arp` marks every other observation in the subnet's scope `alive=false`; an address the result set named, even in a rejected record, is not marked. An incomplete job only adds what it saw.
@@ -475,14 +482,17 @@ app.mount("/mcp", mcp_app)
 
 Auth for `/mcp` is the same owner key (`API_KEY`), sent as a bearer token: `Authorization: Bearer <API_KEY>`. FastMCP enforces it through its own `auth=`: `OwnerKeyVerifier` in `auth.py` compares the token in constant time and grants the scopes `ipam:read` and `ipam:write`. No tool checks the scopes yet. `X-API-Key` is not accepted on `/mcp`, and an empty bearer is never the owner key (§4.1).
 
-A refused request gets FastMCP's RFC 6750 response, not the REST error envelope:
+A request refused for its credentials gets FastMCP's RFC 6750 response, not the REST error envelope; one refused for its size gets the REST envelope, before its credentials are looked at:
 
 | Request | Status | Response |
 |---|---|---|
 | No `Authorization: Bearer` header (none, `X-API-Key` only, or another scheme) | `401` | Empty body; `WWW-Authenticate: Bearer` |
 | A bearer that is not the owner key | `401` | `WWW-Authenticate: Bearer error="invalid_token", error_description="…"`; JSON body `{"error": "invalid_token", "error_description": "…"}` |
+| A body over 2 MiB, with or without a bearer | `413` | `{"error": {"code": "PAYLOAD_TOO_LARGE", "message": "…"}}`; `Connection: close` (§4.3) |
 
 Both `/mcp` and `/mcp/` behave the same.
+
+**`/mcp` is under the request-body cap (§4.3), not exempt from it.** A tool call carries its arguments in the body. The largest is `bulk_create_hosts` with 1,000 rows, the same batch as the REST import plus the JSON-RPC envelope, and the measured worst case fits (`test_the_largest_mcp_bulk_call_is_served`); every other tool takes one host, one range or a few ids. The cap is checked before the bearer, so an oversized body is `413` even without one. The MCP SDK has a 4 MiB limit of its own, but it sits behind FastMCP's authentication and so bounds only clients that already hold a credential; `/mcp` is the route that becomes internet-facing with remote MCP (v0.2 M3), where a limit that holds before authentication matters most.
 
 ### 5.2 MCP tool inventory
 
@@ -602,6 +612,7 @@ tlg-ipam/
 │       ├── schemas.py        # Pydantic request/response schemas
 │       ├── agent_protocol.py # the agent wire contract: check-in, job and result-set shapes, PROTOCOL_VERSION, sanitising agent text
 │       ├── auth.py           # owner-key check (REST dependency + /mcp bearer verifier); agent-token dependency
+│       ├── body_limit.py     # the one request-body cap (BODY_MAX), outermost middleware, every route and /mcp
 │       ├── mcp_server.py     # FastMCP tools (thin wrappers over services)
 │       ├── services/         # business logic — single source of truth
 │       │   ├── backups.py    # consistent SQLite online-backup snapshots
@@ -742,6 +753,7 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 - Settings exposes a SQLite backup download created through the online backup API rather than streaming the active database file.
 - `docs/backup-and-restore.md` describes a scheduled pull of `GET /api/v1/backup` from another host (dated files, retention) and a restore procedure; following it against a running instance produces a dated snapshot and a working restore from it. Its examples use placeholder domains only.
 - The container runs one uvicorn worker, pinned by `--workers 1` in the image's `CMD` (§2.2).
+- A request body over 2 MiB is `413 PAYLOAD_TOO_LARGE` on every route, `/mcp` included, before authentication or parsing, with a declared `Content-Length` and without one (§4.3).
 
 ### UI quality
 - Dark mode correct — no hardcoded colours bleeding through.
