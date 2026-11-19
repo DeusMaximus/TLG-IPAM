@@ -211,11 +211,6 @@ class CheckinResponse(BaseModel):
 
 # --- Results ---
 
-# The largest results body the server reads, in bytes; a larger one is refused with
-# `413` before it is parsed. A /20, the largest subnet with a scan target, has 4,094
-# usable addresses, and a record with a MAC and a 253-character name is under 330
-# bytes. (#60 replaces this with one cap applied to every route.)
-RESULTS_BODY_MAX = 2 * 1024 * 1024
 # records in one result set: every address of a /20
 OBSERVATIONS_MAX = 4096
 FDNS_MAX = 4096

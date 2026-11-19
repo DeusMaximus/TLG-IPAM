@@ -18,13 +18,13 @@ from sqlalchemy.exc import OperationalError
 from app.agent_protocol import (
     OBSERVATIONS_MAX,
     RDNS_NAME_MAX,
-    RESULTS_BODY_MAX,
     SCAN_ERROR_MAX,
     echo_ip,
     rdns_name,
     scan_error,
 )
 from app.database import SessionLocal
+from app.main import REQUEST_BODY_MAX
 from app.models import Agent, Change, Host, Observation, ReservedRange, ScanTarget, Token
 from app.schemas import ScanTargetUpdate, SubnetUpdate
 from app.errors import ApiError
@@ -1254,7 +1254,7 @@ async def _raw(agent_api, token, content, headers=None):
 
 async def test_a_body_over_the_cap_is_refused_unread(client, agent_api):
     agent, token, subnet, target, job = await setup(client, agent_api)
-    res = await _raw(agent_api, token, b" " * (RESULTS_BODY_MAX + 1))
+    res = await _raw(agent_api, token, b" " * (REQUEST_BODY_MAX + 1))
     assert res.status_code == 413
     assert res.json()["error"]["code"] == "PAYLOAD_TOO_LARGE"
     assert (await target_row(target["id"])).current_job_id == job["job_id"]
@@ -1264,7 +1264,7 @@ async def test_a_streamed_body_over_the_cap_is_refused(client, agent_api):
     agent, token, subnet, target, job = await setup(client, agent_api)
 
     async def chunks():
-        for _ in range(RESULTS_BODY_MAX // 65536 + 2):
+        for _ in range(REQUEST_BODY_MAX // 65536 + 2):
             yield b" " * 65536
 
     res = await _raw(agent_api, token, chunks())
@@ -1287,14 +1287,17 @@ async def test_a_body_at_the_cap_is_read(client, agent_api):
             "observations": [obs("10.0.0.10")],
         }
     ).encode()
-    body += b" " * (RESULTS_BODY_MAX - len(body))
+    body += b" " * (REQUEST_BODY_MAX - len(body))
     res = await _raw(agent_api, token, body, {"Content-Type": "application/json"})
     assert res.status_code == 200, res.text
 
 
-async def test_the_unauthenticated_are_refused_before_the_body_is_read(agent_api):
-    res = await agent_api.post("/api/v1/agent/results", content=b"x" * (RESULTS_BODY_MAX + 1))
-    assert res.status_code == 401
+async def test_the_unauthenticated_are_refused_by_the_shared_cap(agent_api):
+    """#60: the shared cap refuses an over-cap body before any route runs, so the
+    unauthenticated over-cap answer is the cap's `413`, not the authentication `401`."""
+    res = await agent_api.post("/api/v1/agent/results", content=b"x" * (REQUEST_BODY_MAX + 1))
+    assert res.status_code == 413
+    assert res.json()["error"]["code"] == "PAYLOAD_TOO_LARGE"
 
 
 async def _asgi_post(path: str, headers: dict[str, str], body: bytes) -> tuple[int, int]:
@@ -1340,7 +1343,7 @@ async def test_a_declared_length_over_the_cap_is_refused_without_reading(client,
         {
             "authorization": f"Bearer {token}",
             "content-type": "application/json",
-            "content-length": str(RESULTS_BODY_MAX + 1),
+            "content-length": str(REQUEST_BODY_MAX + 1),
         },
         b"{}",
     )

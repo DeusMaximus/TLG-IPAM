@@ -1,3 +1,4 @@
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -54,7 +55,114 @@ class MCPPathRewriteMiddleware:
         await self.app(scope, receive, send)
 
 
+# The one limit on the size of a request body, applied before the body is buffered and
+# before any route or dependency runs (`RequestBodyCapMiddleware`). 2 MiB: the largest
+# legitimate bodies are the bulk host create — measured at 1,123,579 bytes, the largest
+# the UI sends (1,000 hosts, the `BulkImportRequest.hosts` cap, at schema maxima) — and
+# the 2 MiB results body #11 capped `POST /api/v1/agent/results` with
+# (`agent_protocol.RESULTS_BODY_MAX`, replaced by this shared cap).
+REQUEST_BODY_MAX = 2 * 1024 * 1024
+
+_BODY_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _declared_length(scope: dict) -> int | None:
+    """The request's `Content-Length`, or None when it has none or it is not a number
+    (`scope["headers"]` is a list of lowercased-name byte pairs)."""
+    for name, value in scope.get("headers", []):
+        if name == b"content-length":
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
+def _replays(messages, receive):
+    """A `receive` that yields the messages the cap middleware already read, then the
+    original `receive` for anything after them."""
+    queue = iter(messages)
+
+    async def replayed():
+        try:
+            return next(queue)
+        except StopIteration:
+            return await receive()
+
+    return replayed
+
+
+class RequestBodyCapMiddleware:
+    """Refuse request bodies over `REQUEST_BODY_MAX` before the app runs.
+
+    A declared length over the cap is refused unread; a body sent without one (chunked)
+    is counted as it streams and refused once the count passes the cap. Either way the
+    answer is 413 in the `{"error": {"code", "message"}}` shape, and neither the
+    authentication dependency nor the JSON parser runs. One cap for every route, the
+    `/mcp` mount included: a tool call carries its arguments in the body. A body at the
+    cap is served.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("method") not in _BODY_METHODS:
+            await self.app(scope, receive, send)
+            return
+        declared = _declared_length(scope)
+        if declared is not None and declared > REQUEST_BODY_MAX:
+            await self._refuse(send)
+            return
+        chunked = any(
+            name == b"transfer-encoding" and b"chunked" in value.lower()
+            for name, value in scope.get("headers", [])
+        )
+        if declared is not None and not chunked:
+            # The server enforces the declared length; the app reads the body itself.
+            await self.app(scope, receive, send)
+            return
+        # No declared length, or the body is chunked: read it here, so the cap holds
+        # before the app runs.
+        messages = []
+        body = bytearray()
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message["type"] != "http.request":
+                break  # http.disconnect: pass it on; the app sees the same disconnect
+            body += message.get("body", b"")
+            if len(body) > REQUEST_BODY_MAX:
+                await self._refuse(send)
+                return
+            if not message.get("more_body", False):
+                break
+        await self.app(scope, _replays(messages, receive), send)
+
+    async def _refuse(self, send):
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "PAYLOAD_TOO_LARGE",
+                    "message": f"The request body may be at most {REQUEST_BODY_MAX} bytes",
+                }
+            }
+        ).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+
 app.add_middleware(MCPPathRewriteMiddleware)
+app.add_middleware(RequestBodyCapMiddleware)
 
 
 @app.exception_handler(ApiError)
