@@ -8,9 +8,13 @@ FastAPI or FastMCP reads or parses a body. A body over `BODY_MAX` is refused wit
 - A declared `Content-Length` over the cap is refused with nothing read. One at or
   under it is passed through untouched, to be read when (and if) the route reads it:
   the HTTP server frames the body by that length and delivers no byte past it.
-- A body with no usable `Content-Length` (chunked) is read here, counting, and refused
-  as soon as it would pass the cap; one that fits is handed on whole. So such a body
-  is held before authentication, but never more than the cap of it.
+- Any other body is read here, counting, and refused as soon as it would pass the cap;
+  one that fits is handed on whole. So such a body is held before authentication, but
+  never more than the cap of it. That is a body with no `Content-Length`, one whose
+  `Content-Length` is not a plain number, and any request with a `Transfer-Encoding`
+  header whatever its `Content-Length` says: a server that accepts both headers frames
+  the body by `Transfer-Encoding` (RFC 9112 §6.3; h11 does, httptools refuses the
+  request), so the declared length says nothing about how much will arrive.
 
 The refusal closes the connection (`Connection: close`), so the server stops reading
 the rest of an oversized body rather than draining it to reuse the connection.
@@ -25,6 +29,7 @@ import json
 BODY_MAX = 2 * 1024 * 1024
 
 _CONTENT_LENGTH = b"content-length"
+_TRANSFER_ENCODING = b"transfer-encoding"
 _REFUSAL = json.dumps(
     {
         "error": {
@@ -51,10 +56,14 @@ async def _refuse(send) -> None:
 
 
 def _declared_length(scope) -> int | None:
-    """The request's `Content-Length`, or None when it has none or one that is not a
-    plain decimal number (which uvicorn refuses itself; another server might not). The
+    """The request's `Content-Length` when it frames the body, else None: when it has
+    none, one that is not a plain decimal number (which uvicorn refuses itself; another
+    server might not), or any `Transfer-Encoding`, which frames the body instead. The
     largest of repeated headers counts."""
-    values = [v for k, v in scope.get("headers", ()) if k.lower() == _CONTENT_LENGTH]
+    headers = [(k.lower(), v) for k, v in scope.get("headers", ())]
+    if any(k == _TRANSFER_ENCODING for k, _ in headers):
+        return None
+    values = [v for k, v in headers if k == _CONTENT_LENGTH]
     if not values or not all(v.isdigit() for v in values):  # bytes: ASCII digits only
         return None
     return max(int(v) for v in values)

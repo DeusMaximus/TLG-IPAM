@@ -170,6 +170,54 @@ async def test_a_chunked_body_over_the_cap_is_refused_before_the_app(spies, path
     assert res.reads == BODY_MAX // CHUNK + 1
 
 
+@pytest.mark.parametrize("path,extra", ROUTES)
+async def test_a_small_declared_length_does_not_let_a_chunked_body_past(spies, path, extra):
+    """Review of PR #80: `Content-Length: 2` beside `Transfer-Encoding: chunked`. h11
+    frames such a body by the chunks, so a large one arrived uncounted. Any
+    `Transfer-Encoding` now means the body is counted, whatever the length says."""
+    async with running_app():
+        res = await asgi_post(
+            app,
+            path,
+            {
+                "content-type": "application/json",
+                "content-length": "2",
+                "transfer-encoding": "chunked",
+                **extra,
+            },
+            over_the_cap(),
+        )
+    assert res.status == 413
+    assert res.json() == REFUSAL
+    assert spies == []
+    assert res.reads == BODY_MAX // CHUNK + 1
+
+
+@pytest.mark.parametrize("name", [b"transfer-encoding", b"Transfer-Encoding"])
+async def test_any_transfer_encoding_means_the_body_is_counted(name):
+    """Whatever the declared length: a small one does not pass a large body, and a
+    large one does not refuse a small body the chunks frame."""
+    async def drain(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    for declared, body, status in [(b"2", b"x" * 11, 413), (b"999", b"x" * 10, 204)]:
+        answer = Answer()
+
+        async def receive(body=body):
+            answer.reads += 1
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message):
+            if message["type"] == "http.response.start":
+                answer.status = message["status"]
+
+        scope = {"type": "http", "headers": [(b"content-length", declared), (name, b"chunked")]}
+        await BodyLimitMiddleware(drain, cap=10)(scope, receive, send)
+        assert (declared, answer.status, answer.reads) == (declared, status, 1)
+
+
 async def test_a_chunked_body_is_refused_at_the_chunk_that_crosses_the_cap(spies):
     """One chunk larger than the cap is refused whole, never appended."""
     res = await asgi_post(
