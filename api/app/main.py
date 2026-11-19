@@ -95,19 +95,19 @@ def _replays(messages, receive):
 class RequestBodyCapMiddleware:
     """Refuse request bodies over `REQUEST_BODY_MAX` before the app runs.
 
-    A declared length over the cap is refused unread; a body sent without one (chunked)
-    is counted as it streams and refused once the count passes the cap. Either way the
-    answer is 413 in the `{"error": {"code", "message"}}` shape, and neither the
-    authentication dependency nor the JSON parser runs. One cap for every route, the
-    `/mcp` mount included: a tool call carries its arguments in the body. A body at the
-    cap is served.
+    A declared `Content-Length` over the cap is refused unread, on every method; a
+    body sent without one is counted as it streams and refused once the count passes
+    the cap. Either way the answer is 413 in the `{"error": {"code", "message"}}`
+    shape, and neither the authentication dependency nor the JSON parser runs. One cap
+    for every route, the `/mcp` mount included: a tool call carries its arguments in
+    the body. A body at the cap is served.
     """
 
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope.get("method") not in _BODY_METHODS:
+        if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
         declared = _declared_length(scope)
@@ -118,12 +118,15 @@ class RequestBodyCapMiddleware:
             name == b"transfer-encoding" and b"chunked" in value.lower()
             for name, value in scope.get("headers", [])
         )
-        if declared is not None and not chunked:
-            # The server enforces the declared length; the app reads the body itself.
+        # Read the body here, so the cap holds before the app runs, when the request
+        # may carry one the server does not refuse on its own: chunked, or a method
+        # the server does not enforce a body on.
+        reads = chunked or (declared is None and scope.get("method") in _BODY_METHODS)
+        if not reads:
+            # A declared length under the cap is enforced by the server; a bodyless
+            # method without one is read by the app as before.
             await self.app(scope, receive, send)
             return
-        # No declared length, or the body is chunked: read it here, so the cap holds
-        # before the app runs.
         messages = []
         body = bytearray()
         while True:

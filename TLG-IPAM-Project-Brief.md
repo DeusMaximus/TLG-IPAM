@@ -284,7 +284,7 @@ Agent-facing routes, `/api/v1/agent/*`, take an agent token instead (§3.9), as 
 
 ### 4.2 Endpoints
 
-Every route caps the request body at `main.REQUEST_BODY_MAX` (2 MiB): a body over it is refused `413 PAYLOAD_TOO_LARGE` in the standard error shape before the body is buffered and before any route or dependency runs, so neither authentication nor the JSON parser runs. The cap answers on `Content-Length` over the cap, and counts bytes for a body sent without one (chunked); a body at the cap is served. It covers the `/mcp` mount too — a tool call carries its arguments in the body.
+Every request caps the body at `main.REQUEST_BODY_MAX` (2 MiB): a declared `Content-Length` over the cap is refused `413 PAYLOAD_TOO_LARGE` in the standard error shape before the body is buffered and before any route or dependency runs — on every method, a `GET` included — so neither authentication nor the JSON parser runs. A body sent without one is counted when the method carries bodies; a body at the cap is served. It covers the `/mcp` mount too — a tool call carries its arguments in the body.
 
 | Route | Notes |
 |---|---|

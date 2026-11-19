@@ -65,11 +65,14 @@ async def test_an_over_cap_chunked_body_on_an_agent_route_is_refused(anon_client
     _assert_refused(res)
 
 
-async def _asgi_post(path: str, headers: dict[str, str], body: bytes) -> tuple[int, int]:
-    """POST straight into the ASGI app, counting how often it asks for the body."""
+async def _asgi_request(
+    method: str, path: str, headers: dict[str, str], body: bytes = b""
+) -> tuple[int, int]:
+    """POST/GET straight into the ASGI app, counting how often it asks for the body."""
     from app.main import app
 
     reads = 0
+    started = []
 
     async def receive():
         nonlocal reads
@@ -80,12 +83,11 @@ async def _asgi_post(path: str, headers: dict[str, str], body: bytes) -> tuple[i
         if message["type"] == "http.response.start":
             started.append(message["status"])
 
-    started = []
     scope = {
         "type": "http",
         "asgi": {"version": "3.0"},
         "http_version": "1.1",
-        "method": "POST",
+        "method": method,
         "scheme": "http",
         "path": path,
         "raw_path": path.encode(),
@@ -102,10 +104,32 @@ async def _asgi_post(path: str, headers: dict[str, str], body: bytes) -> tuple[i
 async def test_an_over_cap_declared_length_on_an_owner_route_is_refused_without_reading():
     """A declared length over the cap is refused unread: the app — its authentication
     dependency and JSON parser included — never runs (reads == 0)."""
-    status, reads = await _asgi_post(
-        "/api/v1/hosts", {"content-type": "application/json", "content-length": str(REQUEST_BODY_MAX + 1)}, b"{}"
+    status, reads = await _asgi_request(
+        "POST",
+        "/api/v1/hosts",
+        {"content-type": "application/json", "content-length": str(REQUEST_BODY_MAX + 1)},
+        b"{}",
     )
     assert (status, reads) == (413, 0)
+
+
+async def test_an_over_cap_declared_length_on_a_get_is_refused_without_reading():
+    """The declared-length refusal applies to every method — GET included (the probe
+    found `GET /api/v1/hosts` with `Content-Length: 2097153` answered 401 before the
+    cap covered GETs)."""
+    status, reads = await _asgi_request(
+        "GET", "/api/v1/hosts", {"content-length": str(REQUEST_BODY_MAX + 1)}, b""
+    )
+    assert (status, reads) == (413, 0)
+
+
+async def test_an_over_cap_chunked_body_on_a_get_is_refused():
+    """A chunked GET is a body the server does not enforce on its own: it is counted
+    too."""
+    status, reads = await _asgi_request(
+        "GET", "/api/v1/hosts", {"transfer-encoding": "chunked"}, _over_cap()
+    )
+    assert (status, reads) == (413, 1)
 
 
 async def test_a_body_at_the_cap_is_served_on_an_owner_route(client):
