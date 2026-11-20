@@ -104,14 +104,16 @@ def _inherited(name):
     return not (upper in _SETTINGS_ENV or upper.startswith("UVICORN_") or upper == "WEB_CONCURRENCY")
 
 
-def _uvicorn(tmp_path, api_key):
+def _uvicorn(tmp_path, api_key, *args):
+    """Start uvicorn as the image does, on a loopback port it picks; `args` are more of
+    uvicorn's options (`--http httptools`, say)."""
     env = {n: v for n, v in os.environ.items() if _inherited(n)}
     if api_key is not UNSET:
         env["API_KEY"] = api_key
     env["DB_PATH"] = str(tmp_path / "ipam.db")
     env["STATIC_DIR"] = str(tmp_path / "no-static")
     return subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "0"],
+        [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "0", *args],
         cwd=API_DIR,
         env=env,
         stdout=subprocess.DEVNULL,
