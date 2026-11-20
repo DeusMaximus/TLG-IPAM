@@ -52,7 +52,7 @@ def test_the_checkin_body_is_what_the_server_accepts():
     body = loop.checkin_body([{"name": "eth0", "cidr": "10.0.0.5/24", "mac": "02:00:00:00:00:05"}])
     parsed = server.CheckinRequest.model_validate(body)
     assert parsed.protocol == server.PROTOCOL_VERSION
-    assert parsed.capabilities == ["icmp", "rdns"]
+    assert parsed.capabilities == ["arp", "icmp", "rdns"]
 
 
 def _server_job(**overrides) -> dict:

@@ -40,8 +40,8 @@ LEASE_S = 15 * 60
 
 METHODS = frozenset({"icmp", "arp", "rdns", "fdns"})
 LIVENESS = frozenset({"icmp", "arp"})
-# what this release can run; `arp` is #14, `fdns` is #20
-SUPPORTED = frozenset({"icmp", "rdns"})
+# what this release can run; `fdns` is #20
+SUPPORTED = frozenset({"icmp", "arp", "rdns"})
 
 _HOST_LABEL = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 

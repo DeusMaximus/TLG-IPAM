@@ -24,12 +24,13 @@ from . import __version__, guard, scan
 from .backoff import Backoff, refused_wait
 from .client import AgentClient, Kind
 from .config import Config
-from .probe import Prober, Resolver
+from .probe import ArpLink, Prober, Resolver
 from .protocol import (
     HOSTNAME_MAX,
     LEASE_S,
     PLATFORM_MAX,
     PROTOCOL_VERSION,
+    SUPPORTED,
     VERSION_MAX,
     JobRefused,
     job_ref,
@@ -69,7 +70,8 @@ INTERVAL_MAX_S = 3600
 # jobs waiting behind the one running; the server sends at most one per check-in and
 # none while this agent holds a lease, so this is never reached in normal running
 QUEUE_MAX = 4
-CAPABILITIES = ["icmp", "rdns"]
+# reported at check-in, and not yet used by the server: the methods this release runs
+CAPABILITIES = sorted(SUPPORTED)
 
 
 def checkin_body(interfaces: list[dict]) -> dict:
@@ -91,6 +93,7 @@ class Agent:
         *,
         prober: Prober,
         resolver: Resolver,
+        arp_link: Callable[[str], ArpLink],
         interfaces: Callable[[], list[dict]],
         clock: scan.Clock | None = None,
         rng: random.Random | None = None,
@@ -99,6 +102,7 @@ class Agent:
         self.client = client
         self.prober = prober
         self.resolver = resolver
+        self.arp_link = arp_link
         self.interfaces = interfaces
         self.clock = clock or scan.Clock()
         self.rng = rng or random.SystemRandom()
@@ -159,6 +163,10 @@ class Agent:
                     addresses,
                     prober=self.prober,
                     resolver=self.resolver,
+                    arp_link=self.arp_link,
+                    # read again as the job starts: the ARP sweep needs the interface
+                    # on the subnet as it is now, not as the last check-in saw it
+                    interfaces=self.interfaces(),
                     max_pps=self.config.max_pps,
                     clock=self.clock,
                 )

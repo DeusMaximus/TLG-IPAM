@@ -127,3 +127,24 @@ def test_the_dependencies_are_the_three_the_spec_names():
     lines = (PACKAGE.parents[1] / "requirements.in").read_text().splitlines()
     names = sorted(line.split(">")[0] for line in lines if line.strip() and not line.startswith("#"))
     assert names == ["dnspython", "httpx", "icmplib"]
+
+
+def _socket_names(path):
+    """What a module reaches on the `socket` module: `socket.<name>`."""
+    tree = ast.parse(path.read_text())
+    return {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "socket"
+    }
+
+
+def test_only_the_probe_module_opens_a_packet_socket():
+    """The ARP sweep's raw `AF_PACKET` socket is made in `probe.py` alone, and the
+    only other module that makes a socket, `interfaces.py`, makes a netlink one,
+    which talks to the local kernel and puts nothing on any network."""
+    makers = {p.name for p in MODULES if "socket" in _socket_names(p)}
+    assert makers == {"probe.py", "interfaces.py"}
+    assert {p.name for p in MODULES if "AF_PACKET" in _socket_names(p)} == {"probe.py"}
+    families = {n for n in _socket_names(PACKAGE / "interfaces.py") if n.startswith("AF_")}
+    assert families <= {"AF_NETLINK", "AF_INET", "AF_INET6", "AF_UNSPEC"}

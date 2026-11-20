@@ -4,7 +4,7 @@ import ipaddress
 
 import pytest
 
-from conftest import FakeClock, FakeProber, FakeResolver, job
+from conftest import ETH0, FakeArp, FakeClock, FakeProber, FakeResolver, job
 from tlg_ipam_agent import guard, scan
 from tlg_ipam_agent.config import parse_allowed
 from tlg_ipam_agent.probe import ProbeError
@@ -17,12 +17,14 @@ def planned(**overrides):
     return parsed, guard.plan(parsed, parse_allowed(None))
 
 
-async def sweep(parsed, addresses, *, prober, resolver=None, clock=None, max_pps=200):
+async def sweep(parsed, addresses, *, prober, resolver=None, arp=None, interfaces=ETH0, clock=None, max_pps=200):
     return await scan.run(
         parsed,
         addresses,
         prober=prober,
         resolver=resolver or FakeResolver(),
+        arp_link=arp if arp is not None else FakeArp(),
+        interfaces=interfaces,
         max_pps=max_pps,
         clock=clock or FakeClock(),
     )
@@ -113,25 +115,29 @@ async def test_no_ptr_lookups_without_rdns():
     assert result["observations"] == [{"ip": "10.0.0.3"}]
 
 
-@pytest.mark.parametrize("methods", [["icmp", "arp"], ["icmp", "arp", "rdns"], ["icmp", "fdns"]])
+@pytest.mark.parametrize("methods", [["icmp", "fdns"], ["icmp", "arp", "rdns", "fdns"]])
 async def test_a_method_this_release_cannot_run_makes_the_result_incomplete(methods):
-    """`arp` is #14: a sweep without it must not let the server mark silent addresses
+    """`fdns` is #20: a sweep without it must not let the server mark silent addresses
     dead, so the result set says it is incomplete."""
     prober = FakeProber(alive=["10.0.0.3"])
     parsed, addresses = planned(methods=methods)
     result = await sweep(parsed, addresses, prober=prober)
     assert result["complete"] is False
-    assert "not run by this agent release" in result["error"]
+    assert result["error"] == "not run by this agent release: fdns"
     assert len(prober.sent) == 254
-    assert all("mac" not in o for o in result["observations"])
 
 
-async def test_an_arp_only_job_sends_nothing():
+async def test_an_arp_only_job_sends_no_echo_request():
     prober = FakeProber()
+    arp = FakeArp({"10.0.0.3": "02:00:00:00:00:03"})
     parsed, addresses = planned(methods=["arp"])
-    result = await sweep(parsed, addresses, prober=prober)
+    result = await sweep(parsed, addresses, prober=prober, arp=arp)
     assert prober.sent == []
-    assert result["complete"] is False and result["observations"] == []
+    assert result["complete"] is True
+    assert result["observations"] == [
+        {"ip": "10.0.0.3", "mac": "02:00:00:00:00:03"},
+        {"ip": "10.0.0.5", "mac": "02:00:00:00:00:05"},
+    ]
 
 
 async def test_a_prober_that_cannot_work_stops_the_sweep():

@@ -61,9 +61,9 @@ with `TLG_IPAM_KEY` set in your environment. Then ask your assistant things like
 
 ## Scan agent
 
-The scan agent is a small container you run on a Linux host on the VLAN you want swept. It checks in with the server every minute, and when a subnet assigned to it is due it pings every address in the subnet's scan scope, looks up reverse DNS names for the ones that answered, and reports them. It only ever connects out to the server; nothing listens on it. It never runs, downloads or installs anything the server sends.
+The scan agent is a small container you run on a Linux host on the VLAN you want swept. It checks in with the server every minute, and when a subnet assigned to it is due it pings every address in the subnet's scan scope, sends an ARP request to each (which finds hosts that drop ping, and their MACs), looks up reverse DNS names for the ones that answered, and reports them. It only ever connects out to the server; nothing listens on it. It never runs, downloads or installs anything the server sends.
 
-This release does ICMP and reverse DNS. MAC collection (`arp`) comes in a later release: until then a scan issued `arp` runs the rest and is reported incomplete, so it never marks an address as gone.
+This release does ICMP, ARP and reverse DNS. ARP only works on the agent's own VLAN: the server sends it only for a subnet one of the agent's interfaces is on, and a subnet reached through a router gets ICMP and reverse DNS alone, with no MACs. Forward DNS checks (`fdns`) come in a later release.
 
 ### Run one
 
@@ -78,7 +78,7 @@ This release does ICMP and reverse DNS. MAC collection (`arp`) comes in a later 
      ghcr.io/deusmaximus/tlg-ipam-agent:<version>
    ```
 
-   Host networking puts the agent on the VLAN itself, and `NET_RAW` lets it send ICMP echo requests. `--cap-add NET_RAW` adds that capability to Docker's default set rather than leaving the container with it alone; add `--cap-drop ALL` before it if you want only that one. Rootless container runtimes cannot grant a usable `NET_RAW` on the host network and are not supported.
+   Host networking puts the agent on the VLAN itself, and `NET_RAW` lets it send ICMP echo requests and ARP requests. `--cap-add NET_RAW` adds that capability to Docker's default set rather than leaving the container with it alone; add `--cap-drop ALL` before it if you want only that one. Rootless container runtimes cannot grant a usable `NET_RAW` on the host network and are not supported.
 3. Assign the subnet to the agent in the subnet's **Scanning** section, and save. `docker logs tlg-ipam-agent` shows each check-in refusal, each job and how it ended.
 
 The image is not published yet. Until it is, build it from this repository and tag it with the version in the command:
@@ -94,7 +94,7 @@ docker build -f agent/Dockerfile -t ghcr.io/deusmaximus/tlg-ipam-agent:<version>
 | `IPAM_URL` | (required) | The server's URL. Must be `https://`: the token is a credential, and the server's certificate is always verified, with no setting to turn that off. Plain `http://` is accepted only for a server on the agent host's own loopback address (`http://127.0.0.1:8080`). |
 | `IPAM_AGENT_TOKEN` | (required) | The `tlga_…` token from the Agents page. |
 | `ALLOWED_CIDRS` | `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10` | The agent's own limit on what it will scan, whatever the server asks. A job for a subnet outside it is refused without a packet being sent, and the subnet's Scanning section shows why. Set it to your own networks if they use other ranges. |
-| `MAX_PPS` | `200` | The most packets a second a scan sends (1–1000): echo requests and DNS queries together, each failover to another DNS server counted. |
+| `MAX_PPS` | `200` | The most packets a second a scan sends (1–1000): echo requests, ARP requests and DNS queries together, each ARP retry and each failover to another DNS server counted. |
 
 A server certificate from a private CA: mount the CA's bundle and point `SSL_CERT_FILE` at it, for example `-v /etc/ipam-ca.pem:/etc/ipam-ca.pem:ro -e SSL_CERT_FILE=/etc/ipam-ca.pem`. The bundle replaces the system's trusted CAs for the agent, so it has to contain the CA that signed the server's certificate.
 
