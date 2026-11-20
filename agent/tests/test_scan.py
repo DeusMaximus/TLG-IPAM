@@ -1,5 +1,6 @@
 """One job's sweep: pacing, the timeout, PTR lookups (spec §5.2, §5.6)."""
 
+import asyncio
 import ipaddress
 
 import pytest
@@ -7,7 +8,7 @@ import pytest
 from conftest import ETH0, FakeArp, FakeClock, FakeProber, FakeResolver, job
 from tlg_ipam_agent import guard, scan
 from tlg_ipam_agent.config import parse_allowed
-from tlg_ipam_agent.probe import ProbeError
+from tlg_ipam_agent.probe import NO_DNS_SERVER, ProbeError, no_query_sent
 from tlg_ipam_agent.protocol import job_ref, parse_job
 
 
@@ -257,3 +258,116 @@ async def test_a_lookup_still_ends_at_the_jobs_deadline():
     assert len(resolver.asked) < 8
     assert all(t <= 1000 + 12 for t in resolver.times)
     assert result["complete"] is False
+
+
+# --- no server to ask is not a completed lookup (#78) ---
+
+
+async def test_no_dns_server_anywhere_makes_the_scan_incomplete_and_asks_nothing():
+    prober = FakeProber(alive=["10.0.0.3", "10.0.0.9"])
+    resolver = FakeResolver({"10.0.0.3": "printer.home.arpa"}, host=())
+    parsed, addresses = planned(dns_servers=[])
+    result = await sweep(parsed, addresses, prober=prober, resolver=resolver)
+    assert result["complete"] is False
+    assert result["error"] == NO_DNS_SERVER
+    # the live addresses are still reported, without names
+    assert result["observations"] == [{"ip": "10.0.0.3"}, {"ip": "10.0.0.9"}]
+    assert resolver.asked == []
+
+
+async def test_the_jobs_own_server_needs_none_on_the_host():
+    prober = FakeProber(alive=["10.0.0.3"])
+    resolver = FakeResolver({"10.0.0.3": "printer.home.arpa"}, host=())
+    parsed, addresses = planned(dns_servers=["10.0.0.53"])
+    result = await sweep(parsed, addresses, prober=prober, resolver=resolver)
+    assert result["complete"] is True and result["error"] is None
+    assert resolver.asked == [(ipaddress.ip_address("10.0.0.3"), ("10.0.0.53",))]
+
+
+async def test_the_hosts_servers_are_given_to_every_lookup():
+    prober = FakeProber(alive=["10.0.0.3", "10.0.0.9"])
+    resolver = FakeResolver(host=("192.0.2.1", "192.0.2.2"))
+    parsed, addresses = planned(dns_servers=[])
+    result = await sweep(parsed, addresses, prober=prober, resolver=resolver)
+    assert result["complete"] is True
+    assert {servers for _, servers in resolver.asked} == {("192.0.2.1", "192.0.2.2")}
+
+
+async def test_with_nothing_alive_there_is_nothing_to_look_up():
+    """No live address, no lookup to make: a host with no resolver does not make the
+    scan incomplete, and an `icmp`-only job never asks for servers at all."""
+    resolver = FakeResolver(host=())
+    parsed, addresses = planned(dns_servers=[])
+    result = await sweep(parsed, addresses, prober=FakeProber(), resolver=resolver)
+    assert result["complete"] is True and result["error"] is None
+    parsed, addresses = planned(dns_servers=[], methods=["icmp"])
+    result = await sweep(parsed, addresses, prober=FakeProber(alive=["10.0.0.3"]), resolver=resolver)
+    assert result["complete"] is True and result["error"] is None
+
+
+class UnsendableResolver(FakeResolver):
+    """Its lookup for `unsendable` could send the query to no server: it fails once a
+    lookup for an address in `slow` has started. A `slow` lookup takes 0.3 s of real
+    time (so a pool that lets it finish finishes it, and the test fails rather than
+    hangs); any other returns at once."""
+
+    def __init__(self, names, unsendable, slow):
+        super().__init__(names)
+        self.unsendable = ipaddress.ip_address(unsendable)
+        self.slow = {ipaddress.ip_address(a) for a in slow}
+        self.slow_started = asyncio.Event()
+        self.finished: list = []
+        self.cancelled: list = []
+
+    async def ptr(self, address, servers, slot):
+        await slot()
+        try:
+            if address == self.unsendable:
+                await self.slow_started.wait()
+                raise ProbeError(no_query_sent("OSError"))
+            if address in self.slow:
+                self.slow_started.set()
+                await asyncio.sleep(0.3)
+        except asyncio.CancelledError:
+            self.cancelled.append(address)
+            raise
+        self.finished.append(address)
+        return self.names.get(address)
+
+
+async def test_a_lookup_that_could_send_nothing_cancels_the_rest_and_the_scan_is_incomplete():
+    """10.0.0.1 is looked up before 10.0.0.2 fails; the lookups still in flight then
+    are cancelled, none finishes after the failure, and the scan is incomplete with
+    the failure's error (call 7)."""
+    live = ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"]
+    resolver = UnsendableResolver({a: f"h{a[-1]}.home.arpa" for a in live}, "10.0.0.2", slow=live[2:])
+    parsed, addresses = planned()
+    result = await sweep(parsed, addresses, prober=FakeProber(alive=live), resolver=resolver)
+    assert result["complete"] is False
+    assert result["error"] == no_query_sent("OSError")
+    assert [o["ip"] for o in result["observations"]] == live
+    assert result["observations"][0] == {"ip": "10.0.0.1", "rdns_name": "h1.home.arpa"}
+    assert all("rdns_name" not in o for o in result["observations"][1:])
+    assert resolver.finished == [ipaddress.ip_address("10.0.0.1")]
+    assert ipaddress.ip_address("10.0.0.3") in resolver.cancelled
+
+
+async def test_the_icmp_sweep_still_lets_pings_in_flight_finish_after_a_probe_error():
+    """`cancel_on_failure` is the PTR lookups' alone: when the prober fails, the pings
+    already sent still report what answered, as before #78."""
+    clock = FakeClock()
+
+    class Failing(FakeProber):
+        async def ping(self, address, timeout):
+            if address == ipaddress.ip_address("10.0.0.2"):
+                await clock.sleep(0.5)
+                raise ProbeError("ICMP needs CAP_NET_RAW")
+            if address == ipaddress.ip_address("10.0.0.1"):
+                await clock.sleep(2.0)  # still in flight when 10.0.0.2 fails
+            return address in self.alive
+
+    prober = Failing(alive=["10.0.0.1"])
+    parsed, addresses = planned(methods=["icmp"])
+    result = await sweep(parsed, addresses, prober=prober, clock=clock, max_pps=10)
+    assert result["complete"] is False and result["error"] == "ICMP needs CAP_NET_RAW"
+    assert result["observations"] == [{"ip": "10.0.0.1"}]

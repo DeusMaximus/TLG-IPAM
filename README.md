@@ -63,7 +63,7 @@ with `TLG_IPAM_KEY` set in your environment. Then ask your assistant things like
 
 The scan agent is a small container you run on a Linux host on the VLAN you want swept. It checks in with the server every minute, and when a subnet assigned to it is due it pings every address in the subnet's scan scope, sends an ARP request to each (which finds hosts that drop ping, and their MACs), looks up reverse DNS names for the ones that answered, and reports them. It only ever connects out to the server; nothing listens on it. It never runs, downloads or installs anything the server sends.
 
-This release does ICMP, ARP and reverse DNS. ARP only works on the agent's own VLAN: the server sends it only for a subnet one of the agent's interfaces is on, and a subnet reached through a router gets ICMP and reverse DNS alone, with no MACs. Forward DNS checks (`fdns`) come in a later release.
+This release does ICMP, ARP and reverse DNS. Reverse DNS asks the subnet's DNS servers, or, when the subnet names none, the ones in the agent host's `/etc/resolv.conf` (read again for every scan, so fixing the file needs no restart). With neither, the scan sends no DNS query, keeps the names already stored, and is marked incomplete in the subnet's Scanning section; the scan target's `last_scan_error` in the API says the agent has no DNS server to ask. ARP only works on the agent's own VLAN: the server sends it only for a subnet one of the agent's interfaces is on, and a subnet reached through a router gets ICMP and reverse DNS alone, with no MACs. Forward DNS checks (`fdns`) come in a later release.
 
 ### Run one
 

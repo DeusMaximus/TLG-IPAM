@@ -46,6 +46,9 @@ Slot = Callable[[], Awaitable[float]]
 
 
 class Resolver(Protocol):
+    # the servers one job's lookups ask, chosen once as the job's lookups start
+    def servers(self, job_servers: tuple[str, ...]) -> tuple[str, ...]: ...
+    # raises ProbeError when no query of the lookup could be sent: that is no lookup
     async def ptr(self, address: Address, servers: tuple[str, ...], slot: Slot) -> str | None: ...
 
 
@@ -199,6 +202,15 @@ class ArpSession:
 
 # servers tried for one lookup, in order; resolv.conf holds at most three as well
 MAX_DNS_SERVERS = 3
+# where the host's own resolvers are read, when a job names no DNS server
+RESOLV_CONF = "/etc/resolv.conf"
+# the error of a job whose PTR lookups had no server to ask (spec §5.2): fixed text
+NO_DNS_SERVER = "rdns not run: the agent has no DNS server to ask (the job names none, and the host's resolv.conf lists none it can use)"
+
+
+def no_query_sent(cause: str) -> str:
+    """The error of a lookup that could send its query to none of its servers."""
+    return f"rdns stopped: no DNS query could be sent to any server ({cause})"
 
 
 class DnsResolver:
@@ -211,26 +223,67 @@ class DnsResolver:
     MAX_DNS_SERVERS servers in turn, with no retransmission and no TCP; a truncated
     reply is not used. Before each
     query it awaits `slot()`, which takes one packet from the job's budget (`MAX_PPS`,
-    shared with the ICMP sweep) and returns the seconds the lookup has left."""
+    shared with the ICMP sweep) and returns the seconds the lookup has left.
 
-    def __init__(self, port: int = 53):
+    A lookup that could not be made is not a lookup that found no name: with no server
+    to ask, or when every attempt failed before the query went out (until the servers
+    or the lookup's own time ran out), `ptr` raises ProbeError instead of returning
+    None, so the scan reports itself incomplete and the server keeps the names it has
+    (spec §5.7)."""
+
+    def __init__(self, port: int = 53, resolv_conf: str = RESOLV_CONF):
         self.port = port
-        self._system: tuple[str, ...] | None = None
+        self.resolv_conf = resolv_conf
 
-    def _system_servers(self) -> tuple[str, ...]:
-        if self._system is None:
+    def servers(self, job_servers: tuple[str, ...]) -> tuple[str, ...]:
+        """The servers a job's lookups ask: the job's own, else the host's resolvers,
+        read from resolv.conf each time this is called (once per job, so a corrected
+        resolv.conf takes effect at the next job; nothing is cached). Only addresses are
+        kept, before the list is cut to MAX_DNS_SERVERS, so an entry the agent cannot
+        query (a DNS-over-HTTPS URL, say) never takes the place of one it can. Empty
+        when there is none: the job's lookups then have no server to ask."""
+        chosen = job_servers or self._host_servers()
+        usable = []
+        for server in chosen:
             try:
-                # reads the host's resolv.conf; nothing is sent
-                self._system = tuple(dns.resolver.Resolver().nameservers)
-            except dns.exception.DNSException:
-                self._system = ()
-        return self._system
+                ipaddress.ip_address(server)
+            except ValueError:
+                continue
+            usable.append(server)
+        return tuple(usable[:MAX_DNS_SERVERS])
+
+    def _host_servers(self) -> tuple[str, ...]:
+        try:
+            # reads the host's resolv.conf; nothing is sent. dnspython refuses a file
+            # it cannot read, one with no nameserver, and one with a nameserver that is
+            # neither an address nor an https URL: each leaves no server to ask
+            listed = dns.resolver.Resolver(filename=self.resolv_conf).nameservers
+        except (dns.exception.DNSException, ValueError, OSError):
+            return ()
+        return tuple(s for s in listed if isinstance(s, str))
 
     async def ptr(self, address: Address, servers: tuple[str, ...], slot: Slot) -> str | None:
+        """The PTR name of `address`, or None when a server says there is none (NXDOMAIN,
+        or an answer without a PTR record), when every server asked gave no usable
+        answer, or when the lookup's time ran out after a query was sent (or before
+        its first attempt, which only the job's deadline does). Raises ProbeError when
+        there is no server to ask, or when no query was sent before the servers or the
+        lookup's time ran out."""
+        if not servers:
+            raise ProbeError(NO_DNS_SERVER)
         name = dns.reversename.from_address(str(address))
-        for server in (servers or self._system_servers())[:MAX_DNS_SERVERS]:
+        asked = False
+        unsent: str | None = None
+        for server in servers[:MAX_DNS_SERVERS]:
             left = await slot()
             if left <= 0:
+                # the lookup's time is up. After a query was sent, that is a lookup
+                # that asked and got no answer. After only attempts that sent nothing,
+                # it is not a lookup at all. With no attempt yet, the job's deadline
+                # has passed (a lookup's own time starts at its first slot, capped by
+                # the deadline), and the scan reports that cut-off itself
+                if not asked and unsent is not None:
+                    raise ProbeError(no_query_sent(unsent))
                 return None
             # A fresh query, so a fresh id, for every datagram. It carries EDNS(0)
             # advertising a 1232-byte UDP payload, so a resolver can send a PTR answer
@@ -259,9 +312,19 @@ class DnsResolver:
                     # dnspython's default, stated: trailing bytes make a reply bad
                     ignore_trailing=False,
                 )
-            except (dns.exception.DNSException, OSError, ValueError):
-                # no answer in time, a truncated or broken one: the next server
+            except (dns.exception.DNSException, TimeoutError):
+                # no answer in time, a truncated or broken one: the query was sent, and
+                # the next server is asked. (TimeoutError is an OSError: caught first.)
+                asked = True
                 continue
+            except (OSError, ValueError) as exc:
+                # the query was not sent: an address dnspython cannot use, no socket
+                # of its family on this host, no route. With asyncio a failed send
+                # surfaces here too, as an OSError, and so would an ICMP error the
+                # kernel reported for the socket. The next server
+                unsent = type(exc).__name__
+                continue
+            asked = True
             rcode = reply.rcode()
             if rcode == dns.rcode.NXDOMAIN:
                 return None
@@ -271,4 +334,7 @@ class DnsResolver:
                 if rrset.rdtype == dns.rdatatype.PTR and len(rrset):
                     return rrset[0].target.to_text()
             return None
+        if not asked:
+            # every server was tried, and none could be sent the query
+            raise ProbeError(no_query_sent(unsent or "unknown"))
         return None

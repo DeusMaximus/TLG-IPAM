@@ -16,6 +16,6 @@ Tests, from this directory (one-time setup:
 .venv/bin/python -m pytest
 ```
 
-The tests send no packet: the prober, the resolver and the ARP socket are fakes, and
-the end-to-end test runs the agent's client against the server's real routes in
-process.
+The tests send no packet off this machine: the prober and the ARP socket are fakes,
+the resolver is a fake or the real one against DNS responders on loopback, and the
+end-to-end tests run the agent's client against the server's real routes in process.

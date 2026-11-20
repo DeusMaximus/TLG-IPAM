@@ -508,3 +508,134 @@ async def test_on_its_own_link_a_complete_arp_scan_clears_a_name(owner):
     assert sorted(str(a) for a, _ in resolver.asked) == [*LIVE, "10.0.0.5"]
     names = await _names(subnet)
     assert names == {**NEW, "10.0.0.3": None, "10.0.0.5": None}
+
+
+# --- no server to ask is not a completed lookup (#78) ---
+
+
+async def past_the_request_cooldown(target_id) -> None:
+    """Move the target's last scan request back past the server's cooldown."""
+    from app.models import ScanTarget
+
+    async with SessionLocal() as session:
+        await session.execute(
+            update(ScanTarget)
+            .where(ScanTarget.id == target_id)
+            .values(scan_requested_at=datetime.now(timezone.utc) - timedelta(hours=1))
+        )
+        await session.commit()
+
+
+async def test_with_no_dns_server_anywhere_a_scan_keeps_the_stored_names(owner, tmp_path):
+    """Acceptance for #78 through the real routes. The subnet names no DNS server, so
+    the agent uses its host's resolv.conf. A complete scan stores the names; with
+    resolv.conf emptied (the built image in the briefed review), the next scan sends no
+    DNS packet, is incomplete with the fixed error, and the names survive it; with
+    resolv.conf fixed, the scan after that, in the same process, looks them up again.
+    The real resolver, a DNS responder on loopback."""
+    from test_probe import ANSWERS, responder
+
+    from tlg_ipam_agent.probe import NO_DNS_SERVER, DnsResolver
+
+    live = ["10.0.0.1", "10.0.0.2"]
+    keys = {ip: f"{ip.split('.')[-1]}.0.0.10.in-addr.arpa." for ip in live}
+    resolv = tmp_path / "resolv.conf"
+    resolv.write_text("nameserver 127.0.0.1\n")
+    transport, dns_responder, port = await responder()
+    try:
+        agent_row, subnet, target = await setup(owner, cidr="10.0.0.0/29")
+        assert subnet["dns_servers"] in (None, [])
+        agent = make_agent(
+            agent_row["token"],
+            prober=FakeProber(alive=live),
+            resolver=DnsResolver(port=port, resolv_conf=str(resolv)),
+            interfaces=[{"name": "eth0", "cidr": "10.0.0.5/29", "mac": None}],
+        )
+
+        async def scan_once(number):
+            if number > 1:
+                await past_the_request_cooldown(target["id"])
+                await _ok(await owner.post(f"/api/v1/subnets/{subnet['id']}/scan"), 202)
+                await past_the_checkin_gap(agent_row["id"])
+            await agent.checkin_once()
+            await run_queued(agent)
+            seen = await observations(subnet["id"])
+            return {ip: seen[ip].rdns_name for ip in live}, await target_of(owner, target["id"])
+
+        for ip in live:
+            ANSWERS[keys[ip]] = f"old{ip[-1]}.home.arpa."
+        names, shown = await scan_once(1)
+        assert names == {ip: f"old{ip[-1]}.home.arpa" for ip in live}
+        assert shown["last_scan_complete"] is True
+        assert len(dns_responder.arrivals) == len(live)
+
+        resolv.write_text("")
+        for ip in live:
+            ANSWERS[keys[ip]] = f"new{ip[-1]}.home.arpa."
+        names, shown = await scan_once(2)
+        assert names == {ip: f"old{ip[-1]}.home.arpa" for ip in live}
+        assert shown["last_scan_complete"] is False
+        assert shown["last_scan_error"] == NO_DNS_SERVER
+        assert len(dns_responder.arrivals) == len(live)  # no DNS packet in scan 2
+        assert all(o.alive for o in (await observations(subnet["id"])).values())
+
+        resolv.write_text("nameserver 127.0.0.1\n")
+        names, shown = await scan_once(3)
+        assert names == {ip: f"new{ip[-1]}.home.arpa" for ip in live}
+        assert shown["last_scan_complete"] is True and shown["last_scan_error"] is None
+        assert len(dns_responder.arrivals) == 2 * len(live)
+    finally:
+        transport.close()
+        for key in keys.values():
+            ANSWERS.pop(key, None)
+
+
+async def test_lookups_that_send_nothing_keep_the_stored_names_at_one_packet_a_second(owner):
+    """Finding 1 of the briefed round on PR #96, through the real routes. A /30, two
+    live addresses, three DNS servers, MAX_PPS=1. The first scan stores names from a
+    loopback responder. In the second every send fails (port 0, refused by the kernel
+    before anything leaves), and the two lookups share one packet a second, so each
+    runs out its own 2 s with nothing sent while the job still has time: that is no
+    lookup, the scan is incomplete, and the names survive. The clock runs ten times
+    fast."""
+    from test_probe import ANSWERS, responder
+
+    from tlg_ipam_agent.probe import DnsResolver, no_query_sent
+
+    live = ["10.0.0.1", "10.0.0.2"]
+    keys = {ip: f"{ip[-1]}.0.0.10.in-addr.arpa." for ip in live}
+    for ip in live:
+        ANSWERS[keys[ip]] = f"saved{ip[-1]}.home.arpa."
+    transport, dns_responder, port = await responder()
+    try:
+        agent_row, subnet, target = await setup(
+            owner, cidr="10.0.0.0/30", dns_servers=["127.0.0.1", "127.0.0.2", "127.0.0.3"]
+        )
+        agent = make_agent(
+            agent_row["token"],
+            prober=FakeProber(alive=live),
+            resolver=DnsResolver(port=port),
+            interfaces=[{"name": "eth0", "cidr": "10.0.0.2/30", "mac": None}],
+            clock=fast_clock(),
+            max_pps=1,
+        )
+        await agent.checkin_once()
+        await run_queued(agent)
+        assert await _names(subnet) == {ip: f"saved{ip[-1]}.home.arpa" for ip in live}
+        assert (await target_of(owner, target["id"]))["last_scan_complete"] is True
+        assert len(dns_responder.arrivals) == len(live)
+
+        await _ok(await owner.post(f"/api/v1/subnets/{subnet['id']}/scan"), 202)
+        await past_the_checkin_gap(agent_row["id"])
+        agent.resolver = DnsResolver(port=0)
+        await agent.checkin_once()
+        await run_queued(agent)
+        shown = await target_of(owner, target["id"])
+        assert shown["last_scan_complete"] is False
+        assert shown["last_scan_error"] == no_query_sent("OSError")
+        assert await _names(subnet) == {ip: f"saved{ip[-1]}.home.arpa" for ip in live}
+        assert len(dns_responder.arrivals) == len(live)
+    finally:
+        transport.close()
+        for key in keys.values():
+            ANSWERS.pop(key, None)

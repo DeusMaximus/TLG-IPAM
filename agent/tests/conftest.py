@@ -97,13 +97,24 @@ class FakeProber:
         return address in self.alive
 
 
+# the resolver a FakeResolver's host lists, when a job names none
+HOST_DNS = ("192.0.2.53",)
+
+
 class FakeResolver:
-    def __init__(self, names=None, clock: FakeClock | None = None, delay: float = 0.0):
+    """Answers from `names`. `host` stands in for the host's resolv.conf: the servers a
+    job that names none is given (empty: the host has none)."""
+
+    def __init__(self, names=None, clock: FakeClock | None = None, delay: float = 0.0, host=HOST_DNS):
         self.names = {ipaddress.ip_address(k): v for k, v in (names or {}).items()}
         self.asked: list = []
         self.timeouts: list[float] = []
         self.times: list[float] = []
         self.clock, self.delay = clock, delay
+        self.host = tuple(host)
+
+    def servers(self, job_servers):
+        return tuple(job_servers or self.host)
 
     async def ptr(self, address, servers, slot):
         # one query, so one packet from the budget, as the real resolver takes per server
