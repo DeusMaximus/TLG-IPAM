@@ -21,6 +21,7 @@ from pydantic import (
     RootModel,
     TypeAdapter,
     computed_field,
+    field_serializer,
 )
 
 from app import routers
@@ -292,25 +293,40 @@ def walk(roots) -> tuple[set[str], list[str], set[type[BaseModel]]]:
 def test_every_datetime_field_in_the_schemas_is_serialised_with_an_offset():
     """The rule lives in one annotation (`schemas.UtcDatetime`); a field declared with a
     bare `datetime` would be serialised without an offset once read back. The walk
-    starts at every response model of `schemas.py` and follows the models they hold,
-    through a field's annotation: a model, a list, tuple, set, dict, union or optional of
-    one, a root model, a computed field's return annotation, wherever the model is
-    defined. A field is given a value as SQLite returns it and must dump with `+00:00`
-    in both modes.
+    starts at every response model of `schemas.py` and follows the models they hold.
+    A field is given a value as SQLite returns it and must dump with `+00:00` in both
+    modes.
 
-    What it does not see, so a change there needs a test of its own:
+    The annotation shapes it supports (`_sample`): a datetime type (pydantic's
+    constrained ones included), `Annotated[...]` of one, and `list`, `set`, `frozenset`,
+    variadic and fixed-length `tuple`, `dict` with `str` keys, `X | None` and unions of
+    those; a model in any of them; a root model; a computed field's return annotation.
+    Anything else yields no checked field, and the field passes.
+
+    What it does not see, so a change there needs a test of its own (the first two
+    limits are held by tests that fail when the walk improves, so they get flipped):
+    - A serializer on the model that holds a computed field (`field_serializer`,
+      `model_serializer`): the return annotation is dumped by itself, without it.
+      `test_the_walk_does_not_see_a_serializer_on_the_model_holding_a_computed_field`.
+    - A union is checked on its first branch that holds a datetime:
+      `list[UtcDatetime] | tuple[datetime, ...]` passes.
+      `test_the_walk_checks_only_the_first_branch_of_a_union`.
+    - Shapes it has no branch for: `Sequence`, `Mapping`, a `TypedDict`, a dataclass, a
+      `NamedTuple`, an enum holding a datetime. A `dict` is sampled with the key `"k"`,
+      so a key type other than `str` is sampled with a key it does not accept.
     - A field typed `dict` or `Any` (a change's snapshots): `changes.snapshot` gives
       those their offset, `test_a_change_timestamp_and_its_snapshots_carry_an_offset`
       checks it.
-    - A computed field with no return annotation, or a property that returns a value
-      its annotation does not describe.
+    - A property that returns a value its return annotation does not describe.
     - A fixed-length tuple that mixes a datetime with a position that is not a `str`,
-      `int`, `float`, `bool`, `None` or `Literal`: the walk raises `Unsampled`.
-    - Which models a route or tool actually returns. The walk starts at the models
-      `schemas.py` defines, so a model returned directly from elsewhere is never a root;
-      `test_no_route_or_tool_serves_a_model_outside_the_walks_roots` fails if one is.
-    - A response model that is also a request model, or a response model listed in
-      `REQUEST_MODELS` that a request body is validated against."""
+      `int`, `float`, `bool`, `None` or `Literal`: the walk raises `Unsampled`, the one
+      shape it refuses, not skips.
+    - What a route or tool returns. The walk starts at the models `schemas.py` defines.
+      `test_no_route_or_tool_serves_a_model_outside_the_walks_roots` pins what the
+      routers under `app.routers` and the MCP tools declare, and no more: it does not
+      show where an answer's fields come from.
+    - A response model that is also a request model. A response model listed in
+      `REQUEST_MODELS` is refused by name only; see `request_models_unaccounted_for`."""
     defined = _models_defined_in(schemas)
     assert REQUEST_MODELS <= defined.keys(), REQUEST_MODELS - defined.keys()
     checked, wrong, walked = walk(response_models(schemas))
@@ -334,7 +350,9 @@ def test_every_datetime_field_in_the_schemas_is_serialised_with_an_offset():
 
 # The two request models a service validates one by one, out of a body of raw items
 # (`BulkImportRequest.hosts: list[dict]`, `FindingKeysRequest.findings: list[Any]`), so
-# that a bad record is reported without failing the batch: no route names them.
+# that a bad record is reported without failing the batch: no route names them. They are
+# an allowance with no check behind it: nothing here shows a service still validates them
+# or that they are not also used as responses.
 ITEM_MODELS = {"BulkHostItem", "FindingKey"}
 
 
@@ -348,7 +366,8 @@ def _router_modules():
 def request_models_unaccounted_for(listed: set[str]) -> set[str]:
     """Names in `listed` that no request body is validated against: not a model a route
     takes as its body (nor one that model holds, nor one it inherits from) and not one
-    of `ITEM_MODELS`."""
+    of `ITEM_MODELS`. It compares names, not models: a request model of another module
+    with the same name as a listed response model would exempt it."""
     queue = [
         param.field_info.annotation
         for module in _router_modules()
@@ -377,10 +396,14 @@ def test_request_models_lists_only_models_a_request_is_validated_against():
 
 
 async def test_no_route_or_tool_serves_a_model_outside_the_walks_roots(client):
-    """Every route returns its own `{"data": ...}` envelope (no `response_model`), and
-    every MCP tool returns a `dict`, so the models their answers are built from are the
-    ones `schemas.py` defines, which the walk starts at. A route or tool that declared
-    one defined elsewhere would not be walked until it is made a root."""
+    """A pin on declarations, not a proof of where an answer's fields come from. The
+    routers under `app.routers` declare no `response_model` (each returns its own
+    `{"data": ...}` envelope; FastAPI infers one from a model return annotation too),
+    and every MCP tool advertises the output schema of a bare `dict`. A router route or
+    a tool that declared a model defined elsewhere would not be walked until it is made
+    a root, so it fails here. Not seen: a tool annotated `-> dict` that returns another
+    model's `model_dump()`, a route with `response_model=None` and a model return
+    annotation, a route added with `app.add_api_route` outside the routers, a subapp."""
     declared = [
         f"{module.__name__} {route.path}: {route.response_model}"
         for module in _router_modules()
@@ -557,3 +580,40 @@ def test_the_failure_says_where_a_request_model_goes():
     assert wrong == ["ReviewRequest.at (json)", "ReviewRequest.at (python)"]
     message = f"{FAILURE}: {wrong}"
     assert "schemas.UtcDatetime" in message and "REQUEST_MODELS" in message
+
+
+class _SerialisedByTheModel(BaseModel):
+    @computed_field
+    @property
+    def at(self) -> schemas.UtcDatetime:
+        return datetime(2026, 1, 2)
+
+    @field_serializer("at")
+    def _at(self, value) -> str:
+        return value.isoformat()
+
+
+def test_the_walk_does_not_see_a_serializer_on_the_model_holding_a_computed_field():
+    """A known limit, held so that a better walk flips this test: a computed field's
+    return annotation is dumped by itself (`TypeAdapter`), without a `field_serializer`
+    or `model_serializer` of the model that holds it. The annotation here is right and
+    the model's own serializer takes the offset away."""
+    checked, wrong, _ = walk([_SerialisedByTheModel])
+    assert checked == {"_SerialisedByTheModel.at"}
+    assert wrong == []  # the walk passes it
+    assert _SerialisedByTheModel().model_dump(mode="json") == {"at": "2026-01-02T00:00:00"}
+
+
+class _UnionOfTwoShapes(BaseModel):
+    at: list[schemas.UtcDatetime] | tuple[datetime, ...]
+
+
+def test_the_walk_checks_only_the_first_branch_of_a_union():
+    """A known limit, held so that a better walk flips this test: a union is sampled on
+    its first branch that holds a datetime, here the right one, and the bare branch
+    behind it is never given a value."""
+    checked, wrong, _ = walk([_UnionOfTwoShapes])
+    assert checked == {"_UnionOfTwoShapes.at"}
+    assert wrong == []  # the walk passes it
+    held = _UnionOfTwoShapes(at=(datetime(2026, 1, 2),))
+    assert held.model_dump(mode="json") == {"at": ["2026-01-02T00:00:00"]}
