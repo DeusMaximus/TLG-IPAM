@@ -251,11 +251,30 @@ async def targets_by_subnet(
     return {t.subnet_id: t for t in rows}
 
 
+def _scope_out(cidr: str, scope: list[tuple[int, int]]) -> list[dict]:
+    """The scope as a scan-target answer carries it: each range's addresses and the same
+    bounds as integers (`schemas.ScopeRangeOut`), so the UI can place a host by its
+    `ip_int` without parsing an address."""
+    ranges = format_intervals(parse_cidr(cidr), scope)
+    return [{**r, "start_int": lo, "end_int": hi} for r, (lo, hi) in zip(ranges, scope)]
+
+
 async def target_out(session: AsyncSession, target: ScanTarget) -> dict:
+    """The scan-target answer of REST (no MCP tool returns it): the columns, the scope,
+    and `runnable_methods`, what a job would run on the target's agent now."""
+    # jobs imports this module, so it is imported here
+    from . import jobs
+
     subnet = await _get_subnet(session, target.subnet_id)
     columns = {c.name: getattr(target, c.name) for c in target.__table__.columns}
-    scope = await scan_scope_ranges(session, subnet)
-    return ScanTargetOut.model_validate({**columns, "scope": scope}).model_dump(mode="json")
+    agent = await session.get(Agent, target.agent_id) if target.agent_id else None
+    found = await _scope_as_committed(session, subnet.id)
+    out = {
+        **columns,
+        "scope": _scope_out(*found) if found else [],
+        "runnable_methods": jobs.runnable_methods(target, subnet, agent),
+    }
+    return ScanTargetOut.model_validate(out).model_dump(mode="json")
 
 
 def _label(subnet: Subnet) -> str:

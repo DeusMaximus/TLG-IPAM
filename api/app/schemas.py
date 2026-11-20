@@ -436,6 +436,16 @@ class ScanTargetUpdate(BaseModel):
         return v
 
 
+class ScopeRangeOut(ScanRange):
+    """A range of a scan target's scope: the addresses, and the same bounds as integers
+    of the subnet's family (`ipnet`), so a client tells whether a host is in scope by
+    comparing its `ip_int` and never parses an address. A job's ranges stay
+    `agent_protocol.ScanRange`, without the integers."""
+
+    start_int: int
+    end_int: int
+
+
 class ScanTargetOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -456,8 +466,14 @@ class ScanTargetOut(BaseModel):
     last_scan_complete: bool | None
     # the error the agent reported with its last result set, sanitised at ingest
     last_scan_error: str | None = None
+    # What a job for this target would run on its agent now, from the interfaces the
+    # agent reported at its last accepted check-in: `jobs.job_methods`, the rule
+    # check-in issues jobs by. `[]`: no liveness method is left, so the target cannot be
+    # scanned by this agent. Null: not known (no agent, or it has never reported its
+    # interfaces). Computed on read; nothing stores it.
+    runnable_methods: list[str] | None = None
     # the subnet's scan scope (services/scans.scan_scope): inclusive address ranges
-    scope: list[ScanRange] = []
+    scope: list[ScopeRangeOut] = []
 
 
 # --- Findings ---

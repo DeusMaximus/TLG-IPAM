@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
+  agentLimit,
   formatDuration,
   hasDhcpPool,
-  macUnavailable,
   NEW_TARGET,
   scopeRangeText,
   settingsBody,
@@ -46,14 +46,18 @@ describe('settings form', () => {
 })
 
 describe('server-reported state', () => {
-  it('MAC collection is unavailable only when a job is out without arp', () => {
-    const base = { methods: ['icmp', 'arp'], current_job_id: 'j', job_methods: ['icmp'] }
-    expect(macUnavailable(base)).toBe(true)
-    expect(macUnavailable({ ...base, job_methods: ['icmp', 'arp'] })).toBe(false)
-    expect(macUnavailable({ ...base, methods: ['icmp'] })).toBe(false)
-    expect(macUnavailable({ ...base, current_job_id: null })).toBe(false)
-    expect(macUnavailable({ ...base, job_methods: null })).toBe(false)
-    expect(macUnavailable(null)).toBe(false)
+  it('reads what the agent can run from runnable_methods alone', () => {
+    const base = { methods: ['icmp', 'arp', 'rdns'], runnable_methods: ['icmp', 'rdns'] }
+    expect(agentLimit(base)).toBe('no-mac')
+    // whether or not a job is out, and whatever the job was issued with
+    expect(agentLimit({ ...base, current_job_id: 'j', job_methods: ['icmp', 'arp'] })).toBe('no-mac')
+    expect(agentLimit({ ...base, runnable_methods: ['icmp', 'arp', 'rdns'] })).toBeNull()
+    expect(agentLimit({ ...base, methods: ['icmp', 'rdns'] })).toBeNull()
+    expect(agentLimit({ methods: ['arp'], runnable_methods: [] })).toBe('unscannable')
+    // not known: no agent, or one that has never checked in
+    expect(agentLimit({ ...base, runnable_methods: null })).toBeNull()
+    expect(agentLimit({ ...base, runnable_methods: undefined, current_job_id: 'j', job_methods: ['icmp'] })).toBeNull()
+    expect(agentLimit(null)).toBeNull()
   })
 
   it('a pool needs both ends', () => {

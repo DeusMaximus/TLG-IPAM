@@ -131,13 +131,35 @@ describe('what a finding shows', () => {
 })
 
 describe('scope and last seen', () => {
-  it('says a host is outside scope only when the subnet has no scan target', () => {
+  it('says a host is outside scope from the integer bounds the server sends', () => {
     expect(scopeChecker({ loaded: true, target: null })({ ip: '10.0.0.1' })).toBe('out')
     expect(scopeChecker({ loaded: false, target: null })({ ip: '10.0.0.1' })).toBeNull()
-    // the ranges are address strings: the UI does not compare them with a host
-    const target = { scope: [{ start: '10.0.0.1', end: '10.0.0.9' }] }
-    expect(scopeChecker({ loaded: true, target })({ ip: '10.0.0.200' })).toBeNull()
-    expect(scopeChecker({ loaded: true, target: { scope: [] } })({ ip: '10.0.0.1' })).toBeNull()
+    // 10.0.0.1–10.0.0.9 and 10.0.0.20–10.0.0.20, as the server would send them
+    const target = {
+      subnet_id: 's',
+      scope: [
+        { start: '10.0.0.1', end: '10.0.0.9', start_int: 167772161, end_int: 167772169 },
+        { start: '10.0.0.20', end: '10.0.0.20', start_int: 167772180, end_int: 167772180 },
+      ],
+    }
+    const scopeOf = scopeChecker({ loaded: true, target })
+    expect(scopeOf({ subnet_id: 's', ip_int: 167772161 })).toBeNull() // first in scope
+    expect(scopeOf({ subnet_id: 's', ip_int: 167772169 })).toBeNull() // last of a range
+    expect(scopeOf({ subnet_id: 's', ip_int: 167772180 })).toBeNull() // a one-address range
+    expect(scopeOf({ subnet_id: 's', ip_int: 167772170 })).toBe('out') // between ranges
+    expect(scopeOf({ subnet_id: 's', ip_int: 167772200 })).toBe('out') // past the last
+    // a host of another subnet, or one without its integer, is not judged
+    expect(scopeOf({ subnet_id: 'other', ip_int: 167772170 })).toBeNull()
+    expect(scopeOf({ subnet_id: 's', ip: '10.0.0.10' })).toBeNull()
+    // an empty scope scans nothing
+    expect(scopeChecker({ loaded: true, target: { subnet_id: 's', scope: [] } })({ subnet_id: 's', ip_int: 1 })).toBe('out')
+  })
+
+  it('claims nothing when a range lacks its integer bounds', () => {
+    const target = { subnet_id: 's', scope: [{ start: '10.0.0.1', end: '10.0.0.9' }] }
+    expect(scopeChecker({ loaded: true, target })({ subnet_id: 's', ip_int: 167772200 })).toBeNull()
+    const unsafe = { subnet_id: 's', scope: [{ start_int: 0, end_int: 2 ** 60 }] }
+    expect(scopeChecker({ loaded: true, target: unsafe })({ subnet_id: 's', ip_int: 1 })).toBeNull()
   })
 
   it('the last-seen cell', () => {

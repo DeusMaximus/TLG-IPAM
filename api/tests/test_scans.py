@@ -200,7 +200,9 @@ async def test_prefix_shorter_than_20_is_refused(client):
 
     ok = await make_subnet(client, section["id"], "10.1.0.0/20", name="ok")
     target = await make_target(client, ok["id"])
-    assert target["scope"] == [{"start": "10.1.0.1", "end": "10.1.15.254"}]
+    assert target["scope"] == [
+        {"start": "10.1.0.1", "end": "10.1.15.254", "start_int": 167837697, "end_int": 167841790}
+    ]
 
 
 async def test_widening_a_scanned_subnet_past_20_is_refused(client):

@@ -5,10 +5,14 @@ import HostTable from './HostTable'
 
 vi.mock('./DeviceIcon', () => ({ default: ({ type }) => <span>{type}</span> }))
 
-const host = (id, ip) => ({
+// each fixture address's `ip_int`, written out as the server sends it: nothing in web/
+// parses an address
+const IP_INT = { '10.0.0.1': 167772161, '10.0.0.2': 167772162, '10.0.0.10': 167772170 }
+
+const host = (id, ip, ipInt = IP_INT[ip]) => ({
   id: String(id),
   ip,
-  ip_int: ip.split('.').reduce((total, octet) => total * 256 + Number(octet), 0),
+  ip_int: ipInt,
   hostname: `host-${id}`,
   fqdn: null,
   mac: null,
@@ -54,15 +58,28 @@ describe('HostTable', () => {
 
   it('only enables virtualization above 200 rows', () => {
     const { rerender } = render(
-      <HostTable hosts={Array.from({ length: 200 }, (_, index) => host(index, `10.0.0.${index}`))} />,
+      <HostTable hosts={Array.from({ length: 200 }, (_, index) => host(index, `10.0.0.${index}`, 167772160 + index))} />,
     )
     expect(screen.getByTestId('host-table-scroll')).toHaveAttribute('data-virtualized', 'false')
 
     rerender(
-      <HostTable hosts={Array.from({ length: 201 }, (_, index) => host(index, `10.0.0.${index}`))} />,
+      <HostTable hosts={Array.from({ length: 201 }, (_, index) => host(index, `10.0.0.${index}`, 167772160 + index))} />,
     )
     expect(screen.getByTestId('host-table-scroll')).toHaveAttribute('data-virtualized', 'true')
     expect(screen.getByRole('table', { name: 'Hosts' })).toHaveAttribute('aria-rowcount', '202')
     expect(screen.getAllByRole('row').length).toBeLessThan(202)
+  })
+
+  it('reads "not scanned" for the hosts scopeOf places outside the scan scope', () => {
+    const outside = new Set(['2'])
+    render(
+      <HostTable
+        hosts={[host(1, '10.0.0.1'), host(2, '10.0.0.2')]}
+        scopeOf={(h) => (outside.has(h.id) ? 'out' : null)}
+      />,
+    )
+    const rows = screen.getAllByRole('row')
+    expect(within(rows[1]).getAllByRole('cell').at(-1)).toHaveTextContent(/^—$/)
+    expect(within(rows[2]).getAllByRole('cell').at(-1)).toHaveTextContent(/^not scanned$/)
   })
 })
