@@ -302,15 +302,22 @@ NETWORK_REPORTED_NOTE = (
 # holds the bound. (The review that asked for paging measured 5,000 findings, 3,003,133
 # bytes, in one result.) `body_limit.BODY_MAX` bounds what a client sends, not this.
 PAGE_SIZE = 25
-# a cursor holds a subnet's name (120 characters at most), CIDR, id, an address and a type
-CURSOR_MAX = 1024
+# A cursor is base64url of UTF-8 JSON (`ensure_ascii=False`): a subnet's name, at most
+# 120 characters of at most 6 bytes each as JSON (a control character's `\u0000`; a
+# 4-byte character stays 4), so 720; a CIDR (43 at most), an id (36), an address (39
+# digits for IPv6), a type (13) and 14 of JSON punctuation. 865 bytes is 1,156 base64
+# characters; the cap leaves room above that, and every cursor the encoder can make
+# fits (`test_mcp.test_a_cursor_at_its_largest_round_trips`).
+CURSOR_MAX = 2048
 _TYPE_ORDER = {name: index for index, name in enumerate(FINDING_TYPES)}
 
 
 def _encode_cursor(position: tuple) -> str:
     name, cidr, subnet_id, ip_int, type_index = position
     raw = json.dumps(
-        [name, cidr, subnet_id, ip_int, FINDING_TYPES[type_index]], separators=(",", ":")
+        [name, cidr, subnet_id, ip_int, FINDING_TYPES[type_index]],
+        separators=(",", ":"),
+        ensure_ascii=False,
     )
     return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
 

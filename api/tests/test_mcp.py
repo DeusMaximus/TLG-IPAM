@@ -411,6 +411,25 @@ async def test_list_scan_findings_refuses_a_cursor_it_did_not_return(client, cur
     assert result.content[0].text == "cursor: not a cursor list_scan_findings returned"
 
 
+@pytest.mark.parametrize("name", ["😀" * 120, '"' * 120, "\\" * 120, "\x01" * 120])
+def test_a_cursor_at_its_largest_round_trips(name):
+    """Every cursor the encoder can make is one the decoder takes back: a subnet name at
+    its 120-character maximum in the characters JSON encodes longest (#83, Codex)."""
+    ip_int = 2**128 - 1  # an IPv6 address: the most digits
+    cidr = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/128"
+    position = (name, cidr, "f" * 36, ip_int, findings_svc._TYPE_ORDER["name_mismatch"])
+    cursor = findings_svc._encode_cursor(position)
+    assert len(cursor) <= findings_svc.CURSOR_MAX
+    assert findings_svc._decode_cursor(cursor) == position
+
+
+async def test_paging_through_a_subnet_with_a_long_unicode_name(client):
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"], name="😀" * 120)
+    await unknown_hosts(subnet["id"], "10.0.0", range(10, 10 + findings_svc.PAGE_SIZE + 1))
+    assert [len(p) for p in await scan_pages()] == [findings_svc.PAGE_SIZE, 1]
+
+
 async def test_a_page_at_every_field_maximum_fits_a_client(client):
     """The page size holds against the largest finding the API can make: every name at
     its maximum length (the measurement behind `findings.PAGE_SIZE`)."""
