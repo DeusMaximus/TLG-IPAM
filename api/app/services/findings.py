@@ -22,12 +22,16 @@ of the key, the host and `proposed` together.
 Observed values come from the network: a MAC an `arp` job reported, a PTR name any
 device can set for itself (sanitised to the hostname character set at ingest, which
 says nothing about what it means). They are data. No change summary written here, or by
-the hosts service on a finding's behalf, contains one (spec §7.2, invariant 8).
+the hosts service on a finding's behalf, contains one (spec §7.2, invariant 8). An
+assistant that copies one into an MCP `create_host`/`update_host` makes the owner's own
+host write, not an accept: its summary names the host by that hostname, as every host
+summary does (the owner's decision, #79).
 
 Accept and dismiss write on the strength of the scope, so each takes SQLite's write lock
 before it recomputes (`scans.take_write_lock`), and holds it until it commits.
 """
 
+import base64
 import hashlib
 import json
 from collections import Counter
@@ -285,25 +289,87 @@ NETWORK_REPORTED_NOTE = (
 )
 
 
-async def list_named(
-    session: AsyncSession, subnet_id: str | None = None, type_: str | None = None
-) -> list[dict]:
-    """Findings as MCP lists them (`list_scan_findings`, spec §5.8): one subnet's, or
-    every subnet's by subnet name when `subnet_id` is None. Each is `list_findings`'s
-    finding, unchanged, plus the subnet's `subnet_name` and `subnet_cidr` and the
-    recorded `host_name` and `host_fqdn` of the host at the address (null for an
-    `unknown_host`). `dynamic` findings are left out, as `list_findings` leaves them out
-    by default: a scanned DHCP pool is where personal devices answer (spec §7.1).
-    Only reads; a fixed number of statements per subnet."""
-    _check_type(type_)
-    query = select(Subnet.id, Subnet.name, Subnet.cidr, Subnet.domain).order_by(
-        Subnet.name, Subnet.cidr
+# `list_named` hands back at most this many findings per call (spec §5.8), chosen against
+# what one tool result can carry into a client. Claude Code documents its limits: it
+# keeps at most 50,000 characters of a text result and 25,000 tokens of any result, and
+# warns past 10,000 tokens. Measured through the tool as compact JSON: an ordinary
+# finding (short names, a PTR name under the subnet's domain) is about 400 characters,
+# so an ordinary page is about 10,000. A finding with every field at its ASCII maximum
+# (a 120-character subnet name, a 253-character PTR name, hostname and FQDN) is 1,738,
+# so a page of those is 44,057 with the note (45,817 when the owner's names are 4-byte
+# characters): under 50,000 and, even at 2 characters a token, under 25,000 tokens. 29
+# of them would pass 50,000. `test_mcp.test_a_page_at_every_field_maximum_fits_a_client`
+# holds the bound. (The review that asked for paging measured 5,000 findings, 3,003,133
+# bytes, in one result.) `body_limit.BODY_MAX` bounds what a client sends, not this.
+PAGE_SIZE = 25
+# a cursor holds a subnet's name (120 characters at most), CIDR, id, an address and a type
+CURSOR_MAX = 1024
+_TYPE_ORDER = {name: index for index, name in enumerate(FINDING_TYPES)}
+
+
+def _encode_cursor(position: tuple) -> str:
+    name, cidr, subnet_id, ip_int, type_index = position
+    raw = json.dumps(
+        [name, cidr, subnet_id, ip_int, FINDING_TYPES[type_index]], separators=(",", ":")
     )
+    return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> tuple:
+    """The position a cursor names, or a validation error for anything `list_named` did
+    not return: the cursor is the client's, so it is checked as a client string."""
+    refused = validation_error("cursor: not a cursor list_scan_findings returned")
+    if not isinstance(cursor, str) or not cursor or len(cursor) > CURSOR_MAX:
+        raise refused
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        name, cidr, subnet_id, ip_int, type_ = json.loads(raw)
+    except (ValueError, TypeError, RecursionError):
+        raise refused from None
+    if not (
+        all(isinstance(v, str) for v in (name, cidr, subnet_id))
+        and type(ip_int) is int
+        and ip_int >= 0
+        and type_ in _TYPE_ORDER
+    ):
+        raise refused
+    return name, cidr, subnet_id, ip_int, _TYPE_ORDER[type_]
+
+
+async def list_named(
+    session: AsyncSession,
+    subnet_id: str | None = None,
+    type_: str | None = None,
+    cursor: str | None = None,
+) -> dict:
+    """Findings as MCP lists them (`list_scan_findings`, spec §5.8), a page at a time:
+    one subnet's, or every subnet's by subnet name when `subnet_id` is None. Each is
+    `list_findings`'s finding, unchanged, plus the subnet's `subnet_name` and
+    `subnet_cidr` and the recorded `host_name` and `host_fqdn` of the host at the
+    address (null for an `unknown_host`). `dynamic` findings are left out, as
+    `list_findings` leaves them out by default: a scanned DHCP pool is where personal
+    devices answer (spec §7.1).
+
+    Returns `{"findings": [...], "next_cursor": ...}`: at most `PAGE_SIZE` findings, and
+    a cursor when at least one more follows, null otherwise. The order is total, by
+    subnet (name, CIDR, id), then address, then type, and the cursor is the position of
+    the page's last finding, so a client that passes it back gets what comes after it.
+    A finding resolved between calls therefore moves nothing later in the order.
+    Subnets before the cursor's are skipped without a query. Only reads; a fixed number
+    of statements per subnet visited."""
+    _check_type(type_)
+    after = _decode_cursor(cursor) if cursor is not None else None
+    query = select(Subnet.id, Subnet.name, Subnet.cidr, Subnet.domain)
     if subnet_id is not None:
         await get_subnet(session, subnet_id)
         query = query.where(Subnet.id == subnet_id)
-    out = []
-    for subnet in (await session.execute(query)).all():
+    subnets = sorted((await session.execute(query)).all(), key=lambda s: (s.name, s.cidr, s.id))
+    page: list[dict] = []
+    last: tuple | None = None
+    for subnet in subnets:
+        place = (subnet.name, subnet.cidr, subnet.id)
+        if after is not None and place < after[:3]:
+            continue
         found = await list_findings(session, subnet.id, type_)
         if not found:
             continue
@@ -317,9 +383,14 @@ async def list_named(
                 )
             ).all()
         }
-        for f in found:
+        for f in sorted(found, key=lambda f: (f["ip_int"], _TYPE_ORDER[f["type"]])):
+            position = (*place, f["ip_int"], _TYPE_ORDER[f["type"]])
+            if after is not None and position <= after:
+                continue
+            if len(page) == PAGE_SIZE:
+                return {"findings": page, "next_cursor": _encode_cursor(last)}
             host = hosts.get(f["host_id"])
-            out.append(
+            page.append(
                 {
                     **f,
                     "subnet_name": subnet.name,
@@ -332,7 +403,8 @@ async def list_named(
                     ),
                 }
             )
-    return out
+            last = position
+    return {"findings": page, "next_cursor": None}
 
 
 # --- Accept and dismiss ---

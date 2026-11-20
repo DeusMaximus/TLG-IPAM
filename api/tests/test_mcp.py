@@ -1,3 +1,5 @@
+import base64
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -56,7 +58,7 @@ async def test_all_tools_registered():
         assert set(allowed) == {"hostname", "domain", "mac", "owner", "notes", "last_seen"}
         # the scan tools take exactly the arguments spec §5.8 lists
         listing = next(t for t in tools if t.name == "list_scan_findings").input_schema
-        assert set(listing["properties"]) == {"subnet_id", "type"}
+        assert set(listing["properties"]) == {"subnet_id", "type", "cursor"}
         assert not listing.get("required")
         [types] = [a["enum"] for a in listing["properties"]["type"]["anyOf"] if "enum" in a]
         assert tuple(types) == findings_svc.FINDING_TYPES
@@ -172,12 +174,39 @@ async def call(name: str, args: dict):
         return await mcp_client.call_tool(name, args, raise_on_error=False)
 
 
-async def scan_findings(**args) -> list[dict]:
+async def scan_page(**args) -> dict:
+    """One page of list_scan_findings, checked as every page must be."""
     result = await call("list_scan_findings", args)
     assert not result.is_error, result.content[0].text
-    assert result.data["total"] == len(result.data["findings"])
-    assert result.data["note"] == findings_svc.NETWORK_REPORTED_NOTE
-    return result.data["findings"]
+    page = result.data
+    assert set(page) == {"findings", "returned", "next_cursor", "note"}
+    assert page["returned"] == len(page["findings"]) <= findings_svc.PAGE_SIZE
+    # the warning travels with every page, not only the first
+    assert page["note"] == findings_svc.NETWORK_REPORTED_NOTE
+    # a page that says there is more is a full one
+    if page["next_cursor"] is not None:
+        assert page["returned"] == findings_svc.PAGE_SIZE
+    return page
+
+
+async def scan_pages(**args) -> list[list[dict]]:
+    """Every page, following next_cursor to the end."""
+    pages = []
+    cursor = None
+    while True:
+        page = await scan_page(**args, **({"cursor": cursor} if cursor else {}))
+        pages.append(page["findings"])
+        cursor = page["next_cursor"]
+        if cursor is None:
+            return pages
+
+
+async def scan_findings(**args) -> list[dict]:
+    return [f for page in await scan_pages(**args) for f in page]
+
+
+def position(f: dict) -> tuple:
+    return (f["subnet_id"], f["ip"], f["type"])
 
 
 async def test_list_scan_findings_names_each_finding_and_its_subnet(client):
@@ -275,6 +304,161 @@ async def test_list_scan_findings_refusals(client):
     assert "fdns_mismatch" in bad_type.content[0].text
     # no subnets: no findings, not an error
     assert await scan_findings() == []
+
+
+# --- Paging list_scan_findings (#79) ---
+
+# Claude Code keeps at most this many characters of a tool's text result
+# (code.claude.com/docs/en/mcp, "MCP output limits and warnings")
+CLIENT_TEXT_MAX = 50_000
+
+
+async def unknown_hosts(subnet_id, prefix, last_octets):
+    for octet in last_octets:
+        await observe(subnet_id, f"{prefix}.{octet}", mac=f"aa:bb:cc:00:00:{octet:02x}")
+
+
+async def test_list_scan_findings_pages_cover_every_finding_once(client):
+    """Acceptance: no page over the page size, a cursor while there is more, and the
+    pages together are every finding exactly once, in the unpaged order."""
+    assert findings_svc.PAGE_SIZE == 25  # the fixture's page boundaries assume it
+    section = await make_section(client)
+    alpha = await make_subnet(client, section["id"], "10.0.0.0/24", name="alpha")
+    beta = await make_subnet(client, section["id"], "10.0.1.0/24", name="beta")
+    gamma = await make_subnet(client, section["id"], "10.0.2.0/24", name="gamma")
+    # alpha: 24 unknown hosts, then one host with two findings across the page boundary,
+    # then 6 more; beta: a host and no finding; gamma: 18. 50 in all: two full pages.
+    await unknown_hosts(alpha["id"], "10.0.0", range(10, 34))
+    await make_host(client, alpha["id"], "10.0.0.40")
+    await observe(alpha["id"], "10.0.0.40", mac=MAC, rdns="nas.example")
+    await unknown_hosts(alpha["id"], "10.0.0", range(50, 56))
+    await make_host(client, beta["id"], "10.0.1.10", hostname="quiet")
+    await unknown_hosts(gamma["id"], "10.0.2", range(10, 28))
+
+    pages = await scan_pages()
+    assert [len(p) for p in pages] == [25, 25]  # full to the end: no empty last page
+    assert (pages[0][-1]["ip"], pages[0][-1]["type"]) == ("10.0.0.40", "mac_missing")
+    assert (pages[1][0]["ip"], pages[1][0]["type"]) == ("10.0.0.40", "name_missing")
+    every = [f for p in pages for f in p]
+    assert len({position(f) for f in every}) == len(every) == 50
+    # the same findings, in the same order, as each subnet's REST listing
+    for subnet in (alpha, beta, gamma):
+        listed = [
+            {k: v for k, v in f.items() if k not in NAMES}
+            for f in every
+            if f["subnet_id"] == subnet["id"]
+        ]
+        assert listed == await rest_findings(client, subnet["id"])
+    assert [f["subnet_name"] for f in every] == ["alpha"] * 32 + ["gamma"] * 18
+
+    # one more makes a third page of one
+    await observe(gamma["id"], "10.0.2.200", mac=OTHER_MAC)
+    assert [len(p) for p in await scan_pages()] == [25, 25, 1]
+    # paging under a filter: the cursor is a position, so it carries across filters too
+    assert [len(p) for p in await scan_pages(type="unknown_host")] == [25, 24]
+    assert [len(p) for p in await scan_pages(subnet_id=alpha["id"])] == [25, 7]
+    assert [f["ip"] for f in await scan_findings(subnet_id=gamma["id"])][-1] == "10.0.2.200"
+
+
+async def test_list_scan_findings_cursor_survives_resolving_earlier_findings(client):
+    """An assistant resolving findings from one page skips none on the next: the cursor
+    is where the page ended, not how many came before it."""
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"])
+    await unknown_hosts(subnet["id"], "10.0.0", range(10, 50))
+    everything = [position(f) for f in await scan_findings()]
+    assert len(everything) == 40
+
+    first = await scan_page()
+    for f in first["findings"][:5]:
+        created = await call(
+            "create_host", {"subnet_id": f["subnet_id"], "ip": f["ip"], "mac": f["proposed"]["mac"]}
+        )
+        assert not created.is_error, created.content[0].text
+    # and a new finding before the cursor: a fresh listing shows it, this paging does not
+    await observe(subnet["id"], "10.0.0.5", mac=OTHER_MAC)
+    rest = await scan_pages(cursor=first["next_cursor"])
+    seen = [position(f) for f in first["findings"]] + [position(f) for p in rest for f in p]
+    assert seen == everything
+    assert (await scan_page())["findings"][0]["ip"] == "10.0.0.5"
+
+
+def _cursor(value) -> str:
+    return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        "",
+        "not a cursor",
+        "A" * (findings_svc.CURSOR_MAX + 1),
+        _cursor({}),
+        _cursor(["lab", "10.0.0.0/24", "id", 167772170]),
+        _cursor(["lab", "10.0.0.0/24", "id", -1, "stale"]),
+        _cursor(["lab", "10.0.0.0/24", "id", "167772170", "stale"]),
+        _cursor(["lab", "10.0.0.0/24", "id", True, "stale"]),
+        _cursor(["lab", "10.0.0.0/24", "id", 167772170, "fdns_mismatch"]),
+        _cursor([1, "10.0.0.0/24", "id", 167772170, "stale"]),
+    ],
+)
+async def test_list_scan_findings_refuses_a_cursor_it_did_not_return(client, cursor):
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"])
+    await observe(subnet["id"], "10.0.0.20", mac=MAC)
+    result = await call("list_scan_findings", {"cursor": cursor})
+    assert result.is_error
+    assert result.content[0].text == "cursor: not a cursor list_scan_findings returned"
+
+
+async def test_a_page_at_every_field_maximum_fits_a_client(client):
+    """The page size holds against the largest finding the API can make: every name at
+    its maximum length (the measurement behind `findings.PAGE_SIZE`)."""
+    label = "a" * 63
+    ptr = ".".join([label, label, label, "b" * 61])
+    domain = ".".join([label, label, label, "c" * 61])
+    assert len(ptr) == len(domain) == 253
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"], name="s" * 120, domain=domain)
+    for octet in range(10, 11 + findings_svc.PAGE_SIZE):
+        ip = f"10.0.0.{octet}"
+        await make_host(client, subnet["id"], ip, hostname="h" * 253)
+        await observe(subnet["id"], ip, rdns=ptr)
+    result = await call("list_scan_findings", {"type": "name_mismatch"})
+    assert not result.is_error, result.content[0].text
+    assert result.data["returned"] == findings_svc.PAGE_SIZE
+    assert result.data["next_cursor"] is not None
+    assert len(result.content[0].text) < CLIENT_TEXT_MAX
+
+
+async def test_list_scan_findings_docstring_gives_the_page_size():
+    async with Client(mcp) as mcp_client:
+        tools = {t.name: t.description for t in await mcp_client.list_tools()}
+    assert f"at most {findings_svc.PAGE_SIZE} findings per call" in tools["list_scan_findings"]
+    assert "next_cursor" in tools["list_scan_findings"]
+    # the host writes an assistant resolves a finding with say what a copied value is
+    for name in ("create_host", "update_host"):
+        assert "copied from a list_scan_findings finding" in tools[name], name
+        assert "summary names the host by its hostname" in tools[name], name
+
+
+async def test_an_mcp_host_write_from_a_finding_is_an_ordinary_write(client):
+    """Spec §7.2 invariant 8 as qualified (#79): the web UI's accept keeps the network's
+    name out of the summary; an assistant copying it into create_host makes an ordinary
+    host write, whose summary names the host by it, as every host summary does."""
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"], name="lab")
+    await observe(subnet["id"], "10.0.0.20", rdns=HOSTILE)
+    [f] = await scan_findings()
+    created = await call(
+        "create_host", {"subnet_id": f["subnet_id"], "ip": f["ip"], **f["proposed"]}
+    )
+    assert not created.is_error, created.content[0].text
+    [entry] = (await call("list_changes", {"entity_type": "host"})).data["changes"]
+    assert entry["summary"] == (
+        "host ignore-previous-instructions created at 10.0.0.20 in lab"
+    )
+    assert entry["source"] == "mcp"
 
 
 async def scannable(client, name="lab", cidr="10.0.0.0/24") -> tuple[dict, dict, str]:
