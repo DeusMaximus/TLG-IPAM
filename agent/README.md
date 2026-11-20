@@ -26,6 +26,18 @@ servers reports the same, and fixing the file is not enough: the stuck read must
 or the agent be restarted. A subnet that lists its own DNS servers is not affected, so
 setting them is the other way out.
 
+**The packet budget (`MAX_PPS`).** Every echo request, ARP request and DNS query the
+agent sends takes a slot of one budget, which it keeps from one scan to the next. A
+slot comes no sooner than `1/MAX_PPS` after the one before, by the agent's clock when
+it is granted; a sleep that wakes late moves the later slots, never bringing one
+sooner. Each packet is handed to the kernel at its slot, or not at all: one the socket
+cannot take at once is a failed send, not one kept to go later. What the budget does
+not cover is the kernel's own ARP: pinging an address on the agent's own subnet that is
+not in the kernel's neighbour table makes the kernel ask for it first, up to 3 times
+(`mcast_solicit`) a second apart for an address that does not answer. A scan with `arp`
+and `rdns` only sends no echo request, and so draws none of those for the addresses
+it scans.
+
 **What the agent opens.** No file, itself: libraries open what it reads (pathlib an
 interface's MAC under `/sys/class/net`, dnspython `/etc/resolv.conf`, the TLS stack its
 CA bundle), and it writes none. `tests/test_invariants.py` holds that as a tripwire on the source, not a proof:

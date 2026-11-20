@@ -274,6 +274,29 @@ async def test_job_runs_and_reports_live_addresses_with_names():
     ]
 
 
+async def test_one_packet_budget_runs_from_one_job_into_the_next():
+    """Two one-address jobs from one check-in, at MAX_PPS=1: the second job's echo
+    request comes a second after the first job's, though the first job ended at once.
+    With a budget made per job, the second could follow straight after the first, and
+    the second in which one job ends and the next begins would hold one more packet
+    than MAX_PPS (#87)."""
+    first = job(ranges=[{"start": "10.0.0.1", "end": "10.0.0.1"}], methods=["icmp"])
+    second = job(
+        job_id="6f1c2a8e-0000-4000-8000-000000000003",
+        ranges=[{"start": "10.0.0.2", "end": "10.0.0.2"}],
+        methods=["icmp"],
+    )
+    server = FakeServer(checkins=[accepted(first, second)])
+    clock = FakeClock()
+    prober = FakeProber(clock=clock)
+    agent, _ = make_agent(server, prober=prober, clock=clock, max_pps=1)
+    await agent.checkin_once()
+    await drain(agent)
+    assert [str(a) for a in prober.sent] == ["10.0.0.1", "10.0.0.2"]
+    assert len(server.results_posted) == 2
+    assert prober.times[1] - prober.times[0] >= 1.0 - 1e-9
+
+
 async def test_jobs_run_one_at_a_time_while_checkins_continue():
     """The loop keeps checking in while a job runs, and a second job waits for the
     first: the prober never sees two jobs' addresses interleaved."""

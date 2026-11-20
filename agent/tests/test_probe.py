@@ -197,34 +197,47 @@ def _ipv6_loopback() -> bool:
 @pytest.mark.parametrize("second", ["127.0.0.1", "::1"])
 async def test_failover_to_the_next_server_is_paced_with_the_icmp_sweep(second, late, monkeypatch):
     """At MAX_PPS=4 the echo request and both queries (the first server answers
-    SERVFAIL, the second the name) take three slots of one budget: the k-th packet on
-    the wire comes no sooner than k slots (0.25 s each) after the job started.
+    SERVFAIL, the second the name) take three slots of one budget, on the real clock.
 
-    That is the pacer's promise: each send waits for its slot on a schedule, and a slot
-    is never earlier than k intervals from the first. It is not a minimum gap between two
-    sends: a send that leaves late is followed by one that leaves on schedule, sooner
-    than 0.25 s after it (#87 owns whether that should change). Until #99 this test
-    asserted every gap was at least 0.22 s, so it would fail whenever one packet left
-    more than 30 ms after its slot and the next did not. `first-query-late` makes that
-    happen on purpose, handing the first query to dnspython 0.1 s after its slot.
+    What is held (#87): each slot is granted at least 0.25 s after the one before, by
+    the clock the pacer reads, and each packet is handed over at its grant and before
+    the next grant (the echo request in its probe's first step, a query in the step its
+    slot is granted, `probe.QuerySocket`). `first-query-late` wakes the first query's
+    pacing sleep 0.1 s late: before #87 the second query's slot stayed where it was,
+    0.15 s after the first query; now it moves with it. The arrival on loopback, which
+    the responder in this same event loop records, is held only to its schedule: the
+    k-th no sooner than k slots after the job started.
 
-    The failure seen (once in 24 runs for #78, once in 200 for #99, both on macOS and
-    both `::1`) was another dependency: the `::1` responder must share the port the
-    kernel gave the 127.0.0.1 one (the resolver asks every server on one port), and
-    that number can already be taken on ::1 by any other socket on the machine
-    (`EADDRINUSE`). `responders_on_one_port` now tries other ports."""
+    Until #87 the late case delayed the hand-off to dnspython after the slot, which
+    the agent's own socket no longer allows. The failure seen (once in 24 runs for
+    #78, once in 200 for #99, both on macOS and both `::1`) was another dependency: the
+    `::1` responder must share the port the kernel gave the 127.0.0.1 one (the resolver
+    asks every server on one port), and that number can already be taken on ::1 by any
+    other socket on the machine (`EADDRINUSE`). `responders_on_one_port` tries others."""
     if second == "::1" and not _ipv6_loopback():
         pytest.skip("no IPv6 loopback here")
-    if late:
-        real_udp, calls = dns.asyncquery.udp, []
+    grants: list[float] = []
+    handed: list[float] = []
 
-        async def udp(*args, **kwargs):
-            calls.append(1)
-            if len(calls) == 1:
-                await asyncio.sleep(late)
-            return await real_udp(*args, **kwargs)
+    class Recording(scan.Pacer):
+        async def wait(self):
+            await super().wait()
+            grants.append(self._last)
 
-        monkeypatch.setattr(dns.asyncquery, "udp", udp)
+    real_sendto = probe.QuerySocket.sendto
+
+    async def sendto(self, what, destination, timeout):
+        handed.append(time.monotonic())
+        return await real_sendto(self, what, destination, timeout)
+
+    monkeypatch.setattr(scan, "Pacer", Recording)
+    monkeypatch.setattr(probe.QuerySocket, "sendto", sendto)
+    sleeps: list[float] = []
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+        await asyncio.sleep(seconds + (late if len(sleeps) == 1 else 0.0))
+
     if second == "127.0.0.1":
         first_t, first, port = await responder(script=("servfail", "answer"))
         second_t, second_p = first_t, first
@@ -245,10 +258,19 @@ async def test_failover_to_the_next_server_is_paced_with_the_icmp_sweep(second, 
             prober=prober,
             resolver=DnsResolver(port=port),
             max_pps=4,
-            clock=scan.Clock(),
+            clock=scan.Clock(sleep=sleep),
         )
         assert result["observations"] == [{"ip": "10.0.0.9", "rdns_name": "nas.home.arpa"}]
         assert result["complete"] is True
+        assert len(grants) == 3 and len(prober.sent) == 1 and len(handed) == 2
+        # a slot apart, by the pacer's own clock: no tolerance
+        assert all(b - a >= 0.25 - 1e-9 for a, b in zip(grants, grants[1:])), grants
+        if late:
+            assert grants[1] - grants[0] >= 0.25 + late - 1e-9
+        # each packet handed over at its grant, and before the next grant
+        sends = prober.sent + handed
+        assert all(g <= t for g, t in zip(grants, sends)), (grants, sends)
+        assert all(t < g for t, g in zip(sends, grants[1:])), (grants, sends)
         arrivals = sorted(prober.sent + first.arrivals + (second_p.arrivals if second_p is not first else []))
         assert len(arrivals) == 3
         # 1 ms for the event loop, whose timers may fire up to its clock resolution early
@@ -642,14 +664,14 @@ async def test_a_lookup_the_jobs_deadline_stops_before_any_attempt_is_reported_a
         transport.close()
 
 
-# --- #99: what a cancelled lookup's datagram does ---
+# --- #87: a query goes when its slot is granted, or not at all ---
 
 
 class Unwritable:
     """Stands in for a client socket whose kernel send buffer is full: a datagram is
-    refused (`BlockingIOError`, so asyncio's transport keeps it and retries once the
-    socket is writable) until `writable` is set, and then handed to the real socket.
-    `log` records the first refusal and each send."""
+    refused (`BlockingIOError`, on which asyncio's transport would keep it and retry
+    once the socket is writable) until `writable` is set, and then handed to the real
+    socket. `log` records the first refusal and each send."""
 
     def __init__(self, sock, gate, log):
         self._sock, self._gate, self._log = sock, gate, log
@@ -662,7 +684,6 @@ class Unwritable:
         if not self._queued:
             self._queued = True
             self._log.append("queued")
-            self._gate["queued"].set()
         return True
 
     def sendto(self, data, addr):
@@ -679,65 +700,109 @@ class Unwritable:
         return getattr(self._sock, name)
 
 
-async def test_a_datagram_a_cancelled_lookup_had_handed_over_is_not_recalled(monkeypatch):
-    """Briefed round 2 of PR #96, finding 1, held as what the spec now says. Two
-    lookups, real resolver, loopback responder. 10.0.0.9's query is handed to its
-    socket, which cannot take it yet, so asyncio's transport keeps it. Then 10.0.0.8's
-    lookup could send its query to no server: 10.0.0.9's lookup is cancelled, its socket
-    closed, and the scan returns its (incomplete) result set. No query is handed to a
-    socket after the failure. When the socket becomes writable, asyncio still sends the
-    datagram it kept: after the cancellation, after the result set was made. It took
-    its slot, and goes to the job's server.
-
-    The stand-in replaces the transport's `_sock`, an asyncio internal, on the client's
-    sockets only; the responder's is made before it is in place."""
-    transport, proto, port = await responder()
-    loop = asyncio.get_running_loop()
+def unwritable_sockets(loop, gate, log, count=1):
+    """Makes the next `count` datagram sockets the loop creates `Unwritable`: the
+    stand-in replaces the transport's `_sock`, an asyncio internal. The responders are
+    made before it is in place. Undo with `del loop.create_datagram_endpoint`."""
     real_endpoint = loop.create_datagram_endpoint
-    log: list[str] = []
-    gate = {"writable": False, "queued": asyncio.Event()}
+    made = []
 
     async def endpoint(*args, **kwargs):
-        made, protocol = await real_endpoint(*args, **kwargs)
-        made._sock = Unwritable(made._sock, gate, log)
-        return made, protocol
+        transport, protocol = await real_endpoint(*args, **kwargs)
+        if len(made) < count:
+            transport._sock = Unwritable(transport._sock, gate, log)
+        made.append(transport)
+        return transport, protocol
 
-    real_udp = dns.asyncquery.udp
-    handed: list[str] = []
-
-    async def udp(query, where, **kwargs):
-        name = query.question[0].name.to_text()
-        handed.append(name)
-        if name.startswith("8."):
-            await gate["queued"].wait()
-            log.append("failure")
-            raise OSError("no route")
-        return await real_udp(query, where, **kwargs)
-
-    monkeypatch.setattr(dns.asyncquery, "udp", udp)
     loop.create_datagram_endpoint = endpoint
+    return made
+
+
+async def test_a_query_the_socket_cannot_take_at_once_never_leaves_later():
+    """#87, from the review of PR #103 ("Call 1's measured cost"): a query that
+    asyncio's transport kept because the socket's send buffer was full could leave
+    whenever the socket became writable, after its job and during the next one. Now the
+    socket that cannot take a query at once is aborted with it, and the query counts as
+    not sent: the first job's one lookup could send to no server, so it is incomplete
+    and keeps the stored names. Then the socket becomes writable and a second job runs:
+    only its own query arrives, and the first job's never does."""
+    transport, proto, port = await responder()
+    loop = asyncio.get_running_loop()
+    log: list[str] = []
+    gate = {"writable": False}
+    made = unwritable_sockets(loop, gate, log)
     try:
-        raw = job(ranges=[{"start": "10.0.0.8", "end": "10.0.0.9"}], dns_servers=["127.0.0.1"])
-        parsed = parse_job(job_ref(raw), raw)
-        result = await scan.run(
-            parsed, guard.plan(parsed, parse_allowed(None)), prober=TimedProber(alive=["10.0.0.8", "10.0.0.9"]),
-            resolver=DnsResolver(port=port), max_pps=1000, clock=scan.Clock(),
-        )
-        log.append("result")
-        assert result["complete"] is False and result["error"] == no_query_sent("OSError")
-        assert result["observations"] == [{"ip": "10.0.0.8"}, {"ip": "10.0.0.9"}]
-        await asyncio.sleep(0.05)
-        assert proto.arrivals == []  # the kernel has not taken it yet
+
+        async def sweep(address):
+            raw = job(ranges=[{"start": address, "end": address}], dns_servers=["127.0.0.1"])
+            parsed = parse_job(job_ref(raw), raw)
+            return await scan.run(
+                parsed, guard.plan(parsed, parse_allowed(None)), prober=TimedProber(alive=[address]),
+                resolver=DnsResolver(port=port), max_pps=1000, clock=scan.Clock(),
+            )
+
+        first = await sweep("10.0.0.9")
+        assert first["complete"] is False and first["error"] == no_query_sent("BlockingIOError")
+        assert first["observations"] == [{"ip": "10.0.0.9"}]
+        assert len(made) == 1 and made[0].is_closing()
         gate["writable"] = True
-        for _ in range(100):
-            if proto.arrivals:
-                break
-            await asyncio.sleep(0.01)
-        # no query handed over after the failure; the one kept went out after the result
-        assert sorted(handed) == ["8.0.0.10.in-addr.arpa.", "9.0.0.10.in-addr.arpa."]
-        assert log == ["queued", "failure", "result", "kernel took it"]
-        assert len(proto.arrivals) == 1
-        assert proto.questions == [("9.0.0.10.in-addr.arpa.", "PTR")]
+        second = await sweep("10.0.0.8")
+        assert second["complete"] is True
+        await asyncio.sleep(0.1)
+        assert log == ["queued"]  # the kept datagram was dropped with its socket
+        assert proto.questions == [("8.0.0.10.in-addr.arpa.", "PTR")]
+    finally:
+        del loop.create_datagram_endpoint
+        transport.close()
+
+
+async def test_a_server_whose_socket_cannot_take_the_query_gives_way_to_the_next():
+    """The query that could not be handed over is an attempt that sent nothing, as a
+    refused send is: the lookup asks the next server, which answers. One datagram
+    arrives, from the second socket."""
+    transport, proto, port = await responder()
+    loop = asyncio.get_running_loop()
+    log: list[str] = []
+    gate = {"writable": False}
+    unwritable_sockets(loop, gate, log)
+    try:
+        slot, taken = counted()
+        name = await DnsResolver(port=port).ptr(ipaddress.ip_address("10.0.0.9"), ("127.0.0.1",) * 2, slot)
+        assert name == "nas.home.arpa."
+        assert len(taken) == 2  # the slot of the query that was dropped is spent
+        gate["writable"] = True
+        await asyncio.sleep(0.05)
+        assert log == ["queued"] and len(proto.arrivals) == 1
+    finally:
+        del loop.create_datagram_endpoint
+        transport.close()
+
+
+async def test_the_querys_socket_has_no_port_until_the_query_goes():
+    """The query's socket is made before its slot is granted, so it is open while the
+    lookup waits. It is bound to no port then (the kernel picks one at the send), so
+    nothing sent to the host can reach it before the query goes."""
+    transport, proto, port = await responder()
+    loop = asyncio.get_running_loop()
+    made = []
+    real_endpoint = loop.create_datagram_endpoint
+
+    async def endpoint(*args, **kwargs):
+        pair = await real_endpoint(*args, **kwargs)
+        made.append(pair[0])
+        return pair
+
+    loop.create_datagram_endpoint = endpoint
+    ports = []
+    try:
+
+        async def slot():
+            ports.append(made[-1].get_extra_info("socket").getsockname()[1])
+            return 0.5
+
+        name = await DnsResolver(port=port).ptr(ipaddress.ip_address("10.0.0.9"), ("127.0.0.1",), slot)
+        assert name == "nas.home.arpa."
+        assert ports == [0] and len(proto.arrivals) == 1
     finally:
         del loop.create_datagram_endpoint
         transport.close()

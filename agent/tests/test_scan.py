@@ -182,10 +182,15 @@ def test_network_and_broadcast_are_skipped():
 
 
 async def test_probes_that_run_past_the_deadline_make_the_result_incomplete():
-    """Both sends start inside a 1 s job, but the probes take 0.75 s each: the job
-    ends after its deadline, so it is not complete (Codex and Greptile on PR #70)."""
+    """Both sends start inside a 1 s job, but the probes take 0.4 s each: the job
+    ends after its deadline, so it is not complete (Codex and Greptile on PR #70).
+
+    The fake clock adds sleeps up, concurrent ones too: the first probe's 0.4 s and
+    the pacer's 0.5 s put the second send at 0.9 s, and the second probe ends at 1.3 s.
+    (With 0.75 s, the pacer, which looks at the clock again after it sleeps, would put
+    the second send past the deadline, and the test would not reach its point.)"""
     clock = FakeClock()
-    prober = FakeProber(alive=["10.0.0.1", "10.0.0.2"], clock=clock, delay=0.75)
+    prober = FakeProber(alive=["10.0.0.1", "10.0.0.2"], clock=clock, delay=0.4)
     parsed, addresses = planned(ranges=[{"start": "10.0.0.1", "end": "10.0.0.2"}], methods=["icmp"], timeout_s=1)
     result = await sweep(parsed, addresses, prober=prober, clock=clock, max_pps=2)
     assert len(prober.sent) == 2
