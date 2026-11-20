@@ -129,22 +129,58 @@ def test_the_dependencies_are_the_three_the_spec_names():
     assert names == ["dnspython", "httpx", "icmplib"]
 
 
+def _socket_use(tree) -> tuple[bool, set[str]]:
+    """Whether a module imports `socket` in any spelling (`import socket`, `import
+    socket as x`, `from socket import ...`), and the names it reaches on it: attributes
+    of any name the module is bound to, and the names it imports from it."""
+    aliases: set[str] = set()
+    names: set[str] = set()
+    imported = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "socket":
+                    imported = True
+                    aliases.add(alias.asname or "socket")
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module == "socket":
+            imported = True
+            names.update(alias.name for alias in node.names)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in aliases:
+            names.add(node.attr)
+    return imported, names
+
+
 def _socket_names(path):
-    """What a module reaches on the `socket` module: `socket.<name>`."""
-    tree = ast.parse(path.read_text())
-    return {
-        node.attr
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "socket"
-    }
+    return _socket_use(ast.parse(path.read_text()))
 
 
 def test_only_the_probe_module_opens_a_packet_socket():
-    """The ARP sweep's raw `AF_PACKET` socket is made in `probe.py` alone, and the
-    only other module that makes a socket, `interfaces.py`, makes a netlink one,
-    which talks to the local kernel and puts nothing on any network."""
-    makers = {p.name for p in MODULES if "socket" in _socket_names(p)}
-    assert makers == {"probe.py", "interfaces.py"}
-    assert {p.name for p in MODULES if "AF_PACKET" in _socket_names(p)} == {"probe.py"}
-    families = {n for n in _socket_names(PACKAGE / "interfaces.py") if n.startswith("AF_")}
+    """A tripwire, like the checks above: it sees which modules import `socket`, in
+    any spelling, and which of its names they use, not what they do with them.
+
+    The ARP sweep's raw `AF_PACKET` socket is made in `probe.py`. Two other modules
+    may import `socket`: `loop.py` for the host's name alone, and `interfaces.py`,
+    which names no address family but netlink, inet and unspec: its socket talks to
+    the local kernel."""
+    users = {p.name: _socket_names(p) for p in MODULES}
+    assert {name for name, (imported, _) in users.items() if imported} == {"probe.py", "interfaces.py", "loop.py"}
+    assert users["loop.py"][1] == {"gethostname"}
+    assert {name for name, (_, used) in users.items() if "AF_PACKET" in used} == {"probe.py"}
+    families = {n for n in users["interfaces.py"][1] if n.startswith("AF_")}
     assert families <= {"AF_NETLINK", "AF_INET", "AF_INET6", "AF_UNSPEC"}
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import socket as wire\ns = wire.socket(17, wire.SOCK_RAW, 0)\n",
+        "from socket import socket as make\n",
+        "from socket import AF_PACKET\n",
+        "import socket\n",
+    ],
+)
+def test_the_socket_tripwire_sees_every_spelling(source):
+    """Briefed review of PR #84: `import socket as wire` passed the first version."""
+    imported, _ = _socket_use(ast.parse(source))
+    assert imported

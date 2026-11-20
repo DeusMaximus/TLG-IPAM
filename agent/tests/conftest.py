@@ -161,14 +161,20 @@ class FakeArp:
     read back with RFC 826's layout, recorded, and answered with a reply frame from
     `hosts` (`{address: MAC}`), unless the host is in `deaf_first`, which only answers
     a second request. `extra` frames, with their source, are delivered as the link
-    opens: replies nobody asked for, malformed frames. `times` is the fake clock's
-    time at each send: the stand-in for a frame on the wire."""
+    opens: replies nobody asked for, malformed frames. `after` maps an address to
+    frames delivered right after its first request, so they arrive once it has been
+    asked. `times` is the fake clock's time at each send: the stand-in for a frame on
+    the wire."""
 
-    def __init__(self, hosts=None, clock=None, *, deaf_first=(), extra=(), fail_open=None, fail_receive_after=None):
+    def __init__(
+        self, hosts=None, clock=None, *, deaf_first=(), extra=(), after=None,
+        fail_open=None, fail_receive_after=None,
+    ):
         self.hosts = {ipaddress.ip_address(k): v for k, v in (hosts or {}).items()}
         self.deaf_first = {ipaddress.ip_address(a) for a in deaf_first}
         self.clock = clock
         self.extra = list(extra)
+        self.after = {ipaddress.ip_address(k): list(v) for k, v in (after or {}).items()}
         self.fail_open = fail_open
         self.fail_receive_after = fail_receive_after
         self.requests: list = []
@@ -200,6 +206,9 @@ class FakeArp:
         if self.fail_receive_after is not None and len(self.requests) >= self.fail_receive_after:
             self._queue.put_nowait(OSError("interface went down"))
             return
+        if self.requests.count(target) == 1:
+            for item in self.after.get(target, ()):
+                self._queue.put_nowait(item)
         answer = self.hosts.get(target)
         if answer is None or (target in self.deaf_first and self.requests.count(target) < 2):
             return

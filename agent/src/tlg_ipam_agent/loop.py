@@ -72,6 +72,10 @@ INTERVAL_MAX_S = 3600
 QUEUE_MAX = 4
 # reported at check-in, and not yet used by the server: the methods this release runs
 CAPABILITIES = sorted(SUPPORTED)
+# a backstop past the job's own deadline, on the event loop's clock: a scan still
+# running this long after its timeout is stopped, so one stuck await cannot hold the
+# worker until the job's lease runs out
+SCAN_GRACE_S = 30
 
 
 def checkin_body(interfaces: list[dict]) -> dict:
@@ -157,18 +161,26 @@ class Agent:
             body = scan.refusal(ref, refused.reason, self.clock)
         else:
             log.info("job %s: %d addresses in %s", ref.job_id, len(addresses), job.network)
+            scanning = scan.run(
+                job,
+                addresses,
+                prober=self.prober,
+                resolver=self.resolver,
+                arp_link=self.arp_link,
+                # read again as the job starts: the ARP sweep needs the interface on
+                # the subnet as it is now, not as the last check-in saw it
+                interfaces=self.interfaces(),
+                max_pps=self.config.max_pps,
+                clock=self.clock,
+            )
             try:
-                body = await scan.run(
-                    job,
-                    addresses,
-                    prober=self.prober,
-                    resolver=self.resolver,
-                    arp_link=self.arp_link,
-                    # read again as the job starts: the ARP sweep needs the interface
-                    # on the subnet as it is now, not as the last check-in saw it
-                    interfaces=self.interfaces(),
-                    max_pps=self.config.max_pps,
-                    clock=self.clock,
+                body = await asyncio.wait_for(scanning, job.timeout_s + SCAN_GRACE_S)
+            except TimeoutError:
+                # what the scan saw is lost; the server keeps the error and clears the
+                # lease, and the result set marks nothing dead
+                log.error("job %s did not end within its timeout; stopped", ref.job_id)
+                body = scan.refusal(
+                    ref, f"agent error: the scan did not end within {job.timeout_s} s", self.clock
                 )
             except Exception as exc:  # a bug, not a refusal: report it, keep running
                 log.exception("job %s failed", ref.job_id)

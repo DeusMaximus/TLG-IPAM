@@ -8,8 +8,10 @@ any network.
 """
 
 import asyncio
+import bisect
 import ipaddress
 import random
+import re
 import socket
 
 import pytest
@@ -131,21 +133,39 @@ def test_a_reply_from_a_mac_no_station_owns_is_dropped(sender):
 
 
 def test_no_frame_makes_the_parser_fail():
-    """Random frames, and every one-byte change to a good reply: each is a reply or
-    None, never an exception, and a reply is always an address and a unicast MAC."""
+    """Every frame is a reply or None, never an exception, and a reply is always an
+    address and a unicast MAC. The inputs are built to reach past each check in turn:
+    every value of every byte of a good reply (42 x 256), every truncation, random
+    tails behind a valid header, and random values in each header field; random
+    frames alone almost never get past the ethertype."""
     rng = random.Random(14)
     good = arp_frame(NAS, NAS_MAC, HOST_IP)
-    frames = [rng.randbytes(rng.randrange(0, 80)) for _ in range(3000)]
-    frames += [rng.randbytes(42) for _ in range(1000)]
-    for at in range(len(good)):
-        for value in (0x00, 0xFF, good[at] ^ 0x01):
-            frames.append(good[:at] + bytes([value]) + good[at + 1 :])
+    frames = [good[:at] + bytes([value]) + good[at + 1 :] for at in range(len(good)) for value in range(256)]
+    frames += [good[:n] for n in range(len(good))]
+    frames += [good[:14 + n] + rng.randbytes(rng.randrange(0, 60)) for n in range(29) for _ in range(20)]
+    for _ in range(3000):
+        fields = {
+            "ethertype": rng.choice([0x0806, 0x0806, 0x0800, 0x8100, rng.randrange(65536)]),
+            "htype": rng.choice([1, 1, 6, rng.randrange(65536)]),
+            "ptype": rng.choice([0x0800, 0x0800, 0x86DD, rng.randrange(65536)]),
+            "hlen": rng.choice([6, 6, rng.randrange(256)]),
+            "plen": rng.choice([4, 4, rng.randrange(256)]),
+            "oper": rng.choice([2, 2, 1, rng.randrange(65536)]),
+            "pad": rng.randrange(0, 30),
+        }
+        target = rng.choice([HOST_IP, ip(rng.randrange(2**32))])
+        frames.append(arp_frame(ip(rng.randrange(2**32)), rng.randbytes(6), target, rng.randbytes(6), **fields))
+    taken = 0
     for frame in frames:
         found = arp.reply(frame, HOST_IP)
         if found is not None:
+            taken += 1
             address, text = found
             assert isinstance(address, ipaddress.IPv4Address)
             assert arp.is_unicast(arp.mac_bytes(text))
+            assert frame[12:14] == b"\x08\x06" and frame[20:22] == b"\x00\x02" and frame[38:42] == HOST_IP.packed
+    # the inputs reach the end of the parser, both ways
+    assert 100 < taken < len(frames) - 1000
 
 
 # --- which replies the session takes ---
@@ -370,34 +390,65 @@ async def test_requests_go_only_to_the_jobs_addresses():
 
 
 async def test_unsolicited_and_malformed_frames_are_not_reported():
-    extra = [
-        (arp_frame("10.0.0.99", "02:00:00:00:00:99", HOST_IP), source()),  # not in the ranges
-        (arp_frame("192.168.1.1", "02:00:00:00:01:01", HOST_IP), source()),  # not in the subnet
-        (arp_frame("10.0.0.11", "02:00:00:00:00:11", "10.0.0.6"), source()),  # to another host
-        (arp_frame("10.0.0.12", "02:00:00:00:00:12", HOST_IP, oper=1), source()),  # a request
-        (arp_frame("10.0.0.10", "02:00:00:00:00:10", HOST_IP), source(kind=PACKET_OUTGOING)),
-        (arp_frame("10.0.0.10", "02:00:00:00:00:10", HOST_IP), source(interface="eth1")),
-        (b"\x00" * 41, source()),
-        (b"", source()),
-    ]
-    link = FakeArp(extra=extra)
+    """Each frame arrives after the address it names has been asked, so only the
+    check it is meant to meet can drop it."""
+    after = {
+        # a reply to another host, a request, a frame this host is sending, one from
+        # another interface, and a sender MAC no station owns: each about an address
+        # the sweep has just asked
+        "10.0.0.10": [
+            (arp_frame("10.0.0.10", "02:00:00:00:00:10", "10.0.0.6", mac("02:00:00:00:00:06")), source()),
+            (arp_frame("10.0.0.10", "02:00:00:00:00:10", HOST_IP, oper=1), source()),
+            (arp_frame("10.0.0.10", "02:00:00:00:00:10", HOST_IP), source(kind=PACKET_OUTGOING)),
+        ],
+        "10.0.0.11": [
+            (arp_frame("10.0.0.11", "02:00:00:00:00:11", HOST_IP), source(interface="eth1")),
+            (arp_frame("10.0.0.11", "ff:ff:ff:ff:ff:ff", HOST_IP), source()),
+            (arp_frame("10.0.0.11", "02:00:00:00:00:11", HOST_IP, ethertype=0x0800), source()),
+        ],
+        "10.0.0.12": [
+            # from outside the ranges and the subnet, and frames cut short
+            (arp_frame("10.0.0.99", "02:00:00:00:00:99", HOST_IP), source()),
+            (arp_frame("192.168.1.1", "02:00:00:00:01:01", HOST_IP), source()),
+            (arp_frame("10.0.0.12", "02:00:00:00:00:12", HOST_IP)[:41], source()),
+            (b"", source()),
+        ],
+    }
+    link = FakeArp(after=after)
     parsed, addresses = planned(ranges=[{"start": "10.0.0.10", "end": "10.0.0.12"}])
     result = await sweep(parsed, addresses, arp_link=link)
     assert result["observations"] == [] and result["complete"] is True
+    assert sorted(link.requests) == sorted(addresses * 2)  # each silent, so retried
 
 
-@pytest.mark.parametrize("pps", [1, 20, 200])
-async def test_requests_and_echo_requests_share_max_pps(pps):
+async def test_a_reply_that_arrives_after_its_request_is_reported():
+    """The control for the test above: the same delivery path does carry a reply."""
+    after = {"10.0.0.11": [(arp_frame("10.0.0.11", "02:00:00:00:00:11", HOST_IP), source())]}
+    parsed, addresses = planned(ranges=[{"start": "10.0.0.10", "end": "10.0.0.12"}])
+    result = await sweep(parsed, addresses, arp_link=FakeArp(after=after))
+    assert result["observations"] == [{"ip": "10.0.0.11", "mac": "02:00:00:00:00:11"}]
+
+
+def _most_in_one_second(times) -> int:
+    times = sorted(times)
+    return max(bisect.bisect_left(times, t + 1.0 - 1e-9) - i for i, t in enumerate(times))
+
+
+@pytest.mark.parametrize(("pps", "last"), [(1, 40), (20, 254), (200, 254)])
+async def test_requests_and_echo_requests_share_max_pps(pps, last):
+    """Each phase holds more than a second of sends at its rate (the whole /24 at 20
+    and 200 a second): an ARP sweep that skipped the pacer, or paced itself apart
+    from the ICMP sweep, would put more than `pps` in the second where one phase
+    meets the next."""
     clock = FakeClock()
     prober = FakeProber(clock=clock)
     link = FakeArp(clock=clock)
-    parsed, addresses = planned(methods=["icmp", "arp"], ranges=[{"start": "10.0.0.1", "end": "10.0.0.40"}])
+    parsed, addresses = planned(methods=["icmp", "arp"], ranges=[{"start": "10.0.0.1", "end": f"10.0.0.{last}"}])
     await sweep(parsed, addresses, arp_link=link, prober=prober, clock=clock, max_pps=pps)
-    # 40 echo requests, then 39 ARP requests and 39 retries (not to 10.0.0.5)
-    assert len(prober.times) == 40 and len(link.times) == 78
-    times = sorted(prober.times + link.times)
-    for i in range(len(times) - pps):
-        assert times[i + pps] - times[i] >= 1.0 - 1e-9
+    # an echo request to each, then an ARP request and a retry to each but 10.0.0.5
+    assert len(prober.times) == last and len(link.times) == 2 * (last - 1)
+    assert _most_in_one_second(prober.times + link.times) == pps
+    assert _most_in_one_second(link.times) == pps
 
 
 async def test_the_deadline_stops_the_sweep_and_reports_incomplete():
@@ -529,3 +580,150 @@ async def test_ptr_lookups_cover_addresses_found_by_arp():
     parsed, addresses = planned(methods=["icmp", "arp", "rdns"])
     result = await sweep(parsed, addresses, arp_link=link, resolver=resolver)
     assert {"ip": NAS, "mac": NAS_MAC, "rdns_name": "nas.home.arpa"} in result["observations"]
+
+
+async def test_a_reply_that_lands_while_a_retry_waits_for_its_slot_stops_that_retry():
+    """Both silent at first, at 1 a second. While the retry of .2 waits for its slot,
+    .2's late first-round reply arrives: .2 gets no retry (briefed review of PR #84,
+    finding 4)."""
+    clock = FakeClock()
+
+    class Late(FakeArp):
+        async def send(self, frame):
+            await super().send(frame)
+            if self.requests == [ip("10.0.0.1"), ip("10.0.0.2"), ip("10.0.0.1")]:
+                self._queue.put_nowait((arp_frame("10.0.0.2", "02:00:00:00:00:02", HOST_IP), source()))
+
+    link = Late(clock=clock)
+    parsed, addresses = planned(ranges=[{"start": "10.0.0.1", "end": "10.0.0.2"}])
+    result = await sweep(parsed, addresses, arp_link=link, clock=clock, max_pps=1)
+    assert link.requests == [ip("10.0.0.1"), ip("10.0.0.2"), ip("10.0.0.1")]
+    assert result["observations"] == [{"ip": "10.0.0.2", "mac": "02:00:00:00:00:02"}]
+    assert result["complete"] is True
+
+
+class Flood(FakeArp):
+    """A link that is always readable, as under an ARP flood: `receive` returns a
+    frame at once and never yields. Each read records how many times a task beside
+    the sweep has run, so a stretch of reads with no other task running shows."""
+
+    def __init__(self, ticks, **kwargs):
+        super().__init__(**kwargs)
+        self.ticks = ticks
+        self.reads = 0
+        self.longest = 0
+        self._run = 0
+        self._seen = None
+
+    async def receive(self):
+        self.reads += 1
+        if self.ticks[0] == self._seen:
+            self._run += 1
+            self.longest = max(self.longest, self._run)
+        else:
+            self._seen, self._run = self.ticks[0], 1
+        if self.reads > 2_000_000:  # a listener that never yields would read for ever
+            raise ProbeError("the flood outlasted the test")
+        return arp_frame("10.0.0.99", "02:00:00:00:00:99", "10.0.0.6", mac("02:00:00:00:00:06")), source()
+
+
+async def test_a_flood_of_frames_does_not_hold_the_event_loop():
+    """The listener lets other tasks run after each batch, so the sweep, its deadline
+    and the agent's check-ins go on while the socket stays readable (briefed review
+    of PR #84, finding 1)."""
+    ticks = [0]
+
+    async def beside():
+        while True:
+            ticks[0] += 1
+            await asyncio.sleep(0)
+
+    other = asyncio.create_task(beside())
+    try:
+        clock = FakeClock()
+        link = Flood(ticks, clock=clock)
+        parsed, addresses = planned(ranges=[{"start": "10.0.0.1", "end": "10.0.0.20"}])
+        result = await sweep(parsed, addresses, arp_link=link, clock=clock, max_pps=10)
+    finally:
+        other.cancel()
+    assert result["complete"] is True and result["observations"] == [{"ip": "10.0.0.5", "mac": "02:00:00:00:00:05"}]
+    assert link.reads > 0
+    assert link.longest <= probe.ARP_RECEIVE_BATCH
+    assert len(link.requests) == 2 * 19  # every address but 10.0.0.5, and its retry
+
+
+async def test_the_deadline_holds_under_a_flood():
+    """A 2 s job at 1 a second, with the socket always readable: the sweep stops at
+    its deadline and says so."""
+    clock = FakeClock()
+    link = Flood([0], clock=clock)
+    parsed, addresses = planned(timeout_s=2)
+    result = await sweep(parsed, addresses, arp_link=link, clock=clock, max_pps=1)
+    assert result["complete"] is False and "during the ARP sweep" in result["error"]
+    assert len(link.requests) <= 3 and link.closed == 1
+
+
+def _full_socket_pair():
+    """A local datagram socket pair whose sending end is full: the next send would
+    block (Linux says EAGAIN; macOS says ENOBUFS). Nothing reads the other end, and
+    nothing reaches any network."""
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    ours.setblocking(False)
+    while True:
+        try:
+            ours.send(b"\x00" * 42)
+        except OSError:
+            return ours, theirs
+
+
+FULL = r"(send queue full|request not sent) on eth0"
+
+
+async def test_a_full_send_queue_fails_the_send_at_once():
+    """`send` never waits for the socket to be writable, so it cannot hold the job
+    past its deadline (briefed review of PR #84, finding 2)."""
+    ours, theirs = _full_socket_pair()
+    link = object.__new__(PacketLink)
+    link.interface, link._sock = "eth0", ours
+    try:
+        with pytest.raises(ProbeError, match=FULL):
+            await asyncio.wait_for(link.send(b"request"), 0.5)
+    finally:
+        ours.close()
+        theirs.close()
+
+
+async def test_a_send_that_would_block_fails_without_waiting():
+    """The same on every platform: a socket whose send would block (EAGAIN)."""
+
+    class WouldBlock:
+        def send(self, frame):
+            raise BlockingIOError
+
+    link = object.__new__(PacketLink)
+    link.interface, link._sock = "eth0", WouldBlock()
+    with pytest.raises(ProbeError, match="send queue full on eth0"):
+        await asyncio.wait_for(link.send(b"request"), 0.5)
+
+
+async def test_a_sweep_on_a_full_send_queue_ends_incomplete_at_once():
+    ours, theirs = _full_socket_pair()
+
+    def opener(interface):
+        link = object.__new__(PacketLink)
+        link.interface, link._sock = interface, ours
+        return link
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    try:
+        parsed, addresses = planned(timeout_s=1)
+        # a send that waited for the socket would never end: fail instead of hanging
+        result = await asyncio.wait_for(sweep(parsed, addresses, arp_link=opener, clock=scan.Clock()), 5)
+    finally:
+        ours.close()
+        theirs.close()
+    assert loop.time() - started < 0.5
+    assert result["complete"] is False and re.search(FULL, result["error"])
+    # the agent's own address is still reported
+    assert result["observations"] == [{"ip": "10.0.0.5", "mac": "02:00:00:00:00:05"}]

@@ -254,6 +254,34 @@ async def test_arp_finds_a_host_that_drops_ping_and_a_departed_host_is_marked_de
     assert arp.asked("10.0.0.9") == 2  # once a scan
 
 
+async def test_an_arp_scan_cut_off_in_its_retry_round_marks_nothing_dead(owner):
+    """A scan whose deadline falls while the retries go out is incomplete, so the host
+    that left is not marked dead: the silent addresses never had their retry (briefed
+    review of PR #84). At 10 a second, the first round's 13 requests and its wait end
+    at 2.3 s; the 3 s job is cut off in the retries."""
+    agent_row, subnet, target = await setup(owner, methods=("arp",))
+    arp = FakeArp({"10.0.0.2": "02:00:00:00:00:02", "10.0.0.3": "02:00:00:00:00:03"})
+    agent = make_agent(agent_row["token"], prober=FakeProber(), arp=arp, max_pps=10)
+    await agent.checkin_once()
+    await run_queued(agent)
+    assert (await target_of(owner, target["id"]))["last_scan_complete"] is True
+    assert (await observations(subnet["id"]))["10.0.0.3"].alive is True
+
+    del arp.hosts[ipaddress.ip_address("10.0.0.3")]
+    arp.requests.clear()
+    await _ok(await owner.post(f"/api/v1/subnets/{subnet['id']}/scan"), 202)
+    await past_the_checkin_gap(agent_row["id"])
+    await agent.checkin_once()
+    await run_queued(agent, timeout_s=3)
+    shown = await target_of(owner, target["id"])
+    assert shown["last_scan_complete"] is False
+    assert "during the ARP sweep" in shown["last_scan_error"]
+    # the retry round had begun, and had not reached every silent address
+    assert arp.asked("10.0.0.1") == 2 and arp.asked("10.0.0.14") == 1
+    seen = await observations(subnet["id"])
+    assert seen["10.0.0.3"].alive is True and seen["10.0.0.2"].alive is True
+
+
 async def test_an_arp_job_on_an_interface_without_a_mac_marks_nothing_dead(owner):
     """The server issues `arp` by the reported networks alone; an agent that cannot
     send ARP from that interface reports the scan incomplete, so a quiet address is

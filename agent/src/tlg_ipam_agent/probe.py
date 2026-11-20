@@ -73,6 +73,11 @@ class IcmpProber:
 PACKET_OUTGOING = 4
 # an ARP reply is 42 bytes and padding; a longer frame is cut here, and is not one
 ARP_RECV_MAX = 2048
+# frames the listener takes before it lets every other task run. Reading a socket
+# that already holds a frame returns without yielding, so a station that keeps the
+# socket readable (a flood) would otherwise hold the event loop: the job's deadline,
+# the check-ins and cancellation would all wait for the flood to end
+ARP_RECEIVE_BATCH = 64
 
 
 class ArpLink(Protocol):
@@ -115,8 +120,13 @@ class PacketLink:
         self._sock = sock
 
     async def send(self, frame: bytes) -> None:
+        """Hands one frame to the kernel at once. It never waits for the socket to be
+        writable, so a send cannot hold the job past its deadline: a full send queue
+        is a failed send, which stops the sweep."""
         try:
-            await asyncio.get_running_loop().sock_sendall(self._sock, frame)
+            self._sock.send(frame)
+        except BlockingIOError:
+            raise ProbeError(f"ARP send queue full on {self.interface}") from None
         except OSError as exc:
             raise ProbeError(f"ARP request not sent on {self.interface} ({type(exc).__name__})") from None
 
@@ -178,10 +188,13 @@ class ArpSession:
         return True
 
     async def listen(self) -> None:
-        """Take replies until cancelled. A ProbeError from the link ends it."""
+        """Take replies until cancelled, letting every other task run after each
+        ARP_RECEIVE_BATCH frames. A ProbeError from the link ends it."""
         while True:
-            frame, source = await self._link.receive()
-            self.take(frame, source)
+            for _ in range(ARP_RECEIVE_BATCH):
+                frame, source = await self._link.receive()
+                self.take(frame, source)
+            await asyncio.sleep(0)
 
 
 # servers tried for one lookup, in order; resolv.conf holds at most three as well

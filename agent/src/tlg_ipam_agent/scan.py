@@ -115,6 +115,12 @@ class _Pool:
                 # a probe started near the deadline waits only until the deadline, so
                 # the work in flight never carries the job past it
                 tasks.append(asyncio.create_task(one(item, min(self._item_timeout, left))))
+        except BaseException:
+            # cancelled (`loop.SCAN_GRACE_S`, or the agent stopping): the work in
+            # flight goes too, so the wait for it below cannot outlast the cancel
+            for task in tasks:
+                task.cancel()
+            raise
         finally:
             results = await asyncio.gather(*tasks, return_exceptions=True)
         for result in results:
@@ -201,6 +207,9 @@ async def _arp_sweep(
                 check()
                 if clock.monotonic() >= deadline:
                     return False
+                # a reply can land while the slot is awaited: then no retry goes
+                if address in session.answers:
+                    continue
                 await session.request(address)
             check()
             # the round's replies get ARP_TIMEOUT_S after its last request, and less
