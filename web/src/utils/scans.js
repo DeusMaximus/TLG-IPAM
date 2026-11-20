@@ -1,3 +1,6 @@
+import { ONLINE_WITHIN_MS } from './agents'
+import { parseServerTime } from './time'
+
 // Display helpers for a subnet's scanning settings (v0.2 spec §5.2, §5.3, §5.8).
 // The server decides everything about scanning: which addresses are in scope
 // (`scope` on the scan target, from services/scans.scan_scope), which methods a job
@@ -73,6 +76,23 @@ export function agentLimit(target) {
   if (runnable.length === 0) return 'unscannable'
   if ((target.methods || []).includes('arp') && !runnable.includes('arp')) return 'no-mac'
   return null
+}
+
+// How old the evidence for `runnable_methods` is, as the server reports it beside it:
+// the agent's last check-in (`agent_checkin_at`) and whether it was refused. Only an
+// accepted check-in reports interfaces, so after a refused one they are older than
+// that time, by an amount the server does not store.
+//   null — nothing to date: the server does not know what the agent can run, or sent
+//     no time with it
+//   { at, refused, recent } — `at` the server's time as sent; `recent` when the last
+//     check-in was accepted and within the agents page's "online" window
+export function agentReport(target, now = Date.now()) {
+  if (!Array.isArray(target?.runnable_methods)) return null
+  const date = parseServerTime(target.agent_checkin_at)
+  if (!date) return null
+  const refused = target.agent_checkin_refused === true
+  const recent = !refused && now - date.getTime() <= ONLINE_WITHIN_MS
+  return { at: target.agent_checkin_at, refused, recent }
 }
 
 export function formatDuration(ms) {

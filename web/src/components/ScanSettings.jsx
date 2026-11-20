@@ -13,6 +13,7 @@ import { relativeTime } from '../utils/agents'
 import { parseServerTime } from '../utils/time'
 import {
   agentLimit,
+  agentReport,
   formatDuration,
   hasDhcpPool,
   SCAN_METHODS,
@@ -64,6 +65,24 @@ const LIMIT_TEXT = {
   'no-mac': 'MAC collection unavailable — agent is not on this subnet',
 }
 
+// When the agent reported the interfaces those messages are judged from (`agentReport`).
+// Beside a message it always shows; with none, only when the report is not recent, as
+// the absence of a warning rests on the same evidence.
+function Evidence({ report, alone }) {
+  const when = <When value={report.at} />
+  if (report.refused)
+    return alone ? (
+      <>The agent’s last check-in, {when}, was refused: what it can scan is judged from the interfaces it reported before then.</>
+    ) : (
+      <>Based on the interfaces the agent reported before its last check-in, {when}, which was refused.</>
+    )
+  return alone ? (
+    <>The agent last checked in {when}: what it can scan is judged from the interfaces it reported then.</>
+  ) : (
+    <>Based on the interfaces the agent reported {when}.</>
+  )
+}
+
 function Scope({ scope }) {
   if (!scope?.length) return <span className="text-slate-500">no addresses</span>
   const shown = scope.slice(0, SCOPE_SHOWN)
@@ -82,6 +101,7 @@ function Status({ target }) {
   const last = parseServerTime(target.last_scan_at)
   const pending = asked && (!last || asked > last)
   const limit = agentLimit(target)
+  const report = agentReport(target)
   return (
     <dl className="mt-3 grid grid-cols-1 gap-x-6 gap-y-2 text-sm sm:grid-cols-2">
       <div>
@@ -112,10 +132,22 @@ function Status({ target }) {
           <Scope scope={target.scope} />
         </dd>
       </div>
-      {limit && (
-        <p className="text-xs text-amber-400 sm:col-span-2" role="status">
-          {LIMIT_TEXT[limit]}
-        </p>
+      {limit ? (
+        <div className="text-xs sm:col-span-2" role="status">
+          <p className="text-amber-400">{LIMIT_TEXT[limit]}</p>
+          {report && (
+            <p className="mt-0.5 text-slate-400" data-testid="agent-report">
+              <Evidence report={report} />
+            </p>
+          )}
+        </div>
+      ) : (
+        report &&
+        !report.recent && (
+          <p className="text-xs text-slate-400 sm:col-span-2" role="status" data-testid="agent-report">
+            <Evidence report={report} alone />
+          </p>
+        )
       )}
     </dl>
   )

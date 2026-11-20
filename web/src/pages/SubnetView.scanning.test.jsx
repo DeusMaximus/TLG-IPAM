@@ -446,6 +446,109 @@ describe('scanning settings', () => {
     expect(screen.queryByText(/MAC collection unavailable/)).not.toBeInTheDocument()
   })
 
+  // what the server sends: UTC with its offset
+  const ago = (ms) => new Date(Date.now() - ms).toISOString().replace('Z', '+00:00')
+
+  it('says when the agent reported the interfaces a message is judged from', async () => {
+    seed({
+      target: {
+        runnable_methods: ['icmp', 'rdns'],
+        agent_checkin_at: ago(5 * 60 * 1000),
+        agent_checkin_refused: false,
+      },
+    })
+    renderView()
+    const region = await findScanning()
+    expect(
+      await within(region).findByText('MAC collection unavailable — agent is not on this subnet')
+    ).toBeInTheDocument()
+    expect(within(region).getByTestId('agent-report')).toHaveTextContent(
+      'Based on the interfaces the agent reported 5m ago.'
+    )
+  })
+
+  it('says the interfaces are older than a refused last check-in', async () => {
+    seed({
+      target: {
+        methods: ['arp', 'rdns'],
+        runnable_methods: [],
+        agent_checkin_at: ago(2 * 60 * 1000),
+        agent_checkin_refused: true,
+      },
+    })
+    renderView()
+    const region = await findScanning()
+    expect(await within(region).findByText(/^Cannot be scanned by this agent/)).toBeInTheDocument()
+    expect(within(region).getByTestId('agent-report')).toHaveTextContent(
+      'Based on the interfaces the agent reported before its last check-in, 2m ago, which was refused.'
+    )
+  })
+
+  it('with no message, dates the report only when the agent has not checked in recently', async () => {
+    seed({
+      target: {
+        runnable_methods: ['icmp', 'arp', 'rdns'],
+        agent_checkin_at: ago(30 * 1000),
+        agent_checkin_refused: false,
+      },
+    })
+    const { unmount } = renderView()
+    expect(await within(await findScanning()).findByText('idle')).toBeInTheDocument()
+    expect(within(scanning()).queryByTestId('agent-report')).toBeNull()
+    expect(within(scanning()).queryByRole('status')).toBeNull()
+    unmount()
+
+    // an agent gone quiet for three days: no warning, but none is promised either
+    seed({
+      target: {
+        runnable_methods: ['icmp', 'arp', 'rdns'],
+        agent_checkin_at: ago(3 * 24 * 3600 * 1000),
+        agent_checkin_refused: false,
+      },
+    })
+    renderView()
+    expect(await within(await findScanning()).findByTestId('agent-report')).toHaveTextContent(
+      'The agent last checked in 3d ago: what it can scan is judged from the interfaces it reported then.'
+    )
+    expect(within(scanning()).queryByText(/MAC collection unavailable/)).toBeNull()
+  })
+
+  it('with no message, says when a recent check-in was refused', async () => {
+    seed({
+      target: {
+        runnable_methods: ['icmp', 'arp', 'rdns'],
+        agent_checkin_at: ago(20 * 1000),
+        agent_checkin_refused: true,
+      },
+    })
+    renderView()
+    expect(await within(await findScanning()).findByTestId('agent-report')).toHaveTextContent(
+      'The agent’s last check-in, 20s ago, was refused: what it can scan is judged from the interfaces it reported before then.'
+    )
+  })
+
+  it('shows the time from the answer, not from the agents list, and follows the reload', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    seed({
+      target: {
+        runnable_methods: ['icmp', 'rdns'],
+        agent_checkin_at: ago(10 * 60 * 1000),
+        agent_checkin_refused: false,
+      },
+    })
+    renderView()
+    expect(await within(await findScanning()).findByTestId('agent-report')).toHaveTextContent(
+      'reported 10m ago.'
+    )
+    db.target.agent_checkin_at = ago(0)
+    await vi.advanceTimersByTimeAsync(REFRESH_MS)
+    await waitFor(() =>
+      expect(within(scanning()).getByTestId('agent-report')).toHaveTextContent(/reported \d+s ago\./)
+    )
+    // the agents list is read once, for the form, and is not polled for this
+    expect(ipam.listAgents).toHaveBeenCalledTimes(1)
+  })
+
   it('shows the error the agent reported with its last scan, as text and never as markup', async () => {
     const error = '<img src=x onerror="alert(1)"><b>bold</b> guard: subnet outside ALLOWED_CIDRS'
     seed({
