@@ -17,7 +17,7 @@ from app.models import Base, Observation
 from app.services.device_types import seed_defaults
 from sqlalchemy import select, update
 
-from conftest import FakeClock, FakeProber, FakeResolver, make_config
+from conftest import FakeArp, FakeClock, FakeProber, FakeResolver, make_config
 from tlg_ipam_agent import loop as agent_loop
 from tlg_ipam_agent import scan
 from tlg_ipam_agent.backoff import Backoff
@@ -94,7 +94,7 @@ def fast_clock(scale: float = 10.0) -> scan.Clock:
     )
 
 
-def make_agent(token, *, prober, resolver=None, interfaces=LINK, clock=None, **config):
+def make_agent(token, *, prober, resolver=None, arp=None, interfaces=LINK, clock=None, **config):
     http = httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="https://test",
@@ -105,6 +105,7 @@ def make_agent(token, *, prober, resolver=None, interfaces=LINK, clock=None, **c
         AgentClient(http),
         prober=prober,
         resolver=resolver or FakeResolver(),
+        arp_link=arp if arp is not None else FakeArp(),
         interfaces=lambda: interfaces,
         clock=clock or FakeClock(),
         rng=random.Random(7),
@@ -212,19 +213,91 @@ async def test_a_job_outside_the_allowlist_is_refused_and_the_refusal_reaches_th
     assert await observations(subnet["id"]) == {}
 
 
-async def test_an_arp_job_from_this_release_marks_nothing_dead(owner):
-    """`arp` is issued (the agent is on the link) but this release cannot run it: the
-    result set is incomplete, so an address that went quiet is not marked dead."""
+async def test_arp_finds_a_host_that_drops_ping_and_a_departed_host_is_marked_dead(owner):
+    """The acceptance line of #14, against the real routes with the wire faked: a host
+    that answers ARP and not ping is reported alive with its MAC, and once a host has
+    left (it answers neither), the next complete scan marks it dead."""
     agent_row, subnet, target = await setup(owner, methods=("icmp", "arp"))
     prober = FakeProber(alive=["10.0.0.2", "10.0.0.3"])
-    agent = make_agent(agent_row["token"], prober=prober)
+    arp = FakeArp({
+        "10.0.0.2": "02:00:00:00:00:02",
+        "10.0.0.3": "02:00:00:00:00:03",
+        "10.0.0.9": "02:00:00:00:00:09",  # drops ping
+    })
+    agent = make_agent(agent_row["token"], prober=prober, arp=arp)
     await agent.checkin_once()
     await run_queued(agent)
     first = await target_of(owner, target["id"])
-    assert first["job_methods"] is None and first["last_scan_complete"] is False
-    assert "not run by this agent release: arp" in first["last_scan_error"]
+    assert first["last_scan_complete"] is True and first["last_scan_error"] is None
+    assert arp.opened == ["eth0"] and arp.closed == 1
+    seen = await observations(subnet["id"])
+    assert {ip: (o.alive, o.mac) for ip, o in seen.items()} == {
+        "10.0.0.2": (True, "02:00:00:00:00:02"),
+        "10.0.0.3": (True, "02:00:00:00:00:03"),
+        "10.0.0.5": (True, "02:00:00:00:00:05"),  # the agent's own address
+        "10.0.0.9": (True, "02:00:00:00:00:09"),
+    }
 
-    # 10.0.0.3 goes quiet; a scan is requested and the next job runs
+    # 10.0.0.3 leaves the network; a scan is requested and the next job runs
+    prober.alive = {a for a in prober.alive if str(a) != "10.0.0.3"}
+    del arp.hosts[ipaddress.ip_address("10.0.0.3")]
+    await _ok(await owner.post(f"/api/v1/subnets/{subnet['id']}/scan"), 202)
+    await past_the_checkin_gap(agent_row["id"])
+    await agent.checkin_once()
+    await run_queued(agent)
+    assert (await target_of(owner, target["id"]))["last_scan_complete"] is True
+    seen = await observations(subnet["id"])
+    assert {ip for ip, o in seen.items() if o.alive} == {"10.0.0.2", "10.0.0.5", "10.0.0.9"}
+    assert seen["10.0.0.3"].alive is False
+    # the departed host had its request and its retry, and nothing else was retried
+    assert arp.asked("10.0.0.3") == 3  # one in the first scan, two in the second
+    assert arp.asked("10.0.0.9") == 2  # once a scan
+
+
+async def test_an_arp_scan_cut_off_in_its_retry_round_marks_nothing_dead(owner):
+    """A scan whose deadline falls while the retries go out is incomplete, so the host
+    that left is not marked dead: the silent addresses never had their retry (briefed
+    review of PR #84). At 10 a second, the first round's 13 requests and its wait end
+    at 2.3 s; the 3 s job is cut off in the retries."""
+    agent_row, subnet, target = await setup(owner, methods=("arp",))
+    arp = FakeArp({"10.0.0.2": "02:00:00:00:00:02", "10.0.0.3": "02:00:00:00:00:03"})
+    agent = make_agent(agent_row["token"], prober=FakeProber(), arp=arp, max_pps=10)
+    await agent.checkin_once()
+    await run_queued(agent)
+    assert (await target_of(owner, target["id"]))["last_scan_complete"] is True
+    assert (await observations(subnet["id"]))["10.0.0.3"].alive is True
+
+    del arp.hosts[ipaddress.ip_address("10.0.0.3")]
+    arp.requests.clear()
+    await _ok(await owner.post(f"/api/v1/subnets/{subnet['id']}/scan"), 202)
+    await past_the_checkin_gap(agent_row["id"])
+    await agent.checkin_once()
+    await run_queued(agent, timeout_s=3)
+    shown = await target_of(owner, target["id"])
+    assert shown["last_scan_complete"] is False
+    assert "during the ARP sweep" in shown["last_scan_error"]
+    # the retry round had begun, and had not reached every silent address
+    assert arp.asked("10.0.0.1") == 2 and arp.asked("10.0.0.14") == 1
+    seen = await observations(subnet["id"])
+    assert seen["10.0.0.3"].alive is True and seen["10.0.0.2"].alive is True
+
+
+async def test_an_arp_job_on_an_interface_without_a_mac_marks_nothing_dead(owner):
+    """The server issues `arp` by the reported networks alone; an agent that cannot
+    send ARP from that interface reports the scan incomplete, so a quiet address is
+    not marked dead."""
+    agent_row, subnet, target = await setup(owner, methods=("icmp", "arp"))
+    prober = FakeProber(alive=["10.0.0.2", "10.0.0.3"])
+    arp = FakeArp()
+    no_mac = [{"name": "eth0", "cidr": "10.0.0.5/28", "mac": None}]
+    agent = make_agent(agent_row["token"], prober=prober, arp=arp, interfaces=no_mac)
+    await agent.checkin_once()
+    await run_queued(agent)
+    first = await target_of(owner, target["id"])
+    assert first["last_scan_complete"] is False
+    assert "arp not run" in first["last_scan_error"]
+    assert arp.opened == []
+
     prober.alive = {a for a in prober.alive if str(a) != "10.0.0.3"}
     await _ok(await owner.post(f"/api/v1/subnets/{subnet['id']}/scan"), 202)
     await past_the_checkin_gap(agent_row["id"])
@@ -356,20 +429,23 @@ NEW = {ip: f"new{ip.split('.')[-1]}.home.arpa" for ip in LIVE}
 
 async def _named_subnet(owner, methods=("icmp", "rdns")):
     """A /29 whose four live addresses have OLD names stored by a complete scan, and an
-    agent at MAX_PPS=1 (one packet a second on the fake clock), ready for the next."""
+    agent at MAX_PPS=1 (one packet a second on the fake clock), ready for the next.
+    The four answer ARP too, and the agent's interface (10.0.0.5) has a MAC."""
     agent_row, subnet, target = await setup(owner, cidr="10.0.0.0/29", methods=methods)
     resolver = FakeResolver(OLD)
     agent = make_agent(
         agent_row["token"],
         prober=FakeProber(alive=LIVE),
         resolver=resolver,
-        interfaces=[{"name": "eth0", "cidr": "10.0.0.5/29", "mac": None}],
+        arp=FakeArp({ip: f"02:00:00:00:00:0{ip[-1]}" for ip in LIVE}),
+        interfaces=[{"name": "eth0", "cidr": "10.0.0.5/29", "mac": "02:00:00:00:00:05"}],
         clock=fast_clock(),
         max_pps=1,
     )
     await agent.checkin_once()
     await run_queued(agent)
-    assert {ip: o.rdns_name for ip, o in (await observations(subnet["id"])).items()} == OLD
+    names = {ip: o.rdns_name for ip, o in (await observations(subnet["id"])).items()}
+    assert {ip: names[ip] for ip in LIVE} == OLD
     await _ok(await owner.post(f"/api/v1/subnets/{subnet['id']}/scan"), 202)
     await past_the_checkin_gap(agent_row["id"])
     resolver.names = {ipaddress.ip_address(k): v for k, v in NEW.items()}
@@ -418,13 +494,17 @@ async def test_a_complete_scan_still_clears_a_name_its_lookup_did_not_return(own
     assert (await target_of(owner, target["id"]))["last_scan_complete"] is True
 
 
-async def test_on_its_own_link_until_arp_names_are_only_set_or_replaced(owner):
-    """Deliberate call 17: a job issued `arp` is always incomplete from this release
-    (call 4), so a lookup that returns no name leaves the stored one."""
+async def test_on_its_own_link_a_complete_arp_scan_clears_a_name(owner):
+    """Deliberate call 17 of PR #70 held while `arp` could not run: a job issued it
+    was always incomplete, so names there were only set or replaced. Now the agent
+    runs `arp`, a complete scan on its own link clears a name its lookup did not
+    return, as it does elsewhere."""
     agent, resolver, subnet, target = await _named_subnet(owner, methods=("icmp", "arp", "rdns"))
     del resolver.names[ipaddress.ip_address("10.0.0.3")]
     await agent.checkin_once()
     await run_queued(agent)
-    assert len(resolver.asked) == 4
-    assert await _names(subnet) == {**NEW, "10.0.0.3": OLD["10.0.0.3"]}
-    assert (await target_of(owner, target["id"]))["last_scan_complete"] is False
+    assert (await target_of(owner, target["id"]))["last_scan_complete"] is True
+    # the four live addresses, and the agent's own, found by ARP
+    assert sorted(str(a) for a, _ in resolver.asked) == [*LIVE, "10.0.0.5"]
+    names = await _names(subnet)
+    assert names == {**NEW, "10.0.0.3": None, "10.0.0.5": None}

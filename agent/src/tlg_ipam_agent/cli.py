@@ -10,7 +10,7 @@ import sys
 from . import __version__, config, interfaces
 from .client import AgentClient, make_http
 from .loop import Agent, Redact, log
-from .probe import DnsResolver, IcmpProber
+from .probe import DnsResolver, IcmpProber, PacketLink
 
 
 async def _run(cfg: config.Config) -> None:
@@ -24,6 +24,7 @@ async def _run(cfg: config.Config) -> None:
             AgentClient(http),
             prober=IcmpProber(),
             resolver=DnsResolver(),
+            arp_link=PacketLink,
             interfaces=interfaces.discover,
         )
         await agent.run(stop)

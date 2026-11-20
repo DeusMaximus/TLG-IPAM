@@ -1,6 +1,7 @@
 """Fakes for the agent's tests. Nothing here sends a packet: the prober and resolver
-record what they were asked, the clock only counts, and the server is either an
-httpx mock transport or the real app in process (`test_e2e.py`)."""
+record what they were asked, the ARP link stands in for the socket and the hosts on
+the wire, the clock only counts, and the server is either an httpx mock transport or
+the real app in process (`test_e2e.py`)."""
 
 import asyncio
 import ipaddress
@@ -8,6 +9,7 @@ import json
 import os
 import random
 import shutil
+import struct
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -38,6 +40,7 @@ from tlg_ipam_agent import scan  # noqa: E402
 from tlg_ipam_agent.client import AgentClient  # noqa: E402
 from tlg_ipam_agent.config import Config, parse_allowed  # noqa: E402
 from tlg_ipam_agent.loop import Agent  # noqa: E402
+from tlg_ipam_agent.probe import ProbeError  # noqa: E402
 
 TOKEN = "tlga_" + "x" * 43
 BASE = "https://ipam.example.com"
@@ -118,6 +121,113 @@ class FakeResolver:
         return self.names.get(address)
 
 
+# ARP frames written out here from RFC 826, not with the agent's own `arp` module, so a
+# test that reads the agent's frames with them checks the agent against the standard
+ETHER = struct.Struct("!6s6sH")
+ARP = struct.Struct("!HHBBH6s4s6s4s")
+# the interface the tests report: eth0, 10.0.0.5 in the lab /24
+ETH0 = [{"name": "eth0", "cidr": "10.0.0.5/24", "mac": "02:00:00:00:00:05"}]
+HOST_IP = ipaddress.IPv4Address("10.0.0.5")
+HOST_MAC = bytes.fromhex("020000000005")
+PACKET_HOST, PACKET_BROADCAST, PACKET_OUTGOING = 0, 1, 4
+
+
+def mac(text: str) -> bytes:
+    return bytes.fromhex(text.replace(":", ""))
+
+
+def arp_frame(
+    sender_ip, sender_mac, target_ip, target_mac=HOST_MAC, *, oper=2, dst=None,
+    ethertype=0x0806, htype=1, ptype=0x0800, hlen=6, plen=4, pad=0,
+) -> bytes:
+    """An Ethernet ARP frame; by default a reply to this host's eth0 address."""
+    sender_mac = mac(sender_mac) if isinstance(sender_mac, str) else sender_mac
+    frame = ETHER.pack(dst or target_mac, sender_mac, ethertype) + ARP.pack(
+        htype, ptype, hlen, plen, oper,
+        sender_mac, ipaddress.IPv4Address(sender_ip).packed,
+        target_mac, ipaddress.IPv4Address(target_ip).packed,
+    )
+    return frame + b"\x00" * pad
+
+
+def source(interface="eth0", kind=PACKET_HOST, sender=b"\x02" * 6) -> tuple:
+    """The address `recvfrom` gives a frame on a packet socket."""
+    return (interface, 0x0806, kind, 1, sender)
+
+
+class FakeArp:
+    """The ARP socket (`probe.PacketLink`) and the link behind it. Called with an
+    interface name, as the agent opens a link; each request frame the agent sends is
+    read back with RFC 826's layout, recorded, and answered with a reply frame from
+    `hosts` (`{address: MAC}`), unless the host is in `deaf_first`, which only answers
+    a second request. `extra` frames, with their source, are delivered as the link
+    opens: replies nobody asked for, malformed frames. `after` maps an address to
+    frames delivered right after its first request, so they arrive once it has been
+    asked. `times` is the fake clock's time at each send: the stand-in for a frame on
+    the wire."""
+
+    def __init__(
+        self, hosts=None, clock=None, *, deaf_first=(), extra=(), after=None,
+        fail_open=None, fail_receive_after=None,
+    ):
+        self.hosts = {ipaddress.ip_address(k): v for k, v in (hosts or {}).items()}
+        self.deaf_first = {ipaddress.ip_address(a) for a in deaf_first}
+        self.clock = clock
+        self.extra = list(extra)
+        self.after = {ipaddress.ip_address(k): list(v) for k, v in (after or {}).items()}
+        self.fail_open = fail_open
+        self.fail_receive_after = fail_receive_after
+        self.requests: list = []
+        self.times: list[float] = []
+        self.opened: list[str] = []
+        self.closed = 0
+        self._queue: asyncio.Queue | None = None
+
+    def __call__(self, interface: str) -> "FakeArp":
+        if self.fail_open is not None:
+            raise self.fail_open
+        self.opened.append(interface)
+        self.interface = interface
+        self._queue = asyncio.Queue()
+        for item in self.extra:
+            self._queue.put_nowait(item)
+        return self
+
+    async def send(self, frame: bytes) -> None:
+        dst, src, ethertype = ETHER.unpack_from(frame)
+        htype, ptype, hlen, plen, oper, sha, spa, tha, tpa = ARP.unpack_from(frame, ETHER.size)
+        assert len(frame) == 42
+        assert (dst, ethertype, htype, ptype, hlen, plen, oper) == (b"\xff" * 6, 0x0806, 1, 0x0800, 6, 4, 1)
+        assert src == sha and tha == b"\x00" * 6
+        target = ipaddress.IPv4Address(tpa)
+        self.requests.append(target)
+        if self.clock is not None:
+            self.times.append(self.clock.t)
+        if self.fail_receive_after is not None and len(self.requests) >= self.fail_receive_after:
+            self._queue.put_nowait(OSError("interface went down"))
+            return
+        if self.requests.count(target) == 1:
+            for item in self.after.get(target, ()):
+                self._queue.put_nowait(item)
+        answer = self.hosts.get(target)
+        if answer is None or (target in self.deaf_first and self.requests.count(target) < 2):
+            return
+        reply = arp_frame(target, answer, ipaddress.IPv4Address(spa), sha)
+        self._queue.put_nowait((reply, source(self.interface, PACKET_HOST, mac(answer))))
+
+    async def receive(self):
+        item = await self._queue.get()
+        if isinstance(item, Exception):
+            raise ProbeError(f"ARP replies not readable on {self.interface} (OSError)")
+        return item
+
+    def close(self) -> None:
+        self.closed += 1
+
+    def asked(self, address) -> int:
+        return self.requests.count(ipaddress.ip_address(address))
+
+
 class FakeServer:
     """A scripted server behind httpx's mock transport. `checkins` and `results` are
     lists of `(status, body)` answers, used in turn; the last one repeats."""
@@ -166,7 +276,7 @@ def make_config(**overrides) -> Config:
     return Config(**values)
 
 
-def make_agent(server: FakeServer, *, prober=None, resolver=None, clock=None, **config):
+def make_agent(server: FakeServer, *, prober=None, resolver=None, arp=None, clock=None, **config):
     clock = clock or FakeClock()
     http = httpx.AsyncClient(
         transport=httpx.MockTransport(server.handler),
@@ -178,7 +288,8 @@ def make_agent(server: FakeServer, *, prober=None, resolver=None, clock=None, **
         AgentClient(http),
         prober=prober if prober is not None else FakeProber(),
         resolver=resolver if resolver is not None else FakeResolver(),
-        interfaces=lambda: [{"name": "eth0", "cidr": "10.0.0.5/24", "mac": "02:00:00:00:00:05"}],
+        arp_link=arp if arp is not None else FakeArp(),
+        interfaces=lambda: ETH0,
         clock=clock,
         rng=random.Random(1),
     )

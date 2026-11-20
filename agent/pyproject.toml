@@ -4,7 +4,7 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "tlg-ipam-agent"
-description = "Scan agent for TLG-IPAM: ICMP sweeps and reverse DNS of the subnets its server assigns, inside an allowlist set on the agent"
+description = "Scan agent for TLG-IPAM: ICMP and ARP sweeps and reverse DNS of the subnets its server assigns, inside an allowlist set on the agent"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"

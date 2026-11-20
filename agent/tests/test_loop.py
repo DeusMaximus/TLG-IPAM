@@ -186,7 +186,7 @@ async def test_checkin_reports_the_protocol_and_interfaces():
     [body] = server.checkins_posted
     assert body["protocol"] == PROTOCOL_VERSION
     assert body["interfaces"] == [{"name": "eth0", "cidr": "10.0.0.5/24", "mac": "02:00:00:00:00:05"}]
-    assert body["capabilities"] == ["icmp", "rdns"]
+    assert body["capabilities"] == ["arp", "icmp", "rdns"]
     assert body["version"] and body["hostname"] and body["platform"]
 
 
@@ -359,3 +359,31 @@ async def test_a_failure_while_reporting_does_not_stop_the_next_job():
     await drain(agent)
     assert calls == [first["job_id"], second["job_id"]]
     assert [str(a) for a in prober.sent] == ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"]
+
+
+async def test_a_scan_stuck_past_its_timeout_is_stopped_and_reported(monkeypatch):
+    """A backstop on the event loop's own clock: an await that never ends (here a
+    ping) cannot hold the worker until the lease runs out. The result set marks
+    nothing dead (briefed review of PR #84, finding 2)."""
+    from tlg_ipam_agent import loop
+
+    class Stuck(FakeProber):
+        async def ping(self, address, timeout):
+            self.sent.append(address)
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(loop, "SCAN_GRACE_S", 0.2)
+    server = FakeServer(checkins=[accepted(job(methods=["icmp"], timeout_s=1))])
+    agent, _ = make_agent(server, prober=Stuck())
+    await agent.checkin_once()
+    started = asyncio.get_running_loop().time()
+    # bounded without waiting on a cancel, so a backstop that does not work fails
+    # here instead of hanging the suite
+    running = asyncio.create_task(agent.run_job(agent.queue.get_nowait()))
+    done, _ = await asyncio.wait({running}, timeout=5)
+    assert running in done, "the scan was not stopped"
+    running.result()
+    assert asyncio.get_running_loop().time() - started < 3
+    [posted] = server.results_posted
+    assert posted["complete"] is False and posted["observations"] == []
+    assert posted["error"] == "agent error: the scan did not end within 1 s"
