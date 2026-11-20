@@ -289,19 +289,32 @@ NETWORK_REPORTED_NOTE = (
 )
 
 
-# `list_named` hands back at most this many findings per call (spec §5.8), chosen against
+# A page of `list_named` (spec §5.8) is bounded twice, by count and by size, against
 # what one tool result can carry into a client. Claude Code documents its limits: it
 # keeps at most 50,000 characters of a text result and 25,000 tokens of any result, and
-# warns past 10,000 tokens. Measured through the tool as compact JSON: an ordinary
-# finding (short names, a PTR name under the subnet's domain) is about 400 characters,
-# so an ordinary page is about 10,000. A finding with every field at its ASCII maximum
-# (a 120-character subnet name, a 253-character PTR name, hostname and FQDN) is 1,738,
-# so a page of those is 44,057 with the note (45,817 when the owner's names are 4-byte
-# characters): under 50,000 and, even at 2 characters a token, under 25,000 tokens. 29
-# of them would pass 50,000. `test_mcp.test_a_page_at_every_field_maximum_fits_a_client`
-# holds the bound. (The review that asked for paging measured 5,000 findings, 3,003,133
-# bytes, in one result.) `body_limit.BODY_MAX` bounds what a client sends, not this.
+# warns past 10,000 tokens.
+#
+# Count: at most `PAGE_SIZE` findings. Measured through the tool as compact JSON, an
+# ordinary finding (short names, a PTR name under the subnet's domain) is about 400
+# characters, so an ordinary page is about 10,000.
+#
+# Size: the findings on a page come to at most `PAGE_BUDGET` bytes of compact UTF-8 JSON,
+# counted in bytes because a byte count is never below a count of characters or UTF-16
+# units. With the rest of the result (the note, about 330; a cursor, at most 1,156; the
+# keys) a page stays under 50,000 characters and, even at 2 characters a token, under
+# 25,000 tokens. The count alone does not bound it: a domain suffix has no length limit
+# but the request-body cap, and a host's FQDN carries it into every finding. A finding
+# with the other fields at their ASCII maximum (a 120-character subnet name, 253-character
+# PTR name, hostname and domain) is 1,738 bytes, so 25 of them fit the budget and longer
+# ones make shorter pages. A finding over the budget on its own comes alone, so paging
+# always moves on; such a page can still pass a client's limit, and the result puts
+# `next_cursor` before the findings so that a client that cuts the text keeps it.
+# `test_mcp.test_a_page_at_every_field_maximum_fits_a_client` and
+# `test_pages_of_long_domains_stay_inside_the_budget` hold both bounds. (The review that
+# asked for paging measured 5,000 findings, 3,003,133 bytes, in one result.)
+# `body_limit.BODY_MAX` bounds what a client sends, not this.
 PAGE_SIZE = 25
+PAGE_BUDGET = 45_000
 # A cursor is base64url of UTF-8 JSON (`ensure_ascii=False`): a subnet's name, at most
 # 120 characters of at most 6 bytes each as JSON (a control character's `\u0000`; a
 # 4-byte character stays 4), so 720; a CIDR (43 at most), an id (36), an address (39
@@ -343,6 +356,13 @@ def _decode_cursor(cursor: str) -> tuple:
     return name, cidr, subnet_id, ip_int, _TYPE_ORDER[type_]
 
 
+def _encoded_size(value) -> int:
+    """Bytes of compact UTF-8 JSON, as the tool's result carries it."""
+    return len(
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str).encode()
+    )
+
+
 async def list_named(
     session: AsyncSession,
     subnet_id: str | None = None,
@@ -357,8 +377,9 @@ async def list_named(
     `list_findings` leaves them out by default: a scanned DHCP pool is where personal
     devices answer (spec §7.1).
 
-    Returns `{"findings": [...], "next_cursor": ...}`: at most `PAGE_SIZE` findings, and
-    a cursor when at least one more follows, null otherwise. The order is total, by
+    Returns `{"findings": [...], "next_cursor": ...}`: at most `PAGE_SIZE` findings and,
+    unless the first alone is larger, at most `PAGE_BUDGET` bytes of them, and a cursor
+    when at least one more follows, null otherwise. The order is total, by
     subnet (name, CIDR, id), then address, then type, and the cursor is the position of
     the page's last finding, so a client that passes it back gets what comes after it.
     A finding resolved between calls therefore moves nothing later in the order.
@@ -372,6 +393,7 @@ async def list_named(
         query = query.where(Subnet.id == subnet_id)
     subnets = sorted((await session.execute(query)).all(), key=lambda s: (s.name, s.cidr, s.id))
     page: list[dict] = []
+    used = 0
     last: tuple | None = None
     for subnet in subnets:
         place = (subnet.name, subnet.cidr, subnet.id)
@@ -397,19 +419,22 @@ async def list_named(
             if len(page) == PAGE_SIZE:
                 return {"findings": page, "next_cursor": _encode_cursor(last)}
             host = hosts.get(f["host_id"])
-            page.append(
-                {
-                    **f,
-                    "subnet_name": subnet.name,
-                    "subnet_cidr": subnet.cidr,
-                    "host_name": host.hostname if host is not None else None,
-                    "host_fqdn": (
-                        hosts_svc.fqdn_of(host.hostname, host.domain, subnet.domain)
-                        if host is not None
-                        else None
-                    ),
-                }
-            )
+            named = {
+                **f,
+                "subnet_name": subnet.name,
+                "subnet_cidr": subnet.cidr,
+                "host_name": host.hostname if host is not None else None,
+                "host_fqdn": (
+                    hosts_svc.fqdn_of(host.hostname, host.domain, subnet.domain)
+                    if host is not None
+                    else None
+                ),
+            }
+            size = _encoded_size(named) + 1  # and its comma
+            if page and used + size > PAGE_BUDGET:
+                return {"findings": page, "next_cursor": _encode_cursor(last)}
+            page.append(named)
+            used += size
             last = position
     return {"findings": page, "next_cursor": None}
 

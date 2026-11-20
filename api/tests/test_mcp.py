@@ -183,9 +183,12 @@ async def scan_page(**args) -> dict:
     assert page["returned"] == len(page["findings"]) <= findings_svc.PAGE_SIZE
     # the warning travels with every page, not only the first
     assert page["note"] == findings_svc.NETWORK_REPORTED_NOTE
-    # a page that says there is more is a full one
+    # within the size budget, unless one finding alone is larger
+    used = sum(findings_svc._encoded_size(f) + 1 for f in page["findings"])
+    assert used <= findings_svc.PAGE_BUDGET or page["returned"] == 1
+    # a page that says there is more is never empty
     if page["next_cursor"] is not None:
-        assert page["returned"] == findings_svc.PAGE_SIZE
+        assert page["returned"] >= 1
     return page
 
 
@@ -448,6 +451,53 @@ async def test_a_page_at_every_field_maximum_fits_a_client(client):
     assert result.data["returned"] == findings_svc.PAGE_SIZE
     assert result.data["next_cursor"] is not None
     assert len(result.content[0].text) < CLIENT_TEXT_MAX
+
+
+def long_domain(labels: int) -> str:
+    return ".".join(f"{i:03d}" + "d" * 60 for i in range(labels))
+
+
+async def test_pages_of_long_domains_stay_inside_the_budget(client):
+    """Codex on #83: a domain suffix has no length limit, so 25 findings could pass a
+    client's limit. The size budget cuts the page short; paging still sees each finding
+    once, and every page's text stays under what Claude Code keeps."""
+    domain = long_domain(32)  # 32 labels of 63: 2,047 characters, as Codex measured
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"], name="lab", domain=domain)
+    for octet in range(10, 40):
+        ip = f"10.0.0.{octet}"
+        await make_host(client, subnet["id"], ip, hostname=f"host-{octet}")
+        await observe(subnet["id"], ip, mac=MAC)
+    seen = []
+    cursor = None
+    while True:
+        result = await call("list_scan_findings", {"cursor": cursor} if cursor else {})
+        assert not result.is_error, result.content[0].text
+        assert len(result.content[0].text) < CLIENT_TEXT_MAX
+        page = await scan_page(**({"cursor": cursor} if cursor else {}))
+        assert page["returned"] < findings_svc.PAGE_SIZE  # cut short by size, not count
+        seen += [position(f) for f in page["findings"]]
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+    assert len(seen) == len(set(seen)) == 30
+    assert seen == [position(f) for f in await scan_findings()]
+
+
+async def test_a_finding_over_the_budget_comes_alone_with_the_cursor_first(client):
+    section = await make_section(client)
+    # a domain longer than the whole budget: only the request-body cap bounds it
+    subnet = await make_subnet(client, section["id"], name="lab", domain=long_domain(800))
+    for octet in (10, 11):
+        await make_host(client, subnet["id"], f"10.0.0.{octet}", hostname="h")
+        await observe(subnet["id"], f"10.0.0.{octet}", mac=MAC)
+    first = await call("list_scan_findings", {})
+    assert first.data["returned"] == 1 and first.data["next_cursor"] is not None
+    # the cursor and the note come before the findings, so a cut keeps them
+    text = first.content[0].text
+    assert text.index('"next_cursor"') < text.index('"note"') < text.index('"findings"')
+    second = await scan_page(cursor=first.data["next_cursor"])
+    assert (second["returned"], second["next_cursor"]) == (1, None)
 
 
 async def test_list_scan_findings_docstring_gives_the_page_size():

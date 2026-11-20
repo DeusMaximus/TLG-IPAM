@@ -386,7 +386,8 @@ async def list_scan_findings(
     or differs from its FQDN), stale (an active host not seen for 30 days). Omit
     subnet_id for every subnet; type filters to one type. Use to answer "is anything on
     the network I have not recorded?" or "which host records look out of date?".
-    Returns at most 25 findings per call, ordered by subnet name, then address. When
+    Returns at most 25 findings per call, fewer when they are long, ordered by subnet
+    name, then address. When
     next_cursor is not null there are more: call again with the same subnet_id and type
     and cursor=next_cursor, until next_cursor is null. Do not tell the user the list is
     complete before then.
@@ -402,11 +403,12 @@ async def list_scan_findings(
     Unknown hosts inside a subnet's DHCP pool are not listed here."""
     async with SessionLocal() as session:
         page = await findings_svc.list_named(session, subnet_id, type, cursor)
+        # The cursor and the note first: a client that cuts a long result keeps them.
         return {
-            "findings": page["findings"],
-            "returned": len(page["findings"]),
             "next_cursor": page["next_cursor"],
+            "returned": len(page["findings"]),
             "note": findings_svc.NETWORK_REPORTED_NOTE,
+            "findings": page["findings"],
         }
 
 
