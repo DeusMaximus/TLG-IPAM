@@ -901,9 +901,21 @@ def test_at_most_resolv_conf_max_bytes_are_taken(tmp_path):
         (b"nameserver 127.0.0.1\rnameserver ::1\r", ("127.0.0.1", "::1")),
         (b"# comment\n; comment\nsearch home.arpa\nnameserver 127.0.0.1\n", ("127.0.0.1",)),
         (b"nameserver 127.0.0.1\n\xff\n", ()),  # not UTF-8, as dnspython refuses it
+        # not line breaks in a text file, though str.splitlines cuts at each (round 1
+        # of #103): one line, so one nameserver
+        ("nameserver 127.0.0.1\x85nameserver 127.0.0.2\n".encode(), ("127.0.0.1",)),
+        ("nameserver 127.0.0.1\u2028nameserver 127.0.0.2\n".encode(), ("127.0.0.1",)),
+        (b"nameserver 127.0.0.1\fnameserver 127.0.0.2\n", ("127.0.0.1",)),
+        (b"nameserver 127.0.0.1\vnameserver 127.0.0.2\n", ("127.0.0.1",)),
+        # a byte-order mark spoils the first line's keyword
+        ("\ufeffnameserver 127.0.0.1\nnameserver 127.0.0.2\n".encode(), ("127.0.0.2",)),
+        (b"nameserver 127.0.0.1\x00\nnameserver 127.0.0.2\n", ()),  # dnspython refuses the NUL
     ],
 )
 def test_the_file_is_parsed_as_dnspython_parses_it(tmp_path, content, expected):
+    """`read_resolv_conf` hands dnspython a list of lines, which its signature does not
+    name: each case is also parsed by dnspython opening the file itself, and the two
+    must agree."""
     path = tmp_path / "resolv.conf"
     path.write_bytes(content)
     assert read_resolv_conf(str(path)) == expected
@@ -922,3 +934,51 @@ def test_a_symlinked_resolv_conf_is_followed(tmp_path):
     link = tmp_path / "resolv.conf"
     link.symlink_to(target)
     assert read_resolv_conf(str(link)) == ("127.0.0.53",)
+
+
+async def test_choosing_the_servers_ends_at_the_jobs_deadline(monkeypatch, tmp_path):
+    """Round 1 of #103, finding 2, on the real clock: liveness takes 0.8 s of a 1 s job
+    and resolv.conf's read stalls. Choosing the servers waits only for the 0.2 s the
+    job has left, not the read's own second, and the job ends at its deadline with the
+    PTR stage's timeout, not as a job with no server. The stalled read keeps its thread
+    and its lock: the next job starts no second read, and once the read ends one does."""
+    release = threading.Event()
+    calls: list[str] = []
+
+    def stalled(path):
+        calls.append(path)
+        release.wait(5)  # freed by the test; 5 s at most, so a failure cannot hang
+        return ("127.0.0.1",)
+
+    class SlowProber:
+        async def ping(self, address, timeout):
+            await asyncio.sleep(0.8)
+            return True
+
+    monkeypatch.setattr(probe, "read_resolv_conf", stalled)
+    resolver = DnsResolver(resolv_conf=str(tmp_path / "resolv.conf"))
+    assert resolver.read_timeout > 0.5  # the read's own bound is longer than the job has left
+    try:
+        raw = job(ranges=[{"start": "10.0.0.9", "end": "10.0.0.9"}], dns_servers=[], timeout_s=1)
+        parsed = parse_job(job_ref(raw), raw)
+        started = time.monotonic()
+        result = await scan.run(
+            parsed, guard.plan(parsed, parse_allowed(None)), prober=SlowProber(),
+            resolver=resolver, max_pps=200, clock=scan.Clock(),
+        )
+        took = time.monotonic() - started
+        assert result["complete"] is False
+        assert result["error"] == "timed out after 1 s during the PTR lookups"
+        assert result["observations"] == [{"ip": "10.0.0.9"}]
+        assert 0.95 <= took < 1.4, took
+        assert len(calls) == 1
+        assert await resolver.servers(()) == ()  # still blocked: no second read
+        assert len(calls) == 1
+        release.set()
+        for _ in range(100):
+            if await resolver.servers(()) == ("127.0.0.1",):
+                break
+            await asyncio.sleep(0.01)
+        assert len(calls) >= 2
+    finally:
+        release.set()

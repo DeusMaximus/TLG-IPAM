@@ -353,10 +353,21 @@ async def run(
         # are now. With none, no lookup can be made, and a lookup not made is not one
         # that found no name: the result set is incomplete, so the server keeps the
         # names it has (spec §5.7), and no query is sent
-        servers = await resolver.servers(job.dns_servers)
-        if not servers:
-            complete = False
-            errors.append(NO_DNS_SERVER)
+        left = deadline - clock.monotonic()
+        try:
+            if left <= 0:
+                raise TimeoutError
+            # the choice (a read of resolv.conf among it) has only the job's time left,
+            # waited out on the event loop's clock as the read's own bound is; ending
+            # the wait leaves a blocked read's thread, and its lock, as they are
+            servers = await asyncio.wait_for(resolver.servers(job.dns_servers), left)
+        except TimeoutError:
+            timed_out = True
+            errors.append(f"timed out after {job.timeout_s} s during the PTR lookups")
+        else:
+            if not servers:
+                complete = False
+                errors.append(NO_DNS_SERVER)
     if servers:
 
         async def lookup(address: Address, _timeout: float) -> None:

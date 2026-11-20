@@ -12,7 +12,6 @@ builds and the replies it takes are the real ones.
 """
 
 import asyncio
-import io
 import ipaddress
 import os
 import socket
@@ -208,8 +207,8 @@ class ArpSession:
 MAX_DNS_SERVERS = 3
 # where the host's own resolvers are read, when a job names no DNS server
 RESOLV_CONF = "/etc/resolv.conf"
-# how long a job waits for that read, and the most of the file it takes: a read that
-# has not finished by then, or a larger file, gives no server
+# how long a job waits for that read, and the most of the file it parses: a read
+# that has not finished by then, or a larger file, gives no server
 RESOLV_CONF_TIMEOUT_S = 1.0
 RESOLV_CONF_MAX = 64 * 1024
 # the error of a job whose PTR lookups had no server to ask (spec §5.2): fixed text
@@ -235,16 +234,28 @@ def usable_servers(chosen: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(usable[:MAX_DNS_SERVERS])
 
 
+def _text_lines(text: str) -> list[str]:
+    """`text` cut into lines as a file opened in text mode is: at `\n`, `\r\n` and a lone
+    `\r`, and nowhere else (`str.splitlines` also cuts at `\x85`, `\u2028`, form feed
+    and others, which a text file does not)."""
+    return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+
 def read_resolv_conf(path: str) -> tuple[str, ...]:
     """The `nameserver` entries of the resolv.conf at `path`, as dnspython parses the
-    file; empty when there is none. It blocks: `DnsResolver` calls it in a thread.
+    file; empty when there is none. It blocks: `DnsResolver` calls it in its thread.
 
-    Only a regular file is read. It is opened without waiting (`O_NONBLOCK`), so a FIFO
-    or a device at the path is refused at once rather than waited on, and at most
-    RESOLV_CONF_MAX bytes of it are read: a larger file gives none, rather than a list
-    cut short in the middle of an address. dnspython refuses a file that is not UTF-8,
-    one with no nameserver, and one with a nameserver that is neither an address nor
-    an https URL: each gives none. Nothing is sent."""
+    Only a regular file is read. It is opened without waiting for a writer
+    (`O_NONBLOCK`), so a FIFO is refused at once by the regular-file check rather than
+    waited on, and so is a device; that check, like every step here, runs in the
+    read's thread, where the time bound covers an open, `fstat` or read that blocks
+    anyway (a stalled network mount: `O_NONBLOCK` does not make those wait less). At
+    most RESOLV_CONF_MAX bytes are parsed; one byte more is read to tell a larger file,
+    which gives none rather than a list cut short in the middle of an address.
+    dnspython parses the lines (`_text_lines`) as it parses a file it opens itself, so
+    it refuses a file that is not UTF-8, one with no nameserver, and one with a
+    nameserver that is neither an address nor an https URL: each gives none. Nothing
+    is sent."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
     except OSError:
@@ -266,8 +277,10 @@ def read_resolv_conf(path: str) -> tuple[str, ...]:
         return ()
     resolver = dns.resolver.Resolver(configure=False)
     try:
-        # universal newlines, as when dnspython opens the file itself
-        resolver.read_resolv_conf(io.StringIO(data.decode("utf-8"), newline=None))
+        # dnspython iterates what it is given; a list of lines is not a type its
+        # signature names, so test_the_file_is_parsed_as_dnspython_parses_it compares
+        # the result with dnspython opening the same file itself
+        resolver.read_resolv_conf(_text_lines(data.decode("utf-8")))
     except (dns.exception.DNSException, ValueError):
         return ()
     return tuple(s for s in resolver.nameservers if isinstance(s, str))
@@ -316,8 +329,11 @@ class DnsResolver:
         neither the loop (check-ins, the job's deadline, the scan's backstop) nor the
         agent's exit. The job waits for it at most `read_timeout`, and a read that has
         not finished by then gives no server. While a read is still running no other
-        starts, and every job until it ends finds no server, so at most one thread is
-        ever held."""
+        starts, and every job until it ends finds no server, so at most one thread per
+        resolver (the agent makes one) is ever held. Correcting the file does not end
+        that: the blocked operation must return, or the agent be restarted. A job that
+        names its own DNS servers reads no file, and is not affected. `scan.run` waits
+        for this no longer than the job has left."""
         if not self._reading.acquire(blocking=False):
             return ()
         loop = asyncio.get_running_loop()
