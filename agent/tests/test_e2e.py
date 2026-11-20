@@ -602,8 +602,10 @@ async def test_lookups_that_send_nothing_keep_the_stored_names_at_one_packet_a_s
     What it assumes (#107; it failed once in 31 full runs under load, when the pacer
     could still catch up, and has not since): the first scan's two loopback answers
     arrive within the lookup's own 2 s, which dnspython waits out on the real clock
-    whatever the scale, so a stall of the whole process for that long ends a lookup
-    unanswered and the first scan incomplete. The second scan does not depend on
+    whatever the scale, so a stall of the whole process for that long (after the
+    first query is sent) ends a lookup without an answer: the first scan is complete,
+    with no error, and the expected stored names are missing, which fails this test
+    at its first check. The second scan does not depend on
     timing: a lookup whose next slot falls inside its own 2 s sends nothing either
     (port 0 is refused) and goes on to its next server, and every order of the
     slots ends in the same error."""
