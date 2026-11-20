@@ -475,6 +475,13 @@ class ScanTargetOut(BaseModel):
     # scanned by this agent. Null: not known (no agent, or it has never reported its
     # interfaces). Computed on read; nothing stores it.
     runnable_methods: list[str] | None = None
+    # How old that evidence is: the agent's last check-in (its `last_checkin_at`) and
+    # whether it was refused. Only an accepted check-in reports the interfaces, so when
+    # the last one was accepted they are from `agent_checkin_at`; when it was refused
+    # (409 or 422) they are from an earlier accepted check-in, whose time is not stored.
+    # Both null when `runnable_methods` is.
+    agent_checkin_at: UtcDatetime | None = None
+    agent_checkin_refused: bool | None = None
     # the subnet's scan scope (services/scans.scan_scope): inclusive address ranges
     scope: list[ScopeRangeOut] = []
 

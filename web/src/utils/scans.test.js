@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
+import { ONLINE_WITHIN_MS } from './agents'
 import {
   agentLimit,
+  agentReport,
   formatDuration,
   hasDhcpPool,
   NEW_TARGET,
@@ -74,5 +76,38 @@ describe('server-reported state', () => {
     expect(formatDuration(3_900_000)).toBe('1 h 05 min')
     expect(scopeRangeText({ start: '10.0.0.5', end: '10.0.0.5' })).toBe('10.0.0.5')
     expect(scopeRangeText({ start: '10.0.0.1', end: '10.0.0.9' })).toBe('10.0.0.1–10.0.0.9')
+  })
+})
+
+describe('how old what the agent can run is', () => {
+  const now = Date.parse('2026-11-20T12:00:00Z')
+  const target = (extra) => ({ methods: ['icmp', 'arp'], runnable_methods: ['icmp'], ...extra })
+
+  it('dates the report by the agent’s last check-in, read as a server time', () => {
+    const at = '2026-11-20T11:59:00+00:00'
+    expect(agentReport(target({ agent_checkin_at: at, agent_checkin_refused: false }), now)).toEqual({
+      at,
+      refused: false,
+      recent: true,
+    })
+    // a time without an offset is UTC (parseServerTime), not local time
+    const bare = agentReport(target({ agent_checkin_at: '2026-11-20T11:58:00', agent_checkin_refused: false }), now)
+    expect(bare.recent).toBe(true)
+  })
+
+  it('is not recent once the agent is past the online window, or its last check-in was refused', () => {
+    const old = new Date(now - ONLINE_WITHIN_MS - 1000).toISOString()
+    expect(agentReport(target({ agent_checkin_at: old, agent_checkin_refused: false }), now).recent).toBe(false)
+    const refused = agentReport(
+      target({ agent_checkin_at: '2026-11-20T11:59:30+00:00', agent_checkin_refused: true }),
+      now
+    )
+    expect(refused).toMatchObject({ refused: true, recent: false })
+  })
+
+  it('has nothing to date when the server does not know what the agent can run', () => {
+    expect(agentReport(target({ runnable_methods: null, agent_checkin_at: null }), now)).toBeNull()
+    expect(agentReport(target({ agent_checkin_at: null }), now)).toBeNull()
+    expect(agentReport(null, now)).toBeNull()
   })
 })

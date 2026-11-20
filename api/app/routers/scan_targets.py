@@ -11,8 +11,7 @@ router = APIRouter(prefix="/scan-targets", tags=["scan-targets"])
 
 @router.get("")
 async def list_scan_targets(session: AsyncSession = Depends(get_session)):
-    rows = await svc.list_targets(session)
-    data = [await svc.target_out(session, t) for t in rows]
+    data = await svc.targets_out(session, await svc.list_targets(session))
     return {"data": data, "total": len(data)}
 
 

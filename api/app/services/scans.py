@@ -63,10 +63,12 @@ def _scope(
     return subtract_intervals(usable_bounds(parse_cidr(cidr)), removed)
 
 
-async def _scope_as_committed(
-    session: AsyncSession, subnet_id: str
-) -> tuple[str, list[tuple[int, int]]] | None:
-    """The subnet's CIDR and scan scope, from the database; None once it is deleted.
+async def _scopes_as_committed(
+    session: AsyncSession, subnet_ids: list[str]
+) -> dict[str, tuple[str, list[tuple[int, int]]]]:
+    """Each subnet's CIDR and scan scope, from the database, by subnet id; a deleted
+    subnet is not in the answer. One statement per input whatever the number of subnets
+    (the scan-target list), and the only place the scope's inputs are read.
 
     Every input is read as columns, never taken from objects the session loaded
     earlier, and no loaded object is refreshed: check-in's lease compare-and-set relies
@@ -76,26 +78,55 @@ async def _scope_as_committed(
     nothing can change it before it commits (`drop_out_of_scope`, `results.ingest`,
     and check-in after `jobs._claim`).
     """
-    row = (
+    if not subnet_ids:
+        return {}
+    rows = (
         await session.execute(
-            select(Subnet.cidr, Subnet.dhcp_start, Subnet.dhcp_end).where(Subnet.id == subnet_id)
-        )
-    ).first()
-    if row is None:
-        return None
-    pool_scanned = await session.scalar(
-        select(ScanTarget.scan_dhcp_pool).where(ScanTarget.subnet_id == subnet_id)
-    )
-    excluded = (
-        await session.execute(
-            select(ReservedRange.start_int, ReservedRange.end_int).where(
-                ReservedRange.subnet_id == subnet_id, ReservedRange.scan_excluded.is_(True)
+            select(Subnet.id, Subnet.cidr, Subnet.dhcp_start, Subnet.dhcp_end).where(
+                Subnet.id.in_(subnet_ids)
             )
         )
     ).all()
-    cidr, dhcp_start, dhcp_end = row
-    scope = _scope(cidr, (dhcp_start, dhcp_end), [tuple(r) for r in excluded], bool(pool_scanned))
-    return cidr, scope
+    if not rows:
+        return {}
+    pool_scanned = dict(
+        (
+            await session.execute(
+                select(ScanTarget.subnet_id, ScanTarget.scan_dhcp_pool).where(
+                    ScanTarget.subnet_id.in_(subnet_ids)
+                )
+            )
+        ).all()
+    )
+    excluded: dict[str, list[tuple[int, int]]] = {}
+    for subnet_id, start, end in (
+        await session.execute(
+            select(ReservedRange.subnet_id, ReservedRange.start_int, ReservedRange.end_int).where(
+                ReservedRange.subnet_id.in_(subnet_ids), ReservedRange.scan_excluded.is_(True)
+            )
+        )
+    ).all():
+        excluded.setdefault(subnet_id, []).append((start, end))
+    return {
+        subnet_id: (
+            cidr,
+            _scope(
+                cidr,
+                (dhcp_start, dhcp_end),
+                excluded.get(subnet_id, []),
+                bool(pool_scanned.get(subnet_id)),
+            ),
+        )
+        for subnet_id, cidr, dhcp_start, dhcp_end in rows
+    }
+
+
+async def _scope_as_committed(
+    session: AsyncSession, subnet_id: str
+) -> tuple[str, list[tuple[int, int]]] | None:
+    """The subnet's CIDR and scan scope, from the database (`_scopes_as_committed`);
+    None once it is deleted."""
+    return (await _scopes_as_committed(session, [subnet_id])).get(subnet_id)
 
 
 async def scan_scope(session: AsyncSession, subnet: Subnet | str) -> list[tuple[int, int]]:
@@ -259,22 +290,67 @@ def _scope_out(cidr: str, scope: list[tuple[int, int]]) -> list[dict]:
     return [{**r, "start_int": lo, "end_int": hi} for r, (lo, hi) in zip(ranges, scope)]
 
 
-async def target_out(session: AsyncSession, target: ScanTarget) -> dict:
-    """The scan-target answer of REST (no MCP tool returns it): the columns, the scope,
-    and `runnable_methods`, what a job would run on the target's agent now."""
+def _agent_checkin(agent: Agent | None, runnable: list[str] | None) -> dict:
+    """How old the evidence for `runnable_methods` is: the agent's last check-in, and
+    whether it was refused. Only an accepted check-in writes the interfaces; a refused
+    one (409 or 422) writes `last_checkin_at` and `last_error` and leaves them as they
+    were, and an accepted one clears `last_error`. So when the last check-in was
+    accepted the interfaces are from `last_checkin_at`; when it was refused they are
+    from an earlier accepted one, whose time is not stored. Both null when
+    `runnable_methods` is."""
+    if agent is None or runnable is None:
+        return {"agent_checkin_at": None, "agent_checkin_refused": None}
+    return {
+        "agent_checkin_at": agent.last_checkin_at,
+        "agent_checkin_refused": agent.last_error is not None,
+    }
+
+
+async def targets_out(session: AsyncSession, targets: list[ScanTarget]) -> list[dict]:
+    """The scan-target answers of REST (no MCP tool returns them), in the order given:
+    the columns, the scope, `runnable_methods` (what a job would run on the target's
+    agent now) and the agent's last check-in it is judged from.
+
+    The subnets, the agents and the scope's inputs are each read in one statement for
+    all the targets (`_scopes_as_committed`), so the list costs the same number of
+    statements for one target as for five hundred."""
     # jobs imports this module, so it is imported here
     from . import jobs
 
-    subnet = await _get_subnet(session, target.subnet_id)
-    columns = {c.name: getattr(target, c.name) for c in target.__table__.columns}
-    agent = await session.get(Agent, target.agent_id) if target.agent_id else None
-    found = await _scope_as_committed(session, subnet.id)
-    out = {
-        **columns,
-        "scope": _scope_out(*found) if found else [],
-        "runnable_methods": jobs.runnable_methods(target, subnet, agent),
-    }
-    return ScanTargetOut.model_validate(out).model_dump(mode="json")
+    subnet_ids = list({t.subnet_id for t in targets})
+    agent_ids = list({t.agent_id for t in targets if t.agent_id})
+    subnets = {}
+    if subnet_ids:
+        rows = await session.scalars(select(Subnet).where(Subnet.id.in_(subnet_ids)))
+        subnets = {s.id: s for s in rows}
+    agents = {}
+    if agent_ids:
+        rows = await session.scalars(select(Agent).where(Agent.id.in_(agent_ids)))
+        agents = {a.id: a for a in rows}
+    scopes = await _scopes_as_committed(session, list(subnets))
+    answers = []
+    for target in targets:
+        subnet = subnets.get(target.subnet_id)
+        if subnet is None:
+            raise not_found("Subnet", target.subnet_id)
+        agent = agents.get(target.agent_id) if target.agent_id else None
+        columns = {c.name: getattr(target, c.name) for c in target.__table__.columns}
+        found = scopes.get(subnet.id)
+        runnable = jobs.runnable_methods(target, subnet, agent)
+        out = {
+            **columns,
+            "scope": _scope_out(*found) if found else [],
+            "runnable_methods": runnable,
+            **_agent_checkin(agent, runnable),
+        }
+        answers.append(ScanTargetOut.model_validate(out).model_dump(mode="json"))
+    return answers
+
+
+async def target_out(session: AsyncSession, target: ScanTarget) -> dict:
+    """One target's answer, built as the list builds each (`targets_out`)."""
+    [answer] = await targets_out(session, [target])
+    return answer
 
 
 def _label(subnet: Subnet) -> str:
