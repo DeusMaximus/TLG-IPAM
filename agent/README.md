@@ -11,14 +11,17 @@ Running it, and what each setting does: the "Scan agent" section of the
 
 **Reverse DNS and the host's `/etc/resolv.conf`.** A subnet that lists no DNS servers
 is looked up through the agent host's `/etc/resolv.conf`, read again for every scan.
-The agent reads it in a thread of its own: it looks at the path first, and has
-dnspython open and parse it only if it is a regular file (or a link to one) of at most
-64 KiB, read within a second. Anything else gives no server, and a FIFO, a device or a
-directory is never opened: the scan is marked incomplete with "rdns not run: the agent
-has no DNS server to ask", and the names already stored are kept (if the scan's own
-time runs out while it waits for the read, it reports the reverse-DNS timeout instead).
-If the read is stuck (a network mount that stopped answering, or a FIFO put at the
-path just after the agent looked at it), every later scan of a subnet without DNS
+The agent reads it in a thread of its own: it looks at the path first (`os.stat`), and
+has dnspython open and parse it only if, when it looks, the path is a regular file (or
+a link to one) of at most 64 KiB; the read must end within a second. What the look
+finds to be anything else gives no server and is not opened: a FIFO, a device, a
+directory or a larger file. The look is not a bound on what is then read: a file that
+grows past 64 KiB after the look is parsed whole, and a FIFO put at the path after the
+look is opened, and the read waits on it. A path that gives no server marks the scan
+incomplete with "rdns not run: the agent has no DNS server to ask", and the names
+already stored are kept (if the scan's own time runs out while it waits for the read,
+it reports the reverse-DNS timeout instead). If the read is stuck (a network mount
+that stopped answering, or that FIFO), every later scan of a subnet without DNS
 servers reports the same, and fixing the file is not enough: the stuck read must end,
 or the agent be restarted. A subnet that lists its own DNS servers is not affected, so
 setting them is the other way out.
