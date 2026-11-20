@@ -22,6 +22,7 @@ from .test_checkin import (  # noqa: F401 (agent_api is a fixture)
     target_row,
 )
 from .test_findings import HOSTILE, MAC, OTHER_MAC, dismiss, key, observe
+from app.ipnet import parse_ip
 from .test_findings import findings as rest_findings
 
 EXPECTED_TOOLS = {
@@ -390,28 +391,68 @@ def _cursor(value) -> str:
     return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
 
 
+# a well-formed position: name, CIDR, id, address, type
+GOOD_CURSOR = ["lab", "10.0.0.0/24", "id", 167772170, "stale"]
+# per slot, values of the wrong type or outside the vocabulary
+WRONG_IN_SLOT = {
+    0: [1, None, True, [], {}],
+    1: [1, None, True, [], {}],
+    2: [1, None, True, [], {}],
+    3: ["167772170", True, -1, 1.5, None, [], {}],
+    4: [1, None, True, [], {}, ["stale"], "fdns_mismatch"],
+}
+
+
+def _wrong_slot_cursors() -> list:
+    return [
+        pytest.param(
+            _cursor(GOOD_CURSOR[:slot] + [wrong] + GOOD_CURSOR[slot + 1 :]),
+            id=f"slot{slot}-{json.dumps(wrong)}",
+        )
+        for slot, values in WRONG_IN_SLOT.items()
+        for wrong in values
+    ]
+
+
 @pytest.mark.parametrize(
     "cursor",
     [
         "",
         "not a cursor",
-        "A" * (findings_svc.CURSOR_MAX + 1),
         _cursor({}),
-        _cursor(["lab", "10.0.0.0/24", "id", 167772170]),
-        _cursor(["lab", "10.0.0.0/24", "id", -1, "stale"]),
-        _cursor(["lab", "10.0.0.0/24", "id", "167772170", "stale"]),
-        _cursor(["lab", "10.0.0.0/24", "id", True, "stale"]),
-        _cursor(["lab", "10.0.0.0/24", "id", 167772170, "fdns_mismatch"]),
-        _cursor([1, "10.0.0.0/24", "id", 167772170, "stale"]),
+        _cursor("stale"),
+        _cursor(GOOD_CURSOR[:4]),
+        _cursor([*GOOD_CURSOR, "extra"]),
+        # well-formed but longer than CURSOR_MAX: refused by its length alone
+        _cursor(["x" * 1600, *GOOD_CURSOR[1:]]),
+        *_wrong_slot_cursors(),
     ],
 )
-async def test_list_scan_findings_refuses_a_cursor_it_did_not_return(client, cursor):
+async def test_list_scan_findings_refuses_a_malformed_cursor(client, cursor):
+    """Refused with the one fixed message, whatever is wrong and in whichever slot
+    (Codex's briefed round on #83: a list or an object in the type's slot was raised as
+    an internal error), never with an internal error's text."""
     section = await make_section(client)
     subnet = await make_subnet(client, section["id"])
     await observe(subnet["id"], "10.0.0.20", mac=MAC)
     result = await call("list_scan_findings", {"cursor": cursor})
     assert result.is_error
-    assert result.content[0].text == "cursor: not a cursor list_scan_findings returned"
+    assert result.content[0].text == findings_svc.CURSOR_REFUSED
+
+
+async def test_a_well_formed_cursor_is_read_as_a_position(client):
+    """Shape is all the check is: an unsigned cursor a client made up is a position in
+    the order, and a cursor of the same shape as the over-long one, under the cap, is
+    not refused."""
+    assert len(_cursor(["x" * 1000, *GOOD_CURSOR[1:]])) <= findings_svc.CURSOR_MAX
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"], name="lab")
+    await observe(subnet["id"], "10.0.0.20", mac=MAC)
+    await observe(subnet["id"], "10.0.0.30", mac=OTHER_MAC)
+    made_up = ["lab", subnet["cidr"], subnet["id"], int(parse_ip("10.0.0.20")), "unknown_host"]
+    page = await scan_page(cursor=_cursor(made_up))
+    assert [f["ip"] for f in page["findings"]] == ["10.0.0.30"]
+    assert (await scan_page(cursor=_cursor(["x" * 1000, *GOOD_CURSOR[1:]])))["findings"] == []
 
 
 @pytest.mark.parametrize("name", ["😀" * 120, '"' * 120, "\\" * 120, "\x01" * 120])
@@ -451,6 +492,84 @@ async def test_a_page_at_every_field_maximum_fits_a_client(client):
     assert result.data["returned"] == findings_svc.PAGE_SIZE
     assert result.data["next_cursor"] is not None
     assert len(result.content[0].text) < CLIENT_TEXT_MAX
+
+
+async def test_pages_order_by_name_then_cidr_then_id(client):
+    """The order's three subnet keys each decide somewhere: name over CIDR (zulu has the
+    lowest CIDR and comes last), CIDR over id (the two "same" subnets' ids run against
+    their CIDRs), and id alone between "twin" subnets of one name and CIDR in two
+    sections, where a page boundary falls between them."""
+    assert findings_svc.PAGE_SIZE == 25  # the boundary below assumes it
+    home = await make_section(client, "Home")
+    away = await make_section(client, "Away")
+    zulu = await make_subnet(client, home["id"], "10.0.0.0/24", name="zulu")
+    high = await make_subnet(client, home["id"], "10.0.2.0/24", name="same")
+    # the "same" subnet with the lower CIDR gets the higher id, so CIDR and id disagree
+    while True:
+        low = await make_subnet(client, home["id"], "10.0.1.0/24", name="same")
+        if low["id"] > high["id"]:
+            break
+        assert (await client.delete(f"/api/v1/subnets/{low['id']}")).status_code == 204
+    twins = sorted(
+        [
+            await make_subnet(client, home["id"], "10.0.3.0/24", name="twin"),
+            await make_subnet(client, away["id"], "10.0.3.0/24", name="twin"),
+        ],
+        key=lambda s: s["id"],
+    )
+    counts = {low["id"]: 6, high["id"]: 6, twins[0]["id"]: 13, twins[1]["id"]: 13, zulu["id"]: 3}
+    for subnet in (zulu, high, low, *twins):
+        prefix = subnet["cidr"].rsplit(".", 1)[0]
+        await unknown_hosts(subnet["id"], prefix, range(10, 10 + counts[subnet["id"]]))
+
+    pages = await scan_pages()
+    assert [len(p) for p in pages] == [25, 16]
+    # the first page ends at the last finding of the first twin
+    assert pages[0][-1]["subnet_id"] == twins[0]["id"]
+    expected = [
+        (subnet["id"], f"{subnet['cidr'].rsplit('.', 1)[0]}.{octet}")
+        for subnet in (low, high, *twins, zulu)
+        for octet in range(10, 10 + counts[subnet["id"]])
+    ]
+    assert [(f["subnet_id"], f["ip"]) for p in pages for f in p] == expected
+
+
+# The review's accepted values (Codex's briefed round on #83), each through the REST API
+# the owner uses: names JSON escapes six characters at a time, and a domain far longer
+# than any finding the count was measured with.
+ACCEPTED_LONG = {
+    "control-character hostnames": ("s" * 120, "example.com", "\x01" * 253),
+    "a 5,058-character domain": ("lab", ".".join(["d" * 63] * 79) + ".dd", "h" * 253),
+    "control characters in subnet name and hostname": (
+        "\x01" * 120,
+        ".".join(["a" * 63] * 3) + "." + "c" * 61,
+        "\x01" * 253,
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(ACCEPTED_LONG))
+async def test_pages_of_accepted_long_values_fit_a_client(client, case):
+    name, domain, hostname = ACCEPTED_LONG[case]
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"], name=name, domain=domain)
+    for octet in range(10, 36):
+        ip = f"10.0.0.{octet}"
+        await make_host(client, subnet["id"], ip, hostname=hostname)
+        await observe(subnet["id"], ip, rdns=HOSTILE)
+    seen = []
+    cursor = None
+    while True:
+        args = {"type": "name_mismatch", **({"cursor": cursor} if cursor else {})}
+        result = await call("list_scan_findings", args)
+        assert not result.is_error, result.content[0].text
+        assert len(result.content[0].text) < CLIENT_TEXT_MAX
+        assert len(result.content[0].text.encode()) < CLIENT_TEXT_MAX
+        seen += [f["ip"] for f in result.data["findings"]]
+        cursor = result.data["next_cursor"]
+        if cursor is None:
+            break
+    assert seen == [f"10.0.0.{octet}" for octet in range(10, 36)]
 
 
 def long_domain(labels: int) -> str:

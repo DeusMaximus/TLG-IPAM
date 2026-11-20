@@ -655,6 +655,9 @@ async def configured(client) -> tuple[dict, dict]:
         methods=["icmp", "rdns"],
         interval_minutes=60,
     )
+    # a second target, which no request here may touch
+    other = await make_subnet(client, subnet["section_id"], "10.0.1.0/24", name="other")
+    await make_target(client, other["id"], agent_id=agent["id"])
     return subnet, target
 
 
@@ -676,12 +679,26 @@ async def test_mcp_request_scan_changes_only_the_request_time(client):
     after = await database_rows()
 
     [entry] = [key for table, key, what in differences(before, after) if table == "changes"]
-    assert after["changes"][entry]["source"] == "mcp"
     assert differences(before, after) == {
         ("scan_targets", (target["id"],), "scan_requested_at"),
         ("changes", entry, "row"),
     }
     assert before["scan_targets"][(target["id"],)]["scan_requested_at"] is None
+    # and the one new audit row is the request's own, whole
+    row = after["changes"][entry]
+    assert (row["entity_type"], row["entity_id"], row["action"]) == (
+        "scan_target",
+        target["id"],
+        "update",
+    )
+    assert row["summary"] == "scan target of subnet lab (10.0.0.0/24): scan requested"
+    assert (row["source"], row["actor"]) == ("mcp", None)
+    old, new = row["before"], row["after"]
+    assert old["scan_requested_at"] is None and new["scan_requested_at"] is not None
+    assert {k: v for k, v in new.items() if k != "scan_requested_at"} == {
+        k: v for k, v in old.items() if k != "scan_requested_at"
+    }
+    assert (old["methods"], old["interval_minutes"]) == (["icmp", "rdns"], 60)
 
 
 @pytest.mark.parametrize("refusal", ["cooldown", "disabled", "unassigned"])

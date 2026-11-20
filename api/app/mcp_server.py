@@ -390,7 +390,10 @@ async def list_scan_findings(
     name, then address. When
     next_cursor is not null there are more: call again with the same subnet_id and type
     and cursor=next_cursor, until next_cursor is null. Do not tell the user the list is
-    complete before then.
+    complete before then. Each call reads the current data: a finding that appears
+    earlier in the order after you started, or a subnet renamed meanwhile, can be missed
+    or repeated, so to see the current state (after the user has changed things, say)
+    start again without cursor.
     Each finding has its key (subnet_id, ip, type, observed), the subnet's name and
     CIDR, the host recorded at the address (host_id, host_name, host_fqdn; null for
     unknown_host), and proposed: the host fields that resolving it would set

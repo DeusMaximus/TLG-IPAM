@@ -335,24 +335,34 @@ def _encode_cursor(position: tuple) -> str:
     return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
 
 
+CURSOR_REFUSED = "cursor: malformed; pass next_cursor exactly as list_scan_findings returned it"
+
+
 def _decode_cursor(cursor: str) -> tuple:
-    """The position a cursor names, or a validation error for anything `list_named` did
-    not return: the cursor is the client's, so it is checked as a client string."""
-    refused = validation_error("cursor: not a cursor list_scan_findings returned")
+    """The position a cursor names, or a validation error for one that is not well-formed:
+    the cursor is the client's, so it is checked as a client string, by its shape. This
+    is not proof that `list_named` issued it: the cursor is unsigned, and a well-formed
+    position a client made up is read as a position. Nothing trusts it beyond that: it
+    only says where in the listing's order to start."""
     if not isinstance(cursor, str) or not cursor or len(cursor) > CURSOR_MAX:
-        raise refused
+        raise validation_error(CURSOR_REFUSED)
     try:
         raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
-        name, cidr, subnet_id, ip_int, type_ = json.loads(raw)
+        value = json.loads(raw)
     except (ValueError, TypeError, RecursionError):
-        raise refused from None
+        raise validation_error(CURSOR_REFUSED) from None
+    # Every slot's type is checked before it is used: a list or an object in the type's
+    # slot is unhashable, and must be refused, not raised.
     if not (
-        all(isinstance(v, str) for v in (name, cidr, subnet_id))
-        and type(ip_int) is int
-        and ip_int >= 0
-        and type_ in _TYPE_ORDER
+        type(value) is list
+        and len(value) == 5
+        and all(type(v) is str for v in (value[0], value[1], value[2], value[4]))
+        and type(value[3]) is int
+        and value[3] >= 0
+        and value[4] in _TYPE_ORDER
     ):
-        raise refused
+        raise validation_error(CURSOR_REFUSED)
+    name, cidr, subnet_id, ip_int, type_ = value
     return name, cidr, subnet_id, ip_int, _TYPE_ORDER[type_]
 
 
@@ -384,7 +394,14 @@ async def list_named(
     the page's last finding, so a client that passes it back gets what comes after it.
     A finding resolved between calls therefore moves nothing later in the order.
     Subnets before the cursor's are skipped without a query. Only reads; a fixed number
-    of statements per subnet visited."""
+    of statements per subnet visited.
+
+    Each call reads the data as it is then; there is no snapshot. Following the cursor
+    sees every finding exactly once while the data and the filters stay as they were. A
+    finding that appears before the cursor after paging began is not seen until a
+    fresh listing (no cursor), and a subnet renamed meanwhile can move its findings
+    across the cursor, so they are missed or seen twice. The tool's docstring tells the
+    assistant to start again without a cursor when it needs the current state."""
     _check_type(type_)
     after = _decode_cursor(cursor) if cursor is not None else None
     query = select(Subnet.id, Subnet.name, Subnet.cidr, Subnet.domain)
