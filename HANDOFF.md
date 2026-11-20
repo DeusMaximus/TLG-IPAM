@@ -27,34 +27,78 @@ Template:
 
 ---
 
-## 2026-11-20 — Claude Code (Fable 5.2), orchestrator — waves 1 and 2: six PRs merged; #99 and #85 in flight
-- **Done:** six PRs squash-merged on the owner's go-ahead, all implemented by Opus 5.5. The remote branches are deleted.
-  - Wave 1, from `main` at `b481075`: #82 (#65) `3cbfa63`, #83 (#79) `1987465`, #84 (#14) `7014b58`. Their worker entries are in the archive (`grep -n '^## ' .agents/handoff/2026-11.md`).
-  - Wave 2: #95 (#75) `e76471a`, #96 (#78) `aa95f64`, #98 (#68) `5155f8c`. Their worker entries are below.
-  - Reviews (Codex, GPT-6.1 Sol): briefed rounds on #83, #84 (each NO-GO, then GO) and #96 (GO, then GO again after the orchestrator sent two of its P3s back, because one was a case #78 itself asks to close). One outside read each on #82, #95 and #98 in place of Greptile, which reviewed nothing (monthly cap until 2026-11-22; its MCP `trigger_code_review` is still untried).
-  - Issues filed, each on the owner's go-ahead: #85 to #94, #97, #99, #100, #101. That covers every follow-up from today's reviews and everything earlier entries listed as unfiled (from #80: #89, #90, #91; from #13: #92, #93, #94).
+## 2026-11-20 — Claude Code (Fable 5.2), orchestrator — waves 1 and 2: eight PRs merged; #104 in flight
+- **Done:** eight PRs squash-merged on the owner's go-ahead, all implemented by Opus 5.5. The remote branches are deleted. Worker entries are below or in the archive (`grep -n '^## ' .agents/handoff/2026-11.md`).
+  - Wave 1, from `main` at `b481075`: #82 (#65) `3cbfa63`, #83 (#79) `1987465`, #84 (#14) `7014b58`.
+  - Wave 2: #95 (#75) `e76471a`, #96 (#78) `aa95f64`, #98 (#68) `5155f8c`, #102 (#85) `df336cb`, #103 (#99) `c34feae`.
+  - Reviews (Codex, GPT-6.1 Sol): briefed rounds on #83 and #84 (each NO-GO, then GO), and on #96 and #103 (each GO, then GO again after the orchestrator sent P3s back: on #96 one was a case the issue itself asks to close, on #103 both were in code the PR added and one loosened the invariant tripwire). One outside read each on #82, #95, #98 and #102 in place of Greptile, which reviewed nothing (monthly cap until 2026-11-22; its MCP `trigger_code_review` is still untried).
+  - Issues filed, each on the owner's go-ahead: #85 to #94, #97, #99 to #101, #104, #105. That covers every follow-up from today's reviews and everything earlier entries listed as unfiled (from #80: #89, #90, #91; from #13: #92, #93, #94).
 - **Decisions (the owner's):**
   - #84 merged before its real-VLAN acceptance line was run; that check and the five left from PR #70 are #88.
   - #84's deliberate calls merged as written. The 2026-11-16 interim rule ends: a complete scan on the agent's own link clears a stored PTR name.
   - `list_scan_findings` returns `next_cursor`, `returned`, `note`, `findings` in place of `findings`/`total`.
   - A subnet lists at most eight DNS servers and a job carries the first three (#75).
-- **State:** green. `main` is `5155f8c` plus hand-off commits. Measured on `main` after the last merge: 804 server tests, 493 agent tests, 103 web tests, lint and build pass. No PR is open.
-  - In flight, started after this commit: #99 on the agent lane and #85 on the `schemas.py` lane, one worker each.
+  - #103 merged with a known gap in the tripwire (an alias of `os` gets a write past the `os.open` check; `AGENTS.md` says so). #104 closes it and runs next.
+- **State:** green. `main` is `c34feae` plus hand-off commits; CI is green on `c34feae`. Measured on `main` after the last merge: 808 server tests, 602 agent tests, 103 web tests. No PR is open.
+  - In flight, started after this commit: #104 on the agent lane, one worker.
   - ARP is on by default: a new target's methods are `icmp`, `arp`, `rdns`, and the server issues `arp` whenever the agent has an interface on the subnet. No agent built from this `main` has run on a real network.
+  - Since #99 the agent reads the host's `resolv.conf` in one daemon thread. A read that gets stuck (a stalled mount) leaves every later scan that relies on the host's resolvers incomplete until the read returns or the agent restarts.
   - Codex's state for a PR is in its summary comment, as `codex-review-state:v1` JSON (`commit_sha`, `has_any_findings`, `status`); a clean pass is also a plain comment naming the commit. CodeRabbit posts a notice on each PR that it skips the repository; ignore it.
   - The worktrees of merged branches and finished reviews under the T3 worktree directory on this machine are still there; none was removed.
 - **Waiting on the owner:**
+  - Which of the ready issues below to start beside the agent lane.
   - #88, on a test host on a real VLAN. Until it is done, a target on a subnet that matters can be set to `icmp`, `rdns`.
   - #100: whether a scan in which no DNS server gave a usable answer keeps clearing stored names. The issue holds the four options.
   - #91: whether the 2 MiB bound on a bulk import stands, or the dialog batches, or fields are bounded.
   - Three lines proposed for the worker brief in `.agents/orchestration.md`, used in every brief today but not added to the file: how a clean Codex result arrives, that a worker never changes git config, and that a worker never edits `HANDOFF.md`.
   - #5 and #25 (`owner` label).
 - **Next:** the rest of M2a. Every issue below is ready except where it says so.
-  - `agent/` (`probe.py`, `scan.py`), one after the other, each with a briefed round: #99 (in flight), then #87. #100 after the owner decides; #93 is a stretch in M2b.
-  - `schemas.py` and the hosts service: #85 (in flight).
-  - No file in common with those two lanes or each other, so any can run beside them: #101 (`services/scans.py`, the scan-targets route, `ScanSettings.jsx`), #97 (`ipnet.py`, `services/subnets.py`, `services/jobs.py`, `agent/tests/test_answer_limit.py`), #89 (`body_limit.py`, briefed round).
+  - `agent/` (`probe.py`, `scan.py`, `test_invariants.py`), one after the other, each with a briefed round: #104 (in flight), then #87, which carries a comment with the measured spill of a held datagram into the next job. #100 after the owner decides; #93 is a stretch in M2b.
+  - No file in common with the agent lane or with each other, so any can run beside it: #105 (tests only: `api/tests/`, the `AGENTS.md` datetime bullet; work for the mechanical seat), #101 (`services/scans.py`, the scan-targets route, `ScanSettings.jsx`), #97 (`ipnet.py`, `services/subnets.py`, `services/jobs.py`, `agent/tests/test_answer_limit.py`), #89 (`body_limit.py`, briefed round).
   - #20 (stretch) last; it must measure its largest `fdns` result set against `body_limit.BODY_MAX` and add its names to `test_answer_limit.py`.
   - Then M2b (#21–#24, with #92 and #94 beside #23 and #24) and M3 (#26–#32). #86 and #90 close before #26 exposes `/mcp`; no OAuth grant may be issued before #28's write-scope checks are in force (noted on #26 and #28).
+
+## 2026-11-20 — Claude Code (Opus 5.5) — #99: agent rDNS follow-ups (PR #103), briefed rounds 1 and 2 answered
+- **Done:** [PR #103](https://github.com/DeusMaximus/TLG-IPAM/pull/103) closes #99, head `ca2a194`, cut from `main` at `7345d2a`. CI green and Codex clean on `ca2a194`; Greptile not run (monthly cap); CodeRabbit skips the repo.
+  - `e11b06f` (the issue):
+    - Cancellation wording qualified, no transport abort (call 1): no query is handed to a socket after a lookup that sent nothing; one already handed over may be sent by asyncio after the result set.
+    - Two pool guards kill #96's round-2 mutants. `FakeResolver` follows `probe.usable_servers` and refuses `()`.
+    - The failover flake was `EADDRINUSE` on `::1` (1/200 on `main`), fixed by `responders_on_one_port`; its gap assertion became the pacer's schedule bound.
+    - `resolv.conf` is read by `probe.read_resolv_conf` in one daemon thread: 1 s bound, regular files only, at most 64 KiB parsed.
+  - Round 1 (Codex, GPT-6.1 Sol): GO at `e11b06f`, two P3s sent back. Answered in `3a64754`:
+    - Tripwire: `io` dropped, with dnspython given lines cut as a text file is, pinned against dnspython opening the file. Write openers are forbidden names; `os.open` is held to an unrebound `os`; read openers are listed per module; 21 bypass cases.
+    - `scan.run` bounds the server choice by the job's deadline (PTR timeout on expiry; the read keeps its lock); real-clock regression added.
+    - Wording fixes. Agent 602; real-clock tests 50/50 on macOS and Linux.
+  - Round 2: GO at `3a64754`. Finding 2 fixed; finding 1 fixed with a remainder. Answered by the prose-only `ca2a194`: `AGENTS.md`, `test_invariants.py` comments/docstrings and call 7 now say what the checks enumerate and what they do not see (an alias of `os`; `logging`'s `filename` / `ssl`'s `cafile` passed as `**{…}`). `agent/README.md` notes the deadline case.
+  - **Merged:** `c34feae`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #99 closed. Round 2's remainder and its two P3s are filed as #104, whose preferred fix removes the `os.open` exception (check with `os.stat`, let dnspython open the file). The spill of a held datagram into the next job is a comment on #87. `ca2a194` came after round 2 and was not reviewed by Sol: the orchestrator checked it is prose only (no file under `agent/src/`; `test_invariants.py` parses to the same tree once docstrings and comments are ignored), and Codex was clean on it. The orchestrator re-measured: 602 agent tests on `ca2a194`; the three round-1 bypasses appended to `arp.py` and `probe.py` each fail invariant tests at `3a64754`; 808 server tests merged with #102.
+- **Decisions:** PR body, Deliberate calls 1–8; call 7 rewritten in round 1 and narrowed in round 2; calls 1–6 and 8 stand.
+- **State:** green on `ca2a194`. Agent 602 (493 on `main`), server 804 (no server file changed); web untouched; no schema, protocol or lock change.
+- **Waiting on the owner:** the merge.
+- **To file (orchestrator):** a follow-up issue for round 2's remainder and P3s:
+  - an alias or default of `os` defeats `os.open`'s read-only check in `probe.py`;
+  - the flag negatives pass with `_os_opens` made inert (test them in `probe.py` and assert the reason);
+  - star imports and `match` `**rest` are unseen by the rebinding walker;
+  - keyword openers passed as `**{…}`.
+
+  Call 1's measured cost (a held datagram in the next job's first second) goes to #87.
+- **Next:** #87 (pacer, send loops, spec §5.6's `MAX_PPS` wording) on the same files once this merges; the failover test's `first-query-late` case is the one #87 should tighten.
+
+## 2026-11-20 — Claude Code (Opus 5.5) — #85: an unchanged last_seen is not a change; recursive datetime schema walk (PR #102)
+- **Done:** [PR #102](https://github.com/DeusMaximus/TLG-IPAM/pull/102) closes #85, head `0c101f5`, cut from `main` at `7345d2a`. CI green on `0c101f5` (5/5); Codex clean on `0c101f5` (`has_any_findings: false`); Greptile not run (monthly cap); CodeRabbit skips the repo.
+  - `hosts.update_host` compares the request's `last_seen` with the stored column as instants and skips the assignment when they are equal. A PUT that repeats the stored value, in any offset form, no longer moves `updated_at`.
+  - `test_every_datetime_field_in_the_schemas_is_serialised_with_an_offset` now walks every model `schemas.py` defines except those in `REQUEST_MODELS`, and every model they reach (nested, list, dict, optional) wherever it is defined. Samples have the field's own shape; `AwareDatetime` and pydantic's other constrained datetimes count as datetimes.
+  - `test_the_walk_finds_bare_datetimes_wherever_they_are_and_passes_annotated_ones` keeps the issue's three mutations in the suite.
+  - The `AGENTS.md` datetime bullet and brief §3.4 (`updated_at`) and §4.3 are updated.
+  - **Merged:** `df336cb`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #85 closed. An outside read (Codex, GPT-6.1 Sol) ran in place of Greptile after this entry was written: GO at `0c101f5` with two P3s, filed as #105 (no test holds the stored-column comparison when an observation exists; the walk does not see computed fields, with smaller gaps listed there). It overruled none of the five calls, and found that the edit form never sends `last_seen`, so a plain save cannot write a scan's time into the hand-set column. Codex was clean on `0c101f5`. The orchestrator re-measured: 808 server tests on the head, and with the service comparison disabled the repeated-value test fails.
+- **Decisions:**
+  - The fix compares instants in the service; the validator still returns an aware value. Making offset-less input naive there would have left explicit-offset input moving `updated_at`.
+  - An unchanged PUT still writes one `update` change entry with `before == after`, as on `main`. Only the row update and the `updated_at` move are gone.
+  - The walk lists request models rather than response models, so a new model is checked as a response until it is listed.
+  - The walk follows `agent_protocol` models that an owner response holds (`ScopeRangeOut` inherits `ScanRange`). Agent-route answers are never roots.
+  - Fields typed `dict` or `Any` (audit snapshots) stay outside the walk; the snapshot test covers them.
+- **State:** server suite 808 passed, agent suite 493 passed locally; web untouched. No schema change. Nothing half-finished.
+- **Waiting on the owner:** merge of #102.
+- **Next:** nothing left on #85. The `schemas.py` lane is free once #102 merges.
 
 ## 2026-11-20 — Claude Code (Opus 5.5) — #68: scan targets report what their agent can run (PR #98)
 - **Done:** [PR #98](https://github.com/DeusMaximus/TLG-IPAM/pull/98) closes #68, head `7c4349c`, cut from `main` at `e76471a`. CI green on `7c4349c`; Codex clean on `7c4349c`; Greptile not run (monthly cap); CodeRabbit skips the repo (under 10 stars).
@@ -97,53 +141,3 @@ Template:
   - A follow-up for the web UI not showing `last_scan_error`, though the README's `ALLOWED_CIDRS` row says the Scanning section shows it.
   - The synchronous `resolv.conf` read on the event loop (a FIFO or stalled mount; true on `main` too).
 - **Next:** #87 (the pacer and send loops) builds on this `probe.py` and `scan._Pool`. #75 is in flight on the server; whichever of #75 and #96 merges second takes `main` in with a merge commit.
-
-## 2026-11-20 — Claude Code (Opus 5.5) — #75: bound a subnet's dns_servers and what a job carries (PR #95)
-- **Done:** [PR #95](https://github.com/DeusMaximus/TLG-IPAM/pull/95) closes #75, head `6352707`.
-  - Job bound: `agent_protocol.DNS_SERVERS_MAX = 3`; `Job.dns_servers` has `max_length` set to it. `services/jobs` sends `subnet.dns_servers[:3]`, the first three in the order listed.
-  - Subnet bound: `schemas.SUBNET_DNS_SERVERS_MAX = 8`, checked in `services/subnets._check_dns_servers` on create and on any update that sends `dns_servers`. Over it: `422` "dns_servers: a subnet may list at most 8 DNS servers, not N".
-  - New `agent/tests/test_answer_limit.py` builds the largest check-in answer through the real route and the agent's real client. 104,978 bytes; 106,762 padded to the longest addresses; limit (`RESPONSE_MAX`) 1,048,576; the unbounded pre-#75 answer was 1,153,843. Shown red with the cut removed.
-  - `test_contract.py` checks `probe.MAX_DNS_SERVERS == agent_protocol.DNS_SERVERS_MAX`.
-  - Docs: brief §3.2, §4.5 (new paragraph "The answer fits the agent") and one acceptance line; spec §5.7; the `AGENTS.md` wire-contract bullet.
-  - **Merged:** `e76471a`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #75 closed. The owner kept eight as the subnet bound. An outside read (Codex, GPT-6.1 Sol) ran in place of Greptile after this entry was written: GO at `6352707` with one P3, filed as #97 (a subnet's CIDR is stored as typed, so a zero-padded prefix reaches the job; the "largest answer" test assumes the canonical spelling). Codex was clean on `6352707`. The orchestrator re-measured: 795 server and 465 agent tests on the head, and with the job's cut removed three tests go red (the answer-limit test on the model's own `max_length`, and on the size assertion only when that bound is removed too; the PR body now says so).
-- **Decisions (deliberate calls on the PR, for the owner to overrule):**
-  - Subnet bound 8, job bound 3: the field records what a subnet hands out; a job carries what the agent uses.
-  - A subnet stored with a longer list keeps it. An update that leaves the list out or resends it unchanged is applied; changing it must meet the bound.
-  - No `PROTOCOL_VERSION` raise: same shape, and the server now sends a subset of what it could before.
-  - The agent does not start refusing a job with more than three servers.
-- **State:** green.
-  - CI passed on `6352707` (backend, agent, frontend, locks).
-  - Codex completed on `6352707` with no findings; Greptile not run (monthly cap).
-  - Server 795, agent 465 tests. Web and locks untouched. No schema change.
-- **Waiting on the owner:** merge PR #95. Whether 8 stands as the subnet bound or becomes 3.
-- **Next:**
-  - #78 and #75 both edit `AGENTS.md` (different bullets) and the brief. The PR that merges second takes `main` in with a merge commit.
-  - #20 must add its `fdns` names to the bound in `test_answer_limit.py`, which asserts `fdns == []` until then.
-  - #68 and #85 follow in `schemas.py`.
-
-## 2026-11-20 — Claude Code (Fable 5.2), orchestrator — wave 1 finished: #65, #79 and #14 merged; no work in flight
-- **Done:** three PRs squash-merged on the owner's go-ahead, each with its worker's entry below: #82 (#65) as `3cbfa63`, #83 (#79) as `1987465`, #84 (#14) as `7014b58`. All three ran at once from `main` at `b481075`, implemented by Opus 5.5. The remote branches are deleted.
-  - Briefed rounds (Codex, GPT-6.1 Sol): #83 and #84 each NO-GO, then GO on the fix commits. #82 got one Sol round, GO, as the second outside read: Greptile reviewed none of the three (monthly cap until 2026-11-22; its MCP `trigger_code_review` is still untried).
-  - #84 conflicted with #83 in `AGENTS.md` only (adjacent bullets). Its worker took `main` in with a merge commit; the orchestrator checked the merge mechanical and Codex re-reviewed it.
-  - Issues filed, on the owner's go-ahead: #85 (two datetime follow-ups from #82), #86 (`list_scan_findings`: bound the work per call and the size of one finding, before `/mcp` is exposed), #87 (the agent's send rate: late-wake bursts, kernel ARP outside `MAX_PPS`, no yield in a late send loop), #88 (`owner`: every real-network check on the scan agent).
-- **Decisions (the owner's):**
-  - #84 merged before its second acceptance line (a real VLAN) was run. That check, and the five left from PR #70, are #88.
-  - #84's deliberate calls merged as written: the agent's own address is reported alive with its MAC and no frame; a full send queue fails the send and the scan reads incomplete; a scan 30 s past its timeout is cancelled and reports no observations; the #13 pool now cancels its work in flight.
-  - The 2026-11-16 interim rule ends: a complete scan on the agent's own link now clears a stored PTR name.
-  - `list_scan_findings` returns `next_cursor`, `returned`, `note`, `findings` in place of `findings`/`total`. A finding over the page budget still comes whole, alone on its page.
-- **State:** green. `main` is `7014b58` plus this commit; CI is green on `7014b58`. Measured on `main` after the last merge: 789 server tests, 463 agent tests, 94 web tests, lint and build pass. No PR is open; no worker and no review is running.
-  - ARP is on by default: a new target's methods are `icmp`, `arp`, `rdns`, and the server issues `arp` whenever the agent has an interface on the subnet. No agent built from this `main` has run on a real network.
-  - Codex's state for a PR is in its summary comment, as `codex-review-state:v1` JSON (`commit_sha`, `has_any_findings`, `status`); a clean pass is also a plain comment naming the commit.
-  - The worktrees of merged branches and finished reviews under the T3 worktree directory on this machine are still there; none was removed.
-- **Waiting on the owner:**
-  - #88, on the test host on a real VLAN. Until it is done, a target on a subnet that matters can be set to `icmp`, `rdns`.
-  - Three follow-ups from #80, still not filed: (1) a `Content-Length` padded with thousands of zeroes answers 500 with a traceback before authentication under httptools, and one with trailing whitespace misses the unread refusal (`body_limit._declared_length`); (2) the owner-key line in `AGENTS.md` says every `/mcp` refusal is an RFC 6750 401, and a 413 is not; (3) the cap bounds one body, not aggregate memory or upload duration for unauthenticated chunked bodies, which matters before #26.
-  - Whether the 2 MiB bound on a bulk import stands as shipped. #86 now carries the related question of a per-field limit on `domain` and `notes`.
-  - Three lines proposed for the worker brief in `.agents/orchestration.md`, used in this wave's briefs but not added to the file: how a clean Codex result arrives, that a worker never changes git config, and that a worker never edits `HANDOFF.md`.
-  - #5 and #25 (`owner` label).
-  - Three optional follow-ups the #13 worker raised, not filed: a warning in the Add agent dialog when the UI is open over plain HTTP; a resolver allowlist on the agent's host; pinning the agent's base image by digest.
-- **Next:** wave 2, all in M2a.
-  - `agent/`, one after the other, each with a briefed round: #78 (no resolver is not a completed lookup), then #87.
-  - `schemas.py`, one after the other: #75, #68 (also `web/`), and #85 (also the hosts service). A new datetime field in a response model must be `UtcDatetime`; the test from #65 fails otherwise. An agent lane and a schema lane can run together.
-  - #20 (stretch) last; it must measure its largest `fdns` result set against `body_limit.BODY_MAX`.
-  - Then M2b (#21–#24) and M3 (#26–#32). #86 closes before #26 exposes `/mcp`; no OAuth grant may be issued before #28's write-scope checks are in force (noted on #26 and #28).
