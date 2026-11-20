@@ -160,6 +160,94 @@ async def test_a_waiter_cancelled_before_its_grant_takes_no_slot():
     assert clock.t == pytest.approx(1001.0)
 
 
+class HeldClock(FakeClock):
+    """A fake clock whose first sleep is held until `release()`; every later sleep ends
+    at once and moves the clock on by what it asked. `started` counts the sleeps that
+    have begun. With the first one held, a second sleep that starts is one the pacer
+    let begin while the first was still in progress."""
+
+    def __init__(self):
+        super().__init__()
+        self.started = 0
+        self._held = asyncio.Event()
+
+    def release(self):
+        self._held.set()
+
+    async def _sleep(self, seconds: float) -> None:
+        self.started += 1
+        if self.started == 1:
+            await self._held.wait()
+        else:
+            await asyncio.sleep(0)
+        self.t += max(seconds, 0)
+
+
+async def turns(n: int = 20) -> None:
+    for _ in range(n):
+        await asyncio.sleep(0)
+
+
+async def test_a_later_waiter_does_not_overtake_the_one_holding_the_turn():
+    """The lock `Pacer.wait` serves waiters behind, held to its own test (#107): with
+    the first waiter's sleep held, a second waiter starts no sleep of its own. Without
+    the lock it does, that sleep (which here ends at once) advances the clock, and the
+    second waiter is granted its slot before the first, which is a slot taken twice
+XX The additive
+    fake sleeps of the test above keep arrival order without a lock; this clock does
+    not."""
+    clock = HeldClock()
+    pacer = scan.Pacer(1, clock)
+    await pacer.wait()  # the first slot, at once, at 1000
+    granted: list[int] = []
+
+    async def waiter(i):
+        await pacer.wait()
+        granted.append(i)
+
+    first = asyncio.create_task(waiter(1))
+    await turns(2)  # the first waiter is asleep towards 1001
+    second = asyncio.create_task(waiter(2))
+    await turns()
+    started_while_held = clock.started
+    clock.release()
+    await asyncio.gather(first, second)
+    assert granted == [1, 2], "a later waiter must not overtake the lock holder"
+    assert clock.t == pytest.approx(1002.0)  # a slot each, one after the other
+    assert started_while_held == 1, "a second waiter must not start a sleep before the holder releases"
+
+
+async def test_a_queued_waiter_that_is_cancelled_leaves_the_others_in_turn():
+    """Four waiters behind a held sleep, the third cancelled while it waits for its
+    turn: still no second sleep starts before the holder releases, the cancelled one
+    takes no slot, and the others are granted in the order they came, a slot apart."""
+    clock = HeldClock()
+    pacer = scan.Pacer(1, clock)
+    await pacer.wait()
+    granted: list[tuple[int, float]] = []
+
+    async def waiter(i):
+        await pacer.wait()
+        granted.append((i, clock.t))
+
+    tasks = {}
+    for i in (1, 2, 3, 4):
+        tasks[i] = asyncio.create_task(waiter(i))
+        await turns(2)
+    await turns()
+    started_while_queued = clock.started
+    tasks[3].cancel()
+    await turns()
+    started_after_cancel = clock.started
+    clock.release()
+    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+    assert [i for i, _ in granted] == [1, 2, 4], "the surviving waiters must keep the order they queued in"
+    assert isinstance(results[2], asyncio.CancelledError)
+    assert [t for _, t in granted] == pytest.approx([1001.0, 1002.0, 1003.0])
+    assert started_while_queued == 1, "no waiter may start a sleep before the holder releases"
+    assert started_after_cancel == 1, "cancelling a queued waiter must not start a sleep either"
+
+
 async def test_a_sleep_that_ends_early_is_slept_again():
     clock = OffClock(lambda n, seconds: -seconds / 2)
     pacer = scan.Pacer(4, clock)
