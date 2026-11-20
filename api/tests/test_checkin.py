@@ -36,7 +36,14 @@ from app.routers import agent as agent_router
 from app.services import agents as agents_svc
 from app.services import jobs, scans
 
-from .conftest import app_database, make_section, make_subnet, write_lock
+from .conftest import (
+    PADDED_CIDR,
+    app_database,
+    make_section,
+    make_subnet,
+    store_cidr_as,
+    write_lock,
+)
 
 CHECKIN = {
     "version": "0.2.0",
@@ -513,6 +520,25 @@ async def test_a_list_stored_before_the_bound_is_cut_in_the_job_and_kept(client,
     # the stored list is untouched
     got = (await client.get(f"/api/v1/subnets/{subnet['id']}")).json()["data"]
     assert got["dns_servers"] == servers
+
+
+async def test_a_job_carries_the_canonical_cidr_whatever_the_subnet_stores(client, agent_api):
+    """A subnet stored before #97 with another spelling of its network is scanned: the
+    job carries the canonical spelling, which the agent's 64-character bound takes,
+    and the stored spelling is left as it is."""
+    agent, token = await make_agent(client)
+    interfaces = [{"name": "eth0", "cidr": "192.168.240.5/20", "mac": "02:00:00:00:00:05"}]
+    subnet = await lab(client, "192.168.240.0/20")
+    await make_target(client, subnet["id"], agent["id"])
+    await store_cidr_as(subnet["id"], PADDED_CIDR)
+    assert len(PADDED_CIDR) > 64
+    [job] = await jobs_for(agent_api, token, interfaces=interfaces)
+    assert job["cidr"] == "192.168.240.0/20"
+    # the stored spelling does not change what is scanned or how
+    assert job["ranges"] == [{"start": "192.168.240.1", "end": "192.168.255.254"}]
+    assert job["methods"] == ["icmp", "arp", "rdns"]
+    got = (await client.get(f"/api/v1/subnets/{subnet['id']}")).json()["data"]
+    assert got["cidr"] == PADDED_CIDR
 
 
 def test_the_job_model_refuses_more_servers_than_the_agent_asks():

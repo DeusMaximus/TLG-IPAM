@@ -44,7 +44,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..errors import ApiError, validation_error
-from ..ipnet import parse_ip
+from ..ipnet import canonical_cidr, parse_ip
 from ..models import FindingDismissal, Host, Observation, ScanTarget, Subnet
 from ..schemas import FindingKey, FindingOut, FindingType, HostCreate, HostUpdate
 from . import changes, scans
@@ -317,10 +317,12 @@ PAGE_SIZE = 25
 PAGE_BUDGET = 45_000
 # A cursor is base64url of UTF-8 JSON (`ensure_ascii=False`): a subnet's name, at most
 # 120 characters of at most 6 bytes each as JSON (a control character's `\u0000`; a
-# 4-byte character stays 4), so 720; a CIDR (43 at most), an id (36), an address (39
-# digits for IPv6), a type (13) and 14 of JSON punctuation. 865 bytes is 1,156 base64
-# characters; the cap leaves room above that, and every cursor the encoder can make
-# fits (`test_mcp.test_a_cursor_at_its_largest_round_trips`).
+# 4-byte character stays 4), so 720; a CIDR (43 at most, because the listing uses its
+# canonical spelling, `ipnet.canonical_cidr`, whatever a subnet stored before #97
+# holds), an id (36), an address (39 digits for IPv6), a type (13) and 14 of JSON
+# punctuation. 865 bytes is 1,156 base64 characters; the cap leaves room above that,
+# and every cursor the encoder can make fits
+# (`test_mcp.test_a_cursor_at_its_largest_round_trips`).
 CURSOR_MAX = 2048
 _TYPE_ORDER = {name: index for index, name in enumerate(FINDING_TYPES)}
 
@@ -382,8 +384,9 @@ async def list_named(
     """Findings as MCP lists them (`list_scan_findings`, spec §5.8), a page at a time:
     one subnet's, or every subnet's by subnet name when `subnet_id` is None. Each is
     `list_findings`'s finding, unchanged, plus the subnet's `subnet_name` and
-    `subnet_cidr` and the recorded `host_name` and `host_fqdn` of the host at the
-    address (null for an `unknown_host`). `dynamic` findings are left out, as
+    `subnet_cidr` (its canonical spelling, `ipnet.canonical_cidr`) and the recorded
+    `host_name` and `host_fqdn` of the host at the address (null for an
+    `unknown_host`). `dynamic` findings are left out, as
     `list_findings` leaves them out by default: a scanned DHCP pool is where personal
     devices answer (spec §7.1).
 
@@ -408,12 +411,16 @@ async def list_named(
     if subnet_id is not None:
         await get_subnet(session, subnet_id)
         query = query.where(Subnet.id == subnet_id)
-    subnets = sorted((await session.execute(query)).all(), key=lambda s: (s.name, s.cidr, s.id))
+    # each subnet's place in the order, by its CIDR's canonical spelling: a subnet
+    # stored before #97 may hold a spelling of any length, which the cursor carries
+    rows = (await session.execute(query)).all()
+    subnets = sorted(
+        (((s.name, canonical_cidr(s.cidr), s.id), s) for s in rows), key=lambda pair: pair[0]
+    )
     page: list[dict] = []
     used = 0
     last: tuple | None = None
-    for subnet in subnets:
-        place = (subnet.name, subnet.cidr, subnet.id)
+    for place, subnet in subnets:
         if after is not None and place < after[:3]:
             continue
         found = await list_findings(session, subnet.id, type_)
@@ -439,7 +446,7 @@ async def list_named(
             named = {
                 **f,
                 "subnet_name": subnet.name,
-                "subnet_cidr": subnet.cidr,
+                "subnet_cidr": place[1],
                 "host_name": host.hostname if host is not None else None,
                 "host_fqdn": (
                     hosts_svc.fqdn_of(host.hostname, host.domain, subnet.domain)

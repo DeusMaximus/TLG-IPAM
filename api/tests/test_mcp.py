@@ -12,7 +12,7 @@ from app.models import Change
 from app.services import findings as findings_svc
 from app.services import scans
 
-from .conftest import make_host, make_section, make_subnet
+from .conftest import PADDED_CIDR, make_host, make_section, make_subnet, store_cidr_as
 from .test_checkin import (  # noqa: F401 (agent_api is a fixture)
     agent_api,
     jobs_for,
@@ -532,6 +532,45 @@ async def test_pages_order_by_name_then_cidr_then_id(client):
         for octet in range(10, 10 + counts[subnet["id"]])
     ]
     assert [(f["subnet_id"], f["ip"]) for p in pages for f in p] == expected
+
+
+async def test_paging_through_a_subnet_stored_with_a_long_spelling(client):
+    """A subnet stored with a non-canonical CIDR before #97 is listed, and paged, by its
+    canonical spelling: the cursor carries the CIDR, and the stored 4,300-character one
+    made a cursor over `CURSOR_MAX`, so the listing refused the cursor it had issued."""
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"], "192.168.240.0/20", name="lab")
+    await store_cidr_as(subnet["id"], PADDED_CIDR)
+    await unknown_hosts(subnet["id"], "192.168.240", range(10, 10 + findings_svc.PAGE_SIZE + 1))
+    pages = await scan_pages()
+    assert [len(p) for p in pages] == [findings_svc.PAGE_SIZE, 1]
+    assert {f["subnet_cidr"] for p in pages for f in p} == {"192.168.240.0/20"}
+
+
+async def test_pages_order_subnets_stored_with_other_spellings_by_their_canonical_cidr(client):
+    """Subnets stored before #97 in other spellings are ordered, as the cursor places
+    them, by the canonical spelling: two subnets named "same", a /24 stored as
+    `10.0.0.0/255.255.255.0` and a /25 stored as `10.0.0.0/0.0.0.127`. Sorted by the
+    stored strings, the /25 comes first ("0" before "2") while the cursor's canonical
+    positions put the /24 first, and paging skips the /24's findings (the outside
+    review of PR #113)."""
+    assert findings_svc.PAGE_SIZE == 25  # the fixture's 52 findings cross two boundaries
+    home = await make_section(client, "Home")
+    away = await make_section(client, "Away")
+    wide = await make_subnet(client, home["id"], "10.0.0.0/24", name="same")
+    narrow = await make_subnet(client, away["id"], "10.0.0.0/25", name="same")
+    await store_cidr_as(wide["id"], "10.0.0.0/255.255.255.0")
+    await store_cidr_as(narrow["id"], "10.0.0.0/0.0.0.127")
+    octets = range(10, 36)
+    for subnet in (wide, narrow):
+        await unknown_hosts(subnet["id"], "10.0.0", octets)
+
+    pages = await scan_pages()
+    # every finding, each once, the /24's before the /25's
+    expected = [(s["id"], f"10.0.0.{octet}") for s in (wide, narrow) for octet in octets]
+    assert [(f["subnet_id"], f["ip"]) for p in pages for f in p] == expected
+    assert [len(p) for p in pages] == [25, 25, 2]
+    assert {f["subnet_cidr"] for p in pages for f in p} == {"10.0.0.0/24", "10.0.0.0/25"}
 
 
 # The review's accepted values (Codex's briefed round on #83), each through the REST API

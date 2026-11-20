@@ -6,17 +6,21 @@ The answer is built by the server's real check-in route, in process, and read by
 agent's real client and loop. The worst case is made from the server's own bounds, so
 a change to either side fails here: the largest subnet a target may have
 (`scans.MIN_PREFIX`), its scope split as finely as it can be (every other address
-excluded), every method a target can hold, and a stored `dns_servers` list longer than
-the owner API now accepts, as a subnet saved before the bound keeps."""
+excluded), every method a target can hold, a stored `dns_servers` list longer than
+the owner API now accepts, as a subnet saved before the bound keeps, and a stored CIDR
+spelled as long as the owner API once took, as a subnet saved before #97 keeps. A job
+carries the CIDR's canonical spelling (`ipnet.canonical_cidr`), so the longest CIDR the
+server can send is the longest canonical one, whatever the subnet stores."""
 
 import ipaddress
 import json
 import random
 
 import httpx
+import pytest
 from app.agent_protocol import DNS_SERVERS_MAX
 from app.database import SessionLocal
-from app.ipnet import usable_bounds
+from app.ipnet import canonical_cidr, usable_bounds
 from app.main import app
 from app.models import ReservedRange, Subnet
 from app.schemas import SUBNET_DNS_SERVERS_MAX
@@ -30,9 +34,15 @@ from tlg_ipam_agent.client import RESPONSE_MAX, AgentClient
 from tlg_ipam_agent.loop import Agent
 
 # the longest an IPv4 address, and so a range end, a DNS server or an interface address
-# of a job, can be written; v1 is IPv4-only (`ipnet.parse_ip`, `ipnet.parse_cidr`)
+# of a job, can be written; v1 is IPv4-only (`ipnet.parse_ip`, `ipnet.parse_cidr`). A
+# job's CIDR is canonical, so this is the longest it can be written too.
 _LONGEST_IP = "255.255.255.255"
 _LONGEST_CIDR = "255.255.255.255/32"
+# The spelling of the /20 below that the review of PR #95 stored through the owner API
+# before #97: a prefix padded with 4,298 zeroes. An answer whose job carried it was
+# 109,276 bytes here, past the bound below, and the agent refused the job (its `cidr`
+# over 64 characters).
+_PADDED_CIDR = "192.168.240.0/" + "0" * 4298 + "20"
 
 
 class Recording(httpx.AsyncBaseTransport):
@@ -75,9 +85,12 @@ async def test_the_largest_checkin_answer_is_inside_the_agents_limit(owner):  # 
                     start_int=ip_int, end_int=ip_int, scan_excluded=True,
                 )
             )
-        # stored before the owner API bounded the list (#75), and kept by it
+        # stored before the owner API bounded the list (#75) and canonicalised the
+        # CIDR (#97), and kept by it
         await session.execute(
-            update(Subnet).where(Subnet.id == subnet["id"]).values(dns_servers=legacy)
+            update(Subnet)
+            .where(Subnet.id == subnet["id"])
+            .values(dns_servers=legacy, cidr=_PADDED_CIDR)
         )
         await session.commit()
 
@@ -109,6 +122,9 @@ async def test_the_largest_checkin_answer_is_inside_the_agents_limit(owner):  # 
     assert [r["start"] for r in raw["ranges"]] == [str(ipaddress.ip_address(i)) for i in scanned]
     assert raw["methods"] == ["icmp", "arp", "rdns"]
     assert raw["dns_servers"] == legacy[:DNS_SERVERS_MAX]
+    # the CIDR in its canonical spelling, whatever the subnet stores
+    assert canonical_cidr(_PADDED_CIDR) == str(net)
+    assert raw["cidr"] == str(net)
     # until #20, which must add its names to the bound below
     assert raw["fdns"] == []
 
@@ -116,8 +132,9 @@ async def test_the_largest_checkin_answer_is_inside_the_agents_limit(owner):  # 
     parsed = protocol.parse_job(protocol.job_ref(raw), raw)
     assert len(guard.plan(parsed, make_config().allowed)) == len(scanned)
 
-    # The same answer with every address in it written at its longest, and every method
-    # a target can hold, bounds what any subnet of this size can produce.
+    # The same answer with every address in it, and the CIDR, written at its longest,
+    # and every method a target can hold, bounds what any subnet of this size can
+    # produce.
     answer = {"data": {"checkin_interval_s": 60, "jobs": [raw]}}
     assert _encoded(answer) == size
     bound = {
@@ -139,3 +156,10 @@ async def test_the_largest_checkin_answer_is_inside_the_agents_limit(owner):  # 
     # What the server sent before #75, the whole stored list, would not have fitted.
     unbounded = {"data": {"checkin_interval_s": 60, "jobs": [{**raw, "dns_servers": legacy}]}}
     assert _encoded(unbounded) > RESPONSE_MAX
+
+    # What the server sent before #97, the CIDR as stored, passed that bound, and the
+    # agent refused the job it carried.
+    as_stored = {**raw, "cidr": _PADDED_CIDR}
+    assert _encoded({"data": {"checkin_interval_s": 60, "jobs": [as_stored]}}) > _encoded(bound)
+    with pytest.raises(protocol.JobRefused):
+        protocol.parse_job(protocol.job_ref(as_stored), as_stored)

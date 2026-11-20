@@ -3,7 +3,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.errors import ApiError
 from app.ipnet import (
+    canonical_cidr,
     exclusion_intervals,
     format_intervals,
     interval_size,
@@ -76,3 +78,28 @@ def test_format_intervals_uses_the_network_family():
     assert format_intervals(net, [(base + 1, base + 9)]) == [
         {"start": "10.0.0.1", "end": "10.0.0.9"}
     ]
+
+
+@pytest.mark.parametrize(
+    ("typed", "canonical"),
+    [
+        ("10.0.0.0/24", "10.0.0.0/24"),
+        ("10.0.0.0/255.255.255.0", "10.0.0.0/24"),
+        ("10.0.0.0/0.0.0.255", "10.0.0.0/24"),
+        ("10.0.0.0/0024", "10.0.0.0/24"),
+        ("192.168.240.0/" + "0" * 4298 + "20", "192.168.240.0/20"),
+        ("10.0.0.5", "10.0.0.5/32"),
+        ("255.255.255.255/255.255.255.255", "255.255.255.255/32"),
+    ],
+)
+def test_canonical_cidr_is_one_spelling_per_network(typed, canonical):
+    assert canonical_cidr(typed) == canonical
+    assert ipaddress.ip_network(typed) == ipaddress.ip_network(canonical)
+    # the longest an IPv4 network can be spelled canonically (#97)
+    assert len(canonical_cidr(typed)) <= len("255.255.255.255/32")
+
+
+@pytest.mark.parametrize("bad", ["10.0.0.1/24", " 10.0.0.0/24", "10.0.0.0/33", "fd00::/64"])
+def test_canonical_cidr_refuses_what_parse_cidr_refuses(bad):
+    with pytest.raises(ApiError):
+        canonical_cidr(bad)
