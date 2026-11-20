@@ -18,7 +18,7 @@ import pytest
 from conftest import job
 from tlg_ipam_agent import guard, scan
 from tlg_ipam_agent.config import parse_allowed
-from tlg_ipam_agent.probe import MAX_DNS_SERVERS, DnsResolver
+from tlg_ipam_agent.probe import MAX_DNS_SERVERS, NO_DNS_SERVER, DnsResolver, ProbeError, no_query_sent
 from tlg_ipam_agent.protocol import job_ref, parse_job
 
 ANSWERS = {
@@ -277,5 +277,148 @@ async def test_a_reply_with_the_wrong_id_moves_to_the_next_server():
         assert len(proto.arrivals) == 2
         proto.script = ["wrong-id"]
         assert await resolver.ptr(address, ("127.0.0.1",), unpaced(0.5)) is None
+    finally:
+        transport.close()
+
+
+# --- no server to ask is not a completed lookup (#78) ---
+
+
+def counted(seconds=2.0):
+    """An unpaced slot that counts how often it was taken."""
+    taken = []
+
+    async def slot():
+        taken.append(1)
+        return seconds
+
+    return slot, taken
+
+
+def resolv_conf(tmp_path, text: str):
+    path = tmp_path / "resolv.conf"
+    path.write_text(text)
+    return path
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",  # what the review found in the built image: an empty /etc/resolv.conf
+        "search home.arpa\noptions ndots:1\n",  # no nameserver line
+        "nameserver not-an-address\nnameserver 127.0.0.1\n",  # dnspython refuses the file
+        # dnspython keeps a DNS-over-HTTPS URL, which a UDP query cannot use
+        "nameserver https://dns.example.com/dns-query\n",
+    ],
+)
+def test_a_host_with_no_usable_resolver_gives_no_server(tmp_path, text):
+    resolver = DnsResolver(resolv_conf=str(resolv_conf(tmp_path, text)))
+    assert resolver.servers(()) == ()
+
+
+def test_a_host_with_no_resolv_conf_gives_no_server(tmp_path):
+    assert DnsResolver(resolv_conf=str(tmp_path / "missing")).servers(()) == ()
+
+
+def test_the_jobs_servers_win_over_the_hosts(tmp_path):
+    resolver = DnsResolver(resolv_conf=str(resolv_conf(tmp_path, "nameserver 127.0.0.1\n")))
+    assert resolver.servers(("10.0.0.53",)) == ("10.0.0.53",)
+    assert resolver.servers(()) == ("127.0.0.1",)
+
+
+def test_only_addresses_are_kept_before_the_list_is_cut(tmp_path):
+    """MAX_DNS_SERVERS cuts the list after the entries the agent cannot query are
+    dropped, so three of those first cannot empty it."""
+    text = "".join(f"nameserver https://dns{i}.example.com/dns-query\n" for i in range(3))
+    text += "nameserver 127.0.0.1\nnameserver ::1\nnameserver 127.0.0.2\nnameserver 127.0.0.3\n"
+    resolver = DnsResolver(resolv_conf=str(resolv_conf(tmp_path, text)))
+    assert resolver.servers(()) == ("127.0.0.1", "::1", "127.0.0.2")
+    assert len(resolver.servers(tuple(f"127.0.0.{i}" for i in range(1, 8)))) == MAX_DNS_SERVERS
+
+
+def test_the_hosts_resolvers_are_read_again_for_every_job(tmp_path):
+    """A failed read is not kept: the next call reads resolv.conf again, so a corrected
+    file takes effect at the next job, in the same process."""
+    path = resolv_conf(tmp_path, "")
+    resolver = DnsResolver(resolv_conf=str(path))
+    assert resolver.servers(()) == ()
+    path.write_text("nameserver 127.0.0.1\n")
+    assert resolver.servers(()) == ("127.0.0.1",)
+    path.write_text("nameserver ::1\n")
+    assert resolver.servers(()) == ("::1",)
+    path.unlink()
+    assert resolver.servers(()) == ()
+
+
+async def test_a_lookup_with_no_server_raises_and_takes_no_slot():
+    slot, taken = counted()
+    with pytest.raises(ProbeError) as raised:
+        await DnsResolver().ptr(ipaddress.ip_address("10.0.0.9"), (), slot)
+    assert str(raised.value) == NO_DNS_SERVER
+    assert taken == []
+
+
+async def test_a_query_sent_to_no_server_is_no_lookup():
+    """Port 0 is refused by the kernel before anything is sent (macOS and Linux both
+    fail the send), and a server dnspython cannot parse is never sent to: a lookup
+    whose every server failed like that raises, and is not a lookup that found no
+    name."""
+    address = ipaddress.ip_address("10.0.0.9")
+    slot, taken = counted()
+    with pytest.raises(ProbeError) as raised:
+        await DnsResolver(port=0).ptr(address, ("127.0.0.1", "127.0.0.1"), slot)
+    assert str(raised.value) == no_query_sent("OSError")
+    assert len(taken) == 2  # each attempt took its slot
+    with pytest.raises(ProbeError) as raised:
+        await DnsResolver().ptr(address, ("not-an-address",), unpaced())
+    assert str(raised.value) == no_query_sent("ValueError")
+
+
+async def test_one_server_that_cannot_be_sent_to_does_not_spoil_the_lookup():
+    transport, proto, port = await responder()
+    try:
+        resolver = DnsResolver(port=port)
+        address = ipaddress.ip_address("10.0.0.9")
+        # the first cannot be sent to; the second answers with the name
+        assert await resolver.ptr(address, ("not-an-address", "127.0.0.1"), unpaced()) == "nas.home.arpa."
+        # one sent and silent, one that cannot be sent: it was asked, and found no name
+        proto.script = ["silent"]
+        assert await resolver.ptr(address, ("127.0.0.1", "not-an-address"), unpaced(0.2)) is None
+        assert len(proto.arrivals) == 2
+    finally:
+        transport.close()
+
+
+async def test_no_server_to_ask_makes_the_scan_incomplete_and_a_fixed_host_restores_it(tmp_path):
+    """Acceptance for #78 at the scan: a job naming no DNS server on a host with none
+    reports `complete: false` with the fixed error and sends no DNS packet; once the
+    host's resolv.conf is fixed, the next job with the same resolver looks names up.
+    The responder is on loopback; nothing leaves this machine."""
+    transport, proto, port = await responder()
+    try:
+        path = resolv_conf(tmp_path, "")
+        resolver = DnsResolver(port=port, resolv_conf=str(path))
+        raw = job(ranges=[{"start": "10.0.0.9", "end": "10.0.0.9"}], dns_servers=[])
+        parsed = parse_job(job_ref(raw), raw)
+        addresses = guard.plan(parsed, parse_allowed(None))
+
+        async def sweep():
+            return await scan.run(
+                parsed, addresses, prober=TimedProber(alive=["10.0.0.9"]), resolver=resolver,
+                max_pps=200, clock=scan.Clock(),
+            )
+
+        first = await sweep()
+        assert first["complete"] is False
+        assert first["error"] == NO_DNS_SERVER
+        assert first["observations"] == [{"ip": "10.0.0.9"}]
+        await asyncio.sleep(0.05)
+        assert proto.arrivals == []
+
+        path.write_text("nameserver 127.0.0.1\n")
+        second = await sweep()
+        assert second["complete"] is True and second["error"] is None
+        assert second["observations"] == [{"ip": "10.0.0.9", "rdns_name": "nas.home.arpa"}]
+        assert len(proto.arrivals) == 1
     finally:
         transport.close()

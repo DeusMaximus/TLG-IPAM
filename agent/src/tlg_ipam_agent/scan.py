@@ -2,11 +2,12 @@
 lookups for the addresses either found, inside the job's timeout (spec §5.2, §5.6).
 
 Every packet goes to an address `guard.plan` returned, or, for a PTR lookup, to one of
-the job's DNS servers. Every packet is paced at `MAX_PPS` across the whole job: each
-echo request, each ARP request (a retry included), and each DNS query, a failover to
-the next server included. The result set is `complete` only when every issued method
-ran over every address before the timeout; otherwise it reports what it saw, which
-the server only adds (spec §5.7).
+the job's DNS servers (the host's own resolvers when the job names none). Every packet
+is paced at `MAX_PPS` across the whole job: each echo request, each ARP request (a
+retry included), and each DNS query, a failover to the next server included. The
+result set is `complete` only when every issued method ran over every address before
+the timeout; otherwise it reports what it saw, which the server only adds (spec §5.7).
+A PTR lookup with no server to ask, or whose query could be sent to none, did not run.
 """
 
 import asyncio
@@ -17,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from . import arp
-from .probe import ArpLink, ArpSession, ProbeError, Prober, Resolver
+from .probe import NO_DNS_SERVER, ArpLink, ArpSession, ProbeError, Prober, Resolver
 from .protocol import SUPPORTED, Address, Job, JobRef, Network, rdns_name, scan_error
 
 # one echo request per address, and this long for its reply
@@ -321,7 +322,17 @@ async def run(
         alive.update(macs)
 
     names: dict[Address, str] = {}
+    servers: tuple[str, ...] = ()
     if "rdns" in job.methods and alive and not timed_out:
+        # chosen once for the job: its own servers, else the host's resolvers as they
+        # are now. With none, no lookup can be made, and a lookup not made is not one
+        # that found no name: the result set is incomplete, so the server keeps the
+        # names it has (spec §5.7), and no query is sent
+        servers = resolver.servers(job.dns_servers)
+        if not servers:
+            complete = False
+            errors.append(NO_DNS_SERVER)
+    if servers:
 
         async def lookup(address: Address, _timeout: float) -> None:
             end: float | None = None
@@ -338,14 +349,20 @@ async def run(
                     end = min(now + RDNS_TIMEOUT_S, deadline)
                 return end - now
 
-            name = rdns_name(await resolver.ptr(address, job.dns_servers, slot))
+            name = rdns_name(await resolver.ptr(address, servers, slot))
             if name is not None:
                 names[address] = name
 
-        # unpaced here: the resolver takes a slot for every query it sends
-        if not await _Pool(RDNS_CONCURRENCY, RDNS_TIMEOUT_S, None, clock, deadline).run(sorted(alive), lookup):
-            timed_out = True
-            errors.append(f"timed out after {job.timeout_s} s during the PTR lookups")
+        try:
+            # unpaced here: the resolver takes a slot for every query it sends
+            if not await _Pool(RDNS_CONCURRENCY, RDNS_TIMEOUT_S, None, clock, deadline).run(sorted(alive), lookup):
+                timed_out = True
+                errors.append(f"timed out after {job.timeout_s} s during the PTR lookups")
+        except ProbeError as exc:
+            # a lookup could send its query to none of the servers: the lookups stop,
+            # and the names found before are still reported
+            complete = False
+            errors.append(str(exc))
     if timed_out:
         complete = False
 

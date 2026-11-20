@@ -7,7 +7,7 @@ import pytest
 from conftest import ETH0, FakeArp, FakeClock, FakeProber, FakeResolver, job
 from tlg_ipam_agent import guard, scan
 from tlg_ipam_agent.config import parse_allowed
-from tlg_ipam_agent.probe import ProbeError
+from tlg_ipam_agent.probe import NO_DNS_SERVER, ProbeError, no_query_sent
 from tlg_ipam_agent.protocol import job_ref, parse_job
 
 
@@ -257,3 +257,75 @@ async def test_a_lookup_still_ends_at_the_jobs_deadline():
     assert len(resolver.asked) < 8
     assert all(t <= 1000 + 12 for t in resolver.times)
     assert result["complete"] is False
+
+
+# --- no server to ask is not a completed lookup (#78) ---
+
+
+async def test_no_dns_server_anywhere_makes_the_scan_incomplete_and_asks_nothing():
+    prober = FakeProber(alive=["10.0.0.3", "10.0.0.9"])
+    resolver = FakeResolver({"10.0.0.3": "printer.home.arpa"}, host=())
+    parsed, addresses = planned(dns_servers=[])
+    result = await sweep(parsed, addresses, prober=prober, resolver=resolver)
+    assert result["complete"] is False
+    assert result["error"] == NO_DNS_SERVER
+    # the live addresses are still reported, without names
+    assert result["observations"] == [{"ip": "10.0.0.3"}, {"ip": "10.0.0.9"}]
+    assert resolver.asked == []
+
+
+async def test_the_jobs_own_server_needs_none_on_the_host():
+    prober = FakeProber(alive=["10.0.0.3"])
+    resolver = FakeResolver({"10.0.0.3": "printer.home.arpa"}, host=())
+    parsed, addresses = planned(dns_servers=["10.0.0.53"])
+    result = await sweep(parsed, addresses, prober=prober, resolver=resolver)
+    assert result["complete"] is True and result["error"] is None
+    assert resolver.asked == [(ipaddress.ip_address("10.0.0.3"), ("10.0.0.53",))]
+
+
+async def test_the_hosts_servers_are_given_to_every_lookup():
+    prober = FakeProber(alive=["10.0.0.3", "10.0.0.9"])
+    resolver = FakeResolver(host=("192.0.2.1", "192.0.2.2"))
+    parsed, addresses = planned(dns_servers=[])
+    result = await sweep(parsed, addresses, prober=prober, resolver=resolver)
+    assert result["complete"] is True
+    assert {servers for _, servers in resolver.asked} == {("192.0.2.1", "192.0.2.2")}
+
+
+async def test_with_nothing_alive_there_is_nothing_to_look_up():
+    """No live address, no lookup to make: a host with no resolver does not make the
+    scan incomplete, and an `icmp`-only job never asks for servers at all."""
+    resolver = FakeResolver(host=())
+    parsed, addresses = planned(dns_servers=[])
+    result = await sweep(parsed, addresses, prober=FakeProber(), resolver=resolver)
+    assert result["complete"] is True and result["error"] is None
+    parsed, addresses = planned(dns_servers=[], methods=["icmp"])
+    result = await sweep(parsed, addresses, prober=FakeProber(alive=["10.0.0.3"]), resolver=resolver)
+    assert result["complete"] is True and result["error"] is None
+
+
+class UnsendableResolver(FakeResolver):
+    """Its lookups for `unsendable` could send the query to no server."""
+
+    def __init__(self, names, unsendable):
+        super().__init__(names)
+        self.unsendable = {ipaddress.ip_address(a) for a in unsendable}
+
+    async def ptr(self, address, servers, slot):
+        if address in self.unsendable:
+            await slot()
+            raise ProbeError(no_query_sent("OSError"))
+        return await super().ptr(address, servers, slot)
+
+
+async def test_a_lookup_that_could_send_nothing_stops_the_lookups_and_the_scan_is_incomplete():
+    prober = FakeProber(alive=["10.0.0.1", "10.0.0.2", "10.0.0.3"])
+    resolver = UnsendableResolver({"10.0.0.1": "a.home.arpa", "10.0.0.3": "c.home.arpa"}, ["10.0.0.2"])
+    parsed, addresses = planned()
+    result = await sweep(parsed, addresses, prober=prober, resolver=resolver)
+    assert result["complete"] is False
+    assert result["error"] == no_query_sent("OSError")
+    # every live address is reported; the name found before the failure is kept
+    assert [o["ip"] for o in result["observations"]] == ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+    assert result["observations"][0] == {"ip": "10.0.0.1", "rdns_name": "a.home.arpa"}
+    assert "rdns_name" not in result["observations"][1]
