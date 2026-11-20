@@ -597,7 +597,16 @@ async def test_lookups_that_send_nothing_keep_the_stored_names_at_one_packet_a_s
     before anything leaves), and the two lookups share one packet a second, so each
     runs out its own 2 s with nothing sent while the job still has time: that is no
     lookup, the scan is incomplete, and the names survive. The clock runs ten times
-    fast."""
+    fast.
+
+    What it assumes (#107; it failed once in 31 full runs under load, when the pacer
+    could still catch up, and has not since): the first scan's two loopback answers
+    arrive within the lookup's own 2 s, which dnspython waits out on the real clock
+    whatever the scale, so a stall of the whole process for that long ends a lookup
+    unanswered and the first scan incomplete. The second scan does not depend on
+    timing: a lookup whose next slot falls inside its own 2 s sends nothing either
+    (port 0 is refused) and goes on to its next server, and every order of the
+    slots ends in the same error."""
     from test_probe import ANSWERS, responder
 
     from tlg_ipam_agent.probe import DnsResolver, no_query_sent

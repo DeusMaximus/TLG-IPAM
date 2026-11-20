@@ -59,8 +59,6 @@ FORBIDDEN = {
 FORBIDDEN_PREFIXES = ("exec", "spawn", "fork", "posix_spawn", "create_subprocess", "subprocess_")
 # a forbidden name that is harmless on this one module: `re.compile` builds a pattern
 ALLOWED_QUALIFIED = {"re.compile"}
-# the identifiers these prefixes would wrongly catch in the agent's own code
-PREFIX_EXCEPTIONS = {"exception", "exc_info", "exc_text", "exctype"}
 
 # The spellings of having a library open a file to read that the checks enumerate
 # (the agent's own ways of opening one are forbidden names above): pathlib's read_text
@@ -119,7 +117,7 @@ def _identifiers(tree):
 def _forbidden(name: str) -> bool:
     if name in FORBIDDEN:
         return True
-    return name.startswith(FORBIDDEN_PREFIXES) and name not in PREFIX_EXCEPTIONS
+    return name.startswith(FORBIDDEN_PREFIXES)
 
 
 def _file_opens(tree) -> set[str]:
@@ -248,6 +246,91 @@ def test_each_check_refuses_what_it_is_there_for(source, reasons, module):
     snippet, where any `os.open` was refused for its placement)."""
     base = "" if module == "snippet.py" else (PACKAGE / module).read_text() + "\n"
     assert _violations(ast.parse(base + source), module) == reasons
+
+
+# One refused source for each entry of FORBIDDEN, FORBIDDEN_PREFIXES and FILE_KEYWORDS
+# (#107: before this, 44 of the 60 names, three of the five keywords and four of the six
+# prefixes could be dropped with every case above green). The names below are written
+# out and are not read from the lists they guard, so deleting an entry from a list
+# leaves its case here to fail: `test_every_entry_of_each_list_has_a_case` is the
+# other direction, a new entry needing a case. Each is refused for exactly its own
+# reason, alone and appended to the real arp.py and probe.py, as above.
+FORBIDDEN_NAME_CASES = (
+    "exec", "eval", "compile", "__import__", "breakpoint", "getattr", "setattr",
+    "delattr", "globals", "locals", "vars", "__builtins__", "__dict__", "__globals__",
+    "__code__", "__subclasses__", "__loader__", "system", "popen", "startfile",
+    "run_path", "run_module", "import_module", "load_module", "exec_module",
+    "find_spec", "reload", "write_text", "write_bytes", "open", "chmod", "symlink",
+    "subprocess", "pickle", "marshal", "ctypes", "importlib", "runpy", "pip",
+    "ensurepip", "venv", "shutil", "pty", "zipimport", "urlopen", "urlretrieve",
+    "FileIO", "open_code", "fdopen", "openpty", "mkfifo", "mknod", "touch", "truncate",
+    "symlink_to", "hardlink_to", "link_to", "FileHandler", "__setattr__", "__delattr__",
+)
+# a name that is on no list but its prefix, on an attribute of `os`
+FORBIDDEN_PREFIX_CASES = {
+    "exec": "execv",
+    "spawn": "spawnl",
+    "fork": "forkpty",
+    "posix_spawn": "posix_spawnp",
+    "create_subprocess": "create_subprocess_shell",
+    "subprocess_": "subprocess_exec",
+}
+# each keyword as a call's keyword and as a key of `**{...}`
+FILE_KEYWORD_CASES = [
+    (keyword, form, source)
+    for keyword, (call, unpacked) in {
+        "cafile": ("wrap(cafile='x')", "wrap(**{'cafile': 'x'})"),
+        "capath": ("wrap(capath='x')", "wrap(**{'capath': 'x'})"),
+        "certfile": ("wrap(certfile='x')", "wrap(**{'certfile': 'x'})"),
+        "keyfile": ("wrap(keyfile='x')", "wrap(**{'keyfile': 'x'})"),
+        "filename": ("wrap(filename='x')", "wrap(**{'filename': 'x'})"),
+    }.items()
+    for form, source in (("keyword", call), ("unpacked", unpacked))
+]
+
+
+def _refused_in(source: str, module: str) -> list[str]:
+    base = "" if module == "snippet.py" else (PACKAGE / module).read_text() + "\n"
+    return _violations(ast.parse(base + source), module)
+
+
+@pytest.mark.parametrize("module", ["snippet.py", "arp.py", "probe.py"])
+@pytest.mark.parametrize("name", FORBIDDEN_NAME_CASES)
+def test_each_forbidden_name_is_refused_for_its_own_reason(name, module):
+    assert _refused_in(f"value = {name}\n", module) == [f"name {name}"]
+
+
+@pytest.mark.parametrize("module", ["snippet.py", "arp.py", "probe.py"])
+@pytest.mark.parametrize("prefix", FORBIDDEN_PREFIX_CASES)
+def test_each_forbidden_prefix_is_refused_for_its_own_reason(prefix, module):
+    name = FORBIDDEN_PREFIX_CASES[prefix]
+    assert not name.startswith(tuple(p for p in FORBIDDEN_PREFIX_CASES if p != prefix))
+    assert _refused_in(f"import os\nvalue = os.{name}\n", module) == [f"name {name}"]
+
+
+@pytest.mark.parametrize("module", ["snippet.py", "arp.py", "probe.py"])
+@pytest.mark.parametrize(
+    "keyword, form, source", FILE_KEYWORD_CASES, ids=[f"{k}-{f}" for k, f, _ in FILE_KEYWORD_CASES]
+)
+def test_each_file_keyword_is_refused_for_its_own_reason(keyword, form, source, module):
+    assert _refused_in(source + "\n", module) == [f"opens a file with {keyword}="]
+
+
+def test_every_entry_of_each_list_has_a_case():
+    """The other direction from the cases above, which stand when an entry is deleted:
+    an entry added to a list needs a case written out beside it."""
+    assert set(FORBIDDEN_NAME_CASES) == FORBIDDEN
+    assert len(FORBIDDEN_NAME_CASES) == len(set(FORBIDDEN_NAME_CASES))
+    assert set(FORBIDDEN_PREFIX_CASES) == set(FORBIDDEN_PREFIXES)
+    assert {keyword for keyword, _, _ in FILE_KEYWORD_CASES} == FILE_KEYWORDS
+
+
+@pytest.mark.parametrize("name", ["exception", "exc_info", "exc_text", "exctype", "excess", "specs", "forward"])
+def test_names_near_a_forbidden_prefix_are_not_refused(name):
+    """What the removed PREFIX_EXCEPTIONS list was for (#107): `exception` and its
+    neighbours do not start with `exec`, so the prefix check never needed them
+    exempted. The prefixes are exact beginnings, and these are not among them."""
+    assert _violations(ast.parse(f"value = {name}\n"), "snippet.py") == []
 
 
 def test_a_read_passes_only_in_the_module_listed_for_it():
