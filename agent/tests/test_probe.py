@@ -422,3 +422,129 @@ async def test_no_server_to_ask_makes_the_scan_incomplete_and_a_fixed_host_resto
         assert len(proto.arrivals) == 1
     finally:
         transport.close()
+
+
+# --- briefed round 1 of PR #96 ---
+
+
+async def test_a_lookup_whose_own_time_runs_out_after_sending_nothing_is_no_lookup():
+    """Finding 1: two unsendable attempts, then a slot past the lookup's own 2 s
+    while the job still has time. No query went out, so it is not a lookup that found
+    no name."""
+    remaining = iter([2.0, 1.0, 0.0])
+
+    async def slot():
+        return next(remaining)
+
+    with pytest.raises(ProbeError) as raised:
+        await DnsResolver(port=0).ptr(
+            ipaddress.ip_address("10.0.0.1"), ("127.0.0.1", "127.0.0.2", "127.0.0.3"), slot
+        )
+    assert str(raised.value) == no_query_sent("OSError")
+
+
+async def test_after_a_sent_query_a_lookup_out_of_time_is_one_that_found_no_name():
+    transport, proto, port = await responder(script=("silent",))
+    try:
+        remaining = iter([0.2, 0.0])
+
+        async def slot():
+            return next(remaining)
+
+        name = await DnsResolver(port=port).ptr(ipaddress.ip_address("10.0.0.9"), ("127.0.0.1",) * 2, slot)
+        assert name is None and len(proto.arrivals) == 1
+    finally:
+        transport.close()
+
+
+@pytest.mark.parametrize(
+    "failures, expected",
+    [
+        ([TimeoutError()], None),
+        ([TimeoutError(), OSError()], None),
+        ([OSError(), TimeoutError()], None),
+        ([OSError(), OSError()], "OSError"),
+    ],
+)
+async def test_a_built_in_timeout_counts_as_a_sent_query(monkeypatch, failures, expected):
+    """dnspython turns an ordinary receive timeout into dns.exception.Timeout, but the
+    built-in TimeoutError, an OSError, must be read as a sent query too, not as one
+    that could not be sent (review round 1, the exception-order mutants)."""
+    raised = iter(failures)
+
+    async def udp(*args, **kwargs):
+        raise next(raised)
+
+    monkeypatch.setattr(dns.asyncquery, "udp", udp)
+    servers = ("127.0.0.1",) * len(failures)
+    lookup = DnsResolver().ptr(ipaddress.ip_address("10.0.0.9"), servers, unpaced())
+    if expected is None:
+        assert await lookup is None
+    else:
+        with pytest.raises(ProbeError) as error:
+            await lookup
+        assert str(error.value) == no_query_sent(expected)
+
+
+async def test_no_query_goes_out_after_a_lookup_that_could_send_nothing(monkeypatch):
+    """Finding 3: three lookups in flight against a loopback responder; the first
+    query cannot be sent, and the other two would send theirs 30 ms after that. They
+    are cancelled first, so no datagram reaches the responder after the failure."""
+    transport, proto, port = await responder()
+    real_udp = dns.asyncquery.udp
+    calls = 0
+    all_in, failed = asyncio.Event(), asyncio.Event()
+
+    async def udp(query, where, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            all_in.set()
+        if calls == 1:
+            await all_in.wait()
+            failed.set()
+            raise OSError("no route")
+        await failed.wait()
+        await asyncio.sleep(0.03)
+        return await real_udp(query, where, **kwargs)
+
+    monkeypatch.setattr(dns.asyncquery, "udp", udp)
+    try:
+        live = ["10.0.0.7", "10.0.0.8", "10.0.0.9"]
+        raw = job(ranges=[{"start": "10.0.0.7", "end": "10.0.0.9"}], dns_servers=["127.0.0.1"])
+        parsed = parse_job(job_ref(raw), raw)
+        result = await scan.run(
+            parsed, guard.plan(parsed, parse_allowed(None)), prober=TimedProber(alive=live),
+            resolver=DnsResolver(port=port), max_pps=1000, clock=scan.Clock(),
+        )
+        await asyncio.sleep(0.1)
+        assert calls == 3
+        assert proto.arrivals == []
+        assert result["complete"] is False and result["error"] == no_query_sent("OSError")
+        assert result["observations"] == [{"ip": a} for a in live]
+    finally:
+        transport.close()
+
+
+async def test_a_lookup_the_jobs_deadline_stops_before_any_attempt_is_reported_as_the_cut_off():
+    """The other side of finding 1: a lookup whose first slot comes at the job's
+    deadline made no attempt, sent nothing and failed nothing. It is the deadline's
+    cut-off, which the scan reports as the PTR timeout, not as a query that could not
+    be sent. Three pings at 1 a second on the fake clock, a 4 s job: the first lookup
+    gets 1 s and its name, the second's slot comes at the deadline."""
+    from conftest import FakeClock
+
+    transport, proto, port = await responder()
+    try:
+        raw = job(ranges=[{"start": "10.0.0.7", "end": "10.0.0.9"}], dns_servers=["127.0.0.1"], timeout_s=4)
+        parsed = parse_job(job_ref(raw), raw)
+        result = await scan.run(
+            parsed, guard.plan(parsed, parse_allowed(None)),
+            prober=TimedProber(alive=["10.0.0.7", "10.0.0.8", "10.0.0.9"]),
+            resolver=DnsResolver(port=port), max_pps=1, clock=FakeClock(),
+        )
+        assert result["complete"] is False
+        assert result["error"] == "timed out after 4 s during the PTR lookups"
+        assert len(proto.arrivals) == 1
+    finally:
+        transport.close()

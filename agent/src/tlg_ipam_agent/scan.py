@@ -7,7 +7,8 @@ is paced at `MAX_PPS` across the whole job: each echo request, each ARP request 
 retry included), and each DNS query, a failover to the next server included. The
 result set is `complete` only when every issued method ran over every address before
 the timeout; otherwise it reports what it saw, which the server only adds (spec §5.7).
-A PTR lookup with no server to ask, or whose query could be sent to none, did not run.
+A PTR lookup with no server to ask, or whose every attempt failed before its query went
+out, did not run; one the deadline stops before its first attempt is the timeout.
 """
 
 import asyncio
@@ -67,7 +68,11 @@ class Pacer:
 class _Pool:
     """Runs `work(item, timeout)` on each item, at most `limit` at once, each start
     paced, none started after `deadline`, and none given longer than what is left
-    before it. Returns whether every item started and finished before the deadline."""
+    before it. Returns whether every item started and finished before the deadline.
+
+    When a work item raises, no further item is started and the exception is raised
+    once the items in flight are done. With `cancel_on_failure` those items are
+    cancelled at once instead of being let finish, so they send nothing more."""
 
     def __init__(
         self,
@@ -76,11 +81,13 @@ class _Pool:
         pacer: Pacer | None,
         clock: Clock,
         deadline: float,
+        cancel_on_failure: bool = False,
     ):
         """`pacer` paces each start; None when the work paces its own sends."""
         self._sem = asyncio.Semaphore(limit)
         self._item_timeout = item_timeout
         self._pacer, self._clock, self._deadline = pacer, clock, deadline
+        self._cancel_on_failure = cancel_on_failure
 
     async def run(self, items, work) -> bool:
         tasks: list[asyncio.Task] = []
@@ -91,7 +98,13 @@ class _Pool:
             nonlocal failed
             try:
                 await work(item, timeout)
-            except BaseException:
+            except BaseException as exc:
+                if self._cancel_on_failure and not failed and isinstance(exc, Exception):
+                    # the first failure: the rest of the work in flight goes now
+                    this = asyncio.current_task()
+                    for task in tasks:
+                        if task is not this:
+                            task.cancel()
                 failed = True
                 raise
             finally:
@@ -124,6 +137,10 @@ class _Pool:
             raise
         finally:
             results = await asyncio.gather(*tasks, return_exceptions=True)
+        # the failure itself, before the cancellations it caused
+        for result in results:
+            if isinstance(result, Exception):
+                raise result
         for result in results:
             if isinstance(result, BaseException):
                 raise result
@@ -353,14 +370,16 @@ async def run(
             if name is not None:
                 names[address] = name
 
+        # unpaced here: the resolver takes a slot for every query it sends. A lookup
+        # that could send its query to none of the servers cancels the lookups still
+        # running and no more start, so nothing is sent after it
+        pool = _Pool(RDNS_CONCURRENCY, RDNS_TIMEOUT_S, None, clock, deadline, cancel_on_failure=True)
         try:
-            # unpaced here: the resolver takes a slot for every query it sends
-            if not await _Pool(RDNS_CONCURRENCY, RDNS_TIMEOUT_S, None, clock, deadline).run(sorted(alive), lookup):
+            if not await pool.run(sorted(alive), lookup):
                 timed_out = True
                 errors.append(f"timed out after {job.timeout_s} s during the PTR lookups")
         except ProbeError as exc:
-            # a lookup could send its query to none of the servers: the lookups stop,
-            # and the names found before are still reported
+            # the names the lookups that finished found are still reported
             complete = False
             errors.append(str(exc))
     if timed_out:

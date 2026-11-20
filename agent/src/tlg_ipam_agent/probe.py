@@ -226,9 +226,10 @@ class DnsResolver:
     shared with the ICMP sweep) and returns the seconds the lookup has left.
 
     A lookup that could not be made is not a lookup that found no name: with no server
-    to ask, or when the query could be sent to none of them, `ptr` raises ProbeError
-    instead of returning None, so the scan reports itself incomplete and the server
-    keeps the names it has (spec §5.7)."""
+    to ask, or when every attempt failed before the query went out (until the servers
+    or the lookup's own time ran out), `ptr` raises ProbeError instead of returning
+    None, so the scan reports itself incomplete and the server keeps the names it has
+    (spec §5.7)."""
 
     def __init__(self, port: int = 53, resolv_conf: str = RESOLV_CONF):
         self.port = port
@@ -264,8 +265,10 @@ class DnsResolver:
     async def ptr(self, address: Address, servers: tuple[str, ...], slot: Slot) -> str | None:
         """The PTR name of `address`, or None when a server says there is none (NXDOMAIN,
         or an answer without a PTR record), when every server asked gave no usable
-        answer, or when the lookup's time ran out. Raises ProbeError when there is no
-        server to ask, or when the query could be sent to none of them."""
+        answer, or when the lookup's time ran out after a query was sent (or before
+        its first attempt, which only the job's deadline does). Raises ProbeError when
+        there is no server to ask, or when no query was sent before the servers or the
+        lookup's time ran out."""
         if not servers:
             raise ProbeError(NO_DNS_SERVER)
         name = dns.reversename.from_address(str(address))
@@ -274,9 +277,13 @@ class DnsResolver:
         for server in servers[:MAX_DNS_SERVERS]:
             left = await slot()
             if left <= 0:
-                # the lookup's time is up. If no query went out, the job's deadline has
-                # passed (a lookup's own time starts at its first slot), and the scan
-                # reports the cut-off itself
+                # the lookup's time is up. After a query was sent, that is a lookup
+                # that asked and got no answer. After only attempts that sent nothing,
+                # it is not a lookup at all. With no attempt yet, the job's deadline
+                # has passed (a lookup's own time starts at its first slot, capped by
+                # the deadline), and the scan reports that cut-off itself
+                if not asked and unsent is not None:
+                    raise ProbeError(no_query_sent(unsent))
                 return None
             # A fresh query, so a fresh id, for every datagram. It carries EDNS(0)
             # advertising a 1232-byte UDP payload, so a resolver can send a PTR answer
@@ -306,8 +313,8 @@ class DnsResolver:
                     ignore_trailing=False,
                 )
             except (dns.exception.DNSException, TimeoutError):
-                # no answer in time, a truncated or broken one: it was asked, and the
-                # next server is. (TimeoutError is an OSError: it is caught first.)
+                # no answer in time, a truncated or broken one: the query was sent, and
+                # the next server is asked. (TimeoutError is an OSError: caught first.)
                 asked = True
                 continue
             except (OSError, ValueError) as exc:
