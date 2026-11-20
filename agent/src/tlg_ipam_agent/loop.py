@@ -109,6 +109,9 @@ class Agent:
         self.arp_link = arp_link
         self.interfaces = interfaces
         self.clock = clock or scan.Clock()
+        # one packet budget for every job this agent runs, so the second in which one
+        # job ends and the next begins holds no more than MAX_PPS either (spec §5.6)
+        self.pacer = scan.Pacer(config.max_pps, self.clock)
         self.rng = rng or random.SystemRandom()
         self.backoff = Backoff(self.rng)
         self.queue: asyncio.Queue = asyncio.Queue(QUEUE_MAX)
@@ -172,6 +175,7 @@ class Agent:
                 interfaces=self.interfaces(),
                 max_pps=self.config.max_pps,
                 clock=self.clock,
+                pacer=self.pacer,
             )
             try:
                 body = await asyncio.wait_for(scanning, job.timeout_s + SCAN_GRACE_S)

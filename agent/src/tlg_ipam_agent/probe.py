@@ -4,9 +4,12 @@
 These are the only places in the agent that put anything on the network apart from
 its requests to the server, and each is handed one address at a time by `scan.run`,
 which takes its addresses only from `guard.plan`. Every datagram or frame they send
-comes out of the job's one packet budget (`scan.Pacer`): an echo request is one packet
-per call, an ARP request one frame per call, and the resolver takes a slot before each
-query it sends. Tests swap each for a fake that records what it was asked to do and
+comes out of the agent's one packet budget (`scan.Pacer`): an echo request is one
+packet per call, an ARP request one frame per call, and the resolver takes a slot
+before each query it sends. Each is handed to the kernel at its grant or not at all:
+an ARP frame or a DNS query the socket cannot take at once is a failed send, never
+kept to go later. The ARP the kernel sends itself, to reach an on-link address before
+an echo request, is not the agent's and takes no slot (spec §5.6). Tests swap each for a fake that records what it was asked to do and
 sends nothing; the ARP fake stands in for the socket only, so the frames the session
 builds and the replies it takes are the real ones.
 """
@@ -43,7 +46,7 @@ class Prober(Protocol):
     async def ping(self, address: Address, timeout: float) -> bool: ...
 
 
-# awaited before every datagram a lookup sends: takes one packet from the job's budget
+# awaited before every datagram a lookup sends: takes one packet from the budget
 # and returns the seconds the lookup has left (none left: send nothing more)
 Slot = Callable[[], Awaitable[float]]
 
@@ -215,6 +218,70 @@ RESOLV_CONF_MAX = 64 * 1024
 NO_DNS_SERVER = "rdns not run: the agent has no DNS server to ask (the job names none, and the host's resolv.conf lists none it can use)"
 
 
+class QuerySocket(asyncio.DatagramProtocol):
+    """The UDP socket of one DNS query, made before the query takes its slot so that
+    the query is handed to the kernel in the step its slot is granted (`sendto`), as an
+    ARP request is. `dns.asyncquery.udp` is given it as `sock`: it has what dnspython's
+    `DatagramSocket` offers that call (`family`, `sendto`, `recvfrom`). It is bound to
+    no port until the query is sent (the kernel picks one then), so nothing can reach
+    it while the lookup waits for its slot.
+
+    The query goes when the slot is granted or not at all. A socket that cannot take it
+    at once (its send buffer full) does not keep it: asyncio's transport would hold it
+    and send it whenever the socket became writable, after the lookup had ended, after
+    the job, or during the next one. The transport is aborted instead, the datagram
+    with it, and the send fails, so the query counts as not sent. `close` aborts the
+    transport as well: nothing of a lookup's leaves after it. A send the kernel refuses
+    (no route, say) is reported by asyncio to `error_received`, and `recvfrom` raises
+    it, as dnspython's own socket does."""
+
+    def __init__(self, family: int):
+        self.family = family
+        self._transport: asyncio.DatagramTransport | None = None
+        self._received: asyncio.Queue = asyncio.Queue()
+
+    @classmethod
+    async def made(cls, family: int) -> "QuerySocket":
+        made = cls(family)
+        await asyncio.get_running_loop().create_datagram_endpoint(lambda: made, family=family)
+        return made
+
+    def connection_made(self, transport) -> None:
+        self._transport = transport
+
+    def datagram_received(self, data: bytes, addr) -> None:
+        self._received.put_nowait((data, addr))
+
+    def error_received(self, exc: Exception) -> None:
+        self._received.put_nowait(exc)
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        self._received.put_nowait(exc or EOFError("the query's socket closed"))
+
+    async def sendto(self, what: bytes, destination, timeout) -> int:
+        """Hands the query to the kernel now, or raises: it is never kept for later."""
+        self._transport.sendto(what, destination)
+        if self._transport.get_write_buffer_size():
+            # the socket could not take it, and the transport kept it: it goes with
+            # the transport, unsent
+            self.close()
+            raise BlockingIOError("DNS send buffer full")
+        return len(what)
+
+    async def recvfrom(self, size: int, timeout: float | None) -> tuple:
+        try:
+            item = await asyncio.wait_for(self._received.get(), timeout)
+        except TimeoutError:
+            raise dns.exception.Timeout(timeout=timeout) from None
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def close(self) -> None:
+        if self._transport is not None:
+            self._transport.abort()
+
+
 def no_query_sent(cause: str) -> str:
     """The error of a lookup that could send its query to none of its servers."""
     return f"rdns stopped: no DNS query could be sent to any server ({cause})"
@@ -272,9 +339,9 @@ class DnsResolver:
     failover, retransmission and TCP fallback would put datagrams on the wire that the
     packet budget never saw. Here a lookup is one UDP query per server, to at most
     MAX_DNS_SERVERS servers in turn, with no retransmission and no TCP; a truncated
-    reply is not used. Before each
-    query it awaits `slot()`, which takes one packet from the job's budget (`MAX_PPS`,
-    shared with the ICMP sweep) and returns the seconds the lookup has left.
+    reply is not used. Before each query it awaits `slot()`, which takes one packet
+    from the budget (`MAX_PPS`, shared with the ICMP and ARP sweeps) and returns the
+    seconds the lookup has left; the query goes on its own `QuerySocket`, made first.
 
     A lookup that could not be made is not a lookup that found no name: with no server
     to ask, or when every attempt failed before the query went out (until the servers
@@ -359,55 +426,71 @@ class DnsResolver:
         asked = False
         unsent: str | None = None
         for server in servers[:MAX_DNS_SERVERS]:
-            left = await slot()
-            if left <= 0:
-                # the lookup's time is up. After a query was sent, that is a lookup
-                # that asked and got no answer. After only attempts that sent nothing,
-                # it is not a lookup at all. With no attempt yet, the job's deadline
-                # has passed (a lookup's own time starts at its first slot, capped by
-                # the deadline), and the scan reports that cut-off itself
-                if not asked and unsent is not None:
-                    raise ProbeError(no_query_sent(unsent))
-                return None
-            # A fresh query, so a fresh id, for every datagram. It carries EDNS(0)
-            # advertising a 1232-byte UDP payload, so a resolver can send a PTR answer
-            # whole instead of truncating it (a truncated reply is not used); without
-            # EDNS a plain query allows only 512 bytes. Recursion desired, no DNSSEC.
-            # The advertised payload is not a limit on what is read: dnspython
-            # receives up to 65,535 bytes.
-            query = dns.message.make_query(
-                name, dns.rdatatype.PTR, use_edns=0, payload=1232, want_dnssec=False,
-                flags=dns.flags.RD,
-            )
+            # the query's socket is made before its slot is taken, so the query is
+            # handed to the kernel in the step its slot is granted (QuerySocket). An
+            # address that is not one, or no socket of its family on this host, is an
+            # attempt that sent nothing, and takes no slot: the next server
             try:
-                reply = await dns.asyncquery.udp(
-                    query,
-                    server,
-                    timeout=left,
-                    port=self.port,
-                    # a reply from another source address or port is waited out until
-                    # `left`; one from the server with the wrong id is a bad response
-                    # (ignore_errors is off), so the next server is asked
-                    ignore_unexpected=True,
-                    # a truncated reply is not used, PTR record or not, and there is
-                    # no TCP retry: it is treated as no answer, and the next server
-                    # is asked
-                    raise_on_truncation=True,
-                    # dnspython's default, stated: trailing bytes make a reply bad
-                    ignore_trailing=False,
-                )
-            except (dns.exception.DNSException, TimeoutError):
-                # no answer in time, a truncated or broken one: the query was sent, and
-                # the next server is asked. (TimeoutError is an OSError: caught first.)
-                asked = True
-                continue
+                family = socket.AF_INET6 if ipaddress.ip_address(server).version == 6 else socket.AF_INET
+                sock = await QuerySocket.made(family)
             except (OSError, ValueError) as exc:
-                # the query was not sent: an address dnspython cannot use, no socket
-                # of its family on this host, no route. With asyncio a failed send
-                # surfaces here too, as an OSError, and so would an ICMP error the
-                # kernel reported for the socket. The next server
                 unsent = type(exc).__name__
                 continue
+            try:
+                left = await slot()
+                if left <= 0:
+                    # the lookup's time is up. After a query was sent, that is a lookup
+                    # that asked and got no answer. After only attempts that sent
+                    # nothing, it is not a lookup at all. With no attempt yet, the
+                    # job's deadline has passed (a lookup's own time starts at its first
+                    # slot, capped by the deadline), and the scan reports that cut-off
+                    if not asked and unsent is not None:
+                        raise ProbeError(no_query_sent(unsent))
+                    return None
+                # A fresh query, so a fresh id, for every datagram. It carries EDNS(0)
+                # advertising a 1232-byte UDP payload, so a resolver can send a PTR
+                # answer whole instead of truncating it (a truncated reply is not used);
+                # without EDNS a plain query allows only 512 bytes. Recursion desired,
+                # no DNSSEC. The advertised payload is not a limit on what is read:
+                # dnspython receives up to 65,535 bytes.
+                query = dns.message.make_query(
+                    name, dns.rdatatype.PTR, use_edns=0, payload=1232, want_dnssec=False,
+                    flags=dns.flags.RD,
+                )
+                try:
+                    reply = await dns.asyncquery.udp(
+                        query,
+                        server,
+                        timeout=left,
+                        port=self.port,
+                        sock=sock,
+                        # a reply from another source address or port is waited out
+                        # until `left`; one from the server with the wrong id is a bad
+                        # response (ignore_errors is off), so the next server is asked
+                        ignore_unexpected=True,
+                        # a truncated reply is not used, PTR record or not, and there
+                        # is no TCP retry: it is treated as no answer, and the next
+                        # server is asked
+                        raise_on_truncation=True,
+                        # dnspython's default, stated: trailing bytes make a reply bad
+                        ignore_trailing=False,
+                    )
+                except (dns.exception.DNSException, TimeoutError):
+                    # no answer in time, a truncated or broken one: the query was sent,
+                    # and the next server is asked. (TimeoutError is an OSError: caught
+                    # first.)
+                    asked = True
+                    continue
+                except (OSError, ValueError) as exc:
+                    # the query was not sent: the kernel refused it (no route, a port
+                    # it will not send to), or the socket could not take it at once
+                    # (QuerySocket.sendto). An ICMP error the kernel reported for the
+                    # socket after the query went would surface here too. The next
+                    # server
+                    unsent = type(exc).__name__
+                    continue
+            finally:
+                sock.close()
             asked = True
             rcode = reply.rcode()
             if rcode == dns.rcode.NXDOMAIN:
