@@ -17,10 +17,10 @@ import { useFetch } from '../hooks/useFetch'
 import {
   activeToken,
   agentStatus,
-  parseServerTime,
   relativeTime,
   STATUS_LABELS,
 } from '../utils/agents'
+import { parseServerTime } from '../utils/time'
 
 // How often the list and the status dots refresh while the page is open
 const REFRESH_MS = 30 * 1000

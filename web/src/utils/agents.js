@@ -1,3 +1,5 @@
+import { parseServerTime } from './time'
+
 // Display helpers for the Agents page. Everything an agent reports (version,
 // platform, hostname, interfaces) is untrusted text: it is only ever rendered as
 // React text, never as markup or a link.
@@ -11,18 +13,6 @@ export const LATE_WITHIN_MS = 15 * 60 * 1000
 // The agent image, from the project's GitHub container registry (spec §5.6),
 // tagged with the server's version. The release pipeline that publishes it is #24.
 export const AGENT_IMAGE = 'ghcr.io/deusmaximus/tlg-ipam-agent'
-
-// SQLite hands datetimes back without their offset, so a stored time can arrive
-// as "2026-11-16T06:06:07.865439". Every time the server writes is UTC: read an
-// offset-less value as UTC, not as local time. The fraction is cut to
-// milliseconds, the precision Date.parse is specified for.
-export function parseServerTime(value) {
-  if (!value) return null
-  let s = String(value).replace(/(\.\d{3})\d+/, '$1')
-  if (!/(Z|[+-]\d{2}:?\d{2})$/.test(s)) s += 'Z'
-  const ms = Date.parse(s)
-  return Number.isNaN(ms) ? null : new Date(ms)
-}
 
 export function relativeTime(value, now = Date.now()) {
   const date = parseServerTime(value)

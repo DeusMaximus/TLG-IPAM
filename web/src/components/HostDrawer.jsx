@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { X } from 'lucide-react'
 import { createHost, deleteHost, updateHost, HOST_STATUSES } from '../api/ipam'
 import { useToast, useTree } from '../context'
-import { parseServerTime } from '../utils/agents'
+import { formatServerTime } from '../utils/time'
 import { dangerBtn, inputCls, labelCls, primaryBtn, secondaryBtn } from './Modal'
 
 export default function HostDrawer({ host, subnetId, suggestedIp, onClose, onSaved }) {
@@ -126,7 +126,7 @@ export default function HostDrawer({ host, subnetId, suggestedIp, onClose, onSav
           <textarea rows={3} className={inputCls} value={form.notes} onChange={set('notes')} />
           {!isNew && host.last_seen && (
             <p className="mt-3 text-xs text-slate-500">
-              Last seen {parseServerTime(host.last_seen)?.toLocaleString() ?? host.last_seen}
+              Last seen {formatServerTime(host.last_seen)}
               {host.last_seen_source === 'scan' && ' (by a scan)'}
               {host.last_seen_source === 'manual' && ' (set by hand)'}
             </p>

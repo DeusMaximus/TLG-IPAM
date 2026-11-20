@@ -1,3 +1,5 @@
+import { formatServerTime } from '../utils/time'
+
 const SOURCE_LABEL = { ui: 'UI', api: 'API', mcp: 'MCP' }
 
 // One change-log entry in the dashboard's recent-activity feed. `actor` is shown
@@ -15,7 +17,7 @@ export default function ActivityItem({ change }) {
             {change.actor}
           </span>
         )}
-        {new Date(change.ts).toLocaleString()}
+        {formatServerTime(change.ts)}
       </div>
     </div>
   )

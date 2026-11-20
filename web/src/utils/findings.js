@@ -6,7 +6,7 @@
 // chosen by whatever device answered): it is only ever rendered as React text, never
 // as markup or a link.
 
-import { parseServerTime } from './agents'
+import { parseServerTime } from './time'
 
 // The finding types the server raises, in the order the panel lists them. `action` is
 // what accepting one does; `stale` is informational, and accepting it sets the host

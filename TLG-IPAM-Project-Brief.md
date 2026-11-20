@@ -338,6 +338,8 @@ Agent-facing routes, `/api/v1/agent/*`, take an agent token instead (§3.9), as 
 { "error": { "code": "VALIDATION_ERROR", "message": "IP 10.10.30.300 is invalid" } }
 ```
 
+**Datetimes are UTC and carry their offset**, in every REST response and every MCP tool result: ISO 8601 with `+00:00` (`"2026-11-16T06:38:44.765279+00:00"`), the same string in the response to the write that created a row and in every later read of it. SQLite reads a stored datetime back without its zone, so the response models give it back (`schemas.UtcDatetime`). `last_seen`, the one datetime a client writes, is taken as UTC when sent without an offset (§3.4). A change's `before`/`after` snapshots carry the offset too; audit entries written before it did hold their datetimes without one, still UTC, and the UI reads an offset-less value as UTC. The agent routes keep their own shapes (§4.5, §4.6).
+
 **Request bodies are capped at 2 MiB** (2,097,152 bytes, `body_limit.BODY_MAX`, the one place the limit is defined), on every route: owner, agent, and `/mcp` (§5.1). `BodyLimitMiddleware` wraps the whole app, so the cap runs before routing, before any authentication check and before any body is parsed. A larger body is `413 PAYLOAD_TOO_LARGE` "The request body may be at most 2097152 bytes", with `Connection: close`, whatever credentials it carries or lacks:
 
 - a declared `Content-Length` over the cap is refused with nothing read; one within it is left to the route to read, and the HTTP server delivers no byte past it;
