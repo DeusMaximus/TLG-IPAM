@@ -12,7 +12,7 @@ from app.models import Change
 from app.services import findings as findings_svc
 from app.services import scans
 
-from .conftest import make_host, make_section, make_subnet
+from .conftest import PADDED_CIDR, make_host, make_section, make_subnet, store_cidr_as
 from .test_checkin import (  # noqa: F401 (agent_api is a fixture)
     agent_api,
     jobs_for,
@@ -532,6 +532,19 @@ async def test_pages_order_by_name_then_cidr_then_id(client):
         for octet in range(10, 10 + counts[subnet["id"]])
     ]
     assert [(f["subnet_id"], f["ip"]) for p in pages for f in p] == expected
+
+
+async def test_paging_through_a_subnet_stored_with_a_long_spelling(client):
+    """A subnet stored with a non-canonical CIDR before #97 is listed, and paged, by its
+    canonical spelling: the cursor carries the CIDR, and the stored 4,300-character one
+    made a cursor over `CURSOR_MAX`, so the listing refused the cursor it had issued."""
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"], "192.168.240.0/20", name="lab")
+    await store_cidr_as(subnet["id"], PADDED_CIDR)
+    await unknown_hosts(subnet["id"], "192.168.240", range(10, 10 + findings_svc.PAGE_SIZE + 1))
+    pages = await scan_pages()
+    assert [len(p) for p in pages] == [findings_svc.PAGE_SIZE, 1]
+    assert {f["subnet_cidr"] for p in pages for f in p} == {"192.168.240.0/20"}
 
 
 # The review's accepted values (Codex's briefed round on #83), each through the REST API

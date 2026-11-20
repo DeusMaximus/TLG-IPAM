@@ -16,13 +16,13 @@ os.environ["STATIC_DIR"] = os.path.join(_SESSION_DIR, "no-static")
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import event
+from sqlalchemy import event, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.config import settings
 from app.database import SessionLocal, _configure_connection, engine, get_session
 from app.main import app
-from app.models import Base
+from app.models import Base, Subnet
 from app.services import jobs
 from app.services.device_types import seed_defaults
 
@@ -120,6 +120,19 @@ async def make_subnet(client, section_id, cidr="10.0.0.0/24", name="lab", **extr
     )
     assert res.status_code == 201, res.text
     return res.json()["data"]
+
+
+# The spelling of 192.168.240.0/20 the review of PR #95 stored (#97): a prefix length
+# padded with 4,298 zeroes, which `ipaddress.ip_network` takes.
+PADDED_CIDR = "192.168.240.0/" + "0" * 4298 + "20"
+
+
+async def store_cidr_as(subnet_id: str, cidr: str) -> None:
+    """Write a subnet's `cidr` column as a row stored before #97 may hold it: in the
+    spelling it was typed, which the subnet service no longer stores."""
+    async with SessionLocal() as session:
+        await session.execute(update(Subnet).where(Subnet.id == subnet_id).values(cidr=cidr))
+        await session.commit()
 
 
 async def make_host(client, subnet_id, ip, **extra) -> dict:

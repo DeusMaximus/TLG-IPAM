@@ -20,6 +20,17 @@ def parse_cidr(cidr: str) -> ipaddress.IPv4Network:
     return net
 
 
+def canonical_cidr(cidr: str) -> str:
+    """A network's one spelling, `str` of what `parse_cidr` makes of it: `10.0.0.0/24`
+    for `10.0.0.0/255.255.255.0`, `10.0.0.0/0.0.0.255` or `10.0.0.0/0024`, and
+    `10.0.0.5/32` for `10.0.0.5`. `ip_network` takes all of those, and a prefix length
+    padded with any number of zeroes, so the string as typed has no length bound; the
+    canonical one has (18 characters for IPv4, 43 for IPv6). A subnet is stored in it
+    (`services/subnets`), and a job (`services/jobs`) and the findings listing
+    (`services/findings`) send it whatever an older subnet row holds."""
+    return str(parse_cidr(cidr))
+
+
 def parse_ip(ip: str) -> ipaddress.IPv4Address:
     try:
         addr = ipaddress.ip_address(ip)

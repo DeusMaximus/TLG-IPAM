@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..errors import ApiError, conflict, not_found, validation_error
 from ..ipnet import (
+    canonical_cidr,
     exclusion_intervals,
     interval_size,
     iter_free,
@@ -150,14 +151,20 @@ async def _validate_subnet(
     dhcp_end: str | None,
     exclude_id: str | None = None,
 ):
+    """The checks a subnet's fields must pass on create and update, and its network.
+    Networks are compared, never strings, so another spelling of a subnet already in
+    the section overlaps it as a duplicate; messages name each network in its
+    canonical spelling (`ipnet.canonical_cidr`), whatever was typed or is stored."""
     net = parse_cidr(cidr)
+    cidr = str(net)
     others = await session.scalars(select(Subnet).where(Subnet.section_id == section_id))
     for other in others:
         if other.id == exclude_id:
             continue
-        if net.overlaps(parse_cidr(other.cidr)):
+        other_net = parse_cidr(other.cidr)
+        if net.overlaps(other_net):
             raise conflict(
-                f"Subnet {cidr} overlaps {other.name} ({other.cidr}) in the same section"
+                f"Subnet {cidr} overlaps {other.name} ({other_net}) in the same section"
             )
     if gateway and parse_ip(gateway) not in net:
         raise validation_error(f"Gateway {gateway} is not within subnet {cidr}")
@@ -188,7 +195,7 @@ def _check_dns_servers(servers: list[str] | None, stored: list | None = None) ->
 async def create_subnet(session: AsyncSession, payload: SubnetCreate, source: str) -> Subnet:
     _check_dns_servers(payload.dns_servers)
     await get_section(session, payload.section_id)
-    await _validate_subnet(
+    net = await _validate_subnet(
         session,
         section_id=payload.section_id,
         cidr=payload.cidr,
@@ -196,7 +203,8 @@ async def create_subnet(session: AsyncSession, payload: SubnetCreate, source: st
         dhcp_start=payload.dhcp_start,
         dhcp_end=payload.dhcp_end,
     )
-    subnet = Subnet(**payload.model_dump())
+    # stored in its canonical spelling, whatever was typed (#97)
+    subnet = Subnet(**{**payload.model_dump(), "cidr": str(net)})
     session.add(subnet)
     await session.flush()
     changes.record(
@@ -229,7 +237,13 @@ async def update_subnet(
     if "section_id" in data:
         await get_section(session, data["section_id"])
     net = await _validate_subnet(session, **merged, exclude_id=subnet.id)
-    if merged["cidr"] != subnet.cidr:
+    if "cidr" in data:
+        # Stored in its canonical spelling (#97). A subnet stored with another spelling
+        # before then keeps it until an update sends `cidr`, as the UI's form does on
+        # every edit; that update stores the canonical one, and its entry shows both.
+        data["cidr"] = str(net)
+    # the network, not the spelling: respelling the stored network changes nothing
+    if net != parse_cidr(subnet.cidr):
         first, last = usable_bounds(net)
         outside_hosts = await session.scalar(
             select(func.count(Host.id)).where(
@@ -239,7 +253,7 @@ async def update_subnet(
         )
         if outside_hosts:
             raise validation_error(
-                f"Cannot change CIDR to {merged['cidr']}: "
+                f"Cannot change CIDR to {net}: "
                 f"{outside_hosts} existing host(s) would not be assignable in it"
             )
         outside_ranges = await session.scalar(
@@ -251,11 +265,11 @@ async def update_subnet(
         )
         if outside_ranges:
             raise validation_error(
-                f"Cannot change CIDR to {merged['cidr']}: "
+                f"Cannot change CIDR to {net}: "
                 f"{outside_ranges} reserved range(s) would fall outside it"
             )
         if await scans.target_for_subnet(session, subnet.id) is not None:
-            scans.check_prefix(merged["cidr"])
+            scans.check_prefix(str(net))
     before = changes.snapshot(subnet)
     for field, value in data.items():
         setattr(subnet, field, value)
@@ -266,7 +280,7 @@ async def update_subnet(
         entity_type="subnet",
         entity_id=subnet.id,
         action="update",
-        summary=f"subnet {subnet.name} ({subnet.cidr}) updated",
+        summary=f"subnet {subnet.name} ({canonical_cidr(subnet.cidr)}) updated",
         source=source,
         before=before,
         after=changes.snapshot(subnet),
@@ -285,7 +299,7 @@ async def delete_subnet(
     if hosts and not force:
         raise conflict(f"Subnet {subnet.name} still has {len(hosts)} host(s)")
     before = changes.snapshot(subnet)
-    summary = f"subnet {subnet.name} ({subnet.cidr}) deleted"
+    summary = f"subnet {subnet.name} ({canonical_cidr(subnet.cidr)}) deleted"
     if hosts:
         before["hosts"] = [changes.snapshot(h) for h in hosts]
         summary += f" along with {len(hosts)} host(s)"
@@ -315,7 +329,7 @@ async def create_reserved_range(
     start, end = parse_ip(payload.start_ip), parse_ip(payload.end_ip)
     if start not in net or end not in net:
         raise validation_error(
-            f"Reserved range {payload.start_ip}-{payload.end_ip} is not within subnet {subnet.cidr}"
+            f"Reserved range {payload.start_ip}-{payload.end_ip} is not within subnet {net}"
         )
     if int(start) > int(end):
         raise validation_error("start_ip must not be greater than end_ip")

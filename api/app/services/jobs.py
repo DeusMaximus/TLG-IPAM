@@ -47,7 +47,7 @@ from ..agent_protocol import (
     Job,
 )
 from ..errors import ApiError, database_unavailable, validation_error
-from ..ipnet import on_link, parse_cidr
+from ..ipnet import canonical_cidr, on_link, parse_cidr
 from ..models import Agent, Change, ScanTarget, Subnet, Token
 from . import agents, changes, scans
 from .scans import utc
@@ -221,7 +221,9 @@ async def _next_job(session: AsyncSession, agent: Agent, now: datetime) -> Job |
         return Job(
             job_id=job_id,
             subnet_id=subnet.id,
-            cidr=subnet.cidr,
+            # one spelling, whatever the subnet row holds: a subnet stored before #97
+            # may hold one longer than the agent takes (spec §5.7)
+            cidr=canonical_cidr(subnet.cidr),
             ranges=ranges,
             methods=methods,
             # what the agent asks, and no more: a subnet may list more, or hold a
