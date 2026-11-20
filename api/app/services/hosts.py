@@ -10,6 +10,7 @@ from ..errors import ApiError, conflict, not_found, validation_error
 from ..ipnet import ip_in_subnet, iter_free, parse_cidr
 from ..models import Host, Observation, Subnet
 from ..schemas import AllocateRequest, BulkHostItem, HostCreate, HostOut, HostUpdate
+from ..times import utc
 from . import changes, scans
 from . import device_types as device_types_svc
 from .subnets import _allocated_ints, get_subnet, reserved_ranges
@@ -207,6 +208,11 @@ async def update_host(
         addr = ip_in_subnet(data["ip"], subnet.cidr)
         _check_not_reserved(int(addr), subnet)
         host.ip_int = int(addr)
+    if "last_seen" in data and utc(data["last_seen"]) == utc(host.last_seen):
+        # The same instant is not a change. SQLite reads the stored value back without
+        # its zone and the request's is aware (`schemas._HostFields`), so assigning it
+        # would look like a change to the ORM and move `updated_at` (#85).
+        del data["last_seen"]
     for field, value in data.items():
         setattr(host, field, value)
     changes.record(

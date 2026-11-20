@@ -7,7 +7,8 @@ from .agent_protocol import ScanRange
 from .ipnet import normalise_domain, normalise_mac, parse_ip
 from .times import utc
 
-# Every datetime field of a response model (`*Out`). SQLite reads a stored datetime
+# Every datetime field of a response model (every model here that is not a request
+# model, whatever its name, and every model one holds). SQLite reads a stored datetime
 # back without its zone, so a model serialises what it is given: a row still in memory
 # with `+00:00`, the same row read back without. This gives every datetime in a REST or
 # MCP response one form, ISO 8601 in UTC with `+00:00`, either way (brief §4.3): the
@@ -224,7 +225,9 @@ class _HostFields(BaseModel):
     @classmethod
     def _last_seen_utc(cls, v):
         # SQLite keeps the wall-clock time and drops the zone, so a value sent with an
-        # offset is converted to UTC first; a value without one is taken as UTC
+        # offset is converted to UTC first; a value without one is taken as UTC. The
+        # result is aware and the stored value reads back naive, so `hosts.update_host`
+        # compares the two as instants before it assigns one (#85).
         return utc(v)
 
     @field_validator("domain")

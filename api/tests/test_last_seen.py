@@ -185,6 +185,84 @@ async def test_a_manual_value_with_an_offset_is_compared_as_an_instant(client):
     assert at(got["last_seen"]) == later and got["last_seen_source"] == "manual"
 
 
+# --- Repeating the stored value is not a change (#85) ---
+
+# 12:34:56.123456 UTC in each form a client may send it
+STORED = "2026-01-02T12:34:56.123456"
+SAME_INSTANT = (
+    STORED,
+    f"{STORED}+00:00",
+    f"{STORED}Z",
+    "2026-01-02T14:34:56.123456+02:00",
+    "2026-01-02T04:34:56.123456-08:00",
+)
+
+
+async def _stored_last_seen(host_id):
+    async with SessionLocal() as session:
+        return (await session.get(Host, host_id)).last_seen
+
+
+async def test_repeating_the_stored_last_seen_leaves_updated_at_alone(client):
+    """SQLite reads the stored value back without its zone and the request's value is
+    aware, so assigning the same instant used to look like a change and move
+    `updated_at`. Each PUT is its own request, so the host is read back from SQLite."""
+    subnet = await _subnet(client)
+    naive = await make_host(client, subnet["id"], "10.0.0.10", last_seen=STORED)
+    offset = await make_host(client, subnet["id"], "10.0.0.11", last_seen=SAME_INSTANT[3])
+    for host in (naive, offset):
+        first = await get(client, host["id"])
+        for sent in SAME_INSTANT:
+            res = await client.put(f"/api/v1/hosts/{host['id']}", json={"last_seen": sent})
+            assert res.status_code == 200, res.text
+            assert res.json()["data"]["updated_at"] == first["updated_at"], sent
+            got = await get(client, host["id"])
+            assert (got["last_seen"], got["updated_at"]) == (
+                first["last_seen"],
+                first["updated_at"],
+            ), sent
+        assert await _stored_last_seen(host["id"]) == datetime.fromisoformat(STORED)
+
+    # every PUT still goes to the change log, as before: an update whose before and
+    # after are the same
+    changes = (await client.get("/api/v1/changes?entity_type=host")).json()["data"]
+    updates = [c for c in changes if c["action"] == "update"]
+    assert len(updates) == 2 * len(SAME_INSTANT)
+    assert all(c["before"] == c["after"] for c in updates)
+
+
+async def test_resending_every_field_unchanged_leaves_updated_at_alone(client):
+    """As the UI's edit form does: each field as stored, `last_seen` null included."""
+    subnet = await _subnet(client)
+    host = await make_host(client, subnet["id"], "10.0.0.10", hostname="nas", owner="lab")
+    first = await get(client, host["id"])
+    fields = ("ip", "hostname", "domain", "mac", "device_type", "status", "owner", "notes")
+    res = await client.put(
+        f"/api/v1/hosts/{host['id']}", json={**{f: first[f] for f in fields}, "last_seen": None}
+    )
+    assert res.status_code == 200, res.text
+    got = await get(client, host["id"])
+    assert (got["last_seen"], got["updated_at"]) == (None, first["updated_at"])
+
+
+async def test_a_put_that_changes_last_seen_moves_updated_at(client):
+    subnet = await _subnet(client)
+    host = await make_host(client, subnet["id"], "10.0.0.10", last_seen=STORED)
+    first = await get(client, host["id"])
+    # a microsecond later, sent with an offset, and then without
+    for sent, expected in (
+        ("2026-01-02T14:34:56.123457+02:00", "2026-01-02T12:34:56.123457"),
+        ("2026-01-02T12:34:56.123458", "2026-01-02T12:34:56.123458"),
+    ):
+        res = await client.put(f"/api/v1/hosts/{host['id']}", json={"last_seen": sent})
+        assert res.status_code == 200, res.text
+        got = await get(client, host["id"])
+        assert at(got["last_seen"]) == utc(datetime.fromisoformat(expected))
+        assert at(got["updated_at"]) > at(first["updated_at"])
+        assert await _stored_last_seen(host["id"]) == datetime.fromisoformat(expected)
+        first = got
+
+
 # --- Which observation belongs to a host ---
 
 
