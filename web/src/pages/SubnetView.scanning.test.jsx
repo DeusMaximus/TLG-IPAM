@@ -527,6 +527,47 @@ describe('scanning settings', () => {
     )
   })
 
+  // a day ahead of the browser's clock: a server clock set back since, or a browser behind
+  const ahead = () => new Date(Date.now() + 24 * 3600 * 1000).toISOString().replace('Z', '+00:00')
+  const aheadText = (value) =>
+    `at ${new Date(Date.parse(value)).toLocaleString()}, ahead of this browser’s clock`
+
+  it('keeps the line for a report dated ahead of this clock, with its time and not "0s ago"', async () => {
+    const at = ahead()
+    seed({
+      target: {
+        runnable_methods: ['icmp', 'arp', 'rdns'],
+        agent_checkin_at: at,
+        agent_checkin_refused: false,
+      },
+    })
+    const { unmount } = renderView()
+    const line = await within(await findScanning()).findByTestId('agent-report')
+    expect(line).toHaveTextContent(
+      `The agent last checked in ${aheadText(at)}: what it can scan is judged from the interfaces it reported then.`
+    )
+    expect(line).not.toHaveTextContent('0s ago')
+    unmount()
+
+    // beside a message as well
+    seed({
+      target: {
+        runnable_methods: ['icmp', 'rdns'],
+        agent_checkin_at: at,
+        agent_checkin_refused: false,
+      },
+    })
+    renderView()
+    const region = await findScanning()
+    expect(
+      await within(region).findByText('MAC collection unavailable — agent is not on this subnet')
+    ).toBeInTheDocument()
+    expect(within(region).getByTestId('agent-report')).toHaveTextContent(
+      `Based on the interfaces the agent reported ${aheadText(at)}.`
+    )
+    expect(within(region).getByTestId('agent-report')).not.toHaveTextContent('0s ago')
+  })
+
   it('shows the time from the answer, not from the agents list, and follows the reload', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     seed({

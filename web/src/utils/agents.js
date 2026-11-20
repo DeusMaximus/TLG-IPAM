@@ -14,10 +14,35 @@ export const LATE_WITHIN_MS = 15 * 60 * 1000
 // tagged with the server's version. The release pipeline that publishes it is #24.
 export const AGENT_IMAGE = 'ghcr.io/deusmaximus/tlg-ipam-agent'
 
-export function relativeTime(value, now = Date.now()) {
+// A server time no more than this far ahead of the browser's clock is read as "now";
+// one further ahead is not read as an age at all (`serverAge`). One check-in interval:
+// ordinary drift between the browser's clock and the server's is seconds, and stays
+// inside it, so an agent that has just checked in still reads "0s ago" and online;
+// a check-in that just happened cannot be dated a whole interval ahead, so past it the
+// two clocks disagree (a browser clock behind, or a server clock set back after the
+// check-in) and how fresh the time is is not known. The Agents page and the Scanning
+// section both judge by it.
+export const AHEAD_WITHIN_MS = CHECKIN_INTERVAL_S * 1000
+
+// How old a server time is by the browser's clock:
+//   null — no time
+//   { date, ahead: true } — more than AHEAD_WITHIN_MS ahead: the age is not known
+//   { date, ahead: false, age } — `age` in ms, never negative
+export function serverAge(value, now = Date.now()) {
   const date = parseServerTime(value)
-  if (!date) return 'never'
-  const s = Math.max(0, Math.round((now - date.getTime()) / 1000))
+  if (!date) return null
+  const age = now - date.getTime()
+  if (age < -AHEAD_WITHIN_MS) return { date, ahead: true }
+  return { date, ahead: false, age: Math.max(0, age) }
+}
+
+// A time ahead of the browser's clock is shown as itself and said to be ahead, never
+// as "0s ago"
+export function relativeTime(value, now = Date.now()) {
+  const found = serverAge(value, now)
+  if (!found) return 'never'
+  if (found.ahead) return `at ${found.date.toLocaleString()}, ahead of this browser’s clock`
+  const s = Math.round(found.age / 1000)
   if (s < 60) return `${s}s ago`
   const m = Math.floor(s / 60)
   if (m < 60) return `${m}m ago`
@@ -26,14 +51,15 @@ export function relativeTime(value, now = Date.now()) {
   return `${Math.floor(h / 24)}d ago`
 }
 
-// The status dot: disabled wins; otherwise how long ago the last check-in was
+// The status dot: disabled wins; otherwise how long ago the last check-in was, and
+// 'ahead' when that is not known because the time is ahead of the browser's clock
 export function agentStatus(agent, now = Date.now()) {
   if (agent.state === 'disabled') return 'disabled'
-  const last = parseServerTime(agent.last_checkin_at)
-  if (!last) return 'never'
-  const age = now - last.getTime()
-  if (age <= ONLINE_WITHIN_MS) return 'online'
-  if (age <= LATE_WITHIN_MS) return 'late'
+  const found = serverAge(agent.last_checkin_at, now)
+  if (!found) return 'never'
+  if (found.ahead) return 'ahead'
+  if (found.age <= ONLINE_WITHIN_MS) return 'online'
+  if (found.age <= LATE_WITHIN_MS) return 'late'
   return 'offline'
 }
 
@@ -42,6 +68,7 @@ export const STATUS_LABELS = {
   late: 'Late',
   offline: 'Offline',
   never: 'Never checked in',
+  ahead: 'Clocks disagree',
   disabled: 'Disabled',
 }
 

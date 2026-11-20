@@ -25,7 +25,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
 from ..errors import ApiError, conflict, not_found, validation_error
-from ..ipnet import format_intervals, parse_cidr, parse_ip, subtract_intervals, usable_bounds
+from ..ipnet import (
+    canonical_cidr,
+    format_intervals,
+    parse_cidr,
+    parse_ip,
+    subtract_intervals,
+    usable_bounds,
+)
 from ..models import Agent, FindingDismissal, Observation, ReservedRange, ScanTarget, Subnet
 from ..schemas import ScanTargetCreate, ScanTargetOut, ScanTargetUpdate
 from ..times import utc
@@ -41,6 +48,19 @@ MIN_PREFIX = 20
 REQUEST_COOLDOWN = timedelta(minutes=15)
 # ids per DELETE in `drop_out_of_scope`, well inside SQLite's bound-parameter limit
 _DELETE_BATCH = 500
+# Ids bound in one `IN (…)` read of the scan-target list and the scope's inputs. The
+# SQLite build decides how many parameters one statement may bind (999 before 3.32,
+# 32,766 by default since, 250,000 in the image), and a statement past it fails, so
+# the ids go in chunks of this size, inside the smallest of those. Up to this many
+# distinct subnets and agents the list is six statements; past it, a fixed number
+# more per chunk.
+_IN_BATCH = 500
+
+
+def _in_batches(ids) -> list[list]:
+    """Distinct ids, in the order first given, in chunks of `_IN_BATCH`."""
+    distinct = list(dict.fromkeys(ids))
+    return [distinct[i : i + _IN_BATCH] for i in range(0, len(distinct), _IN_BATCH)]
 
 
 # --- Scope ---
@@ -67,10 +87,15 @@ async def _scopes_as_committed(
     session: AsyncSession, subnet_ids: list[str]
 ) -> dict[str, tuple[str, list[tuple[int, int]]]]:
     """Each subnet's CIDR and scan scope, from the database, by subnet id; a deleted
-    subnet is not in the answer. One statement per input for all the subnets given (the
-    scan-target list), with one bound parameter per subnet id, so the SQLite build's
-    parameter limit is the ceiling on one call: past it the statement fails. The only
-    place the scope's inputs are read.
+    subnet is not in the answer, and an id given twice is read once. The only place the
+    scope's inputs are read.
+
+    The ids are read in chunks of `_IN_BATCH` (`_in_batches`), each chunk in one
+    statement per input for all its subnets, with one bound parameter per id: so the
+    number of statements grows by three per chunk, not per subnet, and no statement
+    binds more parameters than the SQLite build allows. A chunk reads all three inputs
+    of each of its subnets, so no subnet's scope is put together from two chunks. One
+    subnet (check-in, ingest, `drop_out_of_scope`) is one chunk.
 
     Every input is read as columns, never taken from objects the session loaded
     earlier, and no loaded object is refreshed: check-in's lease compare-and-set relies
@@ -80,8 +105,17 @@ async def _scopes_as_committed(
     nothing can change it before it commits (`drop_out_of_scope`, `results.ingest`,
     and check-in after `jobs._claim`).
     """
-    if not subnet_ids:
-        return {}
+    scopes: dict[str, tuple[str, list[tuple[int, int]]]] = {}
+    for chunk in _in_batches(subnet_ids):
+        scopes.update(await _scopes_of_chunk(session, chunk))
+    return scopes
+
+
+async def _scopes_of_chunk(
+    session: AsyncSession, subnet_ids: list[str]
+) -> dict[str, tuple[str, list[tuple[int, int]]]]:
+    """`_scopes_as_committed` for one chunk of distinct ids: the subnets' columns, then,
+    if any is found, the pool settings and the excluded ranges of those ids."""
     rows = (
         await session.execute(
             select(Subnet.id, Subnet.cidr, Subnet.dhcp_start, Subnet.dhcp_end).where(
@@ -313,24 +347,23 @@ async def targets_out(session: AsyncSession, targets: list[ScanTarget]) -> list[
     the columns, the scope, `runnable_methods` (what a job would run on the target's
     agent now) and the agent's last check-in it is judged from.
 
-    The subnets, the agents and the scope's inputs are each read in one statement for
-    all the targets (`_scopes_as_committed`), so the list costs the same number of
-    statements for one target as for five hundred. Each statement binds one parameter
-    per distinct subnet or agent, so the SQLite build's parameter limit is the ceiling
-    on one request: past it the list fails."""
+    The subnets, the agents and the scope's inputs are each read in one statement per
+    chunk of `_IN_BATCH` distinct ids (`_in_batches`, `_scopes_as_committed`), not per
+    target: up to that many distinct subnets and agents the list costs the same six
+    statements for one target as for five hundred, and past it a fixed number more per
+    chunk. No statement binds more than `_IN_BATCH` ids, so the SQLite build's
+    parameter limit does not bound the number of targets."""
     # jobs imports this module, so it is imported here
     from . import jobs
 
-    subnet_ids = list({t.subnet_id for t in targets})
-    agent_ids = list({t.agent_id for t in targets if t.agent_id})
     subnets = {}
-    if subnet_ids:
-        rows = await session.scalars(select(Subnet).where(Subnet.id.in_(subnet_ids)))
-        subnets = {s.id: s for s in rows}
+    for chunk in _in_batches(t.subnet_id for t in targets):
+        rows = await session.scalars(select(Subnet).where(Subnet.id.in_(chunk)))
+        subnets.update((s.id, s) for s in rows)
     agents = {}
-    if agent_ids:
-        rows = await session.scalars(select(Agent).where(Agent.id.in_(agent_ids)))
-        agents = {a.id: a for a in rows}
+    for chunk in _in_batches(t.agent_id for t in targets if t.agent_id):
+        rows = await session.scalars(select(Agent).where(Agent.id.in_(chunk)))
+        agents.update((a.id, a) for a in rows)
     scopes = await _scopes_as_committed(session, list(subnets))
     answers = []
     for target in targets:
@@ -358,7 +391,9 @@ async def target_out(session: AsyncSession, target: ScanTarget) -> dict:
 
 
 def _label(subnet: Subnet) -> str:
-    return f"scan target of subnet {subnet.name} ({subnet.cidr})"
+    """The target in an audit summary, by its subnet's name and CIDR, the CIDR in its
+    one spelling whatever a row stored before #97 holds (`ipnet.canonical_cidr`)."""
+    return f"scan target of subnet {subnet.name} ({canonical_cidr(subnet.cidr)})"
 
 
 async def create_target(

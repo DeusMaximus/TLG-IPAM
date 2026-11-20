@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   activeToken,
+  AHEAD_WITHIN_MS,
   agentStatus,
   containerCommand,
   relativeTime,
@@ -25,6 +26,18 @@ describe('agentStatus', () => {
     expect(agentStatus(agent(), NOW)).toBe('never')
   })
 
+  it('does not call an agent online when its last check-in is dated ahead of this clock', () => {
+    // inside the tolerance: just checked in
+    expect(agentStatus(agent({ last_checkin_at: ago(-30) }), NOW)).toBe('online')
+    expect(agentStatus(agent({ last_checkin_at: ago(-AHEAD_WITHIN_MS / 1000) }), NOW)).toBe('online')
+    // past it: how fresh the check-in is is not known
+    expect(agentStatus(agent({ last_checkin_at: ago(-AHEAD_WITHIN_MS / 1000 - 1) }), NOW)).toBe('ahead')
+    expect(agentStatus(agent({ last_checkin_at: ago(-86400) }), NOW)).toBe('ahead')
+    expect(agentStatus(agent({ state: 'disabled', last_checkin_at: ago(-86400) }), NOW)).toBe(
+      'disabled'
+    )
+  })
+
   it('shows disabled whatever the last check-in', () => {
     expect(agentStatus(agent({ state: 'disabled', last_checkin_at: ago(5) }), NOW)).toBe(
       'disabled'
@@ -39,6 +52,18 @@ describe('relativeTime', () => {
     expect(relativeTime(ago(5 * 60), NOW)).toBe('5m ago')
     expect(relativeTime(ago(3 * 3600), NOW)).toBe('3h ago')
     expect(relativeTime(ago(3 * 86400), NOW)).toBe('3d ago')
+    expect(relativeTime(ago(86400), NOW)).toBe('24h ago')
+  })
+
+  it('reads a time a little ahead as now, and one further ahead as itself, never "0s ago"', () => {
+    expect(relativeTime(ago(-30), NOW)).toBe('0s ago')
+    expect(relativeTime(ago(-AHEAD_WITHIN_MS / 1000), NOW)).toBe('0s ago')
+    const ahead = '2026-11-17T12:00:00+00:00'
+    expect(relativeTime(ahead, NOW)).toBe(
+      `at ${new Date(Date.parse(ahead)).toLocaleString()}, ahead of this browser’s clock`
+    )
+    // read as a server time: no offset is UTC
+    expect(relativeTime('2026-11-17T12:00:00', NOW)).toBe(relativeTime(ahead, NOW))
   })
 })
 
