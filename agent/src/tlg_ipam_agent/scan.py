@@ -72,7 +72,15 @@ class _Pool:
 
     When a work item raises, no further item is started and the exception is raised
     once the items in flight are done. With `cancel_on_failure` those items are
-    cancelled at once instead of being let finish, so they send nothing more."""
+    cancelled at once instead of being let finish: none hands another packet to a
+    socket. A cancelled item's packet already handed to a socket is not recalled: the
+    kernel may have it, or asyncio may hold it until the socket can take it and send it
+    after the cancellation, even after the pool has returned.
+
+    When an item failed, the failure is what is raised (the first failed item's, in
+    the order the items started), ahead of any cancellation among the results, so a
+    sibling's CancelledError that the failure caused never leaves the pool in its
+    place. The pool's own cancellation still propagates."""
 
     def __init__(
         self,
@@ -345,10 +353,21 @@ async def run(
         # are now. With none, no lookup can be made, and a lookup not made is not one
         # that found no name: the result set is incomplete, so the server keeps the
         # names it has (spec §5.7), and no query is sent
-        servers = resolver.servers(job.dns_servers)
-        if not servers:
-            complete = False
-            errors.append(NO_DNS_SERVER)
+        left = deadline - clock.monotonic()
+        try:
+            if left <= 0:
+                raise TimeoutError
+            # the choice (a read of resolv.conf among it) has only the job's time left,
+            # waited out on the event loop's clock as the read's own bound is; ending
+            # the wait leaves a blocked read's thread, and its lock, as they are
+            servers = await asyncio.wait_for(resolver.servers(job.dns_servers), left)
+        except TimeoutError:
+            timed_out = True
+            errors.append(f"timed out after {job.timeout_s} s during the PTR lookups")
+        else:
+            if not servers:
+                complete = False
+                errors.append(NO_DNS_SERVER)
     if servers:
 
         async def lookup(address: Address, _timeout: float) -> None:
@@ -372,7 +391,9 @@ async def run(
 
         # unpaced here: the resolver takes a slot for every query it sends. A lookup
         # that could send its query to none of the servers cancels the lookups still
-        # running and no more start, so nothing is sent after it
+        # running and no more start, so no query is handed to a socket after it. One a
+        # cancelled lookup had already handed over may still go out (the pool's
+        # docstring): it took its slot, and goes to one of the job's servers
         pool = _Pool(RDNS_CONCURRENCY, RDNS_TIMEOUT_S, None, clock, deadline, cancel_on_failure=True)
         try:
             if not await pool.run(sorted(alive), lookup):

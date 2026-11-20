@@ -13,7 +13,10 @@ builds and the replies it takes are the real ones.
 
 import asyncio
 import ipaddress
+import os
 import socket
+import stat
+import threading
 from typing import Protocol
 from collections.abc import Awaitable, Callable
 
@@ -47,7 +50,7 @@ Slot = Callable[[], Awaitable[float]]
 
 class Resolver(Protocol):
     # the servers one job's lookups ask, chosen once as the job's lookups start
-    def servers(self, job_servers: tuple[str, ...]) -> tuple[str, ...]: ...
+    async def servers(self, job_servers: tuple[str, ...]) -> tuple[str, ...]: ...
     # raises ProbeError when no query of the lookup could be sent: that is no lookup
     async def ptr(self, address: Address, servers: tuple[str, ...], slot: Slot) -> str | None: ...
 
@@ -204,6 +207,10 @@ class ArpSession:
 MAX_DNS_SERVERS = 3
 # where the host's own resolvers are read, when a job names no DNS server
 RESOLV_CONF = "/etc/resolv.conf"
+# how long a job waits for that read, and the most of the file it parses: a read
+# that has not finished by then, or a larger file, gives no server
+RESOLV_CONF_TIMEOUT_S = 1.0
+RESOLV_CONF_MAX = 64 * 1024
 # the error of a job whose PTR lookups had no server to ask (spec §5.2): fixed text
 NO_DNS_SERVER = "rdns not run: the agent has no DNS server to ask (the job names none, and the host's resolv.conf lists none it can use)"
 
@@ -211,6 +218,72 @@ NO_DNS_SERVER = "rdns not run: the agent has no DNS server to ask (the job names
 def no_query_sent(cause: str) -> str:
     """The error of a lookup that could send its query to none of its servers."""
     return f"rdns stopped: no DNS query could be sent to any server ({cause})"
+
+
+def usable_servers(chosen: tuple[str, ...]) -> tuple[str, ...]:
+    """The servers a lookup may ask, of those `chosen`: only IP addresses are kept, and
+    only then is the list cut to MAX_DNS_SERVERS, so an entry the agent cannot query (a
+    DNS-over-HTTPS URL, say) never takes the place of one it can."""
+    usable = []
+    for server in chosen:
+        try:
+            ipaddress.ip_address(server)
+        except ValueError:
+            continue
+        usable.append(server)
+    return tuple(usable[:MAX_DNS_SERVERS])
+
+
+def _text_lines(text: str) -> list[str]:
+    """`text` cut into lines as a file opened in text mode is: at `\n`, `\r\n` and a lone
+    `\r`, and nowhere else (`str.splitlines` also cuts at `\x85`, `\u2028`, form feed
+    and others, which a text file does not)."""
+    return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+
+def read_resolv_conf(path: str) -> tuple[str, ...]:
+    """The `nameserver` entries of the resolv.conf at `path`, as dnspython parses the
+    file; empty when there is none. It blocks: `DnsResolver` calls it in its thread.
+
+    Only a regular file is read. It is opened without waiting for a writer
+    (`O_NONBLOCK`), so a FIFO is refused at once by the regular-file check rather than
+    waited on, and so is a device; that check, like every step here, runs in the
+    read's thread, where the time bound covers an open, `fstat` or read that blocks
+    anyway (a stalled network mount: `O_NONBLOCK` does not make those wait less). At
+    most RESOLV_CONF_MAX bytes are parsed; one byte more is read to tell a larger file,
+    which gives none rather than a list cut short in the middle of an address.
+    dnspython parses the lines (`_text_lines`) as it parses a file it opens itself, so
+    it refuses a file that is not UTF-8, one with no nameserver, and one with a
+    nameserver that is neither an address nor an https URL: each gives none. Nothing
+    is sent."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+    except OSError:
+        return ()
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return ()
+        data = b""
+        while len(data) <= RESOLV_CONF_MAX:
+            chunk = os.read(fd, RESOLV_CONF_MAX + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        return ()
+    finally:
+        os.close(fd)
+    if len(data) > RESOLV_CONF_MAX:
+        return ()
+    resolver = dns.resolver.Resolver(configure=False)
+    try:
+        # dnspython iterates what it is given; a list of lines is not a type its
+        # signature names, so test_the_file_is_parsed_as_dnspython_parses_it compares
+        # the result with dnspython opening the same file itself
+        resolver.read_resolv_conf(_text_lines(data.decode("utf-8")))
+    except (dns.exception.DNSException, ValueError):
+        return ()
+    return tuple(s for s in resolver.nameservers if isinstance(s, str))
 
 
 class DnsResolver:
@@ -231,36 +304,68 @@ class DnsResolver:
     None, so the scan reports itself incomplete and the server keeps the names it has
     (spec §5.7)."""
 
-    def __init__(self, port: int = 53, resolv_conf: str = RESOLV_CONF):
+    def __init__(
+        self,
+        port: int = 53,
+        resolv_conf: str = RESOLV_CONF,
+        read_timeout: float = RESOLV_CONF_TIMEOUT_S,
+    ):
         self.port = port
         self.resolv_conf = resolv_conf
+        self.read_timeout = read_timeout
+        # held by the thread that reads resolv.conf, for as long as its read runs
+        self._reading = threading.Lock()
 
-    def servers(self, job_servers: tuple[str, ...]) -> tuple[str, ...]:
-        """The servers a job's lookups ask: the job's own, else the host's resolvers,
-        read from resolv.conf each time this is called (once per job, so a corrected
-        resolv.conf takes effect at the next job; nothing is cached). Only addresses are
-        kept, before the list is cut to MAX_DNS_SERVERS, so an entry the agent cannot
-        query (a DNS-over-HTTPS URL, say) never takes the place of one it can. Empty
-        when there is none: the job's lookups then have no server to ask."""
-        chosen = job_servers or self._host_servers()
-        usable = []
-        for server in chosen:
-            try:
-                ipaddress.ip_address(server)
-            except ValueError:
-                continue
-            usable.append(server)
-        return tuple(usable[:MAX_DNS_SERVERS])
+    async def servers(self, job_servers: tuple[str, ...]) -> tuple[str, ...]:
+        """The servers a job's lookups ask (`usable_servers`): the job's own, else the
+        host's resolvers, read from resolv.conf each time this is called (once per job,
+        so a corrected resolv.conf takes effect at the next job; nothing is cached).
+        Empty when there is none: the job's lookups then have no server to ask."""
+        return usable_servers(job_servers or await self._host_servers())
 
-    def _host_servers(self) -> tuple[str, ...]:
-        try:
-            # reads the host's resolv.conf; nothing is sent. dnspython refuses a file
-            # it cannot read, one with no nameserver, and one with a nameserver that is
-            # neither an address nor an https URL: each leaves no server to ask
-            listed = dns.resolver.Resolver(filename=self.resolv_conf).nameservers
-        except (dns.exception.DNSException, ValueError, OSError):
+    async def _host_servers(self) -> tuple[str, ...]:
+        """resolv.conf's servers (`read_resolv_conf`), read off the event loop, in a
+        daemon thread of its own: a read that blocks (a stalled network mount) holds
+        neither the loop (check-ins, the job's deadline, the scan's backstop) nor the
+        agent's exit. The job waits for it at most `read_timeout`, and a read that has
+        not finished by then gives no server. While a read is still running no other
+        starts, and every job until it ends finds no server, so at most one thread per
+        resolver (the agent makes one) is ever held. Correcting the file does not end
+        that: the blocked operation must return, or the agent be restarted. A job that
+        names its own DNS servers reads no file, and is not affected. `scan.run` waits
+        for this no longer than the job has left."""
+        if not self._reading.acquire(blocking=False):
             return ()
-        return tuple(s for s in listed if isinstance(s, str))
+        loop = asyncio.get_running_loop()
+        done: asyncio.Future = loop.create_future()
+
+        def settle(servers: tuple[str, ...]) -> None:
+            if not done.done():
+                done.set_result(servers)
+
+        def read() -> None:
+            servers: tuple[str, ...] = ()
+            try:
+                servers = read_resolv_conf(self.resolv_conf)
+            except Exception:
+                pass  # whatever went wrong, the read gave no server to ask
+            finally:
+                self._reading.release()
+            try:
+                loop.call_soon_threadsafe(settle, servers)
+            except RuntimeError:
+                pass  # the loop has closed: nothing waits for this read any more
+
+        try:
+            threading.Thread(target=read, name="resolv.conf", daemon=True).start()
+        except RuntimeError:
+            # no thread to be had: no read, so no server
+            self._reading.release()
+            return ()
+        try:
+            return await asyncio.wait_for(done, self.read_timeout)
+        except TimeoutError:
+            return ()
 
     async def ptr(self, address: Address, servers: tuple[str, ...], slot: Slot) -> str | None:
         """The PTR name of `address`, or None when a server says there is none (NXDOMAIN,

@@ -352,22 +352,70 @@ async def test_a_lookup_that_could_send_nothing_cancels_the_rest_and_the_scan_is
     assert ipaddress.ip_address("10.0.0.3") in resolver.cancelled
 
 
-async def test_the_icmp_sweep_still_lets_pings_in_flight_finish_after_a_probe_error():
-    """`cancel_on_failure` is the PTR lookups' alone: when the prober fails, the pings
-    already sent still report what answered, as before #78."""
-    clock = FakeClock()
+# --- #99: the two pool contracts the review's mutations showed unguarded ---
 
-    class Failing(FakeProber):
+
+async def test_a_ping_still_in_flight_when_the_prober_fails_still_answers():
+    """`cancel_on_failure` is the PTR lookups' alone. 10.0.0.1's ping is held until
+    10.0.0.2's has failed, then answers: the ICMP sweep lets it, and reports it."""
+    failed = asyncio.Event()
+
+    class Held:
         async def ping(self, address, timeout):
             if address == ipaddress.ip_address("10.0.0.2"):
-                await clock.sleep(0.5)
+                failed.set()
                 raise ProbeError("ICMP needs CAP_NET_RAW")
-            if address == ipaddress.ip_address("10.0.0.1"):
-                await clock.sleep(2.0)  # still in flight when 10.0.0.2 fails
-            return address in self.alive
+            await failed.wait()
+            await asyncio.sleep(0.02)  # the pool has seen the failure by now
+            return True
 
-    prober = Failing(alive=["10.0.0.1"])
-    parsed, addresses = planned(methods=["icmp"])
-    result = await sweep(parsed, addresses, prober=prober, clock=clock, max_pps=10)
-    assert result["complete"] is False and result["error"] == "ICMP needs CAP_NET_RAW"
+    parsed, addresses = planned(methods=["icmp"], ranges=[{"start": "10.0.0.1", "end": "10.0.0.2"}])
+    result = await sweep(parsed, addresses, prober=Held(), max_pps=1000)
     assert result["observations"] == [{"ip": "10.0.0.1"}]
+    assert result["complete"] is False and result["error"] == "ICMP needs CAP_NET_RAW"
+
+
+async def test_a_later_lookups_failure_is_reported_ahead_of_an_earlier_ones_cancellation():
+    """10.0.0.1's lookup is still running when 10.0.0.2's could send its query to no
+    server, so the first is cancelled, and its CancelledError comes first among the
+    pool's results. The pool raises the failure, not the cancellation: scan.run makes
+    its result set. A CancelledError escaping instead would end the agent's worker."""
+    started = asyncio.Event()
+
+    class Resolver(FakeResolver):
+        async def ptr(self, address, servers, slot):
+            await slot()
+            if address == ipaddress.ip_address("10.0.0.2"):
+                await started.wait()
+                raise ProbeError(no_query_sent("OSError"))
+            started.set()
+            await asyncio.sleep(5)  # cancelled long before
+            return "h1.home.arpa"
+
+    live = ["10.0.0.1", "10.0.0.2"]
+    parsed, addresses = planned(ranges=[{"start": "10.0.0.1", "end": "10.0.0.2"}])
+    outcome = (await asyncio.gather(
+        sweep(parsed, addresses, prober=FakeProber(alive=live), resolver=Resolver()),
+        return_exceptions=True,
+    ))[0]
+    assert isinstance(outcome, dict), f"scan.run raised {outcome!r} in place of a result set"
+    assert outcome["complete"] is False and outcome["error"] == no_query_sent("OSError")
+    assert outcome["observations"] == [{"ip": a} for a in live]
+
+
+async def test_the_fake_resolver_keeps_the_real_ones_rules():
+    """`FakeResolver` filters and cuts as `probe.usable_servers` does, and refuses an
+    empty list as `DnsResolver.ptr` does, without taking a slot."""
+    fake = FakeResolver(host=("https://dns.example.com/dns-query", "192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"))
+    assert await fake.servers(()) == ("192.0.2.1", "192.0.2.2", "192.0.2.3")
+    assert await fake.servers(("not-an-address", "10.0.0.53")) == ("10.0.0.53",)
+    taken = []
+
+    async def slot():
+        taken.append(1)
+        return 2.0
+
+    with pytest.raises(ProbeError) as raised:
+        await fake.ptr(ipaddress.ip_address("10.0.0.9"), (), slot)
+    assert str(raised.value) == NO_DNS_SERVER
+    assert taken == []

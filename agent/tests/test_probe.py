@@ -4,21 +4,36 @@ out of the job's one packet budget (finding 1 of the briefed review of PR #70).
 Nothing here leaves 127.0.0.1 or ::1."""
 
 import asyncio
+import errno
 import ipaddress
+import os
 import socket
+import threading
 import time
 
+import dns.asyncquery
+import dns.exception
 import dns.flags
 import dns.message
 import dns.rcode
 import dns.rdatatype
+import dns.resolver
 import dns.rrset
 import pytest
 
 from conftest import job
-from tlg_ipam_agent import guard, scan
+from tlg_ipam_agent import guard, probe, scan
 from tlg_ipam_agent.config import parse_allowed
-from tlg_ipam_agent.probe import MAX_DNS_SERVERS, NO_DNS_SERVER, DnsResolver, ProbeError, no_query_sent
+from tlg_ipam_agent.probe import (
+    MAX_DNS_SERVERS,
+    NO_DNS_SERVER,
+    RESOLV_CONF_MAX,
+    RESOLV_CONF_TIMEOUT_S,
+    DnsResolver,
+    ProbeError,
+    no_query_sent,
+    read_resolv_conf,
+)
 from tlg_ipam_agent.protocol import job_ref, parse_job
 
 ANSWERS = {
@@ -87,6 +102,53 @@ async def responder(host="127.0.0.1", port=0, **kwargs):
     return transport, proto, transport.get_extra_info("sockname")[1]
 
 
+async def responders_on_one_port(attempts: int = 50, make=None, **kwargs):
+    """A responder on 127.0.0.1 (given `kwargs`) and a plain one on ::1, on one port
+    number, for a resolver that asks both on the same port. The kernel picks the IPv4
+    port; when that number is already taken on ::1, both are closed and another pair is
+    tried."""
+    make = make or responder
+    for _ in range(attempts):
+        v4_t, v4, port = await make(**kwargs)
+        try:
+            v6_t, v6, _ = await make(host="::1", port=port)
+        except OSError as exc:
+            v4_t.close()
+            if exc.errno != errno.EADDRINUSE:
+                raise
+            continue
+        return (v4_t, v4), (v6_t, v6), port
+    raise AssertionError(f"no port free on both 127.0.0.1 and ::1 in {attempts} tries")
+
+
+async def test_the_pair_of_responders_finds_a_port_free_on_both():
+    """The collision that made the failover test fail, made on purpose: the first
+    IPv4 port is one already taken on ::1, so that pair is given up and another made."""
+    if not _ipv6_loopback():
+        pytest.skip("no IPv6 loopback here")
+    taken = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    taken.bind(("::1", 0))
+    busy = taken.getsockname()[1]
+    tried: list[int] = []
+
+    async def make(host="127.0.0.1", port=0, **kwargs):
+        if host == "127.0.0.1" and not tried:
+            port = busy  # the kernel's first pick, made to collide
+        made = await responder(host, port, **kwargs)
+        if host == "127.0.0.1":
+            tried.append(made[2])
+        return made
+
+    try:
+        (v4_t, _), (v6_t, _), port = await responders_on_one_port(make=make)
+    finally:
+        taken.close()
+    v4_t.close()
+    v6_t.close()
+    assert tried[0] == busy and len(tried) >= 2
+    assert port == tried[-1] != busy
+
+
 def unpaced(seconds=2.0):
     async def slot():
         return seconds
@@ -131,16 +193,43 @@ def _ipv6_loopback() -> bool:
         return False
 
 
+@pytest.mark.parametrize("late", [0.0, 0.1], ids=["on-time", "first-query-late"])
 @pytest.mark.parametrize("second", ["127.0.0.1", "::1"])
-async def test_failover_to_the_next_server_is_paced_with_the_icmp_sweep(second):
+async def test_failover_to_the_next_server_is_paced_with_the_icmp_sweep(second, late, monkeypatch):
     """At MAX_PPS=4 the echo request and both queries (the first server answers
-    SERVFAIL, the second the name) are at least 0.25 s apart on the wire."""
+    SERVFAIL, the second the name) take three slots of one budget: the k-th packet on
+    the wire comes no sooner than k slots (0.25 s each) after the job started.
+
+    That is the pacer's promise: each send waits for its slot on a schedule, and a slot
+    is never earlier than k intervals from the first. It is not a minimum gap between two
+    sends: a send that leaves late is followed by one that leaves on schedule, sooner
+    than 0.25 s after it (#87 owns whether that should change). Until #99 this test
+    asserted every gap was at least 0.22 s, so it would fail whenever one packet left
+    more than 30 ms after its slot and the next did not. `first-query-late` makes that
+    happen on purpose, handing the first query to dnspython 0.1 s after its slot.
+
+    The failure seen (once in 24 runs for #78, once in 200 for #99, both on macOS and
+    both `::1`) was another dependency: the `::1` responder must share the port the
+    kernel gave the 127.0.0.1 one (the resolver asks every server on one port), and
+    that number can already be taken on ::1 by any other socket on the machine
+    (`EADDRINUSE`). `responders_on_one_port` now tries other ports."""
     if second == "::1" and not _ipv6_loopback():
         pytest.skip("no IPv6 loopback here")
-    first_t, first, port = await responder(script=("servfail", "answer"))
-    second_t, second_p = first_t, first
-    if second != "127.0.0.1":
-        second_t, second_p, _ = await responder(host="::1", port=port)
+    if late:
+        real_udp, calls = dns.asyncquery.udp, []
+
+        async def udp(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                await asyncio.sleep(late)
+            return await real_udp(*args, **kwargs)
+
+        monkeypatch.setattr(dns.asyncquery, "udp", udp)
+    if second == "127.0.0.1":
+        first_t, first, port = await responder(script=("servfail", "answer"))
+        second_t, second_p = first_t, first
+    else:
+        (first_t, first), (second_t, second_p), port = await responders_on_one_port(script=("servfail", "answer"))
     try:
         raw = job(
             ranges=[{"start": "10.0.0.9", "end": "10.0.0.9"}],
@@ -148,6 +237,8 @@ async def test_failover_to_the_next_server_is_paced_with_the_icmp_sweep(second):
         )
         parsed = parse_job(job_ref(raw), raw)
         prober = TimedProber(alive=["10.0.0.9"])
+        # no later than the pacer's first slot, which scan.run takes after this
+        started = time.monotonic()
         result = await scan.run(
             parsed,
             guard.plan(parsed, parse_allowed(None)),
@@ -160,8 +251,9 @@ async def test_failover_to_the_next_server_is_paced_with_the_icmp_sweep(second):
         assert result["complete"] is True
         arrivals = sorted(prober.sent + first.arrivals + (second_p.arrivals if second_p is not first else []))
         assert len(arrivals) == 3
-        gaps = [b - a for a, b in zip(arrivals, arrivals[1:], strict=False)]
-        assert all(g >= 0.25 - 0.03 for g in gaps), gaps
+        # 1 ms for the event loop, whose timers may fire up to its clock resolution early
+        late_by = [round(t - (started + k * 0.25), 3) for k, t in enumerate(arrivals)]
+        assert all(d >= -0.001 for d in late_by), late_by
     finally:
         first_t.close()
         if second_t is not first_t:
@@ -311,43 +403,43 @@ def resolv_conf(tmp_path, text: str):
         "nameserver https://dns.example.com/dns-query\n",
     ],
 )
-def test_a_host_with_no_usable_resolver_gives_no_server(tmp_path, text):
+async def test_a_host_with_no_usable_resolver_gives_no_server(tmp_path, text):
     resolver = DnsResolver(resolv_conf=str(resolv_conf(tmp_path, text)))
-    assert resolver.servers(()) == ()
+    assert await resolver.servers(()) == ()
 
 
-def test_a_host_with_no_resolv_conf_gives_no_server(tmp_path):
-    assert DnsResolver(resolv_conf=str(tmp_path / "missing")).servers(()) == ()
+async def test_a_host_with_no_resolv_conf_gives_no_server(tmp_path):
+    assert await DnsResolver(resolv_conf=str(tmp_path / "missing")).servers(()) == ()
 
 
-def test_the_jobs_servers_win_over_the_hosts(tmp_path):
+async def test_the_jobs_servers_win_over_the_hosts(tmp_path):
     resolver = DnsResolver(resolv_conf=str(resolv_conf(tmp_path, "nameserver 127.0.0.1\n")))
-    assert resolver.servers(("10.0.0.53",)) == ("10.0.0.53",)
-    assert resolver.servers(()) == ("127.0.0.1",)
+    assert await resolver.servers(("10.0.0.53",)) == ("10.0.0.53",)
+    assert await resolver.servers(()) == ("127.0.0.1",)
 
 
-def test_only_addresses_are_kept_before_the_list_is_cut(tmp_path):
+async def test_only_addresses_are_kept_before_the_list_is_cut(tmp_path):
     """MAX_DNS_SERVERS cuts the list after the entries the agent cannot query are
     dropped, so three of those first cannot empty it."""
     text = "".join(f"nameserver https://dns{i}.example.com/dns-query\n" for i in range(3))
     text += "nameserver 127.0.0.1\nnameserver ::1\nnameserver 127.0.0.2\nnameserver 127.0.0.3\n"
     resolver = DnsResolver(resolv_conf=str(resolv_conf(tmp_path, text)))
-    assert resolver.servers(()) == ("127.0.0.1", "::1", "127.0.0.2")
-    assert len(resolver.servers(tuple(f"127.0.0.{i}" for i in range(1, 8)))) == MAX_DNS_SERVERS
+    assert await resolver.servers(()) == ("127.0.0.1", "::1", "127.0.0.2")
+    assert len(await resolver.servers(tuple(f"127.0.0.{i}" for i in range(1, 8)))) == MAX_DNS_SERVERS
 
 
-def test_the_hosts_resolvers_are_read_again_for_every_job(tmp_path):
+async def test_the_hosts_resolvers_are_read_again_for_every_job(tmp_path):
     """A failed read is not kept: the next call reads resolv.conf again, so a corrected
     file takes effect at the next job, in the same process."""
     path = resolv_conf(tmp_path, "")
     resolver = DnsResolver(resolv_conf=str(path))
-    assert resolver.servers(()) == ()
+    assert await resolver.servers(()) == ()
     path.write_text("nameserver 127.0.0.1\n")
-    assert resolver.servers(()) == ("127.0.0.1",)
+    assert await resolver.servers(()) == ("127.0.0.1",)
     path.write_text("nameserver ::1\n")
-    assert resolver.servers(()) == ("::1",)
+    assert await resolver.servers(()) == ("::1",)
     path.unlink()
-    assert resolver.servers(()) == ()
+    assert await resolver.servers(()) == ()
 
 
 async def test_a_lookup_with_no_server_raises_and_takes_no_slot():
@@ -548,3 +640,345 @@ async def test_a_lookup_the_jobs_deadline_stops_before_any_attempt_is_reported_a
         assert len(proto.arrivals) == 1
     finally:
         transport.close()
+
+
+# --- #99: what a cancelled lookup's datagram does ---
+
+
+class Unwritable:
+    """Stands in for a client socket whose kernel send buffer is full: a datagram is
+    refused (`BlockingIOError`, so asyncio's transport keeps it and retries once the
+    socket is writable) until `writable` is set, and then handed to the real socket.
+    `log` records the first refusal and each send."""
+
+    def __init__(self, sock, gate, log):
+        self._sock, self._gate, self._log = sock, gate, log
+        self._queued = False
+
+    def _refuse(self) -> bool:
+        if self._gate["writable"]:
+            self._log.append("kernel took it")
+            return False
+        if not self._queued:
+            self._queued = True
+            self._log.append("queued")
+            self._gate["queued"].set()
+        return True
+
+    def sendto(self, data, addr):
+        if self._refuse():
+            raise BlockingIOError
+        return self._sock.sendto(data, addr)
+
+    def send(self, data):
+        if self._refuse():
+            raise BlockingIOError
+        return self._sock.send(data)
+
+    def __getattr__(self, name):
+        return getattr(self._sock, name)
+
+
+async def test_a_datagram_a_cancelled_lookup_had_handed_over_is_not_recalled(monkeypatch):
+    """Briefed round 2 of PR #96, finding 1, held as what the spec now says. Two
+    lookups, real resolver, loopback responder. 10.0.0.9's query is handed to its
+    socket, which cannot take it yet, so asyncio's transport keeps it. Then 10.0.0.8's
+    lookup could send its query to no server: 10.0.0.9's lookup is cancelled, its socket
+    closed, and the scan returns its (incomplete) result set. No query is handed to a
+    socket after the failure. When the socket becomes writable, asyncio still sends the
+    datagram it kept: after the cancellation, after the result set was made. It took
+    its slot, and goes to the job's server.
+
+    The stand-in replaces the transport's `_sock`, an asyncio internal, on the client's
+    sockets only; the responder's is made before it is in place."""
+    transport, proto, port = await responder()
+    loop = asyncio.get_running_loop()
+    real_endpoint = loop.create_datagram_endpoint
+    log: list[str] = []
+    gate = {"writable": False, "queued": asyncio.Event()}
+
+    async def endpoint(*args, **kwargs):
+        made, protocol = await real_endpoint(*args, **kwargs)
+        made._sock = Unwritable(made._sock, gate, log)
+        return made, protocol
+
+    real_udp = dns.asyncquery.udp
+    handed: list[str] = []
+
+    async def udp(query, where, **kwargs):
+        name = query.question[0].name.to_text()
+        handed.append(name)
+        if name.startswith("8."):
+            await gate["queued"].wait()
+            log.append("failure")
+            raise OSError("no route")
+        return await real_udp(query, where, **kwargs)
+
+    monkeypatch.setattr(dns.asyncquery, "udp", udp)
+    loop.create_datagram_endpoint = endpoint
+    try:
+        raw = job(ranges=[{"start": "10.0.0.8", "end": "10.0.0.9"}], dns_servers=["127.0.0.1"])
+        parsed = parse_job(job_ref(raw), raw)
+        result = await scan.run(
+            parsed, guard.plan(parsed, parse_allowed(None)), prober=TimedProber(alive=["10.0.0.8", "10.0.0.9"]),
+            resolver=DnsResolver(port=port), max_pps=1000, clock=scan.Clock(),
+        )
+        log.append("result")
+        assert result["complete"] is False and result["error"] == no_query_sent("OSError")
+        assert result["observations"] == [{"ip": "10.0.0.8"}, {"ip": "10.0.0.9"}]
+        await asyncio.sleep(0.05)
+        assert proto.arrivals == []  # the kernel has not taken it yet
+        gate["writable"] = True
+        for _ in range(100):
+            if proto.arrivals:
+                break
+            await asyncio.sleep(0.01)
+        # no query handed over after the failure; the one kept went out after the result
+        assert sorted(handed) == ["8.0.0.10.in-addr.arpa.", "9.0.0.10.in-addr.arpa."]
+        assert log == ["queued", "failure", "result", "kernel took it"]
+        assert len(proto.arrivals) == 1
+        assert proto.questions == [("9.0.0.10.in-addr.arpa.", "PTR")]
+    finally:
+        del loop.create_datagram_endpoint
+        transport.close()
+
+
+# --- #99: resolv.conf is read off the event loop, bounded in time and size ---
+
+
+def ticker(interval: float = 0.01):
+    """A timer beside the code under test: the times it fired, and its task."""
+    ticks: list[float] = []
+
+    async def tick():
+        while True:
+            ticks.append(time.monotonic())
+            await asyncio.sleep(interval)
+
+    return ticks, asyncio.create_task(tick())
+
+
+def longest_gap(ticks: list[float], until: float) -> float:
+    return max(b - a for a, b in zip(ticks, ticks[1:] + [until], strict=True))
+
+
+def unblock_later(path, after: float = 2.0, until: float = 4.0) -> None:
+    """A writer for the FIFO at `path` from `after` seconds on, so code that blocked on
+    it (opened it to read without O_NONBLOCK) is freed: a test then fails on its
+    assertion rather than hanging. It opens without blocking, and gives up at `until`."""
+
+    def write():
+        time.sleep(after)
+        end = time.monotonic() + until - after
+        while time.monotonic() < end:
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError:
+                time.sleep(0.01)  # no reader yet
+                continue
+            try:
+                os.write(fd, b"nameserver 127.0.0.1\n")
+            finally:
+                os.close(fd)
+            return
+
+    threading.Thread(target=write, daemon=True).start()
+
+
+async def test_a_fifo_at_the_resolver_path_leaves_the_job_incomplete_and_the_loop_running(tmp_path):
+    """Acceptance for #99: with a FIFO where resolv.conf should be, a job naming no DNS
+    server ends incomplete with the fixed error and sends no DNS packet, and a timer
+    beside it keeps firing. The FIFO is refused at once, without waiting for the read's
+    time bound: it is not a regular file, and opening it does not wait for a writer."""
+    transport, proto, port = await responder()
+    fifo = tmp_path / "resolv.conf"
+    os.mkfifo(fifo)
+    unblock_later(fifo)
+    ticks, timer = ticker()
+    try:
+        raw = job(ranges=[{"start": "10.0.0.9", "end": "10.0.0.9"}], dns_servers=[])
+        parsed = parse_job(job_ref(raw), raw)
+        started = time.monotonic()
+        result = await scan.run(
+            parsed, guard.plan(parsed, parse_allowed(None)), prober=TimedProber(alive=["10.0.0.9"]),
+            resolver=DnsResolver(port=port, resolv_conf=str(fifo)), max_pps=200, clock=scan.Clock(),
+        )
+        took = time.monotonic() - started
+        await asyncio.sleep(0.05)
+        assert result["complete"] is False
+        assert result["error"] == NO_DNS_SERVER
+        assert result["observations"] == [{"ip": "10.0.0.9"}]
+        assert proto.arrivals == []
+        assert longest_gap(ticks, time.monotonic()) < 0.2, ticks
+        assert took < RESOLV_CONF_TIMEOUT_S
+    finally:
+        timer.cancel()
+        transport.close()
+
+
+async def test_a_read_that_does_not_finish_gives_no_server_and_holds_one_thread_at_most(monkeypatch, tmp_path):
+    """A stalled read (a network mount that does not answer, stood in for by a read
+    that waits on an event) is waited for `read_timeout`, on a thread, while the event
+    loop runs on; it gives no server. While it is still blocked, the next job starts no
+    second read and waits for none. Once it ends, the next job reads again."""
+    release = threading.Event()
+    calls: list[str] = []
+
+    def stalled(path):
+        calls.append(path)
+        release.wait(5)  # freed by the test; 5 s at most, so a failure cannot hang
+        return ("127.0.0.1",)
+
+    monkeypatch.setattr(probe, "read_resolv_conf", stalled)
+    resolver = DnsResolver(resolv_conf=str(tmp_path / "resolv.conf"), read_timeout=0.3)
+    ticks, timer = ticker()
+    try:
+        started = time.monotonic()
+        assert await resolver.servers(()) == ()
+        waited = time.monotonic() - started
+        assert 0.25 <= waited < 1.0
+        assert longest_gap(ticks, time.monotonic()) < 0.2, ticks
+        assert len(ticks) >= 10
+        started = time.monotonic()
+        assert await resolver.servers(()) == ()
+        assert time.monotonic() - started < 0.1
+        assert len(calls) == 1
+        # a job's own servers need no read
+        assert await resolver.servers(("10.0.0.53",)) == ("10.0.0.53",)
+        release.set()
+        for _ in range(100):
+            if await resolver.servers(()) == ("127.0.0.1",):
+                break
+            await asyncio.sleep(0.01)
+        assert await resolver.servers(()) == ("127.0.0.1",)
+        assert len(calls) >= 2
+    finally:
+        release.set()
+        timer.cancel()
+
+
+def test_a_fifo_or_a_device_is_not_read_and_not_waited_on(tmp_path):
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    unblock_later(fifo)
+    started = time.monotonic()
+    assert read_resolv_conf(str(fifo)) == ()
+    assert time.monotonic() - started < 0.5
+    assert read_resolv_conf(os.devnull) == ()  # a character device
+    assert read_resolv_conf(str(tmp_path)) == ()  # a directory
+    # a FIFO that holds a whole file's worth and then its end (the writer has gone,
+    # another reader keeps the data): it could be read like a file, and is not
+    full = tmp_path / "full"
+    os.mkfifo(full)
+    reader = os.open(full, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        writer = os.open(full, os.O_WRONLY | os.O_NONBLOCK)
+        os.write(writer, b"nameserver 127.0.0.1\n")
+        os.close(writer)
+        assert read_resolv_conf(str(full)) == ()
+    finally:
+        os.close(reader)
+
+
+def test_at_most_resolv_conf_max_bytes_are_taken(tmp_path):
+    """A file of RESOLV_CONF_MAX bytes is read whole; one byte more and it gives no
+    server, rather than a list cut short in the middle of an address."""
+    line = b"nameserver 127.0.0.1\n"
+    at_cap = tmp_path / "at-cap"
+    at_cap.write_bytes(b"#" * (RESOLV_CONF_MAX - len(line) - 1) + b"\n" + line)
+    assert at_cap.stat().st_size == RESOLV_CONF_MAX
+    assert read_resolv_conf(str(at_cap)) == ("127.0.0.1",)
+    over = tmp_path / "over"
+    over.write_bytes(b"#" * (RESOLV_CONF_MAX - len(line)) + b"\n" + line)
+    assert over.stat().st_size == RESOLV_CONF_MAX + 1
+    assert read_resolv_conf(str(over)) == ()
+
+
+@pytest.mark.parametrize(
+    "content, expected",
+    [
+        (b"nameserver 127.0.0.1\r\nnameserver ::1\r\n", ("127.0.0.1", "::1")),
+        (b"nameserver 127.0.0.1\rnameserver ::1\r", ("127.0.0.1", "::1")),
+        (b"# comment\n; comment\nsearch home.arpa\nnameserver 127.0.0.1\n", ("127.0.0.1",)),
+        (b"nameserver 127.0.0.1\n\xff\n", ()),  # not UTF-8, as dnspython refuses it
+        # not line breaks in a text file, though str.splitlines cuts at each (round 1
+        # of #103): one line, so one nameserver
+        ("nameserver 127.0.0.1\x85nameserver 127.0.0.2\n".encode(), ("127.0.0.1",)),
+        ("nameserver 127.0.0.1\u2028nameserver 127.0.0.2\n".encode(), ("127.0.0.1",)),
+        (b"nameserver 127.0.0.1\fnameserver 127.0.0.2\n", ("127.0.0.1",)),
+        (b"nameserver 127.0.0.1\vnameserver 127.0.0.2\n", ("127.0.0.1",)),
+        # a byte-order mark spoils the first line's keyword
+        ("\ufeffnameserver 127.0.0.1\nnameserver 127.0.0.2\n".encode(), ("127.0.0.2",)),
+        (b"nameserver 127.0.0.1\x00\nnameserver 127.0.0.2\n", ()),  # dnspython refuses the NUL
+    ],
+)
+def test_the_file_is_parsed_as_dnspython_parses_it(tmp_path, content, expected):
+    """`read_resolv_conf` hands dnspython a list of lines, which its signature does not
+    name: each case is also parsed by dnspython opening the file itself, and the two
+    must agree."""
+    path = tmp_path / "resolv.conf"
+    path.write_bytes(content)
+    assert read_resolv_conf(str(path)) == expected
+    # the same answer dnspython gives when it opens the file itself
+    try:
+        theirs = tuple(dns.resolver.Resolver(filename=str(path)).nameservers)
+    except (dns.exception.DNSException, ValueError):
+        theirs = ()
+    assert theirs == expected
+
+
+def test_a_symlinked_resolv_conf_is_followed(tmp_path):
+    """systemd-resolved makes /etc/resolv.conf a link to a file of its own."""
+    target = tmp_path / "stub-resolv.conf"
+    target.write_text("nameserver 127.0.0.53\n")
+    link = tmp_path / "resolv.conf"
+    link.symlink_to(target)
+    assert read_resolv_conf(str(link)) == ("127.0.0.53",)
+
+
+async def test_choosing_the_servers_ends_at_the_jobs_deadline(monkeypatch, tmp_path):
+    """Round 1 of #103, finding 2, on the real clock: liveness takes 0.8 s of a 1 s job
+    and resolv.conf's read stalls. Choosing the servers waits only for the 0.2 s the
+    job has left, not the read's own second, and the job ends at its deadline with the
+    PTR stage's timeout, not as a job with no server. The stalled read keeps its thread
+    and its lock: the next job starts no second read, and once the read ends one does."""
+    release = threading.Event()
+    calls: list[str] = []
+
+    def stalled(path):
+        calls.append(path)
+        release.wait(5)  # freed by the test; 5 s at most, so a failure cannot hang
+        return ("127.0.0.1",)
+
+    class SlowProber:
+        async def ping(self, address, timeout):
+            await asyncio.sleep(0.8)
+            return True
+
+    monkeypatch.setattr(probe, "read_resolv_conf", stalled)
+    resolver = DnsResolver(resolv_conf=str(tmp_path / "resolv.conf"))
+    assert resolver.read_timeout > 0.5  # the read's own bound is longer than the job has left
+    try:
+        raw = job(ranges=[{"start": "10.0.0.9", "end": "10.0.0.9"}], dns_servers=[], timeout_s=1)
+        parsed = parse_job(job_ref(raw), raw)
+        started = time.monotonic()
+        result = await scan.run(
+            parsed, guard.plan(parsed, parse_allowed(None)), prober=SlowProber(),
+            resolver=resolver, max_pps=200, clock=scan.Clock(),
+        )
+        took = time.monotonic() - started
+        assert result["complete"] is False
+        assert result["error"] == "timed out after 1 s during the PTR lookups"
+        assert result["observations"] == [{"ip": "10.0.0.9"}]
+        assert 0.95 <= took < 1.4, took
+        assert len(calls) == 1
+        assert await resolver.servers(()) == ()  # still blocked: no second read
+        assert len(calls) == 1
+        release.set()
+        for _ in range(100):
+            if await resolver.servers(()) == ("127.0.0.1",):
+                break
+            await asyncio.sleep(0.01)
+        assert len(calls) >= 2
+    finally:
+        release.set()
