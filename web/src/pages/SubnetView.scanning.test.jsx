@@ -37,10 +37,12 @@ const clone = (v) => JSON.parse(JSON.stringify(v))
 // the server's to work out; this one hard-codes what the real one would answer.
 let db
 
-const SCOPE_WITH_POOL = [{ start: '10.20.0.1', end: '10.20.0.254' }]
+const SCOPE_WITH_POOL = [
+  { start: '10.20.0.1', end: '10.20.0.254', start_int: 169082881, end_int: 169083134 },
+]
 const SCOPE_WITHOUT_POOL = [
-  { start: '10.20.0.1', end: '10.20.0.99' },
-  { start: '10.20.0.201', end: '10.20.0.254' },
+  { start: '10.20.0.1', end: '10.20.0.99', start_int: 169082881, end_int: 169082979 },
+  { start: '10.20.0.201', end: '10.20.0.254', start_int: 169083081, end_int: 169083134 },
 ]
 
 function seed({ target = {}, subnet = {} } = {}) {
@@ -385,33 +387,89 @@ describe('scanning settings', () => {
     expect(within(region).getByText(/incomplete/)).toBeInTheDocument()
   })
 
-  it('says MAC collection is unavailable when the server issued the job without arp', async () => {
+  it('says MAC collection is unavailable from what the server reports, with no job out', async () => {
+    seed({ target: { runnable_methods: ['icmp', 'rdns'] } })
+    renderView()
+    const region = await findScanning()
+    expect(await within(region).findByText('idle')).toBeInTheDocument()
+    expect(
+      within(region).getByText('MAC collection unavailable — agent is not on this subnet')
+    ).toBeInTheDocument()
+    expect(within(region).queryByText(/Cannot be scanned/)).toBeNull()
+  })
+
+  it('says an arp-only target cannot be scanned by this agent', async () => {
+    seed({ target: { methods: ['arp', 'rdns'], runnable_methods: [] } })
+    renderView()
+    const region = await findScanning()
+    expect(await within(region).findByText(/^Cannot be scanned by this agent/)).toBeInTheDocument()
+    expect(within(region).queryByText(/MAC collection unavailable/)).toBeNull()
+  })
+
+  it('says neither when the server does not know, and no longer reads it from a job out', async () => {
+    // a job issued without arp, as before #68, but runnable_methods null: no agent
+    // check-in to judge by, so nothing is claimed
     seed({
       target: {
         current_job_id: 'job-1',
         job_issued_at: new Date().toISOString().replace('Z', ''),
         job_methods: ['icmp', 'rdns'],
+        runnable_methods: null,
       },
     })
     renderView()
-    expect(
-      await within(await findScanning()).findByText(
-        'MAC collection unavailable — agent is not on this subnet'
-      )
-    ).toBeInTheDocument()
+    const region = await findScanning()
+    expect(await within(region).findByText(/job issued/)).toBeInTheDocument()
+    expect(within(region).queryByText(/MAC collection unavailable/)).toBeNull()
+    expect(within(region).queryByText(/Cannot be scanned/)).toBeNull()
   })
 
-  it('does not claim MAC collection is unavailable when arp was issued', async () => {
+  it('says neither for a target with no agent', async () => {
+    seed({ target: { agent_id: null, methods: ['arp'], runnable_methods: null } })
+    renderView()
+    const region = await findScanning()
+    expect(await within(region).findByText(/No agent assigned/)).toBeInTheDocument()
+    expect(within(region).queryByRole('status')).toBeNull()
+  })
+
+  it('does not claim MAC collection is unavailable when the agent can run arp', async () => {
     seed({
       target: {
         current_job_id: 'job-1',
         job_issued_at: new Date().toISOString().replace('Z', ''),
         job_methods: ['icmp', 'arp', 'rdns'],
+        runnable_methods: ['icmp', 'arp', 'rdns'],
       },
     })
     renderView()
     expect(await within(await findScanning()).findByText(/job issued/)).toBeInTheDocument()
     expect(screen.queryByText(/MAC collection unavailable/)).not.toBeInTheDocument()
+  })
+
+  it('shows the error the agent reported with its last scan, as text and never as markup', async () => {
+    const error = '<img src=x onerror="alert(1)"><b>bold</b> guard: subnet outside ALLOWED_CIDRS'
+    seed({
+      target: {
+        last_scan_at: new Date(Date.now() - 60 * 1000).toISOString().replace('Z', ''),
+        last_scan_complete: false,
+        last_scan_error: error,
+      },
+    })
+    renderView()
+    const region = await findScanning()
+    const shown = await within(region).findByTestId('scan-error')
+    expect(shown).toHaveTextContent(`Agent reported: ${error}`)
+    expect(shown.textContent).toContain('<b>bold</b>')
+    expect(region.querySelector('img')).toBeNull()
+    expect(region.querySelector('b')).toBeNull()
+  })
+
+  it('shows no error line when the last scan carried none', async () => {
+    seed({ target: { last_scan_at: '2026-11-16T06:00:00', last_scan_error: null } })
+    renderView()
+    const region = await findScanning()
+    await within(region).findByText(/Last scan/)
+    expect(within(region).queryByTestId('scan-error')).toBeNull()
   })
 })
 
@@ -476,16 +534,17 @@ describe('review fixes', () => {
     )
   })
 
-  it('reloads the target while open, so a job the agent picked up shows', async () => {
+  it('reloads the target while open, so a job and what the agent can run show', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     renderView()
     expect(await within(await findScanning()).findByText('idle')).toBeInTheDocument()
 
-    // the agent checks in and is issued a job without arp
+    // the agent checks in from off the subnet's link and is issued a job without arp
     Object.assign(db.target, {
       current_job_id: 'job-1',
       job_issued_at: new Date().toISOString().replace('Z', ''),
       job_methods: ['icmp', 'rdns'],
+      runnable_methods: ['icmp', 'rdns'],
     })
     await vi.advanceTimersByTimeAsync(REFRESH_MS)
 
@@ -493,5 +552,16 @@ describe('review fixes', () => {
     expect(
       within(scanning()).getByText('MAC collection unavailable — agent is not on this subnet')
     ).toBeInTheDocument()
+
+    // the job finishes, and the agent's next check-in reports an interface on the link
+    Object.assign(db.target, {
+      current_job_id: null,
+      job_issued_at: null,
+      job_methods: null,
+      runnable_methods: ['icmp', 'arp', 'rdns'],
+    })
+    await vi.advanceTimersByTimeAsync(REFRESH_MS)
+    expect(await within(scanning()).findByText('idle')).toBeInTheDocument()
+    expect(within(scanning()).queryByText(/MAC collection unavailable/)).toBeNull()
   })
 })

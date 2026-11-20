@@ -58,12 +58,21 @@ export const hasDhcpPool = (subnet) => Boolean(subnet?.dhcp_start && subnet?.dhc
 export const targetForSubnet = (targets, subnetId) =>
   (targets || []).find((t) => t.subnet_id === subnetId) || null
 
-// The server drops `arp` from a job when the agent has no interface on the subnet
-// (spec §5.2) and records what it issued in `job_methods`. Only a job that is out
-// says so: the scan-target response has no field for it between jobs.
-export function macUnavailable(target) {
-  if (!target?.current_job_id || !Array.isArray(target.job_methods)) return false
-  return (target.methods || []).includes('arp') && !target.job_methods.includes('arp')
+// What the target's agent can run for it, as the server reports it in
+// `runnable_methods`: the methods a job would be issued with now, from the interfaces
+// the agent reported at its last check-in (services/jobs.job_methods, the rule
+// check-in issues jobs by; spec §5.2). Nothing here works out whether the agent is on
+// the subnet.
+//   'unscannable' — no job would be issued: no liveness method the agent can run
+//   'no-mac'      — `arp` is chosen and would be dropped from the job
+//   null          — neither, or the server does not know (no agent, or one that has
+//                   never checked in): then the UI says nothing
+export function agentLimit(target) {
+  const runnable = target?.runnable_methods
+  if (!Array.isArray(runnable)) return null
+  if (runnable.length === 0) return 'unscannable'
+  if ((target.methods || []).includes('arp') && !runnable.includes('arp')) return 'no-mac'
+  return null
 }
 
 export function formatDuration(ms) {

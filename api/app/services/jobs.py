@@ -123,6 +123,23 @@ def job_methods(target: ScanTarget, subnet: Subnet, interfaces: list[dict] | Non
     return [m for m in scans.SCAN_METHODS if m in chosen]
 
 
+def runnable_methods(
+    target: ScanTarget, subnet: Subnet, agent: Agent | None
+) -> list[str] | None:
+    """What a job for the target would run on its agent now, for the scan-target answer
+    (`scans.target_out`): `job_methods` on the interfaces the agent reported at its last
+    accepted check-in, so the answer and check-in apply one rule. `[]` when the target
+    cannot be scanned by this agent. None when that is not known: no agent assigned, or
+    one that has never reported its interfaces (every accepted check-in reports them).
+
+    Read-only and computed on read: the agent's next check-in changes the answer
+    without a write to the target. The agent's state is not consulted; a disabled
+    agent is judged by the interfaces it last reported."""
+    if agent is None or agent.interfaces is None:
+        return None
+    return job_methods(target, subnet, agent.interfaces)
+
+
 def last_attempt(target: ScanTarget) -> datetime | None:
     """When a job for the target last started: its last completed scan, or a later job
     that is still running or never reported back."""

@@ -189,15 +189,27 @@ export function mergeReports(reports, sizes, done) {
 
 // --- Scan scope and last seen ---
 
-// Whether each host is outside the subnet's scan scope: 'out', or null when the server
-// has not said. The UI never works scope out, and does no address arithmetic (IP maths
-// stays in the backend's `ipnet.py`): the scan target's `scope` ranges carry address
-// strings only, so they cannot be compared with a host here. What the server's answers
-// do settle is a subnet with no scan target, which scans nothing. `targetState` is
-// { loaded, target }; while the targets have not loaded, nothing is known.
+// Whether each host is outside the subnet's scan scope: 'out', or null when it is in
+// scope or the server has not said. The UI never works scope out and parses no
+// address (IP maths stays in the backend's `ipnet.py`): each range of the target's
+// `scope` (services/scans.scan_scope) carries its bounds as integers, `start_int` and
+// `end_int`, which are compared with the host's `ip_int` from the same server. A
+// subnet with no scan target scans nothing. `targetState` is { loaded, target }; while
+// the targets have not loaded, or the answer lacks the integers, nothing is known.
+const isIndex = (n) => Number.isSafeInteger(n) && n >= 0
+
 export function scopeChecker({ loaded, target }) {
-  if (loaded && !target) return () => 'out'
-  return () => null
+  if (!loaded) return () => null
+  if (!target) return () => 'out'
+  const ranges = Array.isArray(target.scope) ? target.scope : null
+  if (!ranges || !ranges.every((r) => isIndex(r?.start_int) && isIndex(r?.end_int))) {
+    return () => null
+  }
+  return (host) => {
+    if (host?.subnet_id !== target.subnet_id || !isIndex(host?.ip_int)) return null
+    const inside = ranges.some((r) => r.start_int <= host.ip_int && host.ip_int <= r.end_int)
+    return inside ? null : 'out'
+  }
 }
 
 const SOURCE_TEXT = { scan: 'seen by a scan', manual: 'set by hand' }

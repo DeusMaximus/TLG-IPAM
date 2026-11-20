@@ -12,9 +12,9 @@ import { useFetch } from '../hooks/useFetch'
 import { relativeTime } from '../utils/agents'
 import { parseServerTime } from '../utils/time'
 import {
+  agentLimit,
   formatDuration,
   hasDhcpPool,
-  macUnavailable,
   SCAN_METHODS,
   scopeRangeText,
   settingsBody,
@@ -46,8 +46,22 @@ function LastScan({ target }) {
       {target.last_scan_complete === false && (
         <span className="text-amber-400"> · incomplete</span>
       )}
+      {target.last_scan_error && (
+        // the agent's own text (sanitised at ingest): rendered as text, never as markup
+        <span className="mt-0.5 block break-words text-xs text-amber-400" data-testid="scan-error">
+          Agent reported: {target.last_scan_error}
+        </span>
+      )}
     </span>
   )
+}
+
+// What the server says the target's agent cannot do for it (`runnable_methods`), whether
+// or not a job is out. Nothing is said when the server does not know.
+const LIMIT_TEXT = {
+  unscannable:
+    'Cannot be scanned by this agent — no chosen liveness method can run from it (ARP needs the agent on this subnet). Add ICMP or assign another agent.',
+  'no-mac': 'MAC collection unavailable — agent is not on this subnet',
 }
 
 function Scope({ scope }) {
@@ -67,6 +81,7 @@ function Status({ target }) {
   const asked = parseServerTime(target.scan_requested_at)
   const last = parseServerTime(target.last_scan_at)
   const pending = asked && (!last || asked > last)
+  const limit = agentLimit(target)
   return (
     <dl className="mt-3 grid grid-cols-1 gap-x-6 gap-y-2 text-sm sm:grid-cols-2">
       <div>
@@ -97,9 +112,9 @@ function Status({ target }) {
           <Scope scope={target.scope} />
         </dd>
       </div>
-      {macUnavailable(target) && (
+      {limit && (
         <p className="text-xs text-amber-400 sm:col-span-2" role="status">
-          MAC collection unavailable — agent is not on this subnet
+          {LIMIT_TEXT[limit]}
         </p>
       )}
     </dl>

@@ -456,7 +456,8 @@ async def test_job_carries_scope_methods_dns_and_timeout(client, agent_api):
         {"start": "10.0.0.20", "end": "10.0.0.99"},
         {"start": "10.0.0.200", "end": "10.0.0.254"},
     ]
-    assert job["ranges"] == target["scope"]
+    # the target's answer carries the same ranges, and their integer bounds beside them
+    assert job["ranges"] == [{"start": r["start"], "end": r["end"]} for r in target["scope"]]
     assert job["methods"] == ["icmp", "arp", "rdns"]
     assert job["dns_servers"] == ["10.0.0.53", "10.0.0.54"]
     assert job["timeout_s"] == JOB_TIMEOUT_S

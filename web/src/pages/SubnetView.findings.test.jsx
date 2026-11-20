@@ -34,21 +34,47 @@ vi.mock('../components/DeviceIcon', () => ({ default: ({ type }) => <span>{type}
 
 const clone = (v) => JSON.parse(JSON.stringify(v))
 
-// The scope the server would report for 10.20.0.0/24 with the pool (.100–.200) not scanned
+// The scope the server would report for 10.20.0.0/24 with the pool (.100–.200) not
+// scanned, each range with its bounds as integers (services/scans.target_out). The
+// integers are written out here, as the server sends them: nothing in web/ parses an
+// address, these fixtures included.
 const SCOPE_WITHOUT_POOL = [
-  { start: '10.20.0.1', end: '10.20.0.99' },
-  { start: '10.20.0.201', end: '10.20.0.254' },
+  { start: '10.20.0.1', end: '10.20.0.99', start_int: 169082881, end_int: 169082979 },
+  { start: '10.20.0.201', end: '10.20.0.254', start_int: 169083081, end_int: 169083134 },
 ]
-const SCOPE_WITH_POOL = [{ start: '10.20.0.1', end: '10.20.0.254' }]
+const SCOPE_WITH_POOL = [
+  { start: '10.20.0.1', end: '10.20.0.254', start_int: 169082881, end_int: 169083134 },
+]
 
-const toInt = (ip) => ip.split('.').reduce((total, octet) => total * 256 + Number(octet), 0)
+// each fixture address's `ip_int`, as the server would send it
+const IP_INT = {
+  '10.20.0.1': 169082881,
+  '10.20.0.5': 169082885,
+  '10.20.0.6': 169082886,
+  '10.20.0.39': 169082919,
+  '10.20.0.40': 169082920,
+  '10.20.0.41': 169082921,
+  '10.20.0.45': 169082925,
+  '10.20.0.99': 169082979,
+  '10.20.0.100': 169082980,
+  '10.20.0.150': 169083030,
+  '10.20.0.151': 169083031,
+  '10.20.0.200': 169083080,
+  '10.20.0.201': 169083081,
+  '10.20.0.254': 169083134,
+}
+
+const ipInt = (ip) => {
+  if (!(ip in IP_INT)) throw new Error(`add ${ip} to IP_INT`)
+  return IP_INT[ip]
+}
 
 function host(id, ip, extra = {}) {
   return {
     id,
     subnet_id: 'sub-1',
     ip,
-    ip_int: toInt(ip),
+    ip_int: ipInt(ip),
     hostname: `host-${id}`,
     domain: null,
     fqdn: `host-${id}.home.arpa`,
@@ -71,7 +97,7 @@ function finding(type, ip, observed, extra = {}) {
     ip,
     type,
     observed,
-    ip_int: toInt(ip),
+    ip_int: ipInt(ip),
     host_id: null,
     dynamic: false,
     proposed: {},
@@ -589,7 +615,7 @@ describe('show dynamic', () => {
 })
 
 describe('last seen on host rows', () => {
-  it('reads dates as UTC with their source, and makes no scope claim the server has not made', async () => {
+  it('reads dates as UTC with their source, and "not scanned" outside the scope the server reports', async () => {
     const ago = new Date(Date.UTC(2026, 10, 15, 23, 30))
     seed({
       hosts: [
@@ -598,8 +624,7 @@ describe('last seen on host rows', () => {
           last_seen_source: 'scan',
         }),
         host('h2', '10.20.0.6'),
-        // in the pool, which is not scanned: the target's scope ranges are address
-        // strings, which the UI does not compare, so it says nothing either way
+        // in the pool, which is not scanned: outside every range of the target's scope
         host('h3', '10.20.0.150'),
         host('h4', '10.20.0.151', { last_seen: '2026-10-01T12:00:00', last_seen_source: 'manual' }),
       ],
@@ -612,10 +637,46 @@ describe('last seen on host rows', () => {
     const seen = within(hostRow('10.20.0.5')).getByText(ago.toLocaleDateString())
     expect(seen.closest('[role="cell"]')).toHaveAttribute('title', `${ago.toLocaleString()} (seen by a scan)`)
     expect(within(hostRow('10.20.0.6')).getAllByRole('cell').at(-1)).toHaveTextContent(/^—$/)
-    expect(within(hostRow('10.20.0.150')).getAllByRole('cell').at(-1)).toHaveTextContent(/^—$/)
-    expect(hostRow('10.20.0.151')).toHaveTextContent(
-      `${new Date(Date.UTC(2026, 9, 1, 12)).toLocaleDateString()} · manual`
+    await waitFor(() =>
+      expect(within(hostRow('10.20.0.150')).getAllByRole('cell').at(-1)).toHaveTextContent(/^not scanned$/)
     )
+    expect(hostRow('10.20.0.151')).toHaveTextContent(
+      `${new Date(Date.UTC(2026, 9, 1, 12)).toLocaleDateString()} · not scanned`
+    )
+    expect(within(hostRow('10.20.0.5')).queryByText(/not scanned/)).toBeNull()
+  })
+
+  it('a host in a range excluded from scanning reads "not scanned"; one beside it does not', async () => {
+    // the scope the server reports with 10.20.0.40–10.20.0.44 excluded (pool scanned)
+    const scope = [
+      { start: '10.20.0.1', end: '10.20.0.39', start_int: ipInt('10.20.0.1'), end_int: ipInt('10.20.0.39') },
+      { start: '10.20.0.45', end: '10.20.0.254', start_int: ipInt('10.20.0.45'), end_int: ipInt('10.20.0.254') },
+    ]
+    seed({
+      target: { scan_dhcp_pool: true, scope },
+      hosts: [host('h1', '10.20.0.41'), host('h2', '10.20.0.45'), host('h3', '10.20.0.150')],
+      findings: [],
+    })
+    renderView()
+    await screen.findByRole('table', { name: 'Hosts' })
+    await waitFor(() =>
+      expect(within(hostRow('10.20.0.41')).getAllByRole('cell').at(-1)).toHaveTextContent(/^not scanned$/)
+    )
+    expect(within(hostRow('10.20.0.45')).getAllByRole('cell').at(-1)).toHaveTextContent(/^—$/)
+    // the pool is scanned here, so a host in it is in scope
+    expect(within(hostRow('10.20.0.150')).getAllByRole('cell').at(-1)).toHaveTextContent(/^—$/)
+  })
+
+  it('claims nothing about a host when the scope ranges carry no integer bounds', async () => {
+    seed({
+      target: { scope: [{ start: '10.20.0.1', end: '10.20.0.99' }] },
+      hosts: [host('h1', '10.20.0.150')],
+      findings: [],
+    })
+    renderView()
+    await screen.findByRole('table', { name: 'Hosts' })
+    await screen.findByRole('region', { name: 'Findings' }) // the target has loaded
+    expect(within(hostRow('10.20.0.150')).getAllByRole('cell').at(-1)).toHaveTextContent(/^—$/)
     expect(screen.queryByText('not scanned')).toBeNull()
   })
 
