@@ -39,6 +39,7 @@ from sqlalchemy.orm.attributes import set_committed_value
 
 from ..agent_protocol import (
     CHECKIN_INTERVAL_S,
+    DNS_SERVERS_MAX,
     JOB_TIMEOUT_S,
     PROTOCOL_VERSION,
     CheckinRequest,
@@ -206,7 +207,9 @@ async def _next_job(session: AsyncSession, agent: Agent, now: datetime) -> Job |
             cidr=subnet.cidr,
             ranges=ranges,
             methods=methods,
-            dns_servers=list(subnet.dns_servers or []),
+            # what the agent asks, and no more: a subnet may list more, or hold a
+            # longer list stored before the owner API bounded it (spec §5.7)
+            dns_servers=list(subnet.dns_servers or [])[:DNS_SERVERS_MAX],
             timeout_s=JOB_TIMEOUT_S,
             fdns=[],
         )

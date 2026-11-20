@@ -14,16 +14,24 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from pydantic import ValidationError
 from sqlalchemy import event, select, update
 from sqlalchemy.exc import OperationalError
 
-from app.agent_protocol import CHECKIN_INTERVAL_S, JOB_TIMEOUT_S, PROTOCOL_VERSION
+from app.agent_protocol import (
+    CHECKIN_INTERVAL_S,
+    DNS_SERVERS_MAX,
+    JOB_TIMEOUT_S,
+    PROTOCOL_VERSION,
+    Job,
+)
 from app.auth import require_agent
 from app.config import settings
 from app.database import SessionLocal
 from app.errors import ApiError
 from app.main import app
-from app.models import Agent, Change, ScanTarget, Token
+from app.models import Agent, Change, ScanTarget, Subnet, Token
+from app.schemas import SUBNET_DNS_SERVERS_MAX
 from app.routers import agent as agent_router
 from app.services import agents as agents_svc
 from app.services import jobs, scans
@@ -471,6 +479,50 @@ async def test_subnet_without_dns_servers_sends_an_empty_list(client, agent_api)
     await set_target(target.id, current_job_id=None, job_issued_at=None)
     [job] = await jobs_for(agent_api, token)
     assert job["dns_servers"] == []
+
+
+async def test_a_job_carries_the_first_servers_the_agent_asks(client, agent_api):
+    """A subnet may list more servers than the agent asks per lookup; the job carries
+    the first DNS_SERVERS_MAX of them, in the order listed (#75)."""
+    agent, token = await make_agent(client)
+    servers = [f"10.0.0.{50 + i}" for i in range(SUBNET_DNS_SERVERS_MAX)]
+    subnet = await lab(client, dns_servers=servers)
+    await make_target(client, subnet["id"], agent["id"])
+    [job] = await jobs_for(agent_api, token)
+    assert DNS_SERVERS_MAX < SUBNET_DNS_SERVERS_MAX
+    assert job["dns_servers"] == servers[:DNS_SERVERS_MAX]
+
+
+async def test_a_list_stored_before_the_bound_is_cut_in_the_job_and_kept(client, agent_api):
+    """A subnet stored with a list longer than any bound (before #75) keeps it, and its
+    job still carries only what the agent asks."""
+    agent, token = await make_agent(client)
+    subnet = await lab(client)
+    servers = [f"10.0.{i // 250}.{i % 250 + 1}" for i in range(65_000)]
+    async with SessionLocal() as session:
+        await session.execute(
+            update(Subnet).where(Subnet.id == subnet["id"]).values(dns_servers=servers)
+        )
+        await session.commit()
+    await make_target(client, subnet["id"], agent["id"])
+    res = await checkin(agent_api, token)
+    assert res.status_code == 200, res.text
+    [job] = res.json()["data"]["jobs"]
+    assert job["dns_servers"] == servers[:DNS_SERVERS_MAX]
+    # the stored list is untouched
+    got = (await client.get(f"/api/v1/subnets/{subnet['id']}")).json()["data"]
+    assert got["dns_servers"] == servers
+
+
+def test_the_job_model_refuses_more_servers_than_the_agent_asks():
+    job = {
+        "job_id": "j", "subnet_id": "s", "cidr": "10.0.0.0/24",
+        "ranges": [{"start": "10.0.0.1", "end": "10.0.0.254"}], "methods": ["icmp"],
+        "timeout_s": JOB_TIMEOUT_S, "fdns": [],
+    }
+    Job.model_validate({**job, "dns_servers": ["10.0.0.53"] * DNS_SERVERS_MAX})
+    with pytest.raises(ValidationError):
+        Job.model_validate({**job, "dns_servers": ["10.0.0.53"] * (DNS_SERVERS_MAX + 1)})
 
 
 async def test_target_is_due_on_its_interval(client, agent_api):

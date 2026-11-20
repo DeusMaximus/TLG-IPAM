@@ -1,3 +1,9 @@
+from sqlalchemy import update
+
+from app.database import SessionLocal
+from app.models import Subnet
+from app.schemas import SUBNET_DNS_SERVERS_MAX
+
 from .conftest import make_host, make_section, make_subnet
 
 
@@ -144,3 +150,89 @@ async def test_delete_refused_with_hosts(client):
     await make_host(client, subnet["id"], "10.0.0.5")
     res = await client.delete(f"/api/v1/subnets/{subnet['id']}")
     assert res.status_code == 409
+
+
+# --- DNS servers (#75) ---
+
+
+def _servers(count: int, third: int = 0) -> list[str]:
+    return [f"10.0.{third}.{i + 1}" for i in range(count)]
+
+
+async def _store_dns_servers(subnet_id: str, servers: list[str]) -> None:
+    """A list written before the owner API bounded it, straight to the database."""
+    async with SessionLocal() as session:
+        await session.execute(update(Subnet).where(Subnet.id == subnet_id).values(dns_servers=servers))
+        await session.commit()
+
+
+async def test_dns_servers_over_the_bound_are_refused_naming_the_limit(client):
+    section = await make_section(client)
+    base = {"section_id": section["id"], "cidr": "10.0.0.0/24", "name": "x"}
+    res = await client.post(
+        "/api/v1/subnets", json={**base, "dns_servers": _servers(SUBNET_DNS_SERVERS_MAX + 1)}
+    )
+    assert res.status_code == 422, res.text
+    error = res.json()["error"]
+    assert error["code"] == "VALIDATION_ERROR"
+    assert f"at most {SUBNET_DNS_SERVERS_MAX} DNS servers" in error["message"]
+    # nothing was created
+    assert (await client.get("/api/v1/subnets")).json()["data"] == []
+    sub = await make_subnet(
+        client, section["id"], "10.0.0.0/24", dns_servers=_servers(SUBNET_DNS_SERVERS_MAX)
+    )
+    assert sub["dns_servers"] == _servers(SUBNET_DNS_SERVERS_MAX)
+    res = await client.put(
+        f"/api/v1/subnets/{sub['id']}",
+        json={"dns_servers": _servers(SUBNET_DNS_SERVERS_MAX + 1)},
+    )
+    assert res.status_code == 422, res.text
+    assert f"at most {SUBNET_DNS_SERVERS_MAX} DNS servers" in res.json()["error"]["message"]
+    got = (await client.get(f"/api/v1/subnets/{sub['id']}")).json()["data"]
+    assert got["dns_servers"] == _servers(SUBNET_DNS_SERVERS_MAX)
+
+
+async def test_each_dns_server_is_still_checked_as_an_address(client):
+    section = await make_section(client)
+    res = await client.post(
+        "/api/v1/subnets",
+        json={"section_id": section["id"], "cidr": "10.0.0.0/24", "name": "x", "dns_servers": ["dns.home.arpa"]},
+    )
+    assert res.status_code == 422
+
+
+async def test_a_list_stored_before_the_bound_survives_an_unrelated_edit(client):
+    """A subnet stored with a longer list keeps it: an update that leaves dns_servers
+    out, or resends it unchanged (as the UI's form does), is applied and keeps the list;
+    an update that changes the list must meet the bound."""
+    section = await make_section(client)
+    sub = await make_subnet(client, section["id"], "10.0.0.0/24")
+    legacy = _servers(SUBNET_DNS_SERVERS_MAX + 4)
+    await _store_dns_servers(sub["id"], legacy)
+
+    res = await client.put(f"/api/v1/subnets/{sub['id']}", json={"name": "renamed"})
+    assert res.status_code == 200, res.text
+    assert res.json()["data"]["dns_servers"] == legacy
+
+    res = await client.put(
+        f"/api/v1/subnets/{sub['id']}", json={"notes": "edited in the UI", "dns_servers": legacy}
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["data"]["notes"] == "edited in the UI"
+    assert res.json()["data"]["dns_servers"] == legacy
+
+    # a change that is still over the bound, longer or shorter, is refused whole
+    for changed in (legacy + ["10.0.1.1"], legacy[:-1], list(reversed(legacy))):
+        res = await client.put(
+            f"/api/v1/subnets/{sub['id']}", json={"name": "again", "dns_servers": changed}
+        )
+        assert res.status_code == 422, res.text
+        assert f"at most {SUBNET_DNS_SERVERS_MAX} DNS servers" in res.json()["error"]["message"]
+    got = (await client.get(f"/api/v1/subnets/{sub['id']}")).json()["data"]
+    assert (got["name"], got["dns_servers"]) == ("renamed", legacy)
+
+    # within the bound, or cleared, it is an ordinary edit
+    res = await client.put(f"/api/v1/subnets/{sub['id']}", json={"dns_servers": legacy[:2]})
+    assert res.status_code == 200 and res.json()["data"]["dns_servers"] == legacy[:2]
+    res = await client.put(f"/api/v1/subnets/{sub['id']}", json={"dns_servers": None})
+    assert res.status_code == 200 and res.json()["data"]["dns_servers"] is None

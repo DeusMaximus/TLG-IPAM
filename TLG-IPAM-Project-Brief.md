@@ -90,7 +90,7 @@ A CIDR block, always belonging to one Section.
 | `name` | str — friendly label |
 | `domain` | str, nullable — default domain suffix for hosts in this subnet (e.g. `lab.home.arpa`) |
 | `gateway` | str, nullable — IP within subnet |
-| `dns_servers` | JSON array of IP strings, nullable |
+| `dns_servers` | JSON array of IP strings, nullable. At most 8 on write (`schemas.SUBNET_DNS_SERVERS_MAX`): a longer list is `422` "dns_servers: a subnet may list at most 8 DNS servers, not N". A subnet stored with a longer list before that bound keeps it: an update that leaves `dns_servers` out, or resends the stored list unchanged (as the UI's edit form does), is applied and keeps it; an update that changes it must meet the bound. A scan job carries the first three (§4.5) |
 | `dhcp_start` / `dhcp_end` | str, nullable — inclusive bounds of the DHCP pool. Both within the subnet; allocation skips this range. |
 | `notes` | text, nullable |
 
@@ -395,7 +395,9 @@ Gateway, DHCP, reserved-range, and allocated-address exclusions are represented 
 
 An accepted result set clears both copies of the lease (§4.6). Expiry clears neither: the next job issued overwrites them, so a late result for an expired lease is still accepted until then.
 
-**The job.** `ranges` is the subnet's scan scope from `services/scans.scan_scope` (§3.10); a target whose scope is empty gets no job. `methods` are the target's, minus `arp` when the subnet is not on the agent's link, and minus `fdns` until the forward-DNS check exists (#20), so `fdns` is always empty. The subnet is on the agent's link when one reported IPv4 interface's network contains the whole subnet. A target left with neither `icmp` nor `arp` gets no job, and is not leased. `dns_servers` are the subnet's, or empty. `timeout_s` is 600.
+**The job.** `ranges` is the subnet's scan scope from `services/scans.scan_scope` (§3.10); a target whose scope is empty gets no job. `methods` are the target's, minus `arp` when the subnet is not on the agent's link, and minus `fdns` until the forward-DNS check exists (#20), so `fdns` is always empty. The subnet is on the agent's link when one reported IPv4 interface's network contains the whole subnet. A target left with neither `icmp` nor `arp` gets no job, and is not leased. `dns_servers` are the first three of the subnet's, in the order listed, or empty: three is `agent_protocol.DNS_SERVERS_MAX`, the most the agent asks per lookup, so a subnet that lists more, or holds a longer list stored before the owner API bounded it (§3.2), costs the answer nothing. `timeout_s` is 600.
+
+**The answer fits the agent.** The agent reads at most 1 MiB of an answer and retries a larger one, so a job that made the answer larger would never run. The largest the server can build is a /20 target (the largest allowed) whose scope is split at every other address, issued `icmp`, `arp` and `rdns`, with three servers: 104,978 bytes, and 106,762 with every address in it written at its longest (`agent/tests/test_answer_limit.py`, which fails if either side's bounds move it past the limit). Before the job's servers were bounded, the same subnet holding 65,000 of them sent 1,153,843 bytes.
 
 ### 4.6 Scan results
 
@@ -730,6 +732,7 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 - Scan targets are refused for prefixes shorter than `/20` and for method sets without `icmp` or `arp`. Deleting a subnet deletes its scan target; deleting an agent unassigns its targets. Every scan-target and scan-exclusion change is in the change log.
 - A scan target is issued to its agent at check-in when its interval has passed or a scan was requested, and is not issued again while its lease is live; an expired lease makes it due again. A job's ranges are the scan scope, and `arp` is dropped for a subnet that is not on the agent's link; a target with no liveness method left gets no job.
 - A check-in on another protocol gets no jobs and a `409 PROTOCOL_MISMATCH`, recorded in the agent's `last_error`. Agent-reported fields are length-capped and printable-only; a check-in that breaks either is refused and recorded the same way.
+- A subnet's `dns_servers` over 8 entries is refused on write, naming the limit, and a longer list stored before the bound survives an unrelated edit. A job carries at most three servers, whatever the subnet stores, and the largest check-in answer the server can build is inside the agent's 1 MiB answer limit.
 - A second scan request for a subnet within 15 minutes is refused, whoever asks.
 - An agent checks in at most once every 10 seconds, and keeps at most 100 audit entries of its own; text it reports about itself never reaches an assistant through `list_changes`. A target whose jobs keep timing out does not starve the agent's other due targets.
 - Scan results: an out-of-scope address, a wrong job id and a second result set are each rejected without affecting valid records; an incomplete job adds what it saw, marks nothing dead and clears no stored name; a hostile `rdns_name` (spaces, markup, instructions) is dropped; deleting a subnet with observations succeeds. Ingest writes no host and no change-log entry, and observations that leave scan scope are deleted with the change that narrows it.

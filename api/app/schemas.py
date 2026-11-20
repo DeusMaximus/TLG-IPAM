@@ -87,6 +87,14 @@ class SectionOut(BaseModel):
 
 # --- Subnets ---
 
+# The most DNS servers the owner API takes for a subnet (`services/subnets` checks it,
+# since an update that resends a longer list stored before this bound is let through
+# unchanged). The field documents what the subnet hands out, which may be more than
+# the three a resolver uses (glibc's MAXNS, and the agent's `MAX_DNS_SERVERS`): a
+# dual-stack subnet with four resolvers per family. A scan job carries only the first
+# `agent_protocol.DNS_SERVERS_MAX` of them.
+SUBNET_DNS_SERVERS_MAX = 8
+
 
 class _SubnetFields(BaseModel):
     vlan_id: int | None = Field(default=None, ge=1, le=4094)
