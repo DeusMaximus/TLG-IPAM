@@ -207,8 +207,8 @@ class ArpSession:
 MAX_DNS_SERVERS = 3
 # where the host's own resolvers are read, when a job names no DNS server
 RESOLV_CONF = "/etc/resolv.conf"
-# how long a job waits for that read, and the most of the file it parses: a read
-# that has not finished by then, or a larger file, gives no server
+# how long a job waits for that read, and the largest file it parses: a read that
+# has not finished by then, or a file larger when it is looked at, gives no server
 RESOLV_CONF_TIMEOUT_S = 1.0
 RESOLV_CONF_MAX = 64 * 1024
 # the error of a job whose PTR lookups had no server to ask (spec §5.2): fixed text
@@ -234,54 +234,32 @@ def usable_servers(chosen: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(usable[:MAX_DNS_SERVERS])
 
 
-def _text_lines(text: str) -> list[str]:
-    """`text` cut into lines as a file opened in text mode is: at `\n`, `\r\n` and a lone
-    `\r`, and nowhere else (`str.splitlines` also cuts at `\x85`, `\u2028`, form feed
-    and others, which a text file does not)."""
-    return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-
-
 def read_resolv_conf(path: str) -> tuple[str, ...]:
     """The `nameserver` entries of the resolv.conf at `path`, as dnspython parses the
     file; empty when there is none. It blocks: `DnsResolver` calls it in its thread.
 
-    Only a regular file is read. It is opened without waiting for a writer
-    (`O_NONBLOCK`), so a FIFO is refused at once by the regular-file check rather than
-    waited on, and so is a device; that check, like every step here, runs in the
-    read's thread, where the time bound covers an open, `fstat` or read that blocks
-    anyway (a stalled network mount: `O_NONBLOCK` does not make those wait less). At
-    most RESOLV_CONF_MAX bytes are parsed; one byte more is read to tell a larger file,
-    which gives none rather than a list cut short in the middle of an address.
-    dnspython parses the lines (`_text_lines`) as it parses a file it opens itself, so
-    it refuses a file that is not UTF-8, one with no nameserver, and one with a
-    nameserver that is neither an address nor an https URL: each gives none. Nothing
-    is sent."""
+    The path is looked at first (`os.stat`, following a link as an open would), and
+    only a regular file of at most RESOLV_CONF_MAX bytes is handed to dnspython, which
+    opens it to read and parses it: a FIFO is refused without being opened, so its
+    read never waits for a writer, and so are a device, a directory and a larger file.
+    That is a look before the open, not a bound on it: a file that grows between the
+    two is parsed whole, and a path swapped for a FIFO in that moment blocks the read
+    until a writer comes. Both need control of the host, which already decides what
+    the path holds, and the thread and its time bound hold the job and the event loop
+    to a second as they do for a stalled network mount (`DnsResolver._host_servers`).
+    dnspython refuses a file it cannot open, one that is not UTF-8, one with no
+    nameserver, and one with a nameserver that is neither an address nor an https URL:
+    each gives none. Nothing is sent."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
-    except OSError:
+        status = os.stat(path)
+    except (OSError, ValueError):
         return ()
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return ()
-        data = b""
-        while len(data) <= RESOLV_CONF_MAX:
-            chunk = os.read(fd, RESOLV_CONF_MAX + 1 - len(data))
-            if not chunk:
-                break
-            data += chunk
-    except OSError:
-        return ()
-    finally:
-        os.close(fd)
-    if len(data) > RESOLV_CONF_MAX:
+    if not stat.S_ISREG(status.st_mode) or status.st_size > RESOLV_CONF_MAX:
         return ()
     resolver = dns.resolver.Resolver(configure=False)
     try:
-        # dnspython iterates what it is given; a list of lines is not a type its
-        # signature names, so test_the_file_is_parsed_as_dnspython_parses_it compares
-        # the result with dnspython opening the same file itself
-        resolver.read_resolv_conf(_text_lines(data.decode("utf-8")))
-    except (dns.exception.DNSException, ValueError):
+        resolver.read_resolv_conf(path)
+    except (dns.exception.DNSException, OSError, ValueError):
         return ()
     return tuple(s for s in resolver.nameservers if isinstance(s, str))
 
@@ -325,7 +303,8 @@ class DnsResolver:
 
     async def _host_servers(self) -> tuple[str, ...]:
         """resolv.conf's servers (`read_resolv_conf`), read off the event loop, in a
-        daemon thread of its own: a read that blocks (a stalled network mount) holds
+        daemon thread of its own: a read that blocks (a stalled network mount, or a FIFO
+        put at the path after `read_resolv_conf` looked at it) holds
         neither the loop (check-ins, the job's deadline, the scan's backstop) nor the
         agent's exit. The job waits for it at most `read_timeout`, and a read that has
         not finished by then gives no server. While a read is still running no other

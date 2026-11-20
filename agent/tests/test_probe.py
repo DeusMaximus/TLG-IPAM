@@ -870,6 +870,7 @@ def test_a_fifo_or_a_device_is_not_read_and_not_waited_on(tmp_path):
     # another reader keeps the data): it could be read like a file, and is not
     full = tmp_path / "full"
     os.mkfifo(full)
+    unblock_later(full)
     reader = os.open(full, os.O_RDONLY | os.O_NONBLOCK)
     try:
         writer = os.open(full, os.O_WRONLY | os.O_NONBLOCK)
@@ -910,12 +911,24 @@ def test_at_most_resolv_conf_max_bytes_are_taken(tmp_path):
         # a byte-order mark spoils the first line's keyword
         ("\ufeffnameserver 127.0.0.1\nnameserver 127.0.0.2\n".encode(), ("127.0.0.2",)),
         (b"nameserver 127.0.0.1\x00\nnameserver 127.0.0.2\n", ()),  # dnspython refuses the NUL
+        # the rest of the sixteen round 2 of #103 compared
+        (b"nameserver 127.0.0.1\nnameserver ::1\r\nnameserver 127.0.0.2\rnameserver 127.0.0.3",
+         ("127.0.0.1", "::1", "127.0.0.2", "127.0.0.3")),  # mixed line ends, the last unterminated
+        (b"nameserver 127.0.0.1", ("127.0.0.1",)),
+        (b"", ()),
+        (b"nameserver 127.0.0.1 trailing text\n", ("127.0.0.1",)),
+        # four: the file's parse keeps them all, `usable_servers` takes three
+        (b"nameserver 127.0.0.1\nnameserver 127.0.0.2\nnameserver 127.0.0.3\nnameserver 127.0.0.4\n",
+         ("127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4")),
+        (b"nameserver fe80::1%lo0\n", ("fe80::1%lo0",)),
+        (b"nameserver https://dns.example.com/dns-query\nnameserver 127.0.0.1\n",
+         ("https://dns.example.com/dns-query", "127.0.0.1")),
     ],
 )
 def test_the_file_is_parsed_as_dnspython_parses_it(tmp_path, content, expected):
-    """`read_resolv_conf` hands dnspython a list of lines, which its signature does not
-    name: each case is also parsed by dnspython opening the file itself, and the two
-    must agree."""
+    """dnspython opens and parses the file (#104; #99 had read it and handed dnspython
+    its lines): each case's answer is the one dnspython gives for the same file when
+    it is made with `filename=`, as the agent made it before #99."""
     path = tmp_path / "resolv.conf"
     path.write_bytes(content)
     assert read_resolv_conf(str(path)) == expected
@@ -934,6 +947,96 @@ def test_a_symlinked_resolv_conf_is_followed(tmp_path):
     link = tmp_path / "resolv.conf"
     link.symlink_to(target)
     assert read_resolv_conf(str(link)) == ("127.0.0.53",)
+
+
+def resolv_conf_threads() -> list[threading.Thread]:
+    return [t for t in threading.enumerate() if t.name == "resolv.conf"]
+
+
+async def no_read_thread_left() -> bool:
+    for _ in range(100):
+        if not resolv_conf_threads():
+            return True
+        await asyncio.sleep(0.01)
+    return False
+
+
+@pytest.mark.parametrize("kind", ["fifo", "device", "directory", "oversized"])
+async def test_what_is_not_an_ordinary_file_gives_no_server_and_leaves_no_thread(tmp_path, kind):
+    """Acceptance for #104: a FIFO, a device (a link to /dev/null), a directory or a file
+    over RESOLV_CONF_MAX at the resolver path gives no server at once, well inside the
+    read's time bound, while a timer beside it keeps firing. No read thread is left
+    behind, and once the path holds an ordinary file again the next job reads it."""
+    path = tmp_path / "resolv.conf"
+    if kind == "fifo":
+        os.mkfifo(path)
+        unblock_later(path)  # frees a read that opened it and waited, so a failure cannot hang
+    elif kind == "device":
+        path.symlink_to(os.devnull)
+    elif kind == "directory":
+        path.mkdir()
+    else:
+        path.write_bytes(b"nameserver 127.0.0.1\n" + b"#" * RESOLV_CONF_MAX)
+    resolver = DnsResolver(resolv_conf=str(path))
+    ticks, timer = ticker()
+    try:
+        started = time.monotonic()
+        assert await resolver.servers(()) == ()
+        assert time.monotonic() - started < RESOLV_CONF_TIMEOUT_S / 2
+        await asyncio.sleep(0.05)
+        assert longest_gap(ticks, time.monotonic()) < 0.2, ticks
+        assert await no_read_thread_left()
+        if kind == "directory":
+            path.rmdir()
+        else:
+            path.unlink()
+        path.write_text("nameserver 127.0.0.1\n")
+        assert await resolver.servers(()) == ("127.0.0.1",)
+        assert await no_read_thread_left()
+    finally:
+        timer.cancel()
+
+
+async def test_a_fifo_put_at_the_path_after_the_look_holds_one_thread_until_a_writer_comes(monkeypatch, tmp_path):
+    """What #104 gives up, held to its bound: the path is looked at (`os.stat`) before
+    dnspython opens it, so a FIFO swapped in between those two blocks the open until a
+    writer comes. The swap is stood in for by a `stat` that calls the FIFO a regular
+    file. The job waits `read_timeout` and finds no server, the loop runs on, the next
+    job starts no second read; once a writer comes the thread ends, and the next job
+    reads the file then at the path."""
+
+    class LooksRegular:  # what `os.stat` saw before the swap
+        @staticmethod
+        def S_ISREG(mode):
+            return True
+
+    fifo = tmp_path / "resolv.conf"
+    os.mkfifo(fifo)
+    monkeypatch.setattr(probe, "stat", LooksRegular)
+    resolver = DnsResolver(resolv_conf=str(fifo), read_timeout=0.3)
+    ticks, timer = ticker()
+    freed = False
+    try:
+        started = time.monotonic()
+        assert await resolver.servers(()) == ()
+        assert 0.25 <= time.monotonic() - started < 1.0
+        assert longest_gap(ticks, time.monotonic()) < 0.2, ticks
+        assert len(resolv_conf_threads()) == 1  # blocked in dnspython's open
+        started = time.monotonic()
+        assert await resolver.servers(()) == ()  # no second read while it is blocked
+        assert time.monotonic() - started < 0.1
+        assert len(resolv_conf_threads()) == 1
+        monkeypatch.undo()
+        unblock_later(fifo, after=0)
+        freed = True
+        assert await no_read_thread_left()
+        fifo.unlink()
+        fifo.write_text("nameserver 127.0.0.1\n")
+        assert await resolver.servers(()) == ("127.0.0.1",)
+    finally:
+        if not freed:
+            unblock_later(fifo, after=0)
+        timer.cancel()
 
 
 async def test_choosing_the_servers_ends_at_the_jobs_deadline(monkeypatch, tmp_path):
