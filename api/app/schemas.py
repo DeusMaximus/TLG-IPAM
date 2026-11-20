@@ -1,10 +1,23 @@
-from datetime import datetime, timezone
-from typing import Any, Literal
+from datetime import datetime
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, field_validator
 
 from .agent_protocol import ScanRange
 from .ipnet import normalise_domain, normalise_mac, parse_ip
+from .times import utc
+
+# Every datetime field of a response model (`*Out`). SQLite reads a stored datetime
+# back without its zone, so a model serialises what it is given: a row still in memory
+# with `+00:00`, the same row read back without. This gives every datetime in a REST or
+# MCP response one form, ISO 8601 in UTC with `+00:00`, either way (brief §4.3): the
+# same string from `model_dump()` and `model_dump(mode="json")` (whose own form for UTC
+# is `Z`). Applied when the model is dumped, so a value set with
+# `model_copy(update=...)` is covered too. Request models keep plain `datetime`:
+# services pass their `model_dump()` to the ORM.
+UtcDatetime = Annotated[
+    datetime, PlainSerializer(lambda value: utc(value).isoformat(), return_type=str)
+]
 
 HostStatus = Literal["active", "reserved", "dhcp", "offline"]
 HostClearField = Literal["hostname", "domain", "mac", "owner", "notes", "last_seen"]
@@ -204,7 +217,7 @@ class _HostFields(BaseModel):
     def _last_seen_utc(cls, v):
         # SQLite keeps the wall-clock time and drops the zone, so a value sent with an
         # offset is converted to UTC first; a value without one is taken as UTC
-        return v.astimezone(timezone.utc) if v is not None and v.tzinfo else v
+        return utc(v)
 
     @field_validator("domain")
     @classmethod
@@ -250,11 +263,11 @@ class HostOut(BaseModel):
     owner: str | None
     notes: str | None
     # the later of the stored value (set by hand) and the address's observation
-    last_seen: datetime | None
+    last_seen: UtcDatetime | None
     # which of the two `last_seen` is: "manual", "scan", or null when neither is set
     last_seen_source: LastSeenSource | None = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: UtcDatetime
+    updated_at: UtcDatetime
 
 
 class AllocateRequest(_HostFields):
@@ -286,7 +299,7 @@ class ChangeOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: str
-    ts: datetime
+    ts: UtcDatetime
     entity_type: str
     entity_id: str
     action: str
@@ -345,11 +358,11 @@ class TokenOut(BaseModel):
     id: str
     kind: str
     token_prefix: str
-    created_at: datetime
-    last_used_at: datetime | None
-    expires_at: datetime | None
-    used_at: datetime | None
-    revoked_at: datetime | None
+    created_at: UtcDatetime
+    last_used_at: UtcDatetime | None
+    expires_at: UtcDatetime | None
+    used_at: UtcDatetime | None
+    revoked_at: UtcDatetime | None
 
 
 class AgentOut(BaseModel):
@@ -362,12 +375,12 @@ class AgentOut(BaseModel):
     platform: str | None
     hostname: str | None
     interfaces: list | None
-    last_checkin_at: datetime | None
+    last_checkin_at: UtcDatetime | None
     last_error: str | None
     # the agent's own record of its last job; it is busy while that is live
     current_job_id: str | None
-    job_issued_at: datetime | None
-    created_at: datetime
+    job_issued_at: UtcDatetime | None
+    created_at: UtcDatetime
     tokens: list[TokenOut]
 
 
@@ -425,12 +438,12 @@ class ScanTargetOut(BaseModel):
     methods: list[str]
     scan_dhcp_pool: bool
     interval_minutes: int | None
-    scan_requested_at: datetime | None
+    scan_requested_at: UtcDatetime | None
     current_job_id: str | None
-    job_issued_at: datetime | None
+    job_issued_at: UtcDatetime | None
     job_methods: list[str] | None
-    created_at: datetime
-    last_scan_at: datetime | None
+    created_at: UtcDatetime
+    last_scan_at: UtcDatetime | None
     last_scan_duration_ms: int | None
     last_scan_complete: bool | None
     # the error the agent reported with its last result set, sanitised at ingest
