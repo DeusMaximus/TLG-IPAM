@@ -10,19 +10,27 @@ body before parsing it.
 
 import ipaddress
 import json
+import secrets
+import socket
+import sys
+import time
+from dataclasses import dataclass
 
 import pytest
 from starlette.requests import Request
 
 from app.auth import OwnerKeyVerifier, require_agent, require_api_key
-from app.body_limit import BODY_MAX, BodyLimitMiddleware
+from app.body_limit import BODY_MAX, BodyLimitMiddleware, _declared_over, _length_digits
 from app.main import app
 
 from .conftest import make_section, make_subnet
 from .test_auth import INITIALIZE, INITIALIZED, MCP_ACCEPT, OWNER_BEARER, running_app
 from .test_checkin import agent_api, make_agent  # noqa: F401 (agent_api is a fixture)
+from .test_startup import START_DEADLINE, _read_stderr, _stop, _uvicorn, _wait_until_serving
 
 CHUNK = 64 * 1024
+# More leading zeroes than `int()` converts (Python's 4,300-digit guard, which stays on)
+ZEROES = b"0" * 4500
 REFUSAL = {
     "error": {
         "code": "PAYLOAD_TOO_LARGE",
@@ -202,7 +210,15 @@ async def test_any_transfer_encoding_means_the_body_is_counted(name):
         await send({"type": "http.response.start", "status": 204, "headers": []})
         await send({"type": "http.response.body", "body": b""})
 
-    for declared, body, status in [(b"2", b"x" * 11, 413), (b"999", b"x" * 10, 204)]:
+    cases = [
+        (b"2", b"x" * 11, 413),
+        (b"999", b"x" * 10, 204),
+        # spelt as httptools passes a length on (#89): still counted, never trusted
+        (ZEROES + b"2", b"x" * 11, 413),
+        (b"2\t", b"x" * 11, 413),
+        (ZEROES + b"999 ", b"x" * 10, 204),
+    ]
+    for declared, body, status in cases:
         answer = Answer()
 
         async def receive(body=body):
@@ -378,8 +394,17 @@ async def test_a_declared_length_at_the_cap_is_not_read_by_the_middleware():
 
 @pytest.mark.parametrize(
     "lengths",
-    [[b"12abc"], [b"-1"], [b"\xb2"], [b"10", b"x"]],
-    ids=["not a number", "negative", "a non-ASCII digit", "one of two not a number"],
+    [[b"12abc"], [b"-1"], [b"\xb2"], [b"10", b"x"], [b""], [b" \t"], [b"1 2"], [b"5\x0b"]],
+    ids=[
+        "not a number",
+        "negative",
+        "a non-ASCII digit",
+        "one of two not a number",
+        "empty",
+        "only whitespace",
+        "whitespace inside",
+        "a vertical tab, not optional whitespace",
+    ],
 )
 async def test_an_unusable_content_length_is_counted_as_if_absent(lengths):
     """No server should deliver such a request, uvicorn does not: if one did, the body
@@ -409,6 +434,102 @@ async def test_an_unusable_content_length_is_counted_as_if_absent(lengths):
     }
     await target(scope, receive, send)
     assert (answer.status, answer.reads, called) == (413, 2, [])
+
+
+# --- A declared length as the HTTP server passes it on (#89) ---
+
+
+def test_the_padded_lengths_here_are_past_the_integer_conversion_guard():
+    """So the cases below would raise in `int()`, as `main` did before #89."""
+    assert 0 < sys.get_int_max_str_digits() < len(ZEROES)
+    with pytest.raises(ValueError):
+        int(ZEROES + b"2")
+
+
+@pytest.mark.parametrize(
+    "value,digits",
+    [
+        pytest.param(b"2097153", b"2097153", id="plain"),
+        pytest.param(ZEROES + b"2097153", b"2097153", id="zero-padded"),
+        pytest.param(ZEROES + b"2", b"2", id="zero-padded, small"),
+        pytest.param(ZEROES, b"0", id="only zeroes"),
+        pytest.param(b"0", b"0", id="zero"),
+        pytest.param(b"2097153 ", b"2097153", id="trailing space"),
+        pytest.param(b"2097153\t", b"2097153", id="trailing tab"),
+        pytest.param(b"  2097153", b"2097153", id="leading spaces"),
+        pytest.param(b" \t2097153\t ", b"2097153", id="space and tab at both ends"),
+        pytest.param(b"\t" + ZEROES + b"5 ", b"5", id="zero-padded inside whitespace"),
+        pytest.param(b"", None, id="empty"),
+        pytest.param(b" \t ", None, id="only whitespace"),
+        pytest.param(b"1 2", None, id="whitespace inside"),
+        pytest.param(b"+5", None, id="signed"),
+        pytest.param(b"-1", None, id="negative"),
+        pytest.param(b"0x10", None, id="hexadecimal"),
+        pytest.param(b"\xb2", None, id="a non-ASCII digit"),
+        pytest.param(b"5\r", None, id="a carriage return"),
+        pytest.param(b"\x0b5", None, id="a vertical tab"),
+        pytest.param(b"5\x0c", None, id="a form feed"),
+    ],
+)
+def test_a_length_is_read_as_its_significant_digits(value, digits):
+    assert _length_digits(value) == digits
+
+
+@pytest.mark.parametrize(
+    "value,over",
+    [
+        pytest.param(ZEROES + b"2097153", True, id="zero-padded, one over"),
+        pytest.param(ZEROES + b"2097152", False, id="zero-padded, at the cap"),
+        pytest.param(ZEROES + b"2", False, id="zero-padded, small"),
+        pytest.param(ZEROES, False, id="only zeroes"),
+        pytest.param(b"2097153 ", True, id="trailing space, one over"),
+        pytest.param(b"2097153\t", True, id="trailing tab, one over"),
+        pytest.param(b"2097152\t", False, id="trailing tab, at the cap"),
+        pytest.param(b"10000000", True, id="one digit more than the cap"),
+        pytest.param(b"9" * 5000, True, id="5,000 digits"),
+        pytest.param(ZEROES + b"9" * 5000, True, id="zero-padded, 5,000 digits"),
+    ],
+)
+def test_a_declared_length_is_compared_with_the_cap_unconverted(value, over):
+    assert _declared_over({"headers": [(b"content-length", value)]}, BODY_MAX) is over
+
+
+@pytest.mark.parametrize("value", [ZEROES + b"2", b"2 ", ZEROES + b"2097153\t"])
+def test_a_transfer_encoding_beside_a_padded_length_means_the_body_is_counted(value):
+    headers = [(b"content-length", value), (b"transfer-encoding", b"chunked")]
+    assert _declared_over({"headers": headers}, BODY_MAX) is None
+
+
+def test_repeated_padded_lengths_count_by_the_largest():
+    headers = [(b"content-length", ZEROES + b"5"), (b"content-length", b"11\t")]
+    assert _declared_over({"headers": headers}, 10) is True
+    assert _declared_over({"headers": headers}, 11) is False
+
+
+PADDED_OVER = [ZEROES + b"11", b"11 ", b"11\t", b" \t11\t "]
+PADDED_WITHIN = [ZEROES + b"10", b"10 ", b"\t10", ZEROES]
+
+
+@pytest.mark.parametrize("declared", PADDED_OVER)
+async def test_a_padded_length_over_the_cap_is_refused_unread(declared):
+    async def inner(scope, receive, send):
+        raise AssertionError("not reached")
+
+    res = await asgi_post(BodyLimitMiddleware(inner, cap=10), "/", {"content-length": declared}, [b"x" * 11])
+    assert (res.status, res.reads, res.json()) == (413, 0, REFUSAL)
+
+
+@pytest.mark.parametrize("declared", PADDED_WITHIN)
+async def test_a_padded_length_within_the_cap_is_left_to_the_app(declared):
+    seen = []
+
+    async def inner(scope, receive, send):
+        seen.append("called")
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    res = await asgi_post(BodyLimitMiddleware(inner, cap=10), "/", {"content-length": declared}, [b"x" * 10])
+    assert (res.status, res.reads, seen) == (204, 0, ["called"])
 
 
 async def test_the_largest_of_repeated_lengths_counts():
@@ -496,3 +617,144 @@ def test_the_cap_wraps_the_whole_app():
     """Outermost of the app's own middleware, so it runs before the `/mcp` rewrite,
     routing and every dependency."""
     assert app.user_middleware[0].cls is BodyLimitMiddleware
+
+
+# --- On a real uvicorn (#89) ---
+#
+# The tests above give the middleware header bytes directly. These send raw bytes to a
+# uvicorn started the way the image starts it, once with each of its HTTP parsers,
+# because which spellings of `Content-Length` reach the app is the parser's decision.
+# The image runs httptools: `uvicorn[standard]` installs it, and uvicorn's default
+# `--http auto` picks it over h11. httptools hands on a length with leading zeroes or
+# trailing whitespace as it came; h11 strips the whitespace and refuses the zeroes
+# with `400` before the app runs.
+
+
+@dataclass
+class Served:
+    parser: str
+    port: int
+    key: str
+
+
+@pytest.fixture(scope="module", params=["httptools", "h11"])
+def served(request, tmp_path_factory):
+    key = secrets.token_hex(32)
+    proc = _uvicorn(tmp_path_factory.mktemp(request.param), key, "--http", request.param)
+    lines, reader = _read_stderr(proc)
+    try:
+        port = _wait_until_serving(lines, time.monotonic() + START_DEADLINE)
+        yield Served(request.param, port, key)
+    finally:
+        _stop(proc, reader)
+    log = []
+    while (line := lines.get_nowait()) is not None:
+        log.append(line)
+    # a 500 from the middleware would log its traceback here
+    assert not any("Traceback" in line or "Exception in ASGI" in line for line in log), "".join(log)
+
+
+def exchange(port: int, request: bytes) -> tuple[int, dict[str, str], bytes, bytes]:
+    """Send `request` as it is and read until the server closes the connection. The
+    status, headers and body of the last answer, and every byte the server sent."""
+    received = b""
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+        sock.sendall(request)
+        try:
+            while chunk := sock.recv(65536):
+                received += chunk
+        except TimeoutError:
+            pytest.fail(f"the server held the connection open after sending {received[:200]!r}")
+    final = received
+    while final.startswith(b"HTTP/1.1 1"):  # an interim answer (`100 Continue`)
+        final = final.partition(b"\r\n\r\n")[2]
+    head, _, body = final.partition(b"\r\n\r\n")
+    status_line, *fields = head.decode("latin-1").split("\r\n")
+    headers = {k.strip().lower(): v.strip() for k, _, v in (f.partition(":") for f in fields)}
+    return int(status_line.split(" ")[1]), headers, body, received
+
+
+def raw_post(path: str, length: bytes, extra: bytes = b"", body: bytes = b"") -> bytes:
+    return (
+        f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n".encode()
+        + extra
+        + b"Content-Length: "
+        + length
+        + b"\r\n\r\n"
+        + body
+    )
+
+
+OVER_SPELLINGS = {
+    "zero-padded": ZEROES + b"2097153",
+    "trailing space": b"2097153 ",
+    "trailing tab": b"2097153\t",
+    "space and tab at both ends": b" \t2097153\t ",
+    "plain": b"2097153",
+}
+
+
+@pytest.mark.parametrize("path", ["/mcp", "/api/v1/hosts", "/api/v1/agent/results", "/health"])
+@pytest.mark.parametrize("length", OVER_SPELLINGS.values(), ids=OVER_SPELLINGS.keys())
+def test_on_uvicorn_a_length_over_the_cap_is_refused_unread_however_spelt(served, path, length):
+    """Sent with `Expect: 100-continue` and no body: the answer comes before any body
+    byte is sent, and uvicorn sends `100 Continue` only when the app first reads."""
+    status, headers, body, received = exchange(
+        served.port, raw_post(path, length, b"Expect: 100-continue\r\n")
+    )
+    assert b"100 Continue" not in received
+    assert ZEROES not in received  # the refusal never echoes the header's value
+    if served.parser == "h11" and length.startswith(ZEROES):
+        assert status == 400  # h11 refuses the zeroes itself, before the app
+        return
+    assert status == 413
+    assert json.loads(body) == REFUSAL
+    assert headers["connection"] == "close"
+
+
+WITHIN_SPELLINGS = {
+    "zero-padded": (ZEROES, b""),
+    "trailing space": (b"", b" "),
+    "trailing tab": (b"", b"\t"),
+}
+
+
+@pytest.mark.parametrize("spelling", WITHIN_SPELLINGS.values(), ids=WITHIN_SPELLINGS.keys())
+def test_on_uvicorn_a_padded_length_within_the_cap_is_served(served, spelling):
+    prefix, suffix = spelling
+    body = json.dumps({"name": "lab"}).encode()
+    status, _headers, answer, _ = exchange(
+        served.port,
+        raw_post(
+            "/api/v1/sections",
+            prefix + str(len(body)).encode() + suffix,
+            f"X-API-Key: {served.key}\r\nContent-Type: application/json\r\nConnection: close\r\n".encode(),
+            body,
+        ),
+    )
+    if served.parser == "h11" and prefix == ZEROES:
+        assert status == 400
+        return
+    assert status == 201, answer
+    assert json.loads(answer)["data"]["name"] == "lab"
+
+
+def test_on_uvicorn_a_zero_padded_length_reaches_mcp_and_health(served):
+    """`/mcp`'s own transport reads `Content-Length` again (the MCP SDK's body limit,
+    which counts the body when `int()` refuses the value); `/health` has no body."""
+    init = json.dumps(INITIALIZE).encode()
+    mcp = raw_post(
+        "/mcp",
+        ZEROES + str(len(init)).encode(),
+        f"Authorization: Bearer {served.key}\r\nAccept: {MCP_ACCEPT}\r\n"
+        "Content-Type: application/json\r\nConnection: close\r\n".encode(),
+        init,
+    )
+    health = b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: " + ZEROES + b"\r\n\r\n"
+    expected = 400 if served.parser == "h11" else None
+    status, _, answer, _ = exchange(served.port, mcp)
+    assert status == (expected or 200), answer
+    if not expected:
+        assert b"serverInfo" in answer
+    status, _, answer, _ = exchange(served.port, health)
+    assert status == (expected or 200), answer
