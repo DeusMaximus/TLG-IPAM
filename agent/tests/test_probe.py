@@ -8,6 +8,7 @@ import errno
 import ipaddress
 import os
 import socket
+import stat
 import threading
 import time
 
@@ -844,20 +845,29 @@ def longest_gap(ticks: list[float], until: float) -> float:
     return max(b - a for a, b in zip(ticks, ticks[1:] + [until], strict=True))
 
 
-def unblock_later(path, after: float = 2.0, until: float = 4.0) -> threading.Event:
+class FifoWriter:
     """A writer for the FIFO at `path` from `after` seconds on, so code that blocked on
     it (opened it to read without O_NONBLOCK) is freed: a test then fails on its
     assertion rather than hanging. It opens without blocking, and gives up at `until`.
-    Setting the event it returns calls the writer off: a test that frees the FIFO
-    itself does so, so that no writer outlives it to write into whatever is then at
-    the path."""
-    stop = threading.Event()
 
-    def write():
-        if stop.wait(after):
+    `fired` says it opened the FIFO and wrote, that is, that a reader was waiting on it
+    and was freed by this writer. A test that frees its reader itself looks at the
+    `fired` of the writer it kept as a safety net: if that one fired, the test passed
+    only because the net caught it. `close` calls the writer off and waits for its
+    thread, so no helper outlives the test to write into whatever is then at the
+    path."""
+
+    def __init__(self, path, after: float = 2.0, until: float = 4.0):
+        self.fired = False
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._write, args=(path, after, until), daemon=True)
+        self._thread.start()
+
+    def _write(self, path, after: float, until: float) -> None:
+        if self._stop.wait(after):
             return
         end = time.monotonic() + until - after
-        while time.monotonic() < end and not stop.is_set():
+        while time.monotonic() < end and not self._stop.is_set():
             try:
                 fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
             except OSError:
@@ -865,12 +875,36 @@ def unblock_later(path, after: float = 2.0, until: float = 4.0) -> threading.Eve
                 continue
             try:
                 os.write(fd, b"nameserver 127.0.0.1\n")
+                self.fired = True
             finally:
                 os.close(fd)
             return
 
-    threading.Thread(target=write, daemon=True).start()
-    return stop
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(PATIENT)
+        assert not self._thread.is_alive(), "the FIFO writer did not end"
+
+
+def is_fifo(path) -> bool:
+    try:
+        return stat.S_ISFIFO(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
+async def free_a_blocked_read(path) -> None:
+    """Cleanup for a test that may stop with a read blocked in the open of the FIFO at
+    `path`: while the path is still a FIFO, a writer frees the read, and the read's
+    thread is waited for. Once the test has replaced the path with a file (so the read
+    has ended), it starts nothing."""
+    if not is_fifo(path):
+        return
+    writer = FifoWriter(path, after=0)
+    try:
+        await no_read_thread_left()
+    finally:
+        writer.close()
 
 
 async def test_a_fifo_at_the_resolver_path_leaves_the_job_incomplete_and_the_loop_running(tmp_path):
@@ -881,7 +915,7 @@ async def test_a_fifo_at_the_resolver_path_leaves_the_job_incomplete_and_the_loo
     transport, proto, port = await responder()
     fifo = tmp_path / "resolv.conf"
     os.mkfifo(fifo)
-    unblock_later(fifo)
+    net = FifoWriter(fifo)
     ticks, timer = ticker()
     try:
         raw = job(ranges=[{"start": "10.0.0.9", "end": "10.0.0.9"}], dns_servers=[])
@@ -900,7 +934,9 @@ async def test_a_fifo_at_the_resolver_path_leaves_the_job_incomplete_and_the_loo
         assert proto.arrivals == []
         assert longest_gap(ticks, time.monotonic()) < LOOP_GAP_MAX, ticks
         assert took < PATIENT / 2  # refused at once: a read waited out would take all of PATIENT
+        assert not net.fired  # nothing opened the FIFO to read
     finally:
+        net.close()
         timer.cancel()
         transport.close()
 
@@ -945,30 +981,34 @@ async def test_a_read_that_does_not_finish_gives_no_server_and_holds_one_thread_
     finally:
         release.set()
         timer.cancel()
+        await no_read_thread_left()
 
 
 def test_a_fifo_or_a_device_is_not_read_and_not_waited_on(tmp_path):
     fifo = tmp_path / "fifo"
     os.mkfifo(fifo)
-    unblock_later(fifo)
-    started = time.monotonic()
-    assert read_resolv_conf(str(fifo)) == ()
-    assert time.monotonic() - started < 0.5
-    assert read_resolv_conf(os.devnull) == ()  # a character device
-    assert read_resolv_conf(str(tmp_path)) == ()  # a directory
-    # a FIFO that holds a whole file's worth and then its end (the writer has gone,
-    # another reader keeps the data): it could be read like a file, and is not
     full = tmp_path / "full"
     os.mkfifo(full)
-    unblock_later(full)
-    reader = os.open(full, os.O_RDONLY | os.O_NONBLOCK)
+    nets = [FifoWriter(fifo), FifoWriter(full)]
     try:
-        writer = os.open(full, os.O_WRONLY | os.O_NONBLOCK)
-        os.write(writer, b"nameserver 127.0.0.1\n")
-        os.close(writer)
-        assert read_resolv_conf(str(full)) == ()
+        started = time.monotonic()
+        assert read_resolv_conf(str(fifo)) == ()
+        assert time.monotonic() - started < 0.5
+        assert read_resolv_conf(os.devnull) == ()  # a character device
+        assert read_resolv_conf(str(tmp_path)) == ()  # a directory
+        # a FIFO that holds a whole file's worth and then its end (the writer has gone,
+        # another reader keeps the data): it could be read like a file, and is not
+        reader = os.open(full, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            writer = os.open(full, os.O_WRONLY | os.O_NONBLOCK)
+            os.write(writer, b"nameserver 127.0.0.1\n")
+            os.close(writer)
+            assert read_resolv_conf(str(full)) == ()
+        finally:
+            os.close(reader)
     finally:
-        os.close(reader)
+        for net in nets:
+            net.close()
 
 
 def test_at_most_resolv_conf_max_bytes_are_taken(tmp_path):
@@ -1053,6 +1093,19 @@ async def until(condition, within: float = PATIENT) -> bool:
     return bool(condition())
 
 
+def returns_without_suspending(coro):
+    """What `coro` returns when it is driven by hand and ends in its first step: having
+    waited for nothing, no sleep, no future and no turn of the event loop. It fails the
+    test if the coroutine suspends. A wait cannot hide from this in a bound: it does not
+    ask how long the call took, which a loaded machine answers for it."""
+    try:
+        coro.send(None)
+    except StopIteration as done:
+        return done.value
+    coro.close()
+    pytest.fail("the call suspended: it waited for something")
+
+
 async def no_read_thread_left(within: float = PATIENT) -> bool:
     return await until(lambda: not resolv_conf_threads(), within)
 
@@ -1064,9 +1117,10 @@ async def test_what_is_not_an_ordinary_file_gives_no_server_and_leaves_no_thread
     read's time bound, while a timer beside it keeps firing. No read thread is left
     behind, and once the path holds an ordinary file again the next job reads it."""
     path = tmp_path / "resolv.conf"
+    net = None
     if kind == "fifo":
         os.mkfifo(path)
-        unblock_later(path)  # frees a read that opened it and waited, so a failure cannot hang
+        net = FifoWriter(path)  # frees a read that opened it and waited, so a failure cannot hang
     elif kind == "device":
         path.symlink_to(os.devnull)
     elif kind == "directory":
@@ -1086,10 +1140,15 @@ async def test_what_is_not_an_ordinary_file_gives_no_server_and_leaves_no_thread
             path.rmdir()
         else:
             path.unlink()
+        if net is not None:
+            net.close()
+            assert not net.fired  # the FIFO was refused, not opened
         path.write_text("nameserver 127.0.0.1\n")
         assert await resolver.servers(()) == ("127.0.0.1",)
         assert await no_read_thread_left()
     finally:
+        if net is not None:
+            net.close()
         timer.cancel()
 
 
@@ -1103,9 +1162,13 @@ async def test_a_fifo_put_at_the_path_after_the_look_holds_one_thread_until_a_wr
 
     Only the first wait is meant to run out its bound (BLOCKED_WAIT). The read at the
     end, which must succeed, was made with that same 0.3 s and failed once under load
-    (#115, the read thread not being scheduled for 0.3 s); it has PATIENT now. A writer
-    set to free the FIFO at STALL keeps a read with no time bound from hanging the
-    test: it is freed, finds a server, and the first assertion fails."""
+    (#115); it has PATIENT now. A writer set to free the FIFO at STALL keeps a read with
+    no time bound from hanging the test: it is freed, finds a server, and the first
+    assertion fails. If that net fired in a run that got to the end, the run fails: it
+    was held up for STALL between the first wait and the test's own writer, and what it
+    saw after that was not its own doing. Whatever happens, the cleanup ends the
+    helpers: the nets are joined, and a read still blocked on the FIFO is freed and its
+    thread waited for."""
 
     class LooksRegular:  # what `os.stat` saw before the swap
         @staticmethod
@@ -1117,7 +1180,8 @@ async def test_a_fifo_put_at_the_path_after_the_look_holds_one_thread_until_a_wr
     monkeypatch.setattr(probe, "stat", LooksRegular)
     resolver = DnsResolver(resolv_conf=str(fifo), read_timeout=BLOCKED_WAIT)
     ticks, timer = ticker()
-    rescue = unblock_later(fifo, after=STALL, until=STALL + 2)
+    net = FifoWriter(fifo, after=STALL, until=STALL + 2)
+    freeing = None
     try:
         started = time.monotonic()
         assert await resolver.servers(()) == ()
@@ -1125,22 +1189,154 @@ async def test_a_fifo_put_at_the_path_after_the_look_holds_one_thread_until_a_wr
         assert longest_gap(ticks, time.monotonic()) < LOOP_GAP_MAX, ticks
         # blocked in dnspython's open: the thread has run, if the machine was slow to
         assert await until(lambda: len(resolv_conf_threads()) == 1)
+        # a call made while the read is blocked makes no wait at all: it ends in the
+        # first step, having suspended nowhere (no sleep, no turn of the loop)
+        assert returns_without_suspending(resolver.servers(())) == ()
         resolver.read_timeout = PATIENT  # a call that waited would now take all of it
         started = time.monotonic()
         assert await resolver.servers(()) == ()  # no second read while it is blocked
         assert time.monotonic() - started < PATIENT / 2
         assert len(resolv_conf_threads()) == 1
         monkeypatch.undo()
-        rescue.set()
-        unblock_later(fifo, after=0)
+        net.close()
+        assert not net.fired, f"the net freed the read: this run was held up for {STALL} s"
+        freeing = FifoWriter(fifo, after=0)
         assert await no_read_thread_left()
+        freeing.close()
+        assert freeing.fired  # the read ended because this writer came
         fifo.unlink()
         fifo.write_text("nameserver 127.0.0.1\n")
         assert await resolver.servers(()) == ("127.0.0.1",)
     finally:
-        rescue.set()
-        unblock_later(fifo, after=0)  # a no-op once the thread has ended and the FIFO is gone
+        net.close()
+        if freeing is not None:
+            freeing.close()
         timer.cancel()
+        await free_a_blocked_read(fifo)  # only if the test stopped before it freed the read
+
+
+async def test_a_call_made_while_a_read_is_stuck_makes_no_wait(monkeypatch, tmp_path):
+    """While a read holds the resolver's lock, a call that needs the host's servers
+    refuses at once, and a call that brings its own servers never looks at the lock:
+    neither suspends, which is judged by driving the call by hand (no bound, so not
+    the host's scheduler). A delay before the refusal, a sleep or a turn of the loop,
+    fails here, which the loose timing checks of the tests beside it do not tell."""
+    release = threading.Event()
+    entered = threading.Event()
+
+    def stalled(path):
+        entered.set()
+        release.wait(STALL)
+        return ("127.0.0.1",)
+
+    monkeypatch.setattr(probe, "read_resolv_conf", stalled)
+    resolver = DnsResolver(resolv_conf=str(tmp_path / "resolv.conf"), read_timeout=PATIENT)
+    first = asyncio.create_task(resolver.servers(()))
+    try:
+        assert await until(entered.is_set)  # the read holds the lock
+        assert returns_without_suspending(resolver.servers(())) == ()
+        assert returns_without_suspending(resolver.servers(("10.0.0.53",))) == ("10.0.0.53",)
+        release.set()
+        assert await first == ("127.0.0.1",)  # the first call was waiting all along
+        assert await resolver.servers(()) == ("127.0.0.1",)  # and the lock is free again
+    finally:
+        release.set()
+        if not first.done():
+            first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+        await no_read_thread_left()
+
+
+STALL_TRIES = 6
+LOOP_STALL = 0.25
+
+
+async def test_the_loop_turns_while_the_servers_are_chosen(monkeypatch, tmp_path):
+    """The loop is not held up while the choice of servers waits for a read held on an
+    event: check-ins, the job's deadline and the scan's backstop run on it. A stall a
+    regression puts into the call is in every wait it makes; one the host puts there
+    (a loaded machine, a late wake) is in few. So the test passes at the first wait in
+    which no gap between the timer's ticks reaches LOOP_STALL, and fails when none of
+    STALL_TRIES waits is clean: a stall of the code's own, like a block of 0.4 s before
+    the wait, shows in all of them, and a loaded machine would have to stall the loop
+    in every one."""
+    release = threading.Event()
+
+    def stalled(path):
+        release.wait(STALL)
+        return ("127.0.0.1",)
+
+    monkeypatch.setattr(probe, "read_resolv_conf", stalled)
+    resolver = DnsResolver(resolv_conf=str(tmp_path / "resolv.conf"), read_timeout=0.2)
+    gaps: list[float] = []
+    try:
+        for _ in range(STALL_TRIES):
+            release.clear()
+            ticks, timer = ticker()
+            try:
+                assert await resolver.servers(()) == ()  # waited its 0.2 s for the held read
+                assert ticks, "the loop did not turn once during the wait"
+                gaps.append(longest_gap(ticks, time.monotonic()))
+            finally:
+                timer.cancel()
+                release.set()  # the read ends, and the next wait starts a read of its own
+            assert await no_read_thread_left()
+            if gaps[-1] < LOOP_STALL:
+                break
+        assert gaps[-1] < LOOP_STALL, f"the loop was held up in every wait, gaps {gaps}"
+    finally:
+        release.set()
+        await no_read_thread_left()
+
+
+async def test_the_choice_of_servers_ends_with_the_jobs_deadline(monkeypatch, tmp_path):
+    """Order against the deadline, not a time taken: the job has one second, the read of
+    resolv.conf is held on an event, and the loop's clock is made to pass the job's
+    deadline (`skew`) while the scan waits for the choice of servers. The scan must
+    then end within a few turns of the loop, the read still held. A wait that goes on
+    after the cancellation (a sleep in the cancelled call) would need the clock to pass
+    again, and the scan is still running after those turns. The loop's timers and the
+    turns are the whole clock here, so the host's scheduler does not decide it; the
+    job's own clock is untouched."""
+    release = threading.Event()
+    entered = threading.Event()
+
+    def stalled(path):
+        entered.set()
+        release.wait(STALL)
+        return ("127.0.0.1",)
+
+    loop = asyncio.get_running_loop()
+    real_time = loop.time
+    skew = [0.0]
+    monkeypatch.setattr(loop, "time", lambda: real_time() + skew[0])
+    monkeypatch.setattr(probe, "read_resolv_conf", stalled)
+    resolver = DnsResolver(resolv_conf=str(tmp_path / "resolv.conf"), read_timeout=PATIENT)
+    raw = job(ranges=[{"start": "10.0.0.9", "end": "10.0.0.9"}], dns_servers=[], timeout_s=1)
+    parsed = parse_job(job_ref(raw), raw)
+    run = asyncio.create_task(scan.run(
+        parsed, guard.plan(parsed, parse_allowed(None)), prober=TimedProber(alive=["10.0.0.9"]),
+        resolver=resolver, max_pps=200, clock=scan.Clock(),
+    ))
+    try:
+        assert await until(entered.is_set)  # the scan is waiting for the choice of servers
+        assert not run.done()
+        skew[0] += 1.5  # the job's second has passed on the loop's clock; PATIENT has not
+        for _ in range(50):
+            await asyncio.sleep(0)  # turns of the loop, no timer
+        assert run.done(), "the scan did not end with the job's deadline"
+        result = run.result()
+        assert result["complete"] is False
+        assert result["error"] == "timed out after 1 s during the PTR lookups"
+        assert result["observations"] == [{"ip": "10.0.0.9"}]
+        assert resolv_conf_threads()  # the read is still held, as it was
+    finally:
+        skew[0] += 100  # whatever the scan still waits for is due
+        release.set()
+        if not run.done():
+            run.cancel()
+        await asyncio.gather(run, return_exceptions=True)
+        await no_read_thread_left()
 
 
 async def test_choosing_the_servers_ends_at_the_jobs_deadline(monkeypatch, tmp_path):
@@ -1190,3 +1386,4 @@ async def test_choosing_the_servers_ends_at_the_jobs_deadline(monkeypatch, tmp_p
         assert len(calls) == 2
     finally:
         release.set()
+        await no_read_thread_left()
