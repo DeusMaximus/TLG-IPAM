@@ -10,7 +10,7 @@ from app import agent_protocol as server
 from app.services import jobs
 
 from conftest import FakeClock, FakeProber, FakeResolver, job
-from tlg_ipam_agent import guard, loop, protocol, scan
+from tlg_ipam_agent import guard, loop, probe, protocol, scan
 from tlg_ipam_agent.config import parse_allowed
 
 AGENT = Path(__file__).resolve().parents[1]
@@ -46,6 +46,12 @@ def test_the_shortest_retry_is_not_inside_the_servers_checkin_gap():
 def test_the_lease_matches_the_server():
     assert protocol.LEASE_S == jobs.LEASE.total_seconds()
     assert protocol.JOB_TIMEOUT_S < protocol.LEASE_S
+
+
+def test_a_job_carries_no_more_dns_servers_than_the_agent_asks():
+    """The server cuts a job's servers to what the agent asks per lookup (#75): more
+    would be bytes of the check-in answer the agent never uses."""
+    assert probe.MAX_DNS_SERVERS == server.DNS_SERVERS_MAX
 
 
 def test_the_checkin_body_is_what_the_server_accepts():

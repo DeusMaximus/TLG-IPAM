@@ -13,6 +13,7 @@ from ..ipnet import (
 )
 from ..models import Host, ReservedRange, Subnet
 from ..schemas import (
+    SUBNET_DNS_SERVERS_MAX,
     ReservedRangeCreate,
     ReservedRangeOut,
     ReservedRangeUpdate,
@@ -171,7 +172,21 @@ async def _validate_subnet(
     return net
 
 
+def _check_dns_servers(servers: list[str] | None, stored: list | None = None) -> None:
+    """A subnet lists at most SUBNET_DNS_SERVERS_MAX DNS servers. An update that resends
+    the list the subnet already holds is let through unchanged, so a subnet stored with
+    a longer list before the bound existed can still be edited (the UI's form resends
+    every field) and loses nothing; changing that list means meeting the bound."""
+    if servers is None or len(servers) <= SUBNET_DNS_SERVERS_MAX or servers == stored:
+        return
+    raise validation_error(
+        f"dns_servers: a subnet may list at most {SUBNET_DNS_SERVERS_MAX} DNS servers, "
+        f"not {len(servers)}"
+    )
+
+
 async def create_subnet(session: AsyncSession, payload: SubnetCreate, source: str) -> Subnet:
+    _check_dns_servers(payload.dns_servers)
     await get_section(session, payload.section_id)
     await _validate_subnet(
         session,
@@ -202,6 +217,8 @@ async def update_subnet(
 ) -> Subnet:
     subnet = await get_subnet(session, subnet_id)
     data = payload.model_dump(exclude_unset=True)
+    if "dns_servers" in data:
+        _check_dns_servers(data["dns_servers"], subnet.dns_servers)
     merged = {
         "section_id": data.get("section_id", subnet.section_id),
         "cidr": data.get("cidr", subnet.cidr),

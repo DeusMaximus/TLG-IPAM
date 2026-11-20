@@ -181,6 +181,13 @@ class FdnsName(BaseModel):
     fqdn: str
 
 
+# The most DNS servers a job carries: the agent asks at most this many per lookup
+# (`probe.MAX_DNS_SERVERS`, checked in the agent's `test_contract.py`). A subnet may
+# list more (`schemas.SUBNET_DNS_SERVERS_MAX`, or a longer list stored before that
+# bound existed); a job carries the first of them, in the order listed.
+DNS_SERVERS_MAX = 3
+
+
 class Job(BaseModel):
     """One scan of one subnet. There is no field through which the server can send a
     command, a script, a binary, or an address outside the subnet (spec §5.1)."""
@@ -193,8 +200,9 @@ class Job(BaseModel):
     ranges: list[ScanRange]
     # the methods to run, a subset of icmp, arp, rdns, fdns with icmp or arp among them
     methods: list[str]
-    # the subnet's DNS servers for rdns and fdns; empty means the agent's own resolver
-    dns_servers: list[str]
+    # the first DNS_SERVERS_MAX of the subnet's DNS servers, for rdns and fdns; empty
+    # means the agent's own resolver
+    dns_servers: list[str] = Field(max_length=DNS_SERVERS_MAX)
     timeout_s: int
     # the names to resolve for fdns; only ever names under the subnet's domain
     fdns: list[FdnsName]
