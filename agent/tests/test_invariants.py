@@ -36,9 +36,11 @@ ALLOWED_IMPORTS = {
 }
 # names that start a process, load or evaluate code, reach attributes by a computed
 # name, or write files; matched as identifiers and as string constants. The second
-# block (#99) is every name the allowed modules offer that opens a file to write,
-# creates one, or sets an attribute by name, which the agent uses none of; `FileIO`
-# and `open_code` stay listed though `io` is not importable.
+# block (#99) names spellings of the allowed modules that open a file to write,
+# create one, or set an attribute by name, which the agent uses none of; `FileIO`
+# and `open_code` stay listed though `io` is not importable. It is a list of names,
+# not every way to write a file: `logging.basicConfig(**{"filename": path})` writes one
+# and names none of them.
 FORBIDDEN = {
     "exec", "eval", "compile", "__import__", "breakpoint", "getattr", "setattr",
     "delattr", "globals", "locals", "vars", "__builtins__", "__dict__", "__globals__",
@@ -54,22 +56,28 @@ FORBIDDEN = {
 # os.posix_spawn*, asyncio.create_subprocess_*, loop.subprocess_*
 FORBIDDEN_PREFIXES = ("exec", "spawn", "fork", "posix_spawn", "create_subprocess", "subprocess_")
 # a forbidden name that is harmless on this one module: `re.compile` builds a pattern.
-# `os.open` can write, so it passes only where `test_os_open_only_reads` holds: each
-# use is a call whose flags argument is spelled as `os.O_*` names from READ_ONLY_FLAGS
-# joined by `|`, in a module that never rebinds the name `os` (an assignment, a
-# parameter, `import x as os`, a `def`, `global`) and never assigns to or deletes an
-# attribute of it. That is a check of spelling, not a proof: it does not see what the
-# flags are at run time if `os` is reached some way it does not look (a computed
-# attribute, `sys.modules`, another module). `probe.read_resolv_conf` opens the host's
-# resolv.conf with `O_NONBLOCK`, which no other way of opening a file offers.
+# `os.open` can write, so it passes only where `test_os_open_only_reads` holds (and,
+# by OPENED_WHERE, in probe.py alone): each use is a call whose flags argument is
+# spelled as `os.O_*` names from READ_ONLY_FLAGS joined by `|`, on a name `os` the
+# checker sees bound by `import os` and not reassigned under that name (an
+# assignment, a parameter, `import x as os`, a `def`, `global`), nor its attributes
+# assigned or deleted through that name. That is a check of spelling, not a proof. It
+# does not see an alias of `os` (`alias = os; alias.O_RDONLY = ...` before the call
+# changes the flags and passes), a computed attribute, `sys.modules`, or another
+# module. `probe.read_resolv_conf` opens the host's resolv.conf with `O_NONBLOCK`,
+# which the agent has no other way to ask for.
 ALLOWED_QUALIFIED = {"re.compile", "os.open"}
 READ_ONLY_FLAGS = {"O_RDONLY", "O_NONBLOCK", "O_NOCTTY", "O_CLOEXEC"}
-# every way the agent's own code opens a file to read, among what the allowed modules
-# offer (the ways to write are forbidden above): `os.open`, pathlib's read_text and
-# read_bytes, ssl's load_*, platform's file readers, dnspython's `read_resolv_conf` and
-# a `Resolver` not made with `configure=False`, and any call naming a file by keyword.
-# `test_files_are_opened_only_where_listed` holds where each is used. It sees the
-# agent's own calls, not what a library opens inside one (ssl's CA bundle, say).
+# the spellings of opening a file to read that the checks enumerate (the named ways
+# to write are forbidden above): `os.open`, pathlib's read_text and read_bytes, ssl's
+# load_*, platform's file readers, dnspython's `read_resolv_conf` and a `Resolver` not
+# made with `configure=False`, and a call that names a file by a keyword written out
+# (`cafile="x"`). `test_files_are_opened_only_where_listed` holds where each is used.
+# It sees those spellings in the agent's own source and nothing else: not a keyword
+# passed through `**{...}` (`ssl.create_default_context(**{"cafile": path})` opens a
+# file unseen), not an allowed module's own way of opening one under another name,
+# and not what a library opens inside a call (ssl's CA bundle, say). It matches names,
+# not types, so it also flags harmless code that shares one (an unrelated `filename=`).
 READ_OPENERS = {
     "read_text", "read_bytes", "load_verify_locations", "load_cert_chain",
     "load_dh_params", "freedesktop_os_release", "libc_ver", "read_resolv_conf",
@@ -140,9 +148,11 @@ def _opens_only_to_read(tree) -> bool:
 
 
 def _os_rebound(tree) -> list[str]:
-    """Each place the module could change what `os` or one of its attributes is: a
-    binding of the name `os` other than `import os` (or `import os.path`), and an
-    assignment to or deletion of an attribute of `os`."""
+    """Each place the module changes what the name `os` or one of its attributes is,
+    under that name: a binding of `os` other than `import os` (or `import os.path`),
+    and an assignment to or deletion of an attribute spelled `os.X`. It does not see
+    the same through an alias (`alias = os; alias.O_RDONLY = ...`), a star import, or a
+    `match` mapping's `**rest`."""
     found = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -166,8 +176,9 @@ def _os_rebound(tree) -> list[str]:
 
 
 def _file_opens(tree) -> set[str]:
-    """The ways of opening a file (READ_OPENERS, `os.open`, FILE_KEYWORDS, an
-    unconfigured `Resolver`) the module names, called or not."""
+    """The enumerated spellings of opening a file (READ_OPENERS, `os.open`,
+    FILE_KEYWORDS written out, an unconfigured `Resolver`) the module uses, called or
+    not; not every way a file can be opened (the comment on READ_OPENERS)."""
     found = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute):
@@ -225,10 +236,11 @@ def test_os_open_only_reads(path):
 
 
 def test_files_are_opened_only_where_listed():
-    """Every way of opening a file the allow-list admits, in every module: only
-    probe.py opens one with `os.open`, and the reads OPENED_WHERE names are the only
-    ones. (Until round 1 of #103 this was `test_only_the_probe_module_opens_a_file`, and
-    looked at `os.open` alone.)"""
+    """The enumerated spellings of opening a file (`_file_opens`), in every module:
+    only probe.py uses `os.open`, and the reads OPENED_WHERE names are the only ones.
+    A tripwire on spellings, not a proof that no module opens a file (the comment on
+    READ_OPENERS says what it does not see). (Until round 1 of #103 this was
+    `test_only_the_probe_module_opens_a_file`, and looked at `os.open` alone.)"""
     used = {p.name: _file_opens(ast.parse(p.read_text())) for p in MODULES}
     assert {name: ways for name, ways in used.items() if ways} == OPENED_WHERE
 
@@ -251,7 +263,7 @@ ROUND_1 = [
     "from os import path as os\n",
     "import os\ndef bypass():\n    global os\n    os = None\n",
     "import os\ndel os.O_RDONLY\n",
-    # the other openers the allowed modules offer
+    # other named openers of the allowed modules
     "import os\nos.fdopen(os.open('x', os.O_RDONLY), 'w')\n",
     "from pathlib import Path\nPath('x').touch()\n",
     "import os\nos.truncate('x', 0)\n",
