@@ -263,6 +263,50 @@ async def test_a_put_that_changes_last_seen_moves_updated_at(client):
         first = got
 
 
+# `hosts.update_host` compares a `last_seen` it is sent with the stored column (the value
+# set by hand), not with the answer's, which is the later of that and the scan's (#105).
+# Against the answer's, repeating the hand-set value would move `updated_at`, and writing
+# the scan time the answer shows would be dropped as "unchanged".
+
+
+async def test_repeating_the_hand_set_last_seen_beside_a_later_scan_leaves_updated_at_alone(
+    client,
+):
+    subnet = await _subnet(client)
+    host = await make_host(client, subnet["id"], "10.0.0.10", last_seen=STORED)
+    await observe(subnet["id"], "10.0.0.10")  # a scan later than the hand-set time
+    first = await get(client, host["id"])
+    assert (at(first["last_seen"]), first["last_seen_source"]) == (SCAN, "scan")
+    for sent in SAME_INSTANT:
+        res = await client.put(f"/api/v1/hosts/{host['id']}", json={"last_seen": sent})
+        assert res.status_code == 200, res.text
+        got = await get(client, host["id"])
+        assert (got["last_seen"], got["updated_at"]) == (first["last_seen"], first["updated_at"])
+        assert await _stored_last_seen(host["id"]) == datetime.fromisoformat(STORED), sent
+
+
+async def test_writing_the_scan_time_the_answer_shows_reaches_the_stored_column(client):
+    subnet = await _subnet(client)
+    host = await make_host(client, subnet["id"], "10.0.0.10", last_seen=STORED)
+    await observe(subnet["id"], "10.0.0.10")
+    first = await get(client, host["id"])
+    shown = first["last_seen"]
+    assert at(shown) == SCAN
+
+    # that instant is not in the column: it is a change, and it goes there
+    res = await client.put(f"/api/v1/hosts/{host['id']}", json={"last_seen": shown})
+    assert res.status_code == 200, res.text
+    got = await get(client, host["id"])
+    assert await _stored_last_seen(host["id"]) == SCAN.replace(tzinfo=None)
+    assert at(got["updated_at"]) > at(first["updated_at"])
+    assert (at(got["last_seen"]), got["last_seen_source"]) == (SCAN, "scan")  # a tie: the scan
+
+    # now it is the stored instant: sending it again changes nothing
+    res = await client.put(f"/api/v1/hosts/{host['id']}", json={"last_seen": shown})
+    assert res.status_code == 200, res.text
+    assert (await get(client, host["id"]))["updated_at"] == got["updated_at"]
+
+
 # --- Which observation belongs to a host ---
 
 
