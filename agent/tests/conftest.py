@@ -40,7 +40,7 @@ from tlg_ipam_agent import scan  # noqa: E402
 from tlg_ipam_agent.client import AgentClient  # noqa: E402
 from tlg_ipam_agent.config import Config, parse_allowed  # noqa: E402
 from tlg_ipam_agent.loop import Agent  # noqa: E402
-from tlg_ipam_agent.probe import ProbeError  # noqa: E402
+from tlg_ipam_agent.probe import NO_DNS_SERVER, ProbeError, usable_servers  # noqa: E402
 
 TOKEN = "tlga_" + "x" * 43
 BASE = "https://ipam.example.com"
@@ -103,7 +103,15 @@ HOST_DNS = ("192.0.2.53",)
 
 class FakeResolver:
     """Answers from `names`. `host` stands in for the host's resolv.conf: the servers a
-    job that names none is given (empty: the host has none)."""
+    job that names none is given (empty: the host has none).
+
+    It keeps the real resolver's contract where a scan can tell: `servers` keeps only
+    addresses and cuts the list to MAX_DNS_SERVERS (`probe.usable_servers`, the real
+    rule), and `ptr` raises ProbeError(NO_DNS_SERVER) for an empty list, taking no slot.
+    What it does not model: reading resolv.conf (a file, a thread, a time bound), the
+    servers asked in turn, one slot per server, and the kinds of failure a real query
+    meets. A lookup here takes one slot and answers at once, or after `delay` on the
+    fake clock; the real resolver's tests are in test_probe.py."""
 
     def __init__(self, names=None, clock: FakeClock | None = None, delay: float = 0.0, host=HOST_DNS):
         self.names = {ipaddress.ip_address(k): v for k, v in (names or {}).items()}
@@ -113,10 +121,12 @@ class FakeResolver:
         self.clock, self.delay = clock, delay
         self.host = tuple(host)
 
-    def servers(self, job_servers):
-        return tuple(job_servers or self.host)
+    async def servers(self, job_servers):
+        return usable_servers(tuple(job_servers or self.host))
 
     async def ptr(self, address, servers, slot):
+        if not servers:
+            raise ProbeError(NO_DNS_SERVER)
         # one query, so one packet from the budget, as the real resolver takes per server
         timeout = await slot()
         if timeout <= 0:

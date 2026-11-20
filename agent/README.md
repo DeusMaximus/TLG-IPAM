@@ -19,3 +19,5 @@ Tests, from this directory (one-time setup:
 The tests send no packet off this machine: the prober and the ARP socket are fakes,
 the resolver is a fake or the real one against DNS responders on loopback, and the
 end-to-end tests run the agent's client against the server's real routes in process.
+The real resolver reads only the files and FIFOs its tests make in a temporary
+directory, never this machine's own `/etc/resolv.conf`.

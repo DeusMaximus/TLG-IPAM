@@ -20,11 +20,15 @@ PACKAGE = Path(__file__).resolve().parents[1] / "src" / "tlg_ipam_agent"
 MODULES = sorted(PACKAGE.glob("*.py"))
 
 # every module the agent may import; anything else fails, so a new import is a choice
-# made in review. `urllib.parse` only: `urllib.request` downloads.
+# made in review. `urllib.parse` only: `urllib.request` downloads. `io`, `stat` and
+# `threading` came with #99, for `probe.read_resolv_conf` and the one thread that runs
+# it: `io.StringIO` hands dnspython the bytes read, `stat.S_ISREG` refuses what is not
+# a regular file, and a daemon thread keeps a blocked read off the event loop.
 ALLOWED_IMPORTS = {
-    "argparse", "asyncio", "collections.abc", "dataclasses", "datetime", "enum",
+    "argparse", "asyncio", "collections.abc", "dataclasses", "datetime", "enum", "io",
     "ipaddress", "json", "logging", "os", "pathlib", "platform", "random", "re",
-    "signal", "socket", "ssl", "struct", "sys", "time", "typing", "urllib.parse",
+    "signal", "socket", "ssl", "stat", "struct", "sys", "threading", "time", "typing",
+    "urllib.parse",
     "httpx", "icmplib",
     "dns.asyncquery", "dns.exception", "dns.flags", "dns.message", "dns.rcode", "dns.rdatatype",
     "dns.resolver", "dns.reversename",
@@ -43,8 +47,12 @@ FORBIDDEN = {
 # and any identifier with these beginnings: os.exec*, os.spawn*, os.fork*,
 # os.posix_spawn*, asyncio.create_subprocess_*, loop.subprocess_*
 FORBIDDEN_PREFIXES = ("exec", "spawn", "fork", "posix_spawn", "create_subprocess", "subprocess_")
-# a forbidden name that is harmless on this one module: `re.compile` builds a pattern
-ALLOWED_QUALIFIED = {"re.compile"}
+# a forbidden name that is harmless on this one module: `re.compile` builds a pattern.
+# `os.open` can write, so it is allowed only as a call whose flags name nothing but
+# READ_ONLY_FLAGS (`test_os_open_only_reads`): `probe.read_resolv_conf` opens the
+# host's resolv.conf without blocking, which no other way of opening a file offers
+ALLOWED_QUALIFIED = {"re.compile", "os.open"}
+READ_ONLY_FLAGS = {"O_RDONLY", "O_NONBLOCK", "O_NOCTTY", "O_CLOEXEC"}
 # the identifiers these prefixes would wrongly catch in the agent's own code
 PREFIX_EXCEPTIONS = {"exception", "exc_info", "exc_text", "exctype"}
 
@@ -73,6 +81,38 @@ def _identifiers(tree):
             yield node.value
 
 
+def _flag_names(node) -> set[str]:
+    """The `os.O_*` names an `os.open` flags argument is made of, joined by `|`; any
+    other expression (a number, a variable, a call) is "?", which no list allows."""
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _flag_names(node.left) | _flag_names(node.right)
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "os":
+        return {node.attr}
+    return {"?"}
+
+
+def _os_opens(tree) -> list[set[str]]:
+    """For each `os.open` in the module, the flags its call names: "?" for flags that
+    are not plain `os.O_*` names, and for an `os.open` that is not called right there
+    (`f = os.open`), whose later flags this check cannot see."""
+    called = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            flags = node.args[1] if len(node.args) > 1 else next(
+                (k.value for k in node.keywords if k.arg == "flags"), None)
+            called[id(node.func)] = _flag_names(flags) if flags is not None else {"?"}
+    found = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute) and node.attr == "open"
+                and isinstance(node.value, ast.Name) and node.value.id == "os"):
+            found.append(called.get(id(node), {"?"}))
+    return found
+
+
+def _opens_only_to_read(tree) -> bool:
+    return all(flags <= READ_ONLY_FLAGS for flags in _os_opens(tree))
+
+
 def _forbidden(name: str) -> bool:
     if name in FORBIDDEN:
         return True
@@ -91,6 +131,17 @@ def test_nothing_that_could_run_load_or_fetch_code_is_named(path):
     assert found == [], f"{path.name}: {found}"
 
 
+@pytest.mark.parametrize("path", MODULES, ids=lambda p: p.name)
+def test_os_open_only_reads(path):
+    tree = ast.parse(path.read_text())
+    assert _opens_only_to_read(tree), f"{path.name}: {_os_opens(tree)}"
+
+
+def test_only_the_probe_module_opens_a_file():
+    users = {p.name for p in MODULES if _os_opens(ast.parse(p.read_text()))}
+    assert users == {"probe.py"}
+
+
 @pytest.mark.parametrize(
     "source",
     [
@@ -102,6 +153,15 @@ def test_nothing_that_could_run_load_or_fetch_code_is_named(path):
         "from pathlib import Path\nPath('x').write_text('y')\n",
         "with open('x', 'w') as f:\n    pass\n",
         "import urllib.request\n",
+        # `os.open` (#99) only to read
+        "import os\nfd = os.open('x', os.O_WRONLY | os.O_CREAT)\n",
+        "import os\nfd = os.open('x', os.O_RDONLY | os.O_APPEND)\n",
+        "import os\nfd = os.open('x', 1)\n",
+        "import os\nfd = os.open('x', flags=os.O_RDWR)\n",
+        "import os\nfd = os.open('x', MODE)\n",
+        "import os\nwrite = os.open\n",
+        "from os import open as o\n",
+        "import os as o\nfd = o.open('x', o.O_RDONLY)\n",
     ],
 )
 def test_the_guard_catches_what_the_review_found_it_missed(source):
@@ -110,7 +170,14 @@ def test_the_guard_catches_what_the_review_found_it_missed(source):
     tree = ast.parse(source)
     bad_import = not set(_imports(tree)) <= ALLOWED_IMPORTS
     bad_name = any(_forbidden(n) for n in _identifiers(tree))
-    assert bad_import or bad_name
+    bad_open = not _opens_only_to_read(tree)
+    assert bad_import or bad_name or bad_open
+
+
+def test_a_read_only_os_open_passes_the_guard():
+    tree = ast.parse("import os\nfd = os.open('x', os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)\n")
+    assert _opens_only_to_read(tree)
+    assert not any(_forbidden(n) for n in _identifiers(tree))
 
 
 def _third_party(path):
