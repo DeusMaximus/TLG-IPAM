@@ -28,6 +28,7 @@ from ..errors import ApiError, conflict, not_found, validation_error
 from ..ipnet import format_intervals, parse_cidr, parse_ip, subtract_intervals, usable_bounds
 from ..models import Agent, FindingDismissal, Observation, ReservedRange, ScanTarget, Subnet
 from ..schemas import ScanTargetCreate, ScanTargetOut, ScanTargetUpdate
+from ..times import utc
 from . import changes
 
 # spec §5.2; the order here is the order methods are stored in
@@ -391,13 +392,6 @@ async def unassign_agent(session: AsyncSession, agent: Agent, source: str) -> No
 
 
 # --- Requested scans ---
-
-
-def utc(value: datetime | None) -> datetime | None:
-    """SQLite hands datetimes back without a zone; every one stored here is UTC."""
-    if value is None or value.tzinfo is not None:
-        return value
-    return value.replace(tzinfo=timezone.utc)
 
 
 def next_request_after(asked: datetime) -> str:

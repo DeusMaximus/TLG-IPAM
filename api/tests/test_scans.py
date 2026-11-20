@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.database import SessionLocal, init_models
 from app.errors import ApiError
 from app.mcp_server import mcp
-from app.models import ReservedRange, ScanTarget, Subnet
+from app.models import Base, ReservedRange, ScanTarget, Subnet
 from app.schemas import ScanTargetCreate
 from app.services import scans
 from app.services import subnets as subnets_svc
@@ -602,7 +602,9 @@ async def test_mcp_get_subnet_shows_scan_settings(client):
 
 async def test_no_mcp_tool_reaches_scan_configuration():
     # Spec §5.8's two scan tools read findings and ask for a scan of the scope the owner
-    # set (#17); neither takes a scan setting, which the argument check below holds.
+    # set (#17); neither takes a scan setting, which the argument check below holds. It
+    # reads names only: what `request_scan` writes is held by the rows, in
+    # `test_mcp_request_scan_changes_only_the_request_time` below.
     scan_tools = {"list_scan_findings", "request_scan"}
     async with Client(mcp) as mcp_client:
         tools = await mcp_client.list_tools()
@@ -614,6 +616,107 @@ async def test_no_mcp_tool_reaches_scan_configuration():
                 tool.name,
                 arg,
             )
+
+
+async def database_rows() -> dict[str, dict[tuple, dict]]:
+    """Every row of every table, by primary key, as committed."""
+    async with SessionLocal() as session:
+        out = {}
+        for table in Base.metadata.sorted_tables:
+            keys = list(table.primary_key.columns)
+            rows = (await session.execute(select(table))).mappings().all()
+            out[table.name] = {tuple(r[k.name] for k in keys): dict(r) for r in rows}
+        return out
+
+
+def differences(before: dict, after: dict) -> set[tuple]:
+    """(table, primary key, column) for every value that differs, and (table, primary
+    key, "row") for a row added or removed."""
+    found = set()
+    for table in before.keys() | after.keys():
+        old, new = before.get(table, {}), after.get(table, {})
+        for key in old.keys() ^ new.keys():
+            found.add((table, key, "row"))
+        for key in old.keys() & new.keys():
+            found |= {(table, key, c) for c in old[key] if old[key][c] != new[key][c]}
+    return found
+
+
+async def configured(client) -> tuple[dict, dict]:
+    """A subnet set up for scanning with every setting away from its default."""
+    subnet = await lab(client, dhcp_start="10.0.0.100", dhcp_end="10.0.0.150")
+    await make_range(client, subnet["id"], "10.0.0.200", "10.0.0.210", scan_excluded=True)
+    await make_range(client, subnet["id"], "10.0.0.220", "10.0.0.230")
+    agent = await make_agent(client)
+    target = await make_target(
+        client,
+        subnet["id"],
+        agent_id=agent["id"],
+        methods=["icmp", "rdns"],
+        interval_minutes=60,
+    )
+    # a second target, which no request here may touch
+    other = await make_subnet(client, subnet["section_id"], "10.0.1.0/24", name="other")
+    await make_target(client, other["id"], agent_id=agent["id"])
+    return subnet, target
+
+
+async def mcp_request_scan(subnet_id):
+    async with Client(mcp) as mcp_client:
+        return await mcp_client.call_tool(
+            "request_scan", {"subnet_id": subnet_id}, raise_on_error=False
+        )
+
+
+async def test_mcp_request_scan_changes_only_the_request_time(client):
+    """Spec §7.2 invariant 2, by the rows rather than the tool's arguments: a request over
+    MCP changes one column of one target, `scan_requested_at`, and adds its audit entry.
+    Every other column of every table, the target's configuration included, is as it was."""
+    subnet, target = await configured(client)
+    before = await database_rows()
+    result = await mcp_request_scan(subnet["id"])
+    assert not result.is_error, result.content[0].text
+    after = await database_rows()
+
+    [entry] = [key for table, key, what in differences(before, after) if table == "changes"]
+    assert differences(before, after) == {
+        ("scan_targets", (target["id"],), "scan_requested_at"),
+        ("changes", entry, "row"),
+    }
+    assert before["scan_targets"][(target["id"],)]["scan_requested_at"] is None
+    # and the one new audit row is the request's own, whole
+    row = after["changes"][entry]
+    assert (row["entity_type"], row["entity_id"], row["action"]) == (
+        "scan_target",
+        target["id"],
+        "update",
+    )
+    assert row["summary"] == "scan target of subnet lab (10.0.0.0/24): scan requested"
+    assert (row["source"], row["actor"]) == ("mcp", None)
+    old, new = row["before"], row["after"]
+    assert old["scan_requested_at"] is None and new["scan_requested_at"] is not None
+    assert {k: v for k, v in new.items() if k != "scan_requested_at"} == {
+        k: v for k, v in old.items() if k != "scan_requested_at"
+    }
+    assert (old["methods"], old["interval_minutes"]) == (["icmp", "rdns"], 60)
+
+
+@pytest.mark.parametrize("refusal", ["cooldown", "disabled", "unassigned"])
+async def test_mcp_request_scan_refused_changes_nothing(client, refusal):
+    subnet, target = await configured(client)
+    if refusal == "cooldown":
+        first = await mcp_request_scan(subnet["id"])
+        assert not first.is_error, first.content[0].text
+    elif refusal == "disabled":
+        res = await client.put(f"/api/v1/scan-targets/{target['id']}", json={"enabled": False})
+        assert res.status_code == 200, res.text
+    else:
+        res = await client.put(f"/api/v1/scan-targets/{target['id']}", json={"agent_id": None})
+        assert res.status_code == 200, res.text
+    before = await database_rows()
+    result = await mcp_request_scan(subnet["id"])
+    assert result.is_error
+    assert differences(before, await database_rows()) == set()
 
 
 async def test_mcp_audit_view_shows_scan_target_entries(client):

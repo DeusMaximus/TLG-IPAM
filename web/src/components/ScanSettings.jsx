@@ -9,7 +9,8 @@ import {
 } from '../api/ipam'
 import { useToast } from '../context'
 import { useFetch } from '../hooks/useFetch'
-import { parseServerTime, relativeTime } from '../utils/agents'
+import { relativeTime } from '../utils/agents'
+import { parseServerTime } from '../utils/time'
 import {
   formatDuration,
   hasDhcpPool,

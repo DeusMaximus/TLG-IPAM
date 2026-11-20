@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import Change
+from ..times import utc
 
 # internal columns kept out of audit snapshots; the audit log is readable over MCP,
 # so a token's hash never goes in it, nor the error text an agent reported with its
@@ -31,7 +32,9 @@ def snapshot(obj) -> dict:
         if column.name in _SNAPSHOT_EXCLUDE:
             continue
         value = getattr(obj, column.name)
-        out[column.name] = value.isoformat() if isinstance(value, datetime) else value
+        # with its offset, as responses give it, whether the object was read back or
+        # is still in memory (`times.utc`)
+        out[column.name] = utc(value).isoformat() if isinstance(value, datetime) else value
     return out
 
 
