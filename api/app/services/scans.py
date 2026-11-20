@@ -67,8 +67,10 @@ async def _scopes_as_committed(
     session: AsyncSession, subnet_ids: list[str]
 ) -> dict[str, tuple[str, list[tuple[int, int]]]]:
     """Each subnet's CIDR and scan scope, from the database, by subnet id; a deleted
-    subnet is not in the answer. One statement per input whatever the number of subnets
-    (the scan-target list), and the only place the scope's inputs are read.
+    subnet is not in the answer. One statement per input for all the subnets given (the
+    scan-target list), with one bound parameter per subnet id, so the SQLite build's
+    parameter limit is the ceiling on one call: past it the statement fails. The only
+    place the scope's inputs are read.
 
     Every input is read as columns, never taken from objects the session loaded
     earlier, and no loaded object is refreshed: check-in's lease compare-and-set relies
@@ -313,7 +315,9 @@ async def targets_out(session: AsyncSession, targets: list[ScanTarget]) -> list[
 
     The subnets, the agents and the scope's inputs are each read in one statement for
     all the targets (`_scopes_as_committed`), so the list costs the same number of
-    statements for one target as for five hundred."""
+    statements for one target as for five hundred. Each statement binds one parameter
+    per distinct subnet or agent, so the SQLite build's parameter limit is the ceiling
+    on one request: past it the list fails."""
     # jobs imports this module, so it is imported here
     from . import jobs
 
