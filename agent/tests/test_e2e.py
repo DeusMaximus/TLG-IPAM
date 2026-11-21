@@ -427,19 +427,36 @@ OLD = {ip: f"old{ip.split('.')[-1]}.home.arpa" for ip in LIVE}
 NEW = {ip: f"new{ip.split('.')[-1]}.home.arpa" for ip in LIVE}
 
 
-async def _named_subnet(owner, methods=("icmp", "rdns")):
+class StalledProber(FakeProber):
+    """A FakeProber that, once `stall_s` is set, holds the answer to every sixth ping
+    (the last of a /29's sweep) for that much real time: the scheduling delay of a
+    loaded machine, made to order. It sends nothing."""
+
+    stall_s = 0.0
+    stalled_at: list[int] = []  # the ping (its number among all it was asked) each stall followed
+
+    async def ping(self, address, timeout):
+        answer = await super().ping(address, timeout)
+        if self.stall_s and len(self.sent) % 6 == 0:
+            self.stalled_at = [*self.stalled_at, len(self.sent)]
+            await asyncio.sleep(self.stall_s)
+        return answer
+
+
+async def _named_subnet(owner, methods=("icmp", "rdns"), *, clock=None, prober=None):
     """A /29 whose four live addresses have OLD names stored by a complete scan, and an
-    agent at MAX_PPS=1 (one packet a second on the fake clock), ready for the next.
-    The four answer ARP too, and the agent's interface (10.0.0.5) has a MAC."""
+    agent at MAX_PPS=1 (one packet a second on its clock, the ten-times-fast one unless
+    the test passes its own), ready for the next. The four answer ARP too, and the
+    agent's interface (10.0.0.5) has a MAC."""
     agent_row, subnet, target = await setup(owner, cidr="10.0.0.0/29", methods=methods)
     resolver = FakeResolver(OLD)
     agent = make_agent(
         agent_row["token"],
-        prober=FakeProber(alive=LIVE),
+        prober=prober or FakeProber(alive=LIVE),
         resolver=resolver,
         arp=FakeArp({ip: f"02:00:00:00:00:0{ip[-1]}" for ip in LIVE}),
         interfaces=[{"name": "eth0", "cidr": "10.0.0.5/29", "mac": "02:00:00:00:00:05"}],
-        clock=fast_clock(),
+        clock=clock or fast_clock(),
         max_pps=1,
     )
     await agent.checkin_once()
@@ -457,13 +474,34 @@ async def _names(subnet) -> dict:
     return {ip: o.rdns_name for ip, o in (await observations(subnet["id"])).items()}
 
 
-async def test_a_scan_cut_off_during_the_ptr_lookups_keeps_the_names_it_did_not_ask(owner):
-    """Six pings take six seconds at 1 pps; of an 8 s job, the lookups get two slots
-    (the clock runs ten times fast: 0.8 s of real time).
-    The two asked get their new names; the two never asked keep their old ones."""
-    agent, resolver, subnet, target = await _named_subnet(owner)
+@pytest.mark.parametrize("stall_s", [0.0, 0.4], ids=["no-stall", "stalled-after-the-sixth-ping"])
+async def test_a_scan_cut_off_during_the_ptr_lookups_keeps_the_names_it_did_not_ask(owner, stall_s):
+    """Six pings take six seconds at 1 pps; of an 8 s job, the lookups get two slots.
+    The two asked get their new names; the two never asked keep their old ones.
+
+    The clock is the test's: FakeClock moves only when a wait is slept, so which slots
+    fall before the deadline is arithmetic (pings at 0..5 s, lookups at 6 s and 7 s, the
+    third lookup's slot at 8 s, the deadline, which leaves it no time to ask, and the
+    fourth's at 9 s) and no real time is spare or short. The
+    test used a clock that runs ten times fast, which left 0.8 s of real time for the
+    two lookups to be admitted; a 150 ms scheduling delay after the sixth ping left one
+    asked and 250 ms none (#118). `stall_s` is that delay, made to order: the answer
+    to the sixth ping is held in real time, and the result must not change. The test
+    asserts that the stall happened, once, after this scan's sixth ping (the first scan
+    runs without it), so a change to the number of pings, or to which one is held,
+    cannot turn the case into a second `no-stall` unnoticed."""
+    clock = FakeClock()
+    prober = StalledProber(alive=LIVE)
+    agent, resolver, subnet, target = await _named_subnet(owner, clock=clock, prober=prober)
+    # the next scan is due an hour on: its first packet has a slot at once, not after
+    # what is left of the gap since the last packet of the scan before
+    clock.t += 3600
+    seeded = len(prober.sent)  # the pings of the scan that stored the old names
+    prober.stall_s = stall_s
     await agent.checkin_once()
     await run_queued(agent, timeout_s=8)
+    # the stall happened, and after the second scan's sixth ping, the last of its sweep
+    assert prober.stalled_at == ([seeded + 6] if stall_s else [])
     asked = sorted(str(a) for a, _ in resolver.asked)
     assert asked == ["10.0.0.1", "10.0.0.2"]
     assert await _names(subnet) == {
