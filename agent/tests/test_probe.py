@@ -995,7 +995,11 @@ async def test_a_resolver_built_with_no_bound_gives_up_on_a_read_after_the_specs
     `read_timeout`, and given a read that does not finish. It gives no server after
     about that second: not at once (the read was waited for) and not several (a
     bound that was raised). The upper limit, WAIT_MAX, is the margin a loaded machine
-    is given, below the 4 s that raised bound would wait."""
+    is given, below the 4 s that raised bound would wait. It is a smoke test: it cannot
+    tell 1 s from 2, which the next test does without the host's scheduler. Its read
+    ends after the wait, with its thread waited for, and nothing is read again after:
+    that recovery is held by the tests above and below it, and a read made against the
+    one-second default would only add a way to fail on a descheduled thread."""
     assert probe.RESOLV_CONF_TIMEOUT_S == 1.0
     release = threading.Event()
     calls: list[str] = []
@@ -1016,9 +1020,58 @@ async def test_a_resolver_built_with_no_bound_gives_up_on_a_read_after_the_specs
         assert len(calls) == 1  # the read had started: this was its wait running out
         release.set()
         assert await no_read_thread_left()
-        assert await resolver.servers(()) == ("127.0.0.1",)  # a read that ends in time is used
     finally:
         release.set()
+        await no_read_thread_left()
+
+
+async def test_the_default_bound_is_a_timer_of_one_second_on_the_loops_clock(monkeypatch, tmp_path):
+    """The other half of the one-second bound (#118, review of PR #119), which the
+    wall-clock test above cannot hold: it accepts any wait from 0.9 s to 3 s, so a bound
+    doubled to 2 s (or raised by a fifth) passes it. Here the wait is measured on the
+    event loop's own clock, which the test moves (`skew`, as the deadline test above
+    does): the read's wait is a timer set for `read_timeout` after it began, and a timer
+    is due once the clock has passed that. The host's scheduler does not decide it.
+
+    With the clock moved by half a second the wait has not ended; moved by one second
+    it has (the clock only moves ahead, so a timer set for one second is due at least
+    then, however long the real time between was); a wait of 1.2 s or 2 s is not due at
+    one second, unless 0.2 s of real time went by between the read starting and the
+    clock moving (a stall that long lets such a bound pass this test; it never fails a
+    bound of one second). It ends in the loop's turns, with no timer of real time."""
+    release = threading.Event()
+    entered = threading.Event()
+
+    def stalled(path):
+        entered.set()
+        release.wait(STALL)  # freed by the test; STALL at most, so a failure cannot hang
+        return ("127.0.0.1",)
+
+    loop = asyncio.get_running_loop()
+    real_time = loop.time
+    skew = [0.0]
+    monkeypatch.setattr(loop, "time", lambda: real_time() + skew[0])
+    monkeypatch.setattr(probe, "read_resolv_conf", stalled)
+    resolver = DnsResolver(resolv_conf=str(tmp_path / "resolv.conf"))  # no bound given
+    waiting = asyncio.create_task(resolver.servers(()))
+    try:
+        assert await until(entered.is_set)  # the read is blocked, and its wait is a timer now
+        skew[0] += 0.5
+        for _ in range(50):
+            await asyncio.sleep(0)  # turns of the loop, no timer of real time
+        assert not waiting.done(), "the wait ended after half a second on the loop's clock"
+        skew[0] += 0.5  # one second in all
+        for _ in range(50):
+            await asyncio.sleep(0)
+        assert waiting.done(), "the wait did not end after one second on the loop's clock"
+        assert waiting.result() == ()
+        assert resolv_conf_threads()  # the read is still held, as it was
+    finally:
+        skew[0] += 100  # whatever the wait still holds is due
+        release.set()
+        if not waiting.done():
+            waiting.cancel()
+        await asyncio.gather(waiting, return_exceptions=True)
         await no_read_thread_left()
 
 
