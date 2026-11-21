@@ -433,12 +433,12 @@ class StalledProber(FakeProber):
     loaded machine, made to order. It sends nothing."""
 
     stall_s = 0.0
-    stalls = 0  # how many times it held an answer: a test can say the stall happened
+    stalled_at: list[int] = []  # the ping (its number among all it was asked) each stall followed
 
     async def ping(self, address, timeout):
         answer = await super().ping(address, timeout)
         if self.stall_s and len(self.sent) % 6 == 0:
-            self.stalls += 1
+            self.stalled_at = [*self.stalled_at, len(self.sent)]
             await asyncio.sleep(self.stall_s)
         return answer
 
@@ -487,19 +487,21 @@ async def test_a_scan_cut_off_during_the_ptr_lookups_keeps_the_names_it_did_not_
     two lookups to be admitted; a 150 ms scheduling delay after the sixth ping left one
     asked and 250 ms none (#118). `stall_s` is that delay, made to order: the answer
     to the sixth ping is held in real time, and the result must not change. The test
-    asserts that the stall happened (once, in this scan: the first one runs without
-    it), so a change to the number of pings cannot turn the case into a second
-    `no-stall` unnoticed."""
+    asserts that the stall happened, once, after this scan's sixth ping (the first scan
+    runs without it), so a change to the number of pings, or to which one is held,
+    cannot turn the case into a second `no-stall` unnoticed."""
     clock = FakeClock()
     prober = StalledProber(alive=LIVE)
     agent, resolver, subnet, target = await _named_subnet(owner, clock=clock, prober=prober)
     # the next scan is due an hour on: its first packet has a slot at once, not after
     # what is left of the gap since the last packet of the scan before
     clock.t += 3600
+    seeded = len(prober.sent)  # the pings of the scan that stored the old names
     prober.stall_s = stall_s
     await agent.checkin_once()
     await run_queued(agent, timeout_s=8)
-    assert prober.stalls == (1 if stall_s else 0)
+    # the stall happened, and after the second scan's sixth ping, the last of its sweep
+    assert prober.stalled_at == ([seeded + 6] if stall_s else [])
     asked = sorted(str(a) for a, _ in resolver.asked)
     assert asked == ["10.0.0.1", "10.0.0.2"]
     assert await _names(subnet) == {

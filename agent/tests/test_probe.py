@@ -996,7 +996,7 @@ async def test_a_resolver_built_with_no_bound_gives_up_on_a_read_after_the_specs
     about that second: not at once (the read was waited for) and not several (a
     bound that was raised). The upper limit, WAIT_MAX, is the margin a loaded machine
     is given, below the 4 s that raised bound would wait. It is a smoke test: it cannot
-    tell 1 s from 2, which the next test does without the host's scheduler. Its read
+    tell 1 s from 2, which the next test does without the host's scheduler, on a clock it freezes. Its read
     ends after the wait, with its thread waited for, and nothing is read again after:
     that recovery is held by the tests above and below it, and a read made against the
     one-second default would only add a way to fail on a descheduled thread."""
@@ -1025,49 +1025,58 @@ async def test_a_resolver_built_with_no_bound_gives_up_on_a_read_after_the_specs
         await no_read_thread_left()
 
 
-async def test_the_default_bound_is_a_timer_of_one_second_on_the_loops_clock(monkeypatch, tmp_path):
+@pytest.mark.parametrize("late_s", [0.0, 1.5], ids=["thread-on-time", "thread-1.5s-late"])
+async def test_the_default_bound_is_a_timer_of_one_second_on_the_loops_clock(monkeypatch, tmp_path, late_s):
     """The other half of the one-second bound (#118, review of PR #119), which the
     wall-clock test above cannot hold: it accepts any wait from 0.9 s to 3 s, so a bound
-    doubled to 2 s (or raised by a fifth) passes it. Here the wait is measured on the
-    event loop's own clock, which the test moves (`skew`, as the deadline test above
-    does): the read's wait is a timer set for `read_timeout` after it began, and a timer
-    is due once the clock has passed that. The host's scheduler does not decide it.
+    doubled to 2 s passes it. Here the event loop's clock is the test's, frozen at an
+    instant read before the resolver is called plus `skew`, and the loop is only turned
+    (`asyncio.sleep(0)`): the read's wait is a timer set at that instant for
+    `read_timeout`, and it is due when the clock has passed it. Real time counts for
+    nothing, so neither a loaded machine nor a read thread that starts late (`late_s`:
+    the delay #115 was about, held before the read says it has begun) moves the clock
+    or the timer: the wait is pending at +0.999 s and done at +1.0 s, for the bound
+    the spec names. A bound of 1.001 s, 1.2 s or 2 s is not done at +1.0 s; one of
+    0.999 s is done at +0.999 s.
 
-    With the clock moved by half a second the wait has not ended; moved by one second
-    it has (the clock only moves ahead, so a timer set for one second is due at least
-    then, however long the real time between was); a wait of 1.2 s or 2 s is not due at
-    one second, unless 0.2 s of real time went by between the read starting and the
-    clock moving (a stall that long lets such a bound pass this test; it never fails a
-    bound of one second). It ends in the loop's turns, with no timer of real time."""
+    A timed sleep never fires on a frozen clock, so the test waits for the thread with
+    turns of the loop and puts the real clock back before its clean-up."""
     release = threading.Event()
     entered = threading.Event()
 
     def stalled(path):
+        time.sleep(late_s)
         entered.set()
         release.wait(STALL)  # freed by the test; STALL at most, so a failure cannot hang
         return ("127.0.0.1",)
 
+    async def turns(n=50):
+        for _ in range(n):
+            await asyncio.sleep(0)  # a turn of the loop; no timer of real time is involved
+
     loop = asyncio.get_running_loop()
     real_time = loop.time
+    frozen = real_time()
     skew = [0.0]
-    monkeypatch.setattr(loop, "time", lambda: real_time() + skew[0])
+    monkeypatch.setattr(loop, "time", lambda: frozen + skew[0])
     monkeypatch.setattr(probe, "read_resolv_conf", stalled)
     resolver = DnsResolver(resolv_conf=str(tmp_path / "resolv.conf"))  # no bound given
     waiting = asyncio.create_task(resolver.servers(()))
     try:
-        assert await until(entered.is_set)  # the read is blocked, and its wait is a timer now
-        skew[0] += 0.5
-        for _ in range(50):
-            await asyncio.sleep(0)  # turns of the loop, no timer of real time
-        assert not waiting.done(), "the wait ended after half a second on the loop's clock"
-        skew[0] += 0.5  # one second in all
-        for _ in range(50):
-            await asyncio.sleep(0)
+        end = time.monotonic() + PATIENT
+        while not entered.is_set() and time.monotonic() < end:
+            await asyncio.sleep(0)  # the read is blocked, and its wait is a timer set at `frozen`
+        assert entered.is_set()
+        skew[0] = 0.999
+        await turns()
+        assert not waiting.done(), "the wait ended before one second on the loop's clock"
+        skew[0] = 1.0
+        await turns()
         assert waiting.done(), "the wait did not end after one second on the loop's clock"
         assert waiting.result() == ()
         assert resolv_conf_threads()  # the read is still held, as it was
     finally:
-        skew[0] += 100  # whatever the wait still holds is due
+        monkeypatch.setattr(loop, "time", real_time)  # the clean-up polls with timed sleeps
         release.set()
         if not waiting.done():
             waiting.cancel()
