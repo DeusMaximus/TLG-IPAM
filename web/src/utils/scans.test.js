@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { ONLINE_WITHIN_MS } from './agents'
+import { AHEAD_WITHIN_MS, agentStatus, ONLINE_WITHIN_MS } from './agents'
 import {
   agentLimit,
   agentReport,
@@ -88,6 +88,7 @@ describe('how old what the agent can run is', () => {
     expect(agentReport(target({ agent_checkin_at: at, agent_checkin_refused: false }), now)).toEqual({
       at,
       refused: false,
+      ahead: false,
       recent: true,
     })
     // a time without an offset is UTC (parseServerTime), not local time
@@ -103,6 +104,38 @@ describe('how old what the agent can run is', () => {
       now
     )
     expect(refused).toMatchObject({ refused: true, recent: false })
+  })
+
+  it('keeps the ordinary ages: seconds ago, exactly the online window, a day, refused', () => {
+    const at = (ms) => new Date(now - ms).toISOString().replace('Z', '+00:00')
+    const report = (ms, refused = false) =>
+      agentReport(target({ agent_checkin_at: at(ms), agent_checkin_refused: refused }), now)
+    expect(report(20 * 1000)).toMatchObject({ ahead: false, recent: true })
+    expect(report(ONLINE_WITHIN_MS)).toMatchObject({ ahead: false, recent: true })
+    expect(report(ONLINE_WITHIN_MS + 1)).toMatchObject({ ahead: false, recent: false })
+    expect(report(24 * 3600 * 1000)).toMatchObject({ ahead: false, recent: false })
+    expect(report(20 * 1000, true)).toMatchObject({ refused: true, ahead: false, recent: false })
+  })
+
+  it('does not call a report dated ahead of this clock recent, by the agents page’s rule', () => {
+    const at = (ms) => new Date(now + ms).toISOString().replace('Z', '+00:00')
+    const report = (ms, refused = false) =>
+      agentReport(target({ agent_checkin_at: at(ms), agent_checkin_refused: refused }), now)
+    // a little ahead (clock drift) is now
+    expect(report(30 * 1000)).toMatchObject({ ahead: false, recent: true })
+    expect(report(AHEAD_WITHIN_MS)).toMatchObject({ ahead: false, recent: true })
+    // further ahead, its freshness is not known: never recent
+    expect(report(AHEAD_WITHIN_MS + 1000)).toMatchObject({ ahead: true, recent: false })
+    expect(report(24 * 3600 * 1000)).toEqual({
+      at: at(24 * 3600 * 1000),
+      refused: false,
+      ahead: true,
+      recent: false,
+    })
+    expect(report(24 * 3600 * 1000, true)).toMatchObject({ refused: true, ahead: true, recent: false })
+    // the same rule as the status dot
+    const agent = { state: 'active', last_checkin_at: at(24 * 3600 * 1000) }
+    expect(agentStatus(agent, now)).toBe('ahead')
   })
 
   it('has nothing to date when the server does not know what the agent can run', () => {

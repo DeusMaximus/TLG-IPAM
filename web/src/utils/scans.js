@@ -1,5 +1,4 @@
-import { ONLINE_WITHIN_MS } from './agents'
-import { parseServerTime } from './time'
+import { ONLINE_WITHIN_MS, serverAge } from './agents'
 
 // Display helpers for a subnet's scanning settings (v0.2 spec §5.2, §5.3, §5.8).
 // The server decides everything about scanning: which addresses are in scope
@@ -84,15 +83,18 @@ export function agentLimit(target) {
 // that time, by an amount the server does not store.
 //   null — nothing to date: the server does not know what the agent can run, or sent
 //     no time with it
-//   { at, refused, recent } — `at` the server's time as sent; `recent` when the last
-//     check-in was accepted and within the agents page's "online" window
+//   { at, refused, ahead, recent } — `at` the server's time as sent; `ahead` when it is
+//     too far ahead of the browser's clock to read as an age (`serverAge`, the rule
+//     the Agents page's status dot uses); `recent` when the last check-in was accepted
+//     and, by its age, within the Agents page's "online" window. A time ahead is never
+//     recent: how fresh it is is not known.
 export function agentReport(target, now = Date.now()) {
   if (!Array.isArray(target?.runnable_methods)) return null
-  const date = parseServerTime(target.agent_checkin_at)
-  if (!date) return null
+  const found = serverAge(target.agent_checkin_at, now)
+  if (!found) return null
   const refused = target.agent_checkin_refused === true
-  const recent = !refused && now - date.getTime() <= ONLINE_WITHIN_MS
-  return { at: target.agent_checkin_at, refused, recent }
+  const recent = !refused && !found.ahead && found.age <= ONLINE_WITHIN_MS
+  return { at: target.agent_checkin_at, refused, ahead: found.ahead, recent }
 }
 
 export function formatDuration(ms) {

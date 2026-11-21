@@ -94,6 +94,44 @@ describe('Agents page', () => {
     expect(within(row).getByText(`${PREFIX}…`)).toBeInTheDocument()
   })
 
+  it('says the clocks disagree for an agent whose last check-in is dated ahead, not online', async () => {
+    // the same time the Scanning section is given for this agent's target
+    const at = new Date(Date.now() + 24 * 3600 * 1000).toISOString().replace('Z', '+00:00')
+    ipam.listAgents.mockResolvedValue({ data: [agentRow({ last_checkin_at: at })], total: 1 })
+    renderPage()
+    const row = await screen.findByTestId('agent-agent-1')
+    expect(within(row).getByText('Clocks disagree')).toBeInTheDocument()
+    expect(within(row).queryByText('Online')).toBeNull()
+    const last = within(row).getByTestId('last-checkin')
+    expect(last).toHaveTextContent(
+      `at ${new Date(Date.parse(at)).toLocaleString()}, ahead of this browser’s clock`
+    )
+    expect(last).not.toHaveTextContent('0s ago')
+  })
+
+  // the exact three-minute boundary is held in utils/agents.test.js, on a fixed clock
+  it('keeps the ordinary ages: seconds ago, minutes inside the online window, a day', async () => {
+    const ago = (ms) => new Date(Date.now() - ms).toISOString().replace('Z', '+00:00')
+    ipam.listAgents.mockResolvedValue({
+      data: [
+        agentRow({ id: 'a-20s', last_checkin_at: ago(20 * 1000) }),
+        agentRow({ id: 'a-2m', last_checkin_at: ago(2 * 60 * 1000) }),
+        agentRow({ id: 'a-1d', last_checkin_at: ago(24 * 3600 * 1000) }),
+      ],
+      total: 3,
+    })
+    renderPage()
+    const seconds = await screen.findByTestId('agent-a-20s')
+    expect(within(seconds).getByText('Online')).toBeInTheDocument()
+    expect(within(seconds).getByTestId('last-checkin')).toHaveTextContent(/^\d+s ago$/)
+    const minutes = screen.getByTestId('agent-a-2m')
+    expect(within(minutes).getByText('Online')).toBeInTheDocument()
+    expect(within(minutes).getByTestId('last-checkin')).toHaveTextContent('2m ago')
+    const day = screen.getByTestId('agent-a-1d')
+    expect(within(day).getByText('Offline')).toBeInTheDocument()
+    expect(within(day).getByTestId('last-checkin')).toHaveTextContent('24h ago')
+  })
+
   it('renders agent-reported text as text, never as markup', async () => {
     ipam.listAgents.mockResolvedValue({
       data: [agentRow({ hostname: '<img src=x onerror=alert(1)>' })],

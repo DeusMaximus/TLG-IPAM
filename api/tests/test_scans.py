@@ -20,7 +20,7 @@ from app.schemas import ScanTargetCreate
 from app.services import scans
 from app.services import subnets as subnets_svc
 
-from .conftest import make_host, make_section, make_subnet
+from .conftest import make_host, make_section, make_subnet, store_cidr_as
 
 SCHEMA_BEFORE_SCAN_TARGETS = Path(__file__).parent / "data" / "schema_before_scan_targets.sql"
 
@@ -395,6 +395,28 @@ async def test_scan_target_writes_are_logged(client):
     assert update["before"]["scan_dhcp_pool"] is False
     assert update["after"]["scan_dhcp_pool"] is True
     assert delete["before"]["id"] == target["id"]
+
+
+async def test_a_scan_target_summary_names_the_cidr_in_its_one_spelling(client):
+    """A subnet row stored before #97 may still hold its CIDR as typed; the scan-target
+    audit summaries name it as `ipnet.canonical_cidr` does (#111)."""
+    subnet = await lab(client, name="iot")
+    await store_cidr_as(subnet["id"], "10.0.0.0/255.255.255.0")
+    agent = await make_agent(client, "iot-scanner")
+    target = await make_target(client, subnet["id"], agent_id=agent["id"])
+    url = f"/api/v1/scan-targets/{target['id']}"
+    assert (await client.put(url, json={"scan_dhcp_pool": True})).status_code == 200
+    res = await client.post(f"/api/v1/subnets/{subnet['id']}/scan")
+    assert res.status_code == 202, res.text
+    assert (await client.delete(url)).status_code == 204
+
+    summaries = [r["summary"] for r in await changes_of(client, "scan_target")]
+    assert summaries == [
+        "scan target of subnet iot (10.0.0.0/24) deleted",
+        "scan target of subnet iot (10.0.0.0/24): scan requested",
+        "scan target of subnet iot (10.0.0.0/24) updated (scan_dhcp_pool)",
+        "scan target of subnet iot (10.0.0.0/24) created, assigned to agent iot-scanner",
+    ]
 
 
 async def test_update_that_changes_nothing_is_not_logged(client):

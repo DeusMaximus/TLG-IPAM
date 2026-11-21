@@ -30,6 +30,8 @@ const DOT = {
   late: 'bg-amber-500',
   offline: 'bg-red-500',
   never: 'border border-slate-500 bg-transparent',
+  // the last check-in is dated ahead of this browser's clock: how fresh it is is not known
+  ahead: 'border border-amber-500 bg-transparent',
   disabled: 'bg-slate-600',
 }
 
@@ -91,7 +93,7 @@ function AgentRow({ agent, targets, subnets, now, onToggle, onRevoke, onDelete }
     <tr className="border-t border-slate-700/60 align-top" data-testid={`agent-${agent.id}`}>
       <td className="px-3 py-2.5">
         <StatusDot agent={agent} now={now} />
-        <div className="mt-0.5 whitespace-nowrap pl-[18px] text-slate-500">
+        <div className="mt-0.5 max-w-56 pl-[18px] text-slate-500" data-testid="last-checkin">
           {relativeTime(agent.last_checkin_at, now)}
         </div>
       </td>

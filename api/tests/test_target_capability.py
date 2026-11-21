@@ -10,7 +10,7 @@ place a host by its `ip_int` without parsing an address.
 import inspect
 import ipaddress
 import re
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -352,3 +352,239 @@ async def test_no_agent_means_no_check_in_time(client, agent_api):
     target = await make_target(client, subnet["id"], None)
     answer = await target_answer(client, target["id"])
     assert answer["agent_checkin_at"] is None and answer["agent_checkin_refused"] is None
+
+
+# --- The list past the SQLite build's parameter limit; scope in chunks (#111) ---
+
+
+@contextmanager
+def statements_with_parameters():
+    """The SQL statements run inside the block, with the parameters each bound."""
+    from app.database import engine
+
+    seen: list[tuple[str, tuple]] = []
+
+    def count(_conn, _cursor, statement, parameters, *_):
+        seen.append((statement, tuple(parameters or ())))
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count)
+    try:
+        yield seen
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count)
+
+
+@pytest.mark.parametrize(
+    ("count", "expected"),
+    [
+        # one chunk: the six statements of the list
+        (5, LIST_STATEMENTS),
+        # two chunks of each: the targets, then two reads each of the subnets, the
+        # agents and the scope's three inputs
+        (6, 1 + 2 + 2 + 2 * 3),
+        (11, 1 + 3 + 3 + 3 * 3),
+    ],
+)
+async def test_the_list_grows_by_a_fixed_number_of_statements_per_chunk(
+    client, monkeypatch, count, expected
+):
+    monkeypatch.setattr(scans, "_IN_BATCH", 5)
+    await seed_targets(count)
+    with statements_with_parameters() as seen:
+        res = await client.get("/api/v1/scan-targets")
+    assert res.status_code == 200, res.text
+    assert len(seen) == expected, [s for s, _ in seen]
+    # no statement binds more ids than a chunk holds
+    assert max(len(params) for _, params in seen) <= 5
+    listed = res.json()["data"]
+    assert len(listed) == count
+    for i, answer in enumerate(listed):
+        assert answer["runnable_methods"] == (["icmp", "arp", "rdns"] if i % 2 == 0 else ["icmp", "rdns"])
+        assert answer["agent_checkin_refused"] is (i % 3 == 0)
+        assert len(answer["scope"]) == (2 if answer["scan_dhcp_pool"] else 3)
+
+
+@asynccontextmanager
+async def parameter_limit(limit: int):
+    """The app's requests served from their own engine on the same database file, on
+    connections that bind at most `limit` parameters per statement: a SQLite build's
+    limit, lowered (`sqlite3.Connection.setlimit`), so a test can pass it without
+    seeding as many rows as the image's build allows (250,000)."""
+    import sqlite3
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.util import await_only
+
+    from app.config import settings
+    from app.database import _configure_connection, get_session
+    from app.main import app
+
+    other = create_async_engine(f"sqlite+aiosqlite:///{settings.db_path}")
+
+    @event.listens_for(other.sync_engine, "connect")
+    def _configure(dbapi_connection, record):
+        _configure_connection(dbapi_connection, record)
+        driver = dbapi_connection.driver_connection  # aiosqlite, on its own thread
+        await_only(
+            driver._execute(driver._conn.setlimit, sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, limit)
+        )
+
+    sessions = async_sessionmaker(other, expire_on_commit=False)
+
+    async def session():
+        async with sessions() as s:
+            yield s
+
+    app.dependency_overrides[get_session] = session
+    try:
+        yield sessions
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        await other.dispose()
+
+
+async def test_the_list_answers_for_more_targets_than_one_statement_can_bind(
+    client, monkeypatch
+):
+    """With a build that binds 8 parameters, 20 targets on 20 subnets with 20 agents: in
+    one statement per input the list fails; in chunks of 8 it answers, and each answer
+    is the target's own (#111)."""
+    from sqlalchemy.exc import OperationalError
+
+    await seed_targets(20)
+    expected = (await client.get("/api/v1/scan-targets")).json()["data"]
+    assert len(expected) == 20
+
+    async with parameter_limit(8):
+        # the limit is in force: unchunked, the first read of the subnets passes it
+        monkeypatch.setattr(scans, "_IN_BATCH", 500)
+        with pytest.raises(OperationalError, match="too many SQL variables"):
+            await client.get("/api/v1/scan-targets")
+
+        monkeypatch.setattr(scans, "_IN_BATCH", 8)
+        res = await client.get("/api/v1/scan-targets")
+        assert res.status_code == 200, res.text
+        assert res.json()["data"] == expected
+
+
+async def seed_scope_shapes() -> list[str]:
+    """Subnets whose scopes differ in every input, each in a section of its own (so two
+    can hold the same CIDR): the subnet ids, in the order made."""
+    from app.models import ReservedRange, Section, Subnet
+
+    shapes = [
+        # cidr, pool, target's scan_dhcp_pool (None: no target), excluded, scanned
+        ("10.0.0.0/24", (100, 199), True, [(10, 19), (30, 39)], [(15, 35)]),
+        ("10.0.0.0/24", (100, 199), False, [(50, 59)], []),
+        ("10.0.1.0/24", (100, 199), None, [], []),
+        ("10.0.2.0/24", None, True, [(0, 255)], []),
+        ("10.0.3.0/30", None, False, [], []),
+        ("10.0.3.4/31", None, False, [], []),
+        ("10.0.3.6/32", None, True, [], []),
+        ("10.0.4.0/24", (100, 199), True, [(10, 19), (20, 29)], [(25, 40)]),
+        ("10.0.5.0/24", (100, 199), False, [(150, 210)], []),
+        ("10.0.6.0/24", (100, 199), True, [(100, 199)], []),
+    ]
+    ids = []
+    async with SessionLocal() as session:
+        for i, (cidr, pool, pool_scanned, excluded, scanned) in enumerate(shapes):
+            section = Section(name=f"shape-{i}")
+            session.add(section)
+            await session.flush()
+            net = ipaddress.ip_network(cidr)
+            base = int(net.network_address)
+            subnet = Subnet(
+                section_id=section.id,
+                cidr=cidr,
+                name=f"shape-{i}",
+                dhcp_start=str(net[pool[0]]) if pool else None,
+                dhcp_end=str(net[pool[1]]) if pool else None,
+            )
+            session.add(subnet)
+            await session.flush()
+            for (lo, hi), excluded_flag in [(r, True) for r in excluded] + [
+                (r, False) for r in scanned
+            ]:
+                session.add(
+                    ReservedRange(
+                        subnet_id=subnet.id,
+                        start_ip=str(net[lo]),
+                        end_ip=str(net[hi]),
+                        start_int=base + lo,
+                        end_int=base + hi,
+                        scan_excluded=excluded_flag,
+                    )
+                )
+            if pool_scanned is not None:
+                session.add(
+                    ScanTarget(
+                        subnet_id=subnet.id, methods=["icmp"], scan_dhcp_pool=pool_scanned
+                    )
+                )
+            ids.append(subnet.id)
+        await session.commit()
+    return ids
+
+
+@pytest.mark.parametrize("batch", [1, 2, 3, 4, 500])
+async def test_each_subnet_gets_its_own_scope_in_any_order_of_ids_and_across_chunks(
+    monkeypatch, batch
+):
+    """`_scopes_as_committed` in chunks gives each subnet the scope of its one-subnet
+    case, whatever the chunk size, the order of the ids or their repeats; a deleted
+    subnet is left out. Every subnet comes to the end of a chunk under some order and
+    size here, the first shape among them: its excluded ranges and its scanned pool
+    must both reach its scope (#111)."""
+    import random
+
+    ids = await seed_scope_shapes()
+    async with SessionLocal() as session:
+        own = {i: await scans._scope_as_committed(session, i) for i in ids}
+    # the first shape by hand: the pool is scanned, both exclusions hold, and the
+    # scanned range over them removes nothing
+    base = int(ipaddress.ip_address("10.0.0.0"))
+    assert own[ids[0]][1] == [(base + 1, base + 9), (base + 20, base + 29), (base + 40, base + 254)]
+    # the same CIDR with the pool not scanned and another exclusion
+    assert own[ids[1]][1] == [
+        (base + 1, base + 49),
+        (base + 60, base + 99),
+        (base + 200, base + 254),
+    ]
+
+    monkeypatch.setattr(scans, "_IN_BATCH", batch)
+    shuffled = ids[:]
+    random.Random(111).shuffle(shuffled)
+    orders = [
+        ids,
+        list(reversed(ids)),
+        shuffled,
+        # repeats, within a chunk and on both sides of a boundary
+        [ids[0], ids[0], *ids[1:4], ids[0], *ids[4:], ids[3], ids[9]],
+        ["no-such-subnet", *ids[5:], "no-such-subnet", *ids[:5]],
+    ]
+    async with SessionLocal() as session:
+        for order in orders:
+            assert await scans._scopes_as_committed(session, order) == own
+        assert await scans._scopes_as_committed(session, []) == {}
+        assert await scans._scopes_as_committed(session, ["no-such-subnet"]) == {}
+
+
+async def test_one_subnets_scope_is_read_in_the_same_three_statements(monkeypatch):
+    """Check-in, ingest and `drop_out_of_scope` read one subnet's scope: three
+    statements, each binding that one id, whatever the chunk size; one for a deleted
+    subnet."""
+    ids = await seed_scope_shapes()
+    for batch in (1, 500):
+        monkeypatch.setattr(scans, "_IN_BATCH", batch)
+        async with SessionLocal() as session:
+            with statements_with_parameters() as seen:
+                await scans.scan_scope(session, ids[0])
+            assert len(seen) == 3
+            assert [params[:1] for _, params in seen] == [(ids[0],)] * 3
+            assert re.search(r"FROM subnets\b", seen[0][0])
+            assert re.search(r"FROM scan_targets\b", seen[1][0])
+            assert re.search(r"FROM reserved_ranges\b", seen[2][0])
+            assert all(" IN (?)" in statement for statement, _ in seen)
+            with statements_with_parameters() as seen:
+                assert await scans.scan_scope(session, "no-such-subnet") == []
+            assert len(seen) == 1
