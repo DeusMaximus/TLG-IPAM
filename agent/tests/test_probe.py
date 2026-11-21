@@ -984,6 +984,44 @@ async def test_a_read_that_does_not_finish_gives_no_server_and_holds_one_thread_
         await no_read_thread_left()
 
 
+async def test_a_resolver_built_with_no_bound_gives_up_on_a_read_after_the_specs_second(monkeypatch, tmp_path):
+    """The production bound on the host's resolv.conf read (#118, spec §5.2: "a read
+    that has not finished within 1 second" gives no server). Every other test here
+    passes its own bound, so none runs a blocked read against the default, and raising
+    RESOLV_CONF_TIMEOUT_S to 4.0 passed them all.
+
+    The second is written out here as a number, not read from the constant, which is
+    what is held to it; and the resolver is built as `loop.py` builds it, with no
+    `read_timeout`, and given a read that does not finish. It gives no server after
+    about that second: not at once (the read was waited for) and not several (a
+    bound that was raised). The upper limit, WAIT_MAX, is the margin a loaded machine
+    is given, below the 4 s that raised bound would wait."""
+    assert probe.RESOLV_CONF_TIMEOUT_S == 1.0
+    release = threading.Event()
+    calls: list[str] = []
+
+    def stalled(path):
+        calls.append(path)
+        release.wait(STALL)  # freed by the test; STALL at most, so a failure cannot hang
+        return ("127.0.0.1",)
+
+    monkeypatch.setattr(probe, "read_resolv_conf", stalled)
+    resolver = DnsResolver(resolv_conf=str(tmp_path / "resolv.conf"))
+    assert resolver.read_timeout == 1.0
+    try:
+        started = time.monotonic()
+        assert await resolver.servers(()) == ()
+        waited = time.monotonic() - started
+        assert 0.9 <= waited < WAIT_MAX, waited
+        assert len(calls) == 1  # the read had started: this was its wait running out
+        release.set()
+        assert await no_read_thread_left()
+        assert await resolver.servers(()) == ("127.0.0.1",)  # a read that ends in time is used
+    finally:
+        release.set()
+        await no_read_thread_left()
+
+
 def test_a_fifo_or_a_device_is_not_read_and_not_waited_on(tmp_path):
     fifo = tmp_path / "fifo"
     os.mkfifo(fifo)
