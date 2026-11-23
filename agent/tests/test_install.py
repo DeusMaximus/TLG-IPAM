@@ -346,6 +346,27 @@ def test_an_update_gives_the_stored_token_to_the_service_user_again(root, monkey
     assert (str(state / "token"), (os.getuid(), os.getgid())) in owners
 
 
+def test_a_state_directory_left_owner_only_is_opened_to_the_service_user(root):
+    """Codex on #130: a `0700` directory (state from a container, say) kept as it was
+    would leave the service user unable to reach its token."""
+    state = root / "var/lib/tlg-ipam-agent"
+    state.mkdir(mode=0o700)
+    state.chmod(0o700)
+    code, said = run_install(root, FakeHost())
+    assert code == 0, said
+    assert stat.S_IMODE(os.stat(state).st_mode) == 0o755
+
+
+def test_a_state_directory_others_can_write_is_refused_not_repaired(root):
+    state = root / "var/lib/tlg-ipam-agent"
+    state.mkdir()
+    state.chmod(0o777)
+    host = FakeHost()
+    code, said = run_install(root, host, exchange=lambda *a: pytest.fail("no exchange"))
+    assert code == 1 and "writable by users other than its owner" in said[-1]
+    assert stat.S_IMODE(os.stat(state).st_mode) == 0o777
+
+
 def _venv(root: Path) -> dict:
     """A virtual environment's layout: `bin/python3` a link to an interpreter outside
     it, and a package with a module."""

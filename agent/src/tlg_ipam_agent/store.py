@@ -193,22 +193,27 @@ def write_file(path: str, data: bytes, mode: int, owner: tuple[int, int] | None 
 
 
 def make_dir(path: str, mode: int) -> bool:
-    """Creates the directory with exactly `mode`, owned by the process, and says whether
-    it did. One already there is kept if `check_dir` accepts it for the process's user,
-    and its mode is not changed."""
+    """Makes the directory at `path` have exactly `mode`, owned by the process, and says
+    whether it created it. One already there is kept if `check_dir` accepts it for the
+    process's user, and is given `mode` too: a state directory left `0700` by a
+    container would keep the service user from reaching its token (Codex on #130)."""
+    created = True
     try:
         os.mkdir(path, mode)
     except FileExistsError:
         check_dir(path, os.geteuid())
-        return False
+        created = False
     except OSError as exc:
         raise StoreError(f"{path} cannot be created: {_reason(exc)}") from None
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | _NO_LINK)
     try:
-        os.fchmod(fd, mode)
-    finally:
-        os.close(fd)
-    return True
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | _NO_LINK)
+        try:
+            os.fchmod(fd, mode)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise StoreError(f"{path} cannot be set up: {_reason(exc)}") from None
+    return created
 
 
 def remove_file(path: str) -> bool:

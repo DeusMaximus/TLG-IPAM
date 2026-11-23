@@ -150,8 +150,10 @@ def test_a_directory_is_made_with_exactly_its_mode(tmp_path):
     finally:
         os.umask(old)
     assert _mode(tmp_path / "d") == 0o755
-    # already there and acceptable: kept as it is
+    # already there and acceptable: kept, and given the mode asked for
     assert store.make_dir(str(tmp_path / "d"), 0o700) is False
+    assert _mode(tmp_path / "d") == 0o700
+    assert store.make_dir(str(tmp_path / "d"), 0o755) is False
     assert _mode(tmp_path / "d") == 0o755
 
 
