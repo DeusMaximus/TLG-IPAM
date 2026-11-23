@@ -321,7 +321,8 @@ FINDING_MAX = 5_000
 # The work one call does is bounded too (#86), whatever the data: at most
 # `CALL_STATEMENTS` SQL statements, each of which reads at most `SCAN_CHUNK` hosts and
 # `SCAN_CHUNK` observations (and the dismissals at those addresses) along their
-# `(subnet_id, ip_int)` indexes, but the one that lists the subnets. That one reads the order key (id, name, CIDR) of each subnet that
+# `(subnet_id, ip_int)` indexes, passing over no row it does not return (`_read_chunk`),
+# but the one that lists the subnets. That one reads the order key (id, name, CIDR) of each subnet that
 # can hold a finding at all: one with an observation, or with a scan target and a host
 # (`stale` needs no observation). A subnet with neither costs no statement. A call that
 # reaches the bound stops where it is and returns what it found, possibly nothing, with
@@ -414,45 +415,71 @@ def _listed_fqdn(host, subnet_domain: str | None) -> str | None:
     return hosts_svc.fqdn_of(host.hostname, host.domain, subnet_domain)
 
 
+def _region_end(ctx: _Context, start: int) -> int | None:
+    """The last address of the stretch `start` is in: before the DHCP pool, the pool, or
+    after it (None, the end of the subnet). A chunk stays inside one, because the pool's
+    observations are read differently (`_read_chunk`)."""
+    if ctx.pool is None:
+        return None
+    low, high = ctx.pool
+    if start < low:
+        return low - 1
+    if start <= high:
+        return high
+    return None
+
+
 async def _read_chunk(session: AsyncSession, ctx: _Context, start: int):
     """The next addresses of the subnet, from `start` up, with their host and observation
     rows and their dismissals: at most `SCAN_CHUNK` rows of each table, in three
     statements. Returns the addresses in order, their rows, and the last address read
     in full, or None when the subnet has nothing after them.
 
-    Each table is read in address order up to `SCAN_CHUNK` rows, along its
-    `(subnet_id, ip_int)` index, so no statement sorts or scans the rest of the subnet
-    (Codex on #129). A table that fills its chunk may have more after it, so only the
-    addresses up to the lower of the full chunks' last ones are taken, and the rest is
-    read again by the next chunk; observations are read no further than a full host
-    chunk's last address, so the rows a statement passes over are read by one chunk
-    only. An observation in the DHCP pool at an address with no host is never taken:
-    it can only be a `dynamic` `unknown_host`, which this listing leaves out, so no
-    cursor names its address."""
+    Each read follows the table's `(subnet_id, ip_int)` index in address order and
+    passes over no row it does not return, so no statement's work grows with the
+    subnet (Codex on #129). A chunk stays in one stretch of the subnet
+    (`_region_end`). Hosts are read up to `SCAN_CHUNK` rows. Outside the DHCP pool,
+    observations are read the same way, no further than a full host chunk's last
+    address. Inside it, only the observations at the chunk's hosts are read: an
+    observation in the pool at an address with no host can only be a `dynamic`
+    `unknown_host`, which this listing leaves out, so it is never read, and no cursor
+    names its address. A table that fills its chunk may have more after it, so only
+    the addresses up to the lower of the full chunks' last ones are taken; the rest is
+    read again by the next chunk. A chunk that ends at its stretch's end returns that
+    end, the pool's own bound, as the last address read."""
+    end = _region_end(ctx, start)
+    in_pool = ctx.pool is not None and ctx.pool[0] <= start <= ctx.pool[1]
+    hosts_query = select(*_HOST_COLUMNS).where(Host.subnet_id == ctx.id, Host.ip_int >= start)
+    if end is not None:
+        hosts_query = hosts_query.where(Host.ip_int <= end)
     hosts = (
-        await session.execute(
-            select(*_HOST_COLUMNS)
-            .where(Host.subnet_id == ctx.id, Host.ip_int >= start)
-            .order_by(Host.ip_int)
-            .limit(SCAN_CHUNK)
-        )
+        await session.execute(hosts_query.order_by(Host.ip_int).limit(SCAN_CHUNK))
     ).all()
-    host_bound = hosts[-1].ip_int if len(hosts) == SCAN_CHUNK else None
-    observations = select(*_OBSERVATION_COLUMNS).where(
-        Observation.subnet_id == ctx.id, Observation.ip_int >= start
-    )
-    if host_bound is not None:
-        observations = observations.where(Observation.ip_int <= host_bound)
-    if ctx.pool is not None:
-        hosted = exists().where(Host.subnet_id == ctx.id, Host.ip_int == Observation.ip_int)
-        observations = observations.where(
-            or_(~Observation.ip_int.between(*ctx.pool), hosted)
+    full = [hosts[-1].ip_int] if len(hosts) == SCAN_CHUNK else []
+    if in_pool:
+        seen = []
+        if hosts:
+            seen = (
+                await session.execute(
+                    select(*_OBSERVATION_COLUMNS).where(
+                        Observation.subnet_id == ctx.id,
+                        Observation.ip_int.in_([h.ip_int for h in hosts]),
+                    )
+                )
+            ).all()
+    else:
+        observations = select(*_OBSERVATION_COLUMNS).where(
+            Observation.subnet_id == ctx.id, Observation.ip_int >= start
         )
-    seen = (
-        await session.execute(observations.order_by(Observation.ip_int).limit(SCAN_CHUNK))
-    ).all()
-    full = [rows[-1].ip_int for rows in (hosts, seen) if len(rows) == SCAN_CHUNK]
-    bound = min(full) if full else None
+        upper = full[0] if full else end
+        if upper is not None:
+            observations = observations.where(Observation.ip_int <= upper)
+        seen = (
+            await session.execute(observations.order_by(Observation.ip_int).limit(SCAN_CHUNK))
+        ).all()
+        if len(seen) == SCAN_CHUNK:
+            full.append(seen[-1].ip_int)
+    bound = min(full) if full else end
     by_host = {r.ip_int: r for r in hosts if bound is None or r.ip_int <= bound}
     by_observation = {r.ip_int: r for r in seen if bound is None or r.ip_int <= bound}
     addresses = sorted(by_host.keys() | by_observation.keys())
@@ -505,10 +532,9 @@ async def list_named(
     across the cursor, so they are missed or seen twice. The tool's docstring tells the
     assistant to start again without a cursor when it needs the current state.
 
-    A cursor from a call that stopped at the bound names an address the call examined,
-    which can be one where a host, an observation or a dismissal is stored and nothing
-    is listed, except an unhosted address in the DHCP pool, which is never read
-    (`_read_chunk`)."""
+    A cursor from a call that stopped at the bound names a host's address, an
+    observation's outside the DHCP pool, or a bound of the pool, possibly with nothing
+    listed there; an unhosted address in the pool is never read (`_read_chunk`)."""
     _check_type(type_)
     after = _decode_cursor(cursor) if cursor is not None else None
     budget = CALL_STATEMENTS - 1  # the subnets' statement below
@@ -544,8 +570,14 @@ async def list_named(
         resume = after is not None and place == after[:3]
         if after is not None and place < after[:3]:
             continue
-        if resume and after[3] > _ROW_INT_MAX:
-            # Nothing is stored after it: `_ADDRESS_END`, the cursor of a call that read
+        # Where the subnet's reading resumes: at the cursor's address, unless the cursor
+        # is after every finding there (its last type), and then at the next one, so a
+        # chunk always ends past the cursor and paging moves on.
+        start = 0
+        if resume:
+            start = after[3] + (1 if after[4] == _LAST_TYPE else 0)
+        if start > _ROW_INT_MAX:
+            # Nothing is stored there: `_ADDRESS_END`, the cursor of a call that read
             # the subnet in full, or an address a client made up past what SQLite's
             # integer column holds, which must not reach a statement.
             continue
@@ -557,7 +589,6 @@ async def list_named(
         if ctx is None:  # deleted since the list was read
             last = end_of_subnet
             continue
-        start = after[3] if resume else 0
         while True:
             if last is not None and budget < _CHUNK_STATEMENTS:
                 return stopped()

@@ -978,6 +978,81 @@ async def test_no_chunk_statement_scans_or_sorts_the_subnet(client):
                     assert "_subnet_ip_int" in step, plan
 
 
+async def vm_instructions(statements: list) -> int:
+    """SQLite virtual-machine instructions to run the given reads again, counted by its
+    progress handler: the work a statement does, rows passed over included, which a
+    query plan does not show (Codex on #129, second round)."""
+    count = [0]
+
+    def tick():
+        count[0] += 1
+        return 0
+
+    async with engine.connect() as conn:
+        raw = (await conn.get_raw_connection()).driver_connection
+        await raw.set_progress_handler(tick, 1)
+        try:
+            for sql, params in statements:
+                (await conn.exec_driver_sql(sql, params)).all()
+        finally:
+            await raw.set_progress_handler(None, 1)
+    return count[0]
+
+
+async def walk_reads(**args) -> tuple[list, list]:
+    """A whole walk's pages, and every statement it ran on hosts, observations or
+    dismissals."""
+    with statements_with_parameters() as seen:
+        pages = await scan_pages(**args)
+    reads = [
+        (sql, params)
+        for sql, params in seen
+        if any(f"FROM {t}" in sql for t in ("hosts", "observations", "finding_dismissals"))
+        and "FROM subnets" not in sql
+    ]
+    return pages, reads
+
+
+async def test_unhosted_pool_observations_cost_no_work(client):
+    """Codex on #129, second round: the observation read passed over every unhosted
+    observation in a scanned pool before its LIMIT, so its work grew with the pool even
+    with the indexes. A pool's observations are now read only at its hosts' addresses:
+    walking a subnet whose pool holds 3,000 unhosted observations does the work of one
+    whose pool holds 100, and lists the same findings."""
+    section = await make_section(client)
+    work = {}
+    for second, unhosted in ((1, 100), (2, 3000)):
+        subnet = await make_subnet(
+            client, section["id"], f"10.{second}.0.0/20", name=f"pool{unhosted}",
+            dhcp_start=f"10.{second}.1.0", dhcp_end=f"10.{second}.14.255",
+        )
+        res = await client.post(
+            "/api/v1/scan-targets", json={"subnet_id": subnet["id"], "scan_dhcp_pool": True}
+        )
+        assert res.status_code == 201, res.text
+        low = int(parse_ip(f"10.{second}.1.0"))
+        async with SessionLocal() as session:
+            for i in range(unhosted):
+                ip = str(ipaddress.IPv4Address(low + i))
+                session.add(
+                    Observation(subnet_id=subnet["id"], ip=ip, ip_int=low + i, mac=MAC)
+                )
+            await session.commit()
+        # a static lease in the pool, and an unknown host on each side of the pool
+        await make_host(client, subnet["id"], f"10.{second}.14.200", hostname="lease")
+        for ip in (f"10.{second}.0.10", f"10.{second}.14.200", f"10.{second}.15.10"):
+            await observe(subnet["id"], ip, mac=OTHER_MAC)
+        pages, reads = await walk_reads(subnet_id=subnet["id"])
+        assert [(f["ip"], f["type"]) for p in pages for f in p] == [
+            (f"10.{second}.0.10", "unknown_host"),
+            (f"10.{second}.14.200", "mac_missing"),
+            (f"10.{second}.15.10", "unknown_host"),
+        ]
+        work[unhosted] = await vm_instructions(reads)
+    # thirty times the pool, the same work give or take the depth of an index
+    assert work[3000] < work[100] * 1.5, work
+
+
 async def test_start_up_creates_the_address_indexes_on_an_existing_database(tmp_path):
     """A database made before #86 has none of the three address indexes; start-up
     creates them, once."""
