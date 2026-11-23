@@ -90,6 +90,18 @@ class ReservedRange(Base):
 
     subnet: Mapped[Subnet] = relationship(back_populates="reserved_ranges")
 
+    __table_args__ = (
+        # what the scope reads (`scans._scopes_of_chunk`): a subnet's excluded ranges,
+        # found without passing over its scanned ranges or another subnet's (#86)
+        Index(
+            "ix_reserved_ranges_subnet_excluded",
+            "subnet_id",
+            "scan_excluded",
+            "start_int",
+            "end_int",
+        ),
+    )
+
 
 class Host(Base):
     __tablename__ = "hosts"

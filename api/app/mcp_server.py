@@ -110,7 +110,8 @@ async def add_reserved_range(
     range held for network gear that is not installed yet. Hosts can still be created
     inside the range manually with create_host. A range added here is always scanned
     (scan_excluded false) if the subnet is scanned: excluding a range from scanning is
-    done in the TLG-IPAM web UI, not over MCP."""
+    done in the TLG-IPAM web UI, not over MCP. A subnet holds at most 100 reserved
+    ranges; past that the call fails, and a range must be deleted first."""
     payload = ReservedRangeCreate(start_ip=start_ip, end_ip=end_ip, description=description)
     async with SessionLocal() as session:
         block = await subnets_svc.create_reserved_range(session, subnet_id, payload, source="mcp")

@@ -6,12 +6,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastmcp import Client
-from sqlalchemy import event, func, select, update
+from sqlalchemy import delete, event, func, select, update
 
 from app.database import SessionLocal, engine
 from app.mcp_server import mcp
 from app import ipnet
-from app.models import Base, Change, Host, Observation, ScanTarget, Subnet
+from app.models import Base, Change, Host, Observation, ReservedRange, ScanTarget, Subnet
+from app.schemas import SUBNET_RESERVED_RANGES_MAX
 from app.services import findings as findings_svc
 from app.services import scans
 
@@ -748,29 +749,33 @@ async def test_the_largest_finding_fits_its_bound(client):
     """`FINDING_MAX` against the largest finding the write limits allow: the subnet name
     and the hostname in control characters (6 bytes each as JSON), the domain at
     `ipnet.DOMAIN_MAX`, and a 253-character PTR name outside it, so the name finding
-    proposes both a hostname and a domain."""
+    proposes both a hostname and a domain, at an address as wide as IPv4 text gets
+    (`192.168.255.254`, ten digits as an integer; briefed round 1 on #129 found the
+    earlier `10.0.0.254` fixture 11 bytes short of it)."""
     domain = ".".join(["a" * 63] * 3) + "." + "c" * 61
     ptr = ".".join(["p" * 63] * 3) + "." + "q" * 61
     assert len(domain) == len(ptr) == 253
     section = await make_section(client)
     subnet = await make_subnet(
-        client, section["id"], "10.0.0.0/24", name="\x01" * 120, domain=domain
+        client, section["id"], "192.168.255.0/24", name="\x01" * 120, domain=domain
     )
     target = await client.post("/api/v1/scan-targets", json={"subnet_id": subnet["id"]})
     assert target.status_code == 201, target.text
     await backdate(ScanTarget, target.json()["data"]["id"])
     host = await make_host(
-        client, subnet["id"], "10.0.0.254", hostname="\x01" * 253, domain=domain
+        client, subnet["id"], "192.168.255.254", hostname="\x01" * 253, domain=domain
     )
-    await observe(subnet["id"], "10.0.0.254", mac=MAC, rdns=ptr, seen=LONG_AGO, alive=False)
-    await observe(subnet["id"], "10.0.0.253", mac=MAC, rdns=ptr)
+    await observe(
+        subnet["id"], "192.168.255.254", mac=MAC, rdns=ptr, seen=LONG_AGO, alive=False
+    )
+    await observe(subnet["id"], "192.168.255.253", mac=MAC, rdns=ptr)
     every = await scan_findings()
     assert {f["type"] for f in every} == {
         "unknown_host", "mac_missing", "name_mismatch", "stale"
     }
     largest = max(encoded(f) for f in every)
     [name] = [f for f in every if f["type"] == "name_mismatch"]
-    assert encoded(name) == largest
+    assert encoded(name) == largest == 4_880  # the figure the brief and spec give
     assert name["host_id"] == host["id"]
     assert name["proposed"] == {"hostname": "p" * 63, "domain": ptr[64:]}
     assert largest <= findings_svc.FINDING_MAX
@@ -931,17 +936,48 @@ def statements_with_parameters():
         event.remove(engine.sync_engine, "before_cursor_execute", before)
 
 
-async def test_no_chunk_statement_scans_or_sorts_the_subnet(client):
+async def add_ranges(subnet_id: str, count: int, *, excluded: bool, first: str) -> None:
+    """`count` one-address reserved ranges from `first` up, written directly: the most a
+    subnet can hold now, or more, as a subnet stored before the limit may."""
+    low = int(parse_ip(first))
+    async with SessionLocal() as session:
+        for i in range(count):
+            ip = str(ipaddress.IPv4Address(low + i))
+            session.add(
+                ReservedRange(
+                    subnet_id=subnet_id, start_ip=ip, end_ip=ip,
+                    start_int=low + i, end_int=low + i, scan_excluded=excluded,
+                )
+            )
+        await session.commit()
+
+
+def call_reads(seen: list) -> list:
+    """Every statement of a call but the one listing the subnets, the bound's one
+    exception."""
+    return [(sql, params) for sql, params in seen if "FROM subnets" not in sql or
+            "WHERE subnets.id" in sql]
+
+
+async def plan_of(sql: str, params) -> list[str]:
+    async with engine.connect() as conn:
+        rows = await conn.exec_driver_sql("EXPLAIN QUERY PLAN " + sql, params)
+        return [row[-1] for row in rows.all()]
+
+
+async def test_no_statement_of_a_call_scans_or_sorts(client):
     """Codex on #129: without an index on the address, each chunk statement scanned and
-    sorted the whole subnet, and the pool's correlated host lookup searched every host
-    for each observation, so a chunk cost grew with the square of the subnet. Every
-    statement of a call that reads hosts, observations or dismissals is a SEARCH on its
-    `(subnet_id, ip_int)` index, with no temporary sort, whatever the subnet holds."""
+    sorted the whole subnet. Briefed round 1: the scope's read of excluded ranges
+    scanned the whole reserved-range table. Every statement of a call but the subnet
+    list is a SEARCH on an index, with no temporary sort, whatever the subnet and the
+    other subnets hold, before and after ANALYZE; the chunk reads use their
+    `(subnet_id, ip_int)` index and the scope its excluded-range one."""
     section = await make_section(client)
     subnet = await make_subnet(
         client, section["id"], "10.1.0.0/20", name="big",
         dhcp_start="10.1.8.1", dhcp_end="10.1.15.254",
     )
+    other = await make_subnet(client, section["id"], "10.2.0.0/20", name="other")
     res = await client.post(
         "/api/v1/scan-targets", json={"subnet_id": subnet["id"], "scan_dhcp_pool": True}
     )
@@ -954,28 +990,30 @@ async def test_no_chunk_statement_scans_or_sorts_the_subnet(client):
             if i % 2:
                 session.add(Host(subnet_id=subnet["id"], ip=ip, ip_int=base + i, mac=MAC))
         await session.commit()
-    with statements_with_parameters() as seen:
-        await scan_page()
-    reads = [
-        (sql, params)
-        for sql, params in seen
-        if any(f"FROM {t}" in sql for t in ("hosts", "observations", "finding_dismissals"))
-        and "FROM subnets" not in sql
-    ]
-    assert len(reads) == 3  # one chunk: hosts, observations, dismissals
-    async with engine.connect() as conn:
+    await add_ranges(subnet["id"], 50, excluded=False, first="10.1.15.100")
+    await add_ranges(subnet["id"], 50, excluded=True, first="10.1.15.200")
+    await add_ranges(other["id"], 3000, excluded=True, first="10.2.0.1")
+    for analyse in (False, True):
+        if analyse:
+            async with engine.begin() as conn:
+                await conn.exec_driver_sql("ANALYZE")
+        with statements_with_parameters() as seen:
+            await scan_page()
+        reads = call_reads(seen)
+        tables = " ".join(sql for sql, _ in reads)
+        for table in ("hosts", "observations", "finding_dismissals", "reserved_ranges"):
+            assert f"FROM {table}" in tables, table
         for sql, params in reads:
-            plan = [
-                row[-1]
-                for row in (
-                    await conn.exec_driver_sql("EXPLAIN QUERY PLAN " + sql, params)
-                ).all()
-            ]
-            assert not [step for step in plan if "TEMP B-TREE" in step], plan
-            assert not [step for step in plan if step.startswith("SCAN")], plan
-            for step in plan:
-                if step.startswith("SEARCH"):
-                    assert "_subnet_ip_int" in step, plan
+            plan = await plan_of(sql, params)
+            assert not [step for step in plan if "TEMP B-TREE" in step], (sql, plan)
+            assert not [step for step in plan if step.startswith("SCAN")], (sql, plan)
+            searches = [step for step in plan if step.startswith("SEARCH")]
+            assert searches, (sql, plan)
+            if "FROM reserved_ranges" in sql:
+                assert all("ix_reserved_ranges_subnet_excluded" in s for s in searches), plan
+            for table in ("hosts", "observations", "finding_dismissals"):
+                if f"FROM {table} " in sql + " " and "EXISTS" not in sql:
+                    assert all("_subnet_ip_int" in s for s in searches), (sql, plan)
 
 
 async def vm_instructions(statements: list) -> int:
@@ -1053,6 +1091,85 @@ async def test_unhosted_pool_observations_cost_no_work(client):
     assert work[3000] < work[100] * 1.5, work
 
 
+async def first_call_work() -> int:
+    """SQLite instructions for every statement the first call of a walk runs, the
+    subnet list included."""
+    with statements_with_parameters() as seen:
+        await scan_page()
+    return await vm_instructions(seen)
+
+
+async def test_every_read_of_a_call_does_bounded_work(client):
+    """Briefed round 1 on #129: the call's statement count stayed at 17 while the
+    scope's read of reserved ranges grew with every range stored, another subnet's and
+    the scanned ones included (508 to 50,008 instructions for 100 to 10,000). Counted
+    over every statement of a call: thousands of ranges that are not this subnet's
+    excluded ones cost nothing, and a subnet at `SUBNET_RESERVED_RANGES_MAX` excluded
+    ranges costs a bounded amount more than one with none."""
+    section = await make_section(client)
+    alpha = await make_subnet(client, section["id"], "10.0.0.0/24", name="alpha")
+    other = await make_subnet(client, section["id"], "10.5.0.0/16", name="other")
+    await unknown_hosts(alpha["id"], "10.0.0", range(10, 40))
+    base = await first_call_work()
+
+    await add_ranges(alpha["id"], 5000 // 50, excluded=False, first="10.0.0.100")
+    await add_ranges(other["id"], 5000, excluded=True, first="10.5.0.1")
+    await add_ranges(other["id"], 5000, excluded=False, first="10.5.100.1")
+    unrelated = await first_call_work()
+    assert unrelated < base * 1.1, (base, unrelated)
+
+    async with SessionLocal() as session:
+        await session.execute(
+            delete(ReservedRange).where(ReservedRange.subnet_id == alpha["id"])
+        )
+        await session.commit()
+    await add_ranges(alpha["id"], SUBNET_RESERVED_RANGES_MAX, excluded=True, first="10.0.0.100")
+    at_limit = await first_call_work()
+    # a few dozen instructions a range, read along the index and merged once
+    assert at_limit - base < SUBNET_RESERVED_RANGES_MAX * 100, (base, at_limit)
+
+
+async def test_a_subnet_holds_at_most_the_reserved_range_limit(client):
+    """The limit that bounds the scope's read (#86), on every write path: the REST
+    create the UI uses and MCP's add_reserved_range. A subnet stored with more before
+    it keeps them, can edit and delete them, and adds one only once it holds fewer."""
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"], "10.0.0.0/24", name="lab")
+    refusal = (
+        f"reserved_ranges: a subnet holds at most {SUBNET_RESERVED_RANGES_MAX} reserved "
+        "ranges; delete one before adding another"
+    )
+    await add_ranges(subnet["id"], SUBNET_RESERVED_RANGES_MAX - 1, excluded=False, first="10.0.0.1")
+    url = f"/api/v1/subnets/{subnet['id']}/reserved"
+    res = await client.post(url, json={"start_ip": "10.0.0.200", "end_ip": "10.0.0.200"})
+    assert res.status_code == 201, res.text
+    res = await client.post(url, json={"start_ip": "10.0.0.201", "end_ip": "10.0.0.201"})
+    assert res.status_code == 422 and res.json()["error"]["message"] == refusal, res.text
+    before = await change_count()
+    over = await call(
+        "add_reserved_range",
+        {"subnet_id": subnet["id"], "start_ip": "10.0.0.202", "end_ip": "10.0.0.202"},
+    )
+    assert over.is_error and over.content[0].text == refusal
+    assert await change_count() == before
+
+    # stored over the limit before it: kept, editable, deletable, and full
+    await add_ranges(subnet["id"], 5, excluded=False, first="10.0.0.210")
+    detail = (await client.get(f"/api/v1/subnets/{subnet['id']}")).json()["data"]
+    ranges = detail["reserved_ranges"]
+    assert len(ranges) == SUBNET_RESERVED_RANGES_MAX + 5
+    res = await client.patch(
+        f"{url}/{ranges[0]['id']}", json={"description": "edited", "scan_excluded": True}
+    )
+    assert res.status_code == 200, res.text
+    res = await client.post(url, json={"start_ip": "10.0.0.250", "end_ip": "10.0.0.250"})
+    assert res.status_code == 422, res.text
+    for r in ranges[1:7]:
+        assert (await client.delete(f"{url}/{r['id']}")).status_code == 204
+    res = await client.post(url, json={"start_ip": "10.0.0.250", "end_ip": "10.0.0.250"})
+    assert res.status_code == 201, res.text
+
+
 async def test_start_up_creates_the_address_indexes_on_an_existing_database(tmp_path):
     """A database made before #86 has none of the three address indexes; start-up
     creates them, once."""
@@ -1114,6 +1231,12 @@ async def test_a_walk_that_stops_early_still_lists_every_finding_once(client, mo
     await backdate(Host, old["id"])  # never seen: stale
     await make_host(client, lab["id"], "10.0.0.50", hostname="quiet", mac=MAC)
     await observe(lab["id"], "10.0.0.50", mac=MAC)  # nothing to list
+    await make_host(client, lab["id"], "10.0.0.51", hostname="swapped", mac=OTHER_MAC)
+    await observe(lab["id"], "10.0.0.51", mac=MAC)  # mac_mismatch
+    await make_host(client, lab["id"], "10.0.0.52")
+    await observe(lab["id"], "10.0.0.52", rdns="printer.home.arpa")  # name_missing
+    await make_host(client, lab["id"], "10.0.0.53", hostname="both", mac=OTHER_MAC)
+    await observe(lab["id"], "10.0.0.53", mac=MAC, rdns="other.home.arpa")  # two at one
     await observe(lab["id"], "10.0.0.60", mac=OTHER_MAC)
     [dismissed] = [f for f in await rest_findings(client, lab["id"]) if f["ip"] == "10.0.0.60"]
     await dismiss(client, key(dismissed))
@@ -1125,15 +1248,13 @@ async def test_a_walk_that_stops_early_still_lists_every_finding_once(client, mo
     await unknown_hosts(iot["id"], "10.0.1", range(10, 17))
 
     filters = [
-        {},
-        {"subnet_id": lab["id"]},
-        {"type": "unknown_host"},
-        {"subnet_id": lab["id"], "type": "mac_missing"},
+        {**subnet, **kind}
+        for subnet in ({}, {"subnet_id": lab["id"]})
+        for kind in ({}, *({"type": t} for t in findings_svc.FINDING_TYPES))
     ]
     unbounded = [await scan_findings(**f) for f in filters]
-    assert {f["type"] for f in unbounded[0]} == {
-        "unknown_host", "mac_missing", "name_mismatch", "stale"
-    }
+    # every type, so a resumed chunk that dropped one would show (briefed round 1)
+    assert {f["type"] for f in unbounded[0]} == set(findings_svc.FINDING_TYPES)
     assert "10.0.0.60" not in {f["ip"] for f in unbounded[0]}
     assert not set(pool) & {f["ip"] for f in unbounded[0]}
     rest = {s["id"]: await rest_findings(client, s["id"]) for s in (iot, lab)}
@@ -1148,11 +1269,13 @@ async def test_a_walk_that_stops_early_still_lists_every_finding_once(client, mo
         assert [{k: v for k, v in f.items() if k not in NAMES} for f in everything] == expected
 
     monkeypatch.setattr(findings_svc, "CALL_STATEMENTS", 10)
+    for chunk in (1, 2, 4):  # at 1, every address is a resume point
+        monkeypatch.setattr(findings_svc, "SCAN_CHUNK", chunk)
+        for args, everything in zip(filters, unbounded):
+            pages = await scan_pages(**args)
+            assert [f for p in pages for f in p] == everything, (chunk, args)
+            assert len(pages) > 2, (chunk, args)
     monkeypatch.setattr(findings_svc, "SCAN_CHUNK", 3)
-    for args, everything in zip(filters, unbounded):
-        pages = await scan_pages(**args)
-        assert [f for p in pages for f in p] == everything, args
-        assert len(pages) > 2 and any(len(p) < 3 for p in pages[:-1]), args
 
     # A cursor from a stop names the last address the call read: never one of the
     # pool's unhosted addresses, which can only be dynamic findings and are not read.

@@ -95,6 +95,13 @@ class SectionOut(BaseModel):
 # dual-stack subnet with four resolvers per family. A scan job carries only the first
 # `agent_protocol.DNS_SERVERS_MAX` of them.
 SUBNET_DNS_SERVERS_MAX = 8
+# The most reserved ranges one subnet holds (#86), excluded from scanning or not: every
+# visit of `findings.list_named` reads a subnet's excluded ranges to build its scope,
+# and `get_subnet` returns them all, so a client must not be able to grow them without
+# end (MCP's `add_reserved_range` adds one per call). A homelab subnet has a handful. A
+# subnet stored with more before the limit keeps them; adding one is refused until it
+# holds fewer (`services/subnets.create_reserved_range`).
+SUBNET_RESERVED_RANGES_MAX = 100
 
 
 class _SubnetFields(BaseModel):

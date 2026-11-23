@@ -312,7 +312,8 @@ NETWORK_REPORTED_NOTE = (
 # suffix `ipnet.DOMAIN_MAX` (since #86). A host whose effective domain was stored longer
 # before #86 is listed with `host_fqdn` null, not with a cut FQDN; its record keeps the
 # domain. `test_mcp.test_the_largest_finding_fits_its_bound` builds the largest finding
-# those bounds allow (control characters, which JSON writes in 6 bytes each, in the names)
+# those bounds allow, 4,880 bytes (control characters, which JSON writes in 6 bytes
+# each, in the names; the address at IPv4's widest)
 # and `test_a_host_with_a_domain_stored_before_the_limit_is_listed_without_its_fqdn` the
 # legacy case.
 PAGE_SIZE = 25
@@ -322,9 +323,14 @@ FINDING_MAX = 5_000
 # `CALL_STATEMENTS` SQL statements, each of which reads at most `SCAN_CHUNK` hosts and
 # `SCAN_CHUNK` observations (and the dismissals at those addresses) along their
 # `(subnet_id, ip_int)` indexes, passing over no row it does not return (`_read_chunk`),
-# but the one that lists the subnets. That one reads the order key (id, name, CIDR) of each subnet that
-# can hold a finding at all: one with an observation, or with a scan target and a host
-# (`stale` needs no observation). A subnet with neither costs no statement. A call that
+# but the one that lists the subnets. That one reads the order key (id, name, CIDR) of
+# each subnet that can hold a finding at all: one with an observation, or with a scan
+# target and a host (`stale` needs no observation). A subnet with neither costs no
+# statement. The scope each visit reads (`scans.scan_scope`) takes only the subnet's
+# excluded reserved ranges, along their own index, and a subnet holds at most
+# `schemas.SUBNET_RESERVED_RANGES_MAX`; one stored with more before that limit is read
+# whole, the other exception (`test_mcp.test_every_read_of_a_call_does_bounded_work`,
+# which counts SQLite instructions over every statement of a call). A call that
 # reaches the bound stops where it is and returns what it found, possibly nothing, with
 # a cursor at the last address it examined; the next call goes on from there. Each call
 # reads at least one chunk, so paging always moves on. Measured on the issue's case (500
@@ -523,7 +529,10 @@ async def list_named(
     last finding when the page is full, or, when the call reached `CALL_STATEMENTS`,
     the last address it examined, so a page can be short, or empty, and still have a
     cursor. A client that passes it back gets what comes after it, so a finding
-    resolved between calls moves nothing later in the order. Only reads.
+    resolved between calls moves nothing later in the order. Only reads. Every read is
+    bounded (the comment on `CALL_STATEMENTS`) but two: the statement listing the
+    subnets, and the excluded reserved ranges of a subnet stored with more than
+    `schemas.SUBNET_RESERVED_RANGES_MAX` before that limit, which its scope reads whole.
 
     Each call reads the data as it is then; there is no snapshot. Following the cursor
     sees every finding exactly once while the data and the filters stay as they were. A
