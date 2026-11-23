@@ -69,7 +69,12 @@ class Pacer:
     The end of a slot is a callback the event loop runs after the granting step, so a
     turn of the loop (its timers and ready sockets among it) comes between any two
     grants, even when every slot is overdue and no send ever waits: the ARP listener,
-    the check-ins, the job's deadline and a cancellation are not held back by a sweep."""
+    the check-ins, the job's deadline and a cancellation are not held back by a sweep.
+
+    A `Pacer` belongs to one event loop. Stopping the loop in the step of a grant and
+    closing it discards the callback that ends the slot and leaves the turn held, so a
+    later change that restarts the agent in process, or keeps a pacer across event loops,
+    has to make a new one."""
 
     def __init__(self, pps: int, clock: Clock):
         self._interval = 1.0 / pps
