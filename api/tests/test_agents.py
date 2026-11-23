@@ -26,8 +26,9 @@ from app.models import Agent, Token
 from app.mcp_server import mcp
 from app.schemas import AGENT_NAME_MAX, AgentCreate
 from app.services import agents as agents_svc
+from app.services import enrolment as enrolment_svc
 
-from .conftest import write_lock
+from .conftest import enrol, make_enrolled_agent, write_lock
 
 SCHEMA_BEFORE_AGENTS = Path(__file__).parent / "data" / "schema_before_agents.sql"
 MCP_PATHS = ("/mcp", "/mcp/")
@@ -62,10 +63,8 @@ CHECKIN = {
 
 
 async def make_agent(client, name="vlan20-scanner") -> tuple[dict, str]:
-    res = await client.post("/api/v1/agents", json={"name": name})
-    assert res.status_code == 201, res.text
-    data = res.json()["data"]
-    return data, data["token"]
+    """An enrolled agent and its plain agent token (`conftest.make_enrolled_agent`)."""
+    return await make_enrolled_agent(client, name)
 
 
 def bearer(token: str) -> dict:
@@ -82,9 +81,13 @@ async def agent_hostname(client, agent_id: str) -> str | None:
     return (await client.get(f"/api/v1/agents/{agent_id}")).json()["data"]["hostname"]
 
 
-async def token_rows(agent_id: str) -> list[Token]:
+async def token_rows(agent_id: str, kind: str | None = "agent") -> list[Token]:
+    """The agent's tokens of `kind` (every kind with None), oldest first. An agent from
+    `make_agent` also holds the enrolment token it was enrolled with, spent."""
     async with SessionLocal() as session:
         query = select(Token).where(Token.agent_id == agent_id).order_by(Token.created_at)
+        if kind is not None:
+            query = query.where(Token.kind == kind)
         return list((await session.scalars(query)).all())
 
 
@@ -103,20 +106,44 @@ def database_text() -> str:
 # --- Create, and the token shown once ---
 
 
-async def test_create_returns_agent_and_token(client):
-    agent, token = await make_agent(client)
+async def create(client, name="vlan20-scanner") -> dict:
+    """`POST /agents`: the agent, `pending`, with its enrolment token."""
+    res = await client.post("/api/v1/agents", json={"name": name})
+    assert res.status_code == 201, res.text
+    return res.json()["data"]
+
+
+async def test_create_returns_a_pending_agent_and_its_enrolment_token(client):
+    agent = await create(client)
     assert agent["name"] == "vlan20-scanner"
-    assert agent["state"] == "active"
+    assert agent["state"] == "pending"
     assert agent["version"] is agent["hostname"] is agent["last_checkin_at"] is None
-    assert token.startswith("tlga_") and len(token) == len("tlga_") + 43
+    plain = agent["enrol_token"]
+    assert plain.startswith("tlge_") and len(plain) == len("tlge_") + 43
     [listed] = agent["tokens"]
-    assert listed["kind"] == "agent"
-    assert listed["token_prefix"] == token[:13]
-    assert listed["revoked_at"] is listed["last_used_at"] is None
+    assert listed["kind"] == "enrol"
+    assert listed["token_prefix"] == plain[:13]
+    assert listed["revoked_at"] is listed["last_used_at"] is listed["used_at"] is None
+    # single-use, and good for an hour from its creation
+    expires = datetime.fromisoformat(listed["expires_at"])
+    assert expires - datetime.fromisoformat(listed["created_at"]) == timedelta(hours=1)
+    assert datetime.fromisoformat(agent["enrol_token_expires_at"]) == expires
     assert set(listed) == {
         "id", "kind", "token_prefix", "created_at", "last_used_at",
         "expires_at", "used_at", "revoked_at",
     }
+
+
+async def test_an_enrolled_agent_holds_its_agent_token(client):
+    agent, token = await make_agent(client)
+    assert agent["state"] == "active"
+    assert token.startswith("tlga_") and len(token) == len("tlga_") + 43
+    # newest first: the agent token, then the enrolment token it was exchanged for
+    issued, spent = agent["tokens"]
+    assert (issued["kind"], spent["kind"]) == ("agent", "enrol")
+    assert issued["token_prefix"] == token[:13]
+    assert issued["revoked_at"] is issued["last_used_at"] is issued["expires_at"] is None
+    assert spent["used_at"] is not None and spent["revoked_at"] is None
 
 
 async def test_two_agents_get_different_tokens(client):
@@ -126,13 +153,19 @@ async def test_two_agents_get_different_tokens(client):
 
 
 async def test_token_is_stored_as_sha256_and_prefix_only(client):
-    agent, token = await make_agent(client)
+    created = await create(client)
+    plain = created["enrol_token"]
+    agent, token = await make_agent(client, "other")
     [row] = await token_rows(agent["id"])
     assert row.token_hash == hashlib.sha256(token.encode()).hexdigest()
     assert row.token_prefix == token[:13]
+    [enrol_row] = await token_rows(created["id"], kind="enrol")
+    assert enrol_row.token_hash == hashlib.sha256(plain.encode()).hexdigest()
+    assert enrol_row.token_prefix == plain[:13]
     dump = database_text()
-    assert token not in dump
-    assert token[13:] not in dump  # nor the secret part on its own
+    for secret in (token, plain):
+        assert secret not in dump
+        assert secret[13:] not in dump  # nor the secret part on its own
 
 
 async def test_plain_token_appears_in_exactly_one_response(client, agent_api):
@@ -163,11 +196,10 @@ async def test_plain_token_appears_in_exactly_one_response(client, agent_api):
     assert token not in database_text()
 
 
-async def test_create_response_is_the_only_one_with_a_token_field(client):
-    agent, _ = await make_agent(client)
+async def test_create_response_is_the_only_owner_answer_with_a_token_field(client):
+    agent = await create(client)
     got = (await client.get(f"/api/v1/agents/{agent['id']}")).json()["data"]
-    assert "token" not in got
-    assert set(agent) - set(got) == {"token"}
+    assert set(agent) - set(got) == {"enrol_token", "enrol_token_expires_at"}
     assert got["tokens"][0]["token_prefix"] == agent["tokens"][0]["token_prefix"]
 
 
@@ -305,21 +337,17 @@ async def test_deleted_agent_token_is_refused(client, agent_api):
 
 
 async def test_enrol_token_is_refused_on_agent_routes(client, agent_api):
-    # Nothing issues an enrol token until M2b (#21); the kind exists in the schema
-    # and must never pass as an agent token.
-    agent, _ = await make_agent(client)
-    plain = "tlge_enrol-token-for-test"
-    async with SessionLocal() as session:
-        session.add(
-            Token(
-                kind="enrol",
-                agent_id=agent["id"],
-                token_hash=agents_svc.hash_token(plain),
-                token_prefix=plain[:13],
-            )
-        )
-        await session.commit()
-    assert (await checkin(agent_api, plain)).status_code == 403
+    # an enrolment token reaches the enrol route only, unused or spent, and never
+    # passes as an agent token, even once its agent is active
+    pending = await create(client)
+    assert (await checkin(agent_api, pending["enrol_token"])).status_code == 403
+    spent = await create(client, "enrolled")
+    assert (await enrol(agent_api, spent["enrol_token"])).status_code == 200
+    for plain in (pending["enrol_token"], spent["enrol_token"]):
+        for path in ("/api/v1/agent/checkin", "/api/v1/agent/results"):
+            res = await agent_api.post(path, json=CHECKIN, headers=bearer(plain))
+            assert res.status_code == 403, path
+            assert res.json()["error"]["message"] == "Invalid agent token"
 
 
 async def test_agent_token_is_refused_on_owner_routes(client, anon_client):
@@ -513,8 +541,8 @@ async def test_refused_enrol_token_is_403_and_never_reaches_the_write(client, ra
 
     assert res.status_code == 403, res.text
     assert waited < timeout / 2
-    enrol = [t for t in await token_rows(agent["id"]) if t.kind == "enrol"]
-    assert [t.last_used_at for t in enrol] == [None]
+    enrol = await token_rows(agent["id"], kind="enrol")
+    assert [t.last_used_at for t in enrol] == [None, None]
 
 
 # --- Owner REST ---
@@ -584,11 +612,11 @@ async def test_database_refuses_names_that_differ_only_in_case(client, monkeypat
         return None
 
     monkeypatch.setattr(agents_svc, "_check_name_free", passes)
-    first, _ = await make_agent(client, "Scanner")
+    await create(client, "Scanner")
     res = await client.post("/api/v1/agents", json={"name": "scanner"})
     assert res.status_code == 409, res.text
     assert res.json()["error"]["code"] == "CONFLICT"
-    other, _ = await make_agent(client, "other")
+    other = await create(client, "other")
     res = await client.put(f"/api/v1/agents/{other['id']}", json={"name": "SCANNER"})
     assert res.status_code == 409, res.text
     res = await client.post("/api/v1/agents", json={"name": "STRASSE"})
@@ -650,15 +678,18 @@ async def test_database_allows_one_live_agent_token_per_agent(client):
 
 
 async def test_mcp_has_no_agent_or_token_tool_and_its_audit_view_has_no_secret(client):
-    _, token = await make_agent(client)
+    plain = (await create(client))["enrol_token"]
+    token = (await enrol(client, plain)).json()["data"]["agent_token"]
     async with Client(mcp) as mcp_client:
         names = {t.name for t in await mcp_client.list_tools()}
         listed = (await mcp_client.call_tool("list_changes", {"entity_type": "token"})).data
-    assert not [n for n in names if "agent" in n or "token" in n]
-    [entry] = listed["changes"]
-    assert entry["action"] == "create"
-    assert token not in repr(listed)
-    assert agents_svc.hash_token(token) not in repr(listed)
+    assert not [n for n in names if "agent" in n or "token" in n or "enrol" in n]
+    # newest first: the enrolment token issued, exchanged, and the agent token issued
+    assert [c["action"] for c in listed["changes"]] == ["create", "update", "create"]
+    for secret in (plain, token):
+        assert secret not in repr(listed)
+        assert secret[13:] not in repr(listed)
+        assert agents_svc.hash_token(secret) not in repr(listed)
 
 
 # --- Audit ---
@@ -669,8 +700,9 @@ async def changes_of(client, entity_type=None) -> list[dict]:
     return list(reversed((await client.get(url)).json()["data"]))  # oldest first
 
 
-async def test_create_logs_the_agent_and_its_token(client):
-    agent, token = await make_agent(client)
+async def test_create_logs_the_agent_and_its_enrolment_token(client):
+    agent = await create(client)
+    plain = agent["enrol_token"]
     rows = await changes_of(client)
     assert [(c["entity_type"], c["action"]) for c in rows] == [
         ("agent", "create"),
@@ -678,9 +710,12 @@ async def test_create_logs_the_agent_and_its_token(client):
     ]
     agent_row, token_row = rows
     assert agent_row["entity_id"] == agent["id"]
+    assert agent_row["after"]["state"] == "pending"
     assert token_row["entity_id"] == agent["tokens"][0]["id"]
-    assert token_row["summary"] == f"token {token[:13]}… issued to agent vlan20-scanner"
+    assert token_row["summary"] == f"enrolment token {plain[:13]}… issued to agent vlan20-scanner"
     assert token_row["after"]["agent_id"] == agent["id"]
+    assert token_row["after"]["kind"] == "enrol"
+    assert token_row["after"]["expires_at"] == agent["enrol_token_expires_at"]
     assert "token_hash" not in token_row["after"]
     assert {c["source"] for c in rows} == {"api"}
     assert {c["actor"] for c in rows} == {None}
@@ -704,8 +739,10 @@ async def test_revoke_is_logged(client):
 
 async def test_delete_logs_the_revoke_and_the_delete(client):
     agent, _ = await make_agent(client)
+    logged = len(await changes_of(client))
     await client.delete(f"/api/v1/agents/{agent['id']}")
-    rows = (await changes_of(client))[2:]
+    # the agent token is revoked; the spent enrolment token is not live, so not again
+    rows = (await changes_of(client))[logged:]
     assert [(c["entity_type"], c["action"]) for c in rows] == [
         ("token", "revoke"),
         ("agent", "delete"),
@@ -716,25 +753,51 @@ async def test_delete_logs_the_revoke_and_the_delete(client):
 
 async def test_delete_after_revoke_logs_no_second_revoke(client):
     agent, _ = await make_agent(client)
+    logged = len(await changes_of(client))
     await client.post(f"/api/v1/agents/{agent['id']}/revoke")
     await client.delete(f"/api/v1/agents/{agent['id']}")
-    rows = await changes_of(client)
+    rows = (await changes_of(client))[logged:]
     assert [(c["entity_type"], c["action"]) for c in rows] == [
-        ("agent", "create"),
-        ("token", "create"),
         ("token", "revoke"),
         ("agent", "delete"),
     ]
 
 
+async def test_a_pending_agents_revoke_and_delete_revoke_its_enrolment_token(client, agent_api):
+    agent = await create(client)
+    res = await client.post(f"/api/v1/agents/{agent['id']}/revoke")
+    assert res.status_code == 200, res.text
+    [token] = res.json()["data"]["tokens"]
+    assert token["revoked_at"] is not None
+    revoke = (await changes_of(client))[-1]
+    assert revoke["summary"] == (
+        f"enrolment token {agent['enrol_token'][:13]}… of agent vlan20-scanner revoked"
+    )
+    assert (await enrol(agent_api, agent["enrol_token"])).status_code == 403
+    # an expired enrolment token is no longer live: nothing is left to revoke
+    other = await create(client, "other")
+    await set_expiry(other["tokens"][0]["id"], datetime.now(timezone.utc) - timedelta(seconds=1))
+    assert (await client.post(f"/api/v1/agents/{other['id']}/revoke")).status_code == 409
+    logged = len(await changes_of(client))
+    assert (await client.delete(f"/api/v1/agents/{other['id']}")).status_code == 204
+    assert [c["action"] for c in (await changes_of(client))[logged:]] == ["delete"]
+
+
+async def set_expiry(token_id: str, when) -> None:
+    async with SessionLocal() as session:
+        await session.execute(update(Token).where(Token.id == token_id).values(expires_at=when))
+        await session.commit()
+
+
 async def test_updates_are_logged_and_no_ops_are_not(client):
     agent, _ = await make_agent(client)
     aid = agent["id"]
+    logged = len(await changes_of(client, "agent"))
     await client.put(f"/api/v1/agents/{aid}", json={"enabled": False})
     await client.put(f"/api/v1/agents/{aid}", json={"enabled": False})  # already disabled
     await client.put(f"/api/v1/agents/{aid}", json={"name": "vlan20-scanner"})  # unchanged
     await client.put(f"/api/v1/agents/{aid}", json={"name": "vlan30", "enabled": True})
-    rows = (await changes_of(client, "agent"))[1:]
+    rows = (await changes_of(client, "agent"))[logged:]
     assert [c["summary"] for c in rows] == [
         "agent vlan20-scanner disabled",
         "agent vlan30 renamed from vlan20-scanner, enabled",
@@ -775,7 +838,14 @@ async def test_database_from_main_gains_the_agents_and_tokens_tables(tmp_path):
         assert "WHERE kind = 'agent' AND revoked_at IS NULL" in live_index
 
         async with async_sessionmaker(engine, expire_on_commit=False)() as session:
-            agent, token = await agents_svc.create_agent(session, AgentCreate(name="a"), "api")
-            assert await agents_svc.authenticate(session, token) is not None
+            agent, _, plain = await agents_svc.create_agent(session, AgentCreate(name="a"), "api")
+            assert await agents_svc.authenticate(session, plain) is None  # not yet enrolled
+
+            async def body():
+                return {}
+
+            answer = await enrolment_svc.enrol(session, plain, body)
+        async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+            assert await agents_svc.authenticate(session, answer["agent_token"]) is not None
     finally:
         await engine.dispose()

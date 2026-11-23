@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..auth import request_source
 from ..database import get_session
-from ..schemas import AgentCreate, AgentCreated, AgentOut, AgentUpdate
+from ..schemas import AgentCreate, AgentEnrolment, AgentOut, AgentUpdate
 from ..services import agents as svc
 
 router = APIRouter(prefix="/agents", tags=["agents"])
@@ -19,14 +19,19 @@ async def list_agents(session: AsyncSession = Depends(get_session)):
     return {"data": [_out(a) for a in rows], "total": len(rows)}
 
 
+def _enrolment(agent, token, plain: str) -> dict:
+    return AgentEnrolment.model_validate(
+        {**_out(agent), "enrol_token": plain, "enrol_token_expires_at": token.expires_at}
+    ).model_dump()
+
+
 @router.post("", status_code=201)
 async def create_agent(
     payload: AgentCreate,
     session: AsyncSession = Depends(get_session),
     source: str = Depends(request_source),
 ):
-    agent, token = await svc.create_agent(session, payload, source)
-    return {"data": AgentCreated.model_validate({**_out(agent), "token": token}).model_dump()}
+    return {"data": _enrolment(*await svc.create_agent(session, payload, source))}
 
 
 @router.get("/{agent_id}")
@@ -51,6 +56,15 @@ async def revoke_agent_tokens(
     source: str = Depends(request_source),
 ):
     return {"data": _out(await svc.revoke_tokens(session, agent_id, source))}
+
+
+@router.post("/{agent_id}/re-enrol", status_code=201)
+async def re_enrol_agent(
+    agent_id: str,
+    session: AsyncSession = Depends(get_session),
+    source: str = Depends(request_source),
+):
+    return {"data": _enrolment(*await svc.re_enrol(session, agent_id, source))}
 
 
 @router.delete("/{agent_id}", status_code=204)

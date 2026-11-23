@@ -1646,13 +1646,15 @@ async def test_an_accepted_result_set_records_its_tokens_use(client, agent_api):
     async def set_used(when):
         async with SessionLocal() as session:
             await session.execute(
-                update(Token).where(Token.agent_id == agent["id"]).values(last_used_at=when)
+                update(Token)
+                .where(Token.agent_id == agent["id"], Token.kind == "agent")
+                .values(last_used_at=when)
             )
             await session.commit()
 
     async def used():
         async with SessionLocal() as session:
-            return _utc(await session.scalar(select(Token.last_used_at)))
+            return _utc(await session.scalar(select(Token.last_used_at).where(Token.kind == "agent")))
 
     await set_used(stale)
     res = await post_results(agent_api, token, {**job, "job_id": "not-the-job"})

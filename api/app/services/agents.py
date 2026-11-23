@@ -1,9 +1,12 @@
-"""Scan agents and their tokens (v0.2 spec §4.2, §5.4).
+"""Scan agents and their tokens (v0.2 spec §4.2, §5.4, §5.6).
 
-An agent token (`tlga_…`) is shown once, in the response that creates it. Only its
-SHA-256 and a short display prefix are stored, so it cannot be recovered afterwards.
-Agents and tokens are configured by the owner over REST only: nothing over MCP
-creates, changes or lists them (spec §7.2, invariant 2).
+"Add agent" creates the agent `pending`, with a single-use enrolment token (`tlge_…`)
+that expires after ENROL_TOKEN_LIFETIME; re-enrol issues a new one for an existing
+agent. The agent exchanges it once for its long-lived agent token (`tlga_…`) at
+`POST /api/v1/agent/enrol` (`services/enrolment`). Each plain token is shown once, in
+the response that issues it. Only its SHA-256 and a short display prefix are stored, so
+it cannot be recovered afterwards. Agents and tokens are configured by the owner over
+REST only: nothing over MCP creates, changes or lists them (spec §7.2, invariant 2).
 """
 
 import hashlib
@@ -15,14 +18,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from ..agent_protocol import AGENT_TOKEN_PREFIX, ENROL_TOKEN_PREFIX
 from ..errors import ApiError, conflict, not_found
 from ..models import Agent, Token
 from ..schemas import AgentCreate, AgentUpdate
+from ..times import utc
 from . import changes, scans
 
-AGENT_TOKEN_PREFIX = "tlga_"
+_PREFIXES = {"agent": AGENT_TOKEN_PREFIX, "enrol": ENROL_TOKEN_PREFIX}
 # characters of the token kept for display: the kind prefix plus 8 of the 43 random ones
 _DISPLAY_LENGTH = len(AGENT_TOKEN_PREFIX) + 8
+# spec §5.6: an enrolment token left in shell history or a chat log is useless after this
+ENROL_TOKEN_LIFETIME = timedelta(hours=1)
 # `last_used_at` is written at most this often per token, and only by a request the
 # route serves (`record_token_use`): a token used at request rate drives reads, not
 # database writes
@@ -42,7 +49,8 @@ def actor_for(agent: Agent) -> str:
     return f"agent:{agent.name}"
 
 
-def _display(token: Token) -> str:
+def display(token: Token) -> str:
+    """A token as the change log names it: its display prefix, never the token."""
     return f"{token.token_prefix}…"
 
 
@@ -80,21 +88,44 @@ async def _flush_name(session: AsyncSession, name: str) -> None:
         raise conflict(f"Agent {name} already exists") from None
 
 
-def _issue_agent_token(session: AsyncSession, agent: Agent) -> tuple[Token, str]:
-    plain = AGENT_TOKEN_PREFIX + secrets.token_urlsafe(32)
+def issue_token(
+    session: AsyncSession, agent: Agent, kind: str, now: datetime
+) -> tuple[Token, str]:
+    """A new token of `kind` for the agent, added to the session; does not flush. An
+    enrolment token expires ENROL_TOKEN_LIFETIME from `now`. Returns the token and the
+    plain value, which the caller shows once and must not store."""
+    plain = _PREFIXES[kind] + secrets.token_urlsafe(32)
     token = Token(
-        kind="agent",
+        kind=kind,
         agent=agent,
         token_hash=hash_token(plain),
         token_prefix=plain[:_DISPLAY_LENGTH],
-        created_at=_now(),
+        created_at=now,
+        expires_at=now + ENROL_TOKEN_LIFETIME if kind == "enrol" else None,
     )
     session.add(token)
     return token, plain
 
 
-def _record_token(
-    session: AsyncSession, token: Token, action: str, summary: str, source: str, before=None
+def live(token: Token, now: datetime) -> bool:
+    """Whether the token can still be used: unrevoked and, for an enrolment token, also
+    unused and unexpired. A spent or expired enrolment token is not revoked: it is
+    already refused, and its row keeps when it was used or ran out."""
+    if token.revoked_at is not None:
+        return False
+    if token.kind == "agent":
+        return True
+    return token.used_at is None and utc(token.expires_at) > now
+
+
+def record_token(
+    session: AsyncSession,
+    token: Token,
+    action: str,
+    summary: str,
+    source: str,
+    before=None,
+    actor: str | None = None,
 ) -> None:
     changes.record(
         session,
@@ -103,26 +134,39 @@ def _record_token(
         action=action,
         summary=summary,
         source=source,
+        actor=actor,
         before=before,
         after=changes.snapshot(token),
     )
 
 
+def _record_enrol_token(session: AsyncSession, token: Token, agent: Agent, source: str) -> None:
+    record_token(
+        session,
+        token,
+        "create",
+        f"enrolment token {display(token)} issued to agent {agent.name}",
+        source,
+    )
+
+
 async def create_agent(
     session: AsyncSession, payload: AgentCreate, source: str
-) -> tuple[Agent, str]:
-    """Create an agent together with its agent token. Returns the agent and the plain
-    token, which the caller shows once and must not store."""
+) -> tuple[Agent, Token, str]:
+    """Create an agent, `pending`, with an enrolment token. Returns the agent, the
+    token and its plain value, which the caller shows once and must not store. The
+    agent holds no agent token until it enrols (`services/enrolment`)."""
     await _check_name_free(session, payload.name)
+    now = _now()
     agent = Agent(
         name=payload.name,
         name_key=_name_key(payload.name),
-        state="active",
-        created_at=_now(),
+        state="pending",
+        created_at=now,
         tokens=[],
     )
     session.add(agent)
-    token, plain = _issue_agent_token(session, agent)
+    token, plain = issue_token(session, agent, "enrol", now)
     await _flush_name(session, agent.name)
     changes.record(
         session,
@@ -133,11 +177,38 @@ async def create_agent(
         source=source,
         after=changes.snapshot(agent),
     )
-    _record_token(
-        session, token, "create", f"token {_display(token)} issued to agent {agent.name}", source
-    )
+    _record_enrol_token(session, token, agent, source)
     await session.commit()
-    return agent, plain
+    return agent, token, plain
+
+
+async def re_enrol(
+    session: AsyncSession, agent_id: str, source: str
+) -> tuple[Agent, Token, str]:
+    """Issue a new enrolment token for an existing agent (spec §5.6): the recovery path
+    for a lost volume, a rebuilt host, or an enrolment whose answer never arrived.
+
+    An enrolment token the agent still holds unused is revoked, so an agent has at
+    most one that can be exchanged. Its agent token, if it has one, is left alone: the
+    agent keeps running on it until the new enrolment token is exchanged, which
+    revokes it. Its identity and scan targets are kept. A disabled agent is refused
+    (`409`): enable it first, so that the exchange cannot hand a token to an agent the
+    owner has stopped."""
+    agent = await get_agent(session, agent_id)
+    if agent.state == "disabled":
+        raise conflict(f"Agent {agent.name} is disabled; enable it before re-enrolling it")
+    now = _now()
+    for old in agent.tokens:
+        if old.kind == "enrol" and live(old, now):
+            before = changes.snapshot(old)
+            old.revoked_at = now
+            summary = f"enrolment token {display(old)} of agent {agent.name} revoked (re-enrol)"
+            record_token(session, old, "revoke", summary, source, before)
+    token, plain = issue_token(session, agent, "enrol", now)
+    await session.flush()
+    _record_enrol_token(session, token, agent, source)
+    await session.commit()
+    return agent, token, plain
 
 
 def _enabled_state(agent: Agent) -> str:
@@ -179,24 +250,37 @@ async def update_agent(
     return agent
 
 
-def _revoke_live_tokens(session: AsyncSession, agent: Agent, source: str, reason: str = "") -> int:
-    now = _now()
+def revoke_live_tokens(
+    session: AsyncSession,
+    agent: Agent,
+    source: str,
+    reason: str = "",
+    *,
+    kinds: tuple[str, ...] = ("agent", "enrol"),
+    actor: str | None = None,
+    now: datetime | None = None,
+) -> int:
+    """Revoke the agent's live tokens of `kinds` (`live`), each with its own change-log
+    entry; does not commit. Returns how many were revoked."""
+    now = now or _now()
     revoked = 0
     for token in agent.tokens:
-        if token.revoked_at is not None:
+        if token.kind not in kinds or not live(token, now):
             continue
         before = changes.snapshot(token)
         token.revoked_at = now
-        summary = f"token {_display(token)} of agent {agent.name} revoked{reason}"
-        _record_token(session, token, "revoke", summary, source, before)
+        noun = "enrolment token" if token.kind == "enrol" else "token"
+        summary = f"{noun} {display(token)} of agent {agent.name} revoked{reason}"
+        record_token(session, token, "revoke", summary, source, before, actor)
         revoked += 1
     return revoked
 
 
 async def revoke_tokens(session: AsyncSession, agent_id: str, source: str) -> Agent:
-    """Revoke every unrevoked token of the agent. The agent itself is kept."""
+    """Revoke every live token of the agent: its agent token and an enrolment token it
+    has not exchanged. The agent itself is kept."""
     agent = await get_agent(session, agent_id)
-    if not _revoke_live_tokens(session, agent, source):
+    if not revoke_live_tokens(session, agent, source):
         raise conflict(f"Agent {agent.name} has no unrevoked token")
     await session.commit()
     return agent
@@ -207,7 +291,7 @@ async def delete_agent(session: AsyncSession, agent_id: str, source: str) -> Non
     change-log entry; its token rows are then deleted with it (cascade). Its scan
     targets keep their settings and become unassigned, each with its own entry."""
     agent = await get_agent(session, agent_id)
-    _revoke_live_tokens(session, agent, source, " (agent deleted)")
+    revoke_live_tokens(session, agent, source, " (agent deleted)")
     await scans.unassign_agent(session, agent, source)
     changes.record(
         session,
@@ -251,6 +335,11 @@ async def authenticate(session: AsyncSession, presented: str) -> Agent | None:
         return None
     session.info[_TOKEN_IN_USE] = token.id
     return agent
+
+
+def carries_agent_token(session: AsyncSession) -> bool:
+    """Whether `authenticate` has accepted an agent token for this session's request."""
+    return _TOKEN_IN_USE in session.info
 
 
 def token_in_use(session: AsyncSession) -> str:

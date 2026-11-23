@@ -1,7 +1,8 @@
 import { useRef, useState } from 'react'
 import { Check, Copy, TriangleAlert } from 'lucide-react'
 import { createAgent } from '../api/ipam'
-import { containerCommand } from '../utils/agents'
+import { containerCommand, enrolCommand } from '../utils/agents'
+import { parseServerTime } from '../utils/time'
 import Modal, { inputCls, labelCls, primaryBtn, secondaryBtn } from './Modal'
 
 const NAME_MAX = 74
@@ -63,12 +64,16 @@ function CopyBlock({ label, text, testId }) {
   )
 }
 
-// Two steps: name the agent, then show its token once. The token lives only in
-// this component's state: onCreated tells the page to reload its list (whose
-// responses never carry a token), and closing unmounts the dialog, so nothing on
-// the page can show the token again. While the create request is in flight no
-// path closes the dialog either: the agent may already exist, and its response
-// is the only place its token will ever appear.
+// Two steps: name the agent, then show its enrolment token once. The token lives
+// only in this component's state: onCreated tells the page to reload its list
+// (whose responses never carry a token), and closing unmounts the dialog, so
+// nothing on the page can show the token again. While the create request is in
+// flight no path closes the dialog either: the agent may already exist, and its
+// response is the only place its token will ever appear.
+//
+// Until the agent exchanges the enrolment token itself (#22) and this dialog
+// becomes the guided install (#23), the exchange is shown as a command to run by
+// hand, and the container command takes the agent token that command prints.
 export default function AddAgentModal({ serverVersion, onClose, onCreated }) {
   const [name, setName] = useState('')
   const [error, setError] = useState(null)
@@ -84,7 +89,11 @@ export default function AddAgentModal({ serverVersion, onClose, onCreated }) {
     setError(null)
     try {
       const res = await createAgent({ name: trimmed })
-      setCreated({ name: res.data.name, token: res.data.token })
+      setCreated({
+        name: res.data.name,
+        token: res.data.enrol_token,
+        expires: parseServerTime(res.data.enrol_token_expires_at),
+      })
       onCreated()
     } catch (err) {
       setError(err.message)
@@ -94,22 +103,29 @@ export default function AddAgentModal({ serverVersion, onClose, onCreated }) {
   }
 
   if (created) {
-    const command = containerCommand({
-      url: window.location.origin,
-      token: created.token,
-      version: serverVersion,
-    })
+    const url = window.location.origin
+    const exchange = enrolCommand({ url, token: created.token })
+    const command = containerCommand({ url, version: serverVersion })
     return (
       <Modal title={`Agent ${created.name} created`} onClose={onClose} maxWidth="max-w-3xl" closeOnBackdrop={false}>
         <div className="flex gap-2 rounded-md border border-amber-800 bg-amber-950/60 px-3 py-2 text-xs text-amber-200">
           <TriangleAlert size={14} className="mt-0.5 shrink-0" />
           <span>
-            This is the only time the token is shown. Copy it or the command now: once this
-            dialog closes it cannot be shown again, and a lost token means deleting the agent
-            and adding a new one.
+            This is the only time the enrolment token is shown. It can be exchanged once, until{' '}
+            {created.expires ? created.expires.toLocaleString() : 'an hour from now'}. Copy it or
+            the command now: once this dialog closes it cannot be shown again. If it is lost or
+            runs out, delete the agent and add it again.
           </span>
         </div>
-        <CopyBlock label="Agent token" text={created.token} testId="agent-token" />
+        <CopyBlock label="Enrolment token" text={created.token} testId="agent-token" />
+        <p className="mt-3 text-xs text-slate-400">
+          1. On the agent&apos;s host, exchange it for the agent token. The answer carries it as{' '}
+          <code>agent_token</code> (<code>tlga_…</code>); it is shown nowhere else.
+        </p>
+        <CopyBlock label="Enrolment command" text={exchange} testId="agent-enrol-command" />
+        <p className="mt-3 text-xs text-slate-400">
+          2. Run the agent with that agent token in place of <code>&lt;agent token&gt;</code>.
+        </p>
         <CopyBlock label="Container command" text={command} testId="agent-command" />
         <p className="mt-3 text-xs text-slate-400">
           Run it on a Linux host on the VLAN to be scanned, with Docker or Podman running as
@@ -147,7 +163,7 @@ export default function AddAgentModal({ serverVersion, onClose, onCreated }) {
           className={inputCls}
         />
         <p className="mt-1 text-xs text-slate-500">
-          Up to {NAME_MAX} characters, unique. The agent&apos;s token is shown once, on the next
+          Up to {NAME_MAX} characters, unique. Its enrolment token is shown once, on the next
           step.
         </p>
         {error && (

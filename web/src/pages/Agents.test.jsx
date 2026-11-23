@@ -27,6 +27,8 @@ vi.mock('../context', async (importOriginal) => ({
 
 const TOKEN = 'tlga_SECRETsecretSECRETsecretSECRETsecret0123'
 const PREFIX = TOKEN.slice(0, 13)
+const ENROL_TOKEN = 'tlge_ENROLenrolENROLenrolENROLenrolENROL0123'
+const EXPIRES = '2026-11-16T07:00:00'
 
 // what the owner routes return: tokens by display prefix only, never the token
 const agentRow = (over = {}) => ({
@@ -58,6 +60,26 @@ const agentRow = (over = {}) => ({
 })
 
 const target = { id: 'tgt-1', subnet_id: 'sub-1', agent_id: 'agent-1', enabled: true }
+
+// what `POST /agents` returns: a pending agent, its one token the enrolment token
+const enrolToken = (over = {}) => ({
+  id: 'tok-e',
+  kind: 'enrol',
+  token_prefix: ENROL_TOKEN.slice(0, 13),
+  created_at: '2026-11-16T06:00:00',
+  last_used_at: null,
+  expires_at: EXPIRES,
+  used_at: null,
+  revoked_at: null,
+  ...over,
+})
+const created = () => ({
+  data: {
+    ...agentRow({ state: 'pending', last_checkin_at: null, tokens: [enrolToken()] }),
+    enrol_token: ENROL_TOKEN,
+    enrol_token_expires_at: EXPIRES,
+  },
+})
 
 function renderPage() {
   return render(
@@ -171,11 +193,31 @@ describe('Agents page', () => {
     expect(within(fresh).getByRole('button', { name: /Revoke/ })).toBeDisabled()
   })
 
-  it('shows the token once, and nothing can show it again after the dialog closes', async () => {
+  it('shows an agent that has not enrolled as such, and lets its enrolment token be revoked', async () => {
+    const pending = (id, token) =>
+      agentRow({ id, name: id, state: 'pending', last_checkin_at: null, tokens: [token] })
+    ipam.listAgents.mockResolvedValue({
+      data: [
+        pending('open', enrolToken({ expires_at: '2999-01-01T00:00:00' })),
+        pending('expired', enrolToken({ expires_at: '2000-01-01T00:00:00' })),
+      ],
+      total: 2,
+    })
+    renderPage()
+    const open = await screen.findByTestId('agent-open')
+    expect(within(open).getByText('not enrolled')).toBeInTheDocument()
+    expect(within(open).queryByText('revoked')).toBeNull()
+    expect(within(open).getByRole('button', { name: /Revoke/ })).toBeEnabled()
+    const expired = screen.getByTestId('agent-expired')
+    expect(within(expired).getByText('not enrolled')).toBeInTheDocument()
+    expect(within(expired).getByRole('button', { name: /Revoke/ })).toBeDisabled()
+  })
+
+  it('shows the enrolment token once, and nothing can show it again after the dialog closes', async () => {
     const user = userEvent.setup()
     ipam.listAgents.mockResolvedValueOnce({ data: [], total: 0 })
     ipam.listScanTargets.mockResolvedValue({ data: [], total: 0 })
-    ipam.createAgent.mockResolvedValue({ data: { ...agentRow(), token: TOKEN } })
+    ipam.createAgent.mockResolvedValue(created())
     renderPage()
 
     await user.click(await screen.findByRole('button', { name: /Add agent/ }))
@@ -183,9 +225,15 @@ describe('Agents page', () => {
     await user.click(screen.getByRole('button', { name: 'Create agent' }))
 
     expect(ipam.createAgent).toHaveBeenCalledWith({ name: 'lab-vlan20' })
-    expect(await screen.findByTestId('agent-token')).toHaveTextContent(TOKEN)
+    expect(await screen.findByTestId('agent-token')).toHaveTextContent(ENROL_TOKEN)
+    // step 1, the exchange by hand, until the agent makes it itself (#22)
+    const exchange = screen.getByTestId('agent-enrol-command').textContent
+    expect(exchange).toContain(`POST ${window.location.origin}/api/v1/agent/enrol`)
+    expect(exchange).toContain(`'Authorization: Bearer ${ENROL_TOKEN}'`)
+    // step 2: the container command holds no token, only a placeholder for the agent's
     const command = screen.getByTestId('agent-command').textContent
-    expect(command).toContain(`-e IPAM_AGENT_TOKEN=${TOKEN}`)
+    expect(command).toContain('-e IPAM_AGENT_TOKEN=<agent token>')
+    expect(command).not.toContain('tlg' + 'e_')
     expect(command).toContain(`-e IPAM_URL=${window.location.origin}`)
     expect(command).toContain('--network host')
     expect(command).toContain('--cap-add NET_RAW')
@@ -202,20 +250,20 @@ describe('Agents page', () => {
 
     expect(screen.queryByRole('dialog')).toBeNull()
     expect(await screen.findByText(`${PREFIX}…`)).toBeInTheDocument()
-    expect(document.body.innerHTML).not.toContain(TOKEN)
-    expect(JSON.stringify({ ...localStorage })).not.toContain(TOKEN)
-    expect(JSON.stringify({ ...sessionStorage })).not.toContain(TOKEN)
+    expect(document.body.innerHTML).not.toContain(ENROL_TOKEN)
+    expect(JSON.stringify({ ...localStorage })).not.toContain(ENROL_TOKEN)
+    expect(JSON.stringify({ ...sessionStorage })).not.toContain(ENROL_TOKEN)
 
     // opening the dialog again starts a new agent; it does not bring the token back
     await user.click(screen.getByRole('button', { name: /Add agent/ }))
     expect(screen.getByLabelText('Name')).toHaveValue('')
-    expect(document.body.innerHTML).not.toContain(TOKEN)
+    expect(document.body.innerHTML).not.toContain(ENROL_TOKEN)
     expect(ipam.createAgent).toHaveBeenCalledTimes(1)
   })
 
   it('drops the token when the dialog is closed with its close button too', async () => {
     const user = userEvent.setup()
-    ipam.createAgent.mockResolvedValue({ data: { ...agentRow(), token: TOKEN } })
+    ipam.createAgent.mockResolvedValue(created())
     renderPage()
 
     await user.click(await screen.findByRole('button', { name: /Add agent/ }))
@@ -225,7 +273,7 @@ describe('Agents page', () => {
 
     await user.click(screen.getByRole('button', { name: 'Close' }))
     expect(screen.queryByRole('dialog')).toBeNull()
-    expect(document.body.innerHTML).not.toContain(TOKEN)
+    expect(document.body.innerHTML).not.toContain(ENROL_TOKEN)
   })
 
   it('cannot be closed while the create request is in flight, so its token is not lost', async () => {
@@ -245,8 +293,8 @@ describe('Agents page', () => {
     await user.click(screen.getByRole('dialog').parentElement)
     expect(screen.getByRole('dialog')).toBeInTheDocument()
 
-    respond({ data: { ...agentRow(), token: TOKEN } })
-    expect(await screen.findByTestId('agent-token')).toHaveTextContent(TOKEN)
+    respond(created())
+    expect(await screen.findByTestId('agent-token')).toHaveTextContent(ENROL_TOKEN)
   })
 
   it('keeps the form open with the server error when the name is taken', async () => {

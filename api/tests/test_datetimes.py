@@ -78,7 +78,9 @@ async def test_a_change_timestamp_and_its_snapshots_carry_an_offset(client):
 
 
 async def test_agent_and_token_datetimes_have_one_form_on_write_and_on_read(client):
-    created, _ = await make_agent(client)
+    # pending, with its one token, the enrolment token the create response carries
+    created = (await client.post("/api/v1/agents", json={"name": "vlan10"})).json()["data"]
+    assert utc_form(created["enrol_token_expires_at"]) == created["tokens"][0]["expires_at"]
     revoked = (await client.post(f"/api/v1/agents/{created['id']}/revoke")).json()["data"]
     read = (await client.get(f"/api/v1/agents/{created['id']}")).json()["data"]
     [listed] = (await client.get("/api/v1/agents")).json()["data"]
@@ -87,6 +89,7 @@ async def test_agent_and_token_datetimes_have_one_form_on_write_and_on_read(clie
         [token] = agent["tokens"]
         assert utc_form(token["created_at"]) == utc_form(created["tokens"][0]["created_at"])
         assert utc_form(token["revoked_at"]) == utc_form(revoked["tokens"][0]["revoked_at"])
+        assert utc_form(token["expires_at"]) == utc_form(created["enrol_token_expires_at"])
 
 
 async def test_scan_target_datetimes_have_one_form_on_write_and_on_read(client):
@@ -336,7 +339,8 @@ def test_every_datetime_field_in_the_schemas_is_serialised_with_an_offset():
         "HostOut.last_seen",
         "ChangeOut.ts",
         "AgentOut.created_at",
-        "AgentCreated.job_issued_at",
+        "AgentEnrolment.job_issued_at",
+        "AgentEnrolment.enrol_token_expires_at",
         "TokenOut.revoked_at",
         "ScanTargetOut.last_scan_at",
     } <= checked

@@ -58,8 +58,17 @@ async def _ok(res, status=200) -> dict:
 
 
 async def setup(owner, *, cidr="10.0.0.0/28", methods=("icmp", "rdns"), **subnet):
-    """An agent, a subnet, and a target assigning the subnet to the agent."""
+    """An agent, enrolled, a subnet, and a target assigning the subnet to the agent.
+    The agent's `token` is the agent token its enrolment token was exchanged for."""
     agent = await _ok(await owner.post("/api/v1/agents", json={"name": "vlan10"}), 201)
+    enrolled = await _ok(
+        await owner.post(
+            "/api/v1/agent/enrol",
+            json={},
+            headers={"Authorization": f"Bearer {agent['enrol_token']}"},
+        )
+    )
+    agent["token"] = enrolled["agent_token"]
     section = await _ok(await owner.post("/api/v1/sections", json={"name": "Homelab"}), 201)
     made = await _ok(
         await owner.post(

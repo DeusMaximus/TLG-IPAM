@@ -10,7 +10,7 @@ from app import agent_protocol as server
 from app.services import jobs
 
 from conftest import FakeClock, FakeProber, FakeResolver, job
-from tlg_ipam_agent import guard, loop, probe, protocol, scan
+from tlg_ipam_agent import config, guard, loop, probe, protocol, scan
 from tlg_ipam_agent.config import parse_allowed
 
 AGENT = Path(__file__).resolve().parents[1]
@@ -37,6 +37,13 @@ AGENT = Path(__file__).resolve().parents[1]
 )
 def test_constants_match_the_server(name):
     assert getattr(protocol, name) == getattr(server, name)
+
+
+def test_the_agent_token_prefix_is_the_servers():
+    """The agent refuses an `IPAM_AGENT_TOKEN` without the prefix the server issues,
+    which is not an enrolment token's (#21)."""
+    assert config.TOKEN_PREFIX == server.AGENT_TOKEN_PREFIX
+    assert not server.ENROL_TOKEN_PREFIX.startswith(config.TOKEN_PREFIX)
 
 
 def test_the_shortest_retry_is_not_inside_the_servers_checkin_gap():
