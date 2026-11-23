@@ -386,11 +386,14 @@ async def list_scan_findings(
     or differs from its FQDN), stale (an active host not seen for 30 days). Omit
     subnet_id for every subnet; type filters to one type. Use to answer "is anything on
     the network I have not recorded?" or "which host records look out of date?".
-    Returns at most 25 findings per call, fewer when they are long, ordered by subnet
-    name, then address. When
-    next_cursor is not null there are more: call again with the same subnet_id and type
-    and cursor=next_cursor, until next_cursor is null. Do not tell the user the list is
-    complete before then. Each call reads the current data: a finding that appears
+    Returns at most 25 findings per call, ordered by subnet name, then address; fewer
+    when they are long, and fewer or none when the call reached its fixed amount of
+    work first. While next_cursor is not null the listing is not finished, even when
+    findings is empty: call again with the same subnet_id and type and
+    cursor=next_cursor, until next_cursor is null. Do not tell the user the list is
+    complete before then. Each finding is at most 5,000 bytes; host_fqdn is null for a
+    host whose domain is longer than a DNS name can be (stored before that limit), and
+    its host record still has it. Each call reads the current data: a finding that appears
     earlier in the order after you started, or a subnet renamed meanwhile, can be missed
     or repeated, so to see the current state (after the user has changed things, say)
     start again without cursor.
