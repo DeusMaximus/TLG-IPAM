@@ -54,8 +54,10 @@ Rules beyond `AGENTS.md`:
 - Open one PR that closes #‹N›. It owes ‹the automatic reviews only / the automatic reviews and a briefed round, which the orchestrator will start and brief: do not write a review brief›. Wait for Codex and Greptile, then fix each finding or reply on its thread with the reason it stands.
 - Do not finish until both reviews have posted. If you cannot subscribe to the PR, wait on its checks from the shell until the `Greptile Review` check completes, then read its comments. Greptile usually takes three to five minutes.
 - The automatic reviews do not run again after a fix commit. If you push after they have reviewed, comment `@codex review` on the PR and say in your final message that Greptile needs a manual retrigger.
+- A clean Codex result is an ordinary PR comment ("Didn't find any major issues", naming the commit it reviewed), not a review object; only a result with findings is a review with inline comments. Do not wait on `pulls/‹n›/reviews` for it. Codex's summary comment ends with `codex-review-state:v1` JSON (`commit_sha`, `has_any_findings`, `status`): `status` `completed` with `commit_sha` equal to your head is its result for that head.
+- Do not change git configuration, in your worktree or in the repository it shares with every other checkout. Commit as the identity already configured.
 - The owner merges.
-- End your final message with your hand-off entry, written to the template in `HANDOFF.md`.
+- Do not edit `HANDOFF.md` or `.agents/handoff/`. End your final message with your hand-off entry, written to the template in `HANDOFF.md`; the orchestrator commits it.
 - If a safety filter or a refusal stops you on a step, stop there. Push what you have, and report the step, the message you got word for word, and what is left on the acceptance list.
 
 Finish with: the PR URL, its head sha, the state of CI and of each automatic review, each acceptance line you could not verify and why, then the hand-off entry.
