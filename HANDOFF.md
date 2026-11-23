@@ -27,38 +27,52 @@ Template:
 
 ---
 
-## 2026-11-24 — Claude Code (Fable 5.2), orchestrator — five PRs merged; #22, #90 and #86 in flight; #100 and #91 decided
-- **Done:** five PRs squash-merged on the owner's go-ahead, remote branches deleted. Worker entries are below (the #120 entry is in the archive).
-  - First wave: #122 (#120) `ed4a7d6`, Sonnet 5.5, tests only. #123 (#121) `d067821`, Opus 5.5: a packet slot ends with the event-loop step it was granted in; one briefed round (Codex, GPT-6.1 Sol), GO with one P3. #124 (#21) `0226262`, Opus 5.5: enrolment tokens, `POST /api/v1/agent/enrol`, re-enrol; two briefed rounds, NO-GO then GO with one P3.
-  - Second wave, so far: #127 (#125) `45712d5` and #128 (#126) `ded8622`, both Sonnet 5.5, tests only, the two P3s from those rounds. Automatic reviews only, both clean on the only head of each.
-  - Filed on the owner's go-ahead: #125 and #126 (now closed). #92 is narrowed to what #124 left of it: the plain-HTTP warning comes only after the enrolment token has been issued, and should come before.
-  - `.agents/orchestration.md` has the three brief lines proposed since 2026-11-20 (`53afb78`).
+## 2026-11-24 — Claude Code (Fable 5.2), orchestrator — six PRs merged; #86 in a fix after a NO-GO; #22's review handed to the owner
+- **Done:** six PRs squash-merged on the owner's go-ahead, remote branches deleted. The newest worker entries are below; older ones are in the archive.
+  - First wave: #122 (#120) `ed4a7d6`; #123 (#121) `d067821`, a packet slot ends with the event-loop step it was granted in; #124 (#21) `0226262`, enrolment tokens, `POST /api/v1/agent/enrol`, re-enrol.
+  - Second wave: #127 (#125) `45712d5` and #128 (#126) `ded8622`, Sonnet 5.5, tests only. #131 (#90) `c5d7139`, Opus 5.5: a 16 MiB budget and a 60 s deadline on request bodies; one briefed round (Codex, GPT-6.1 Sol), GO with no findings.
+  - #92 is narrowed to what #124 left of it: the plain-HTTP warning comes only after the enrolment token has been issued, and should come before.
 - **Decisions (the owner's, 2026-11-24):**
-  - Go-ahead for both waves. The second ran five workers at once against the file's limit of three; the owner was told and did not hold the two tests-only issues back.
-  - #121 was fixed in the agent, not reworded in the spec. #124 merged with its deliberate calls as written, and with the orchestrator's extension of its scope into `services/results` (ingest rechecks the agent's state and its token under the write lock).
+  - Go-ahead for both waves. The second ran five workers at once against the file's limit of three; the owner was told.
   - #100: option 4. The result set reports name lookups separately from liveness; a name is cleared only on an answered "no name"; `PROTOCOL_VERSION` rises. Recorded on the issue.
-  - #91: the 2 MiB bound on an import stands and the dialog does not batch. Length limits on write: `domain` 253 characters, `notes` 4,096; a row over one is that row's `error`. The `bulk_create_hosts` docstring says how large a call may be. Recorded on the issue.
+  - #91: the 2 MiB bound on an import stands and the dialog does not batch. Length limits on write: `domain` 253 characters (PR #129 has it), `notes` 4,096; a row over one is that row's `error`. Recorded on the issue.
   - #5 and #25 (`owner` label): the owner runs them later, after rebuilding the deployment. Do not raise them in every report. #25 still comes before the rest of M3.
-- **State:** `main` is `ded8622` plus hand-off commits. CI was green on `0226262`; it was still running on `45712d5` and `ded8622` when this was written. Measured at the two PR heads, which touch disjoint trees: 1020 server and 924 agent tests. Web: 125 tests, unchanged since #124.
-  - **In flight**, each in its own worktree cut from `a8534eb`, Opus 5.5, each owing the automatic reviews and a briefed round. No PR was open when this was written.
-    - #22 on `22-agent-enrol-install`: owns `agent/` except `scan.py` and `probe.py`, spec §5.6, the README's agent sections.
-    - #90 on `90-bound-unauthenticated-bodies`: owns `api/app/body_limit.py`, brief §4.3, the body-cap text of spec §5.7.
-    - #86 on `86-bound-findings-call`: owns `services/findings.py`, `mcp_server.py`, `test_mcp.py`, the brief's tool table, spec §7.2. Told that a `domain` limit of its own is 253 characters, so #91 adds `notes` only.
-  - Until #22 merges a new agent is enrolled by hand: the Add dialog shows the `tlge_` token and a `curl` for the exchange. Re-enrol is API-only until #23; the README gives the call.
-  - The enrol throttle is global and in memory: 10 attempts that did not enrol per 60 s. One bad request every six seconds keeps new enrolments at `429`.
-  - Since #121 scans take longer: Sol's single runs of a 254-address `icmp,arp,rdns` job at 200 pps went from 7.2 s to 7.7 s (macOS) and 7.9 s to 8.3 s (Linux container). One that only just fitted its timeout can end incomplete. The pair captured in #88 stays unattributed; the agent can no longer produce one.
-  - Still true from earlier entries: ARP is on by default for a new target; a stuck `resolv.conf` read leaves later scans that rely on the host's resolvers incomplete until the agent restarts, and no README says so; a subnet's CIDR stored before #97 keeps its spelling until its next edit.
-  - Reviews: Greptile reviews again and takes about five minutes, but only the first head of a PR. Codex's state for a PR is in its summary comment (`codex-review-state:v1`). CodeRabbit skips the repository. Sol's web run needs Node 24, not 26.
-  - Sonnet 5.5 on #120, #125 and #126: each PR open within six minutes, counts and mutations matched every re-measurement. Opus 5.5 on #121 and #21: counts matched; #21 took three fix commits before its GO.
-  - Nothing wakes the orchestrator when a worker opens its PR: look for open PRs at the start of each turn and watch each one found.
-  - Review briefs and reviews of the first wave are in `.dev/121/` and `.dev/21/` in the main checkout.
-- **Waiting on the owner:** nothing now. Next will be the merges of #22, #90 and #86 as each comes back with its GO.
+- **State:** `main` is `c5d7139` plus hand-off commits. Measured on each PR head merged with `main` before its merge: 1,059 server tests with #131; 924 agent tests since #127.
+  - **PR #129 (#86), in a fix.** Briefed round 1 at `591b8bf`: NO-GO, one P2 and two P3s (`.dev/86/review-1.md`, and on the PR). The P2: the scope read (`scans._scopes_of_chunk`) scans all of `reserved_ranges` and returns every excluded range, outside the call's bound. The worker (thread "#86 — bound list_scan_findings…", branch `86-bound-findings-call`) has all three and may answer with a limit on reserved ranges per subnet: bring that to the owner before the merge. Then `@codex review` and round 2 on the new head.
+  - **PR #130 (#22), waiting on the owner's manual review.** Head `fb39dd7`, CI green, Codex clean. Two Sol sessions failed: one on the network, one on an access gate ("not authenticated with one of your authorized hardware keys") while it tested who can change the unit's code. `.dev/22/manual-handover.md` has the message word for word and what the session established; its logs are in `.dev/22/review-1-partial/`. Two leads it left unrated: `install.not_root_only` does not check the venv's other packages or the links between the unit's interpreter and its file. They have **not** been sent to the worker; the owner chose to wait for the review.
+  - The main checkout was found detached at `fb39dd7` (the review of #130 is being run there). This entry was committed from a separate worktree; do not move the main checkout's HEAD while that review runs.
+  - Both open PRs merge cleanly with `main` at `c5d7139`. Measured on the merges before #131 landed: #129 1,028 server tests; #130 1,137 agent and 1,020 server tests, and the container path (first start enrols, a recreated container on the same volume ignores the spent token) repeated with no network.
+  - Since #131: a body has 60 s to arrive whole (`408`), and all bodies in progress share 16 MiB (`503`). One sender that keeps the budget full holds every other body off; per-client limits, header size and idle connections are left to the proxy (brief §4.3).
+  - Until #22 merges a new agent is enrolled by hand: the Add dialog shows the `tlge_` token and a `curl` for the exchange. Re-enrol is API-only until #23.
+  - The enrol throttle is global and in memory: 10 attempts that did not enrol per 60 s.
+  - Since #121 scans take longer (a 254-address `icmp,arp,rdns` job at 200 pps: 7.2 s to 7.7 s on macOS in single runs). One that only just fitted its timeout can end incomplete.
+  - Still true from earlier entries: ARP is on by default for a new target; a stuck `resolv.conf` read leaves later scans that rely on the host's resolvers incomplete until the agent restarts; a subnet's CIDR stored before #97 keeps its spelling until its next edit.
+  - Reviews: Greptile reviews only the first head of a PR. Codex's state is in its summary comment (`codex-review-state:v1`). On 2026-11-24 the owner's network was on a hotspot and three review sessions died on "Connection failed"; each was restarted once, with its findings written to disk as it went.
+  - Nothing wakes the orchestrator when a worker opens its PR: look for open PRs at the start of each turn.
+- **Waiting on the owner:**
+  - The manual review of PR #130 (Codex app, GPT-6 with Daybreak Blue, hardware key).
+  - Whether to file a follow-up from #131's round: uvicorn takes unbounded request headers on httptools and never closes idle connections. The reviewer says it may follow the merge but must be closed, in the image or by verified proxy settings, before #26 exposes `/mcp`.
 - **Next:**
-  - Verify the three PRs as they open; brief Sol on each once CI is green and the first automatic findings are answered.
-  - #100 after #22 merges (same agent files; Opus 5.5, briefed). #91 after #86 merges (both edit `schemas.py` and `mcp_server.py`; Opus 5.5, automatic reviews).
-  - #23 after #22 (its commands must match what #22 ships), then #92 on the same dialog. #24 waits on #22; #94 goes with #24. #93 and #20 are stretches.
+  - Round 2 on #129 when its fix lands. Verify #130 again when its review is posted; a P1 or P2 goes to the worker (thread "#22 — agent enrolment exchange…").
+  - #100 after #22 merges (same agent files; Opus 5.5, briefed). #91 after #86 merges (adds `notes` only; Opus 5.5, automatic reviews).
+  - #23 after #22: its systemd tab shows `--enrol-token -` (the token on standard input), its container tab a volume and `IPAM_ENROL_TOKEN`. Then #92 on the same dialog. #24 waits on #22; #94 goes with #24. #93 and #20 are stretches.
   - Then M3 (#26 to #32) after #25. No OAuth grant may be issued before #28's write-scope checks are in force.
   - No real-network test is planned. The owner's permission to send packets on the test host covered 2026-11-23 only: ask again first.
+
+## 2026-11-24 — Claude Code (Opus 5.5), worker — #90: a budget and a deadline on request bodies (PR #131)
+- **Done:** [PR #131](https://github.com/DeusMaximus/TLG-IPAM/pull/131) (`90-bound-unauthenticated-bodies`, head `4efe69d`) closes #90.
+  - `body_limit.py`: beside the cap, `BODIES_MAX` (16 MiB) bounds the body bytes of all requests in progress, read by the middleware or by the route, counted until the request ends (`503 UNAVAILABLE` past it). `BODY_TIMEOUT_S` (60 s from the headers, whole body) gives `408 REQUEST_TIMEOUT`.
+  - Every refusal and every response sent before its body has fully arrived closes the connection. Without that, uvicorn keeps reading and discarding a trickled body after an early `401`.
+  - A body the middleware reads is one buffer. A route that reads its own body gets blocks of at least 64 KiB.
+  - Docs: brief §4.3 (limits, measurement, "Left to the reverse proxy or tunnel"), §5.1 table, acceptance list; spec §5.7 and the §6.6 row; the `AGENTS.md` cap bullet.
+  - Merged: `c5d7139`, squash, on the owner's go-ahead; the remote branch is deleted. CI green and Codex clean on `4efe69d`. Greptile reviewed only the first head (`4598df7`, one P2, fixed and resolved) and was not retriggered. Briefed round (Codex, GPT-6.1 Sol): GO with no findings at `4efe69d`; it repeated the memory measurement on Linux (about 63 to 65 MiB before, about 20 MiB after, both parsers) and ran the body-limit tests six times without a failure. The orchestrator ran 1,059 server tests on the head merged with `main` and repeated the real-server run: 9 held and answered `408` at 60 s, 23 refused. The header and idle-connection follow-up is proposed to the owner and not filed. Nothing else from this entry is waiting on the owner.
+- **Decisions:** PR body Deliberate calls 1–11. Budget plus deadline, no spooling. The count runs until the request ends, not until it authenticates, because FastAPI parses a `Body` before the route's dependencies: check-in and the owner routes read a declared-length body before their credential, which the issue had missed. Bytes are counted as they arrive, never reserved. 60 s is twice the agent's 30 s request deadline. A cut body reaches the route as `http.disconnect`, and the middleware swallows the `ClientDisconnect` that follows.
+- **State:** server 1058 and agent 922 pass; CI green on `4efe69d`; no schema change; `PROTOCOL_VERSION` unchanged.
+  - Measured on macOS, loopback, 32 stalled 1.75 MiB bodies: `a8534eb` +60 to +68 MiB on both parsers; the new head +17 to +21 MiB, 9 held, 23 refused, `408` at 60 s.
+  - Codex: one P1 on `4598df7` (per-chunk memory), fixed in `4efe69d`, then clean on `4efe69d` after `@codex review`. Greptile: one P2 on `4598df7` (same finding), fixed and resolved; it has not reviewed `4efe69d`.
+  - Measured, not fixed (outside #90): uvicorn's httptools takes unbounded request headers (8 MiB of one unfinished header was accepted), and idle connections stay open on both parsers. Brief §4.3 lists both as the proxy's job.
+- **Waiting on the owner:** the briefed round (an author from a different model family; the orchestrator briefs it), a Greptile retrigger on `4efe69d`, then merge. Whether to file a follow-up for header size and idle connections (uvicorn options in the image, or the proxy's job only).
+- **Next:** #31 can take its proxy guidance from brief §4.3 and the PR body's "Left to the reverse proxy or tunnel". #86 may change the one brief §4.3 sentence that measures an import, which this PR left alone.
 
 ## 2026-11-24 — Claude Code (Sonnet 5.5), worker — #126: ingest credential read is held to the write lock (PR #128)
 - **Done:** [PR #128](https://github.com/DeusMaximus/TLG-IPAM/pull/128) (`126-ingest-lock-guard-test`, head `aaac816`) closes #126. One test in `api/tests/test_results.py`, `test_ingest_reads_the_credential_only_while_it_holds_the_write_lock`. It wraps `results._credential_live`, records `_write_locked()` at the read, and asserts `seen == [True]`, so it also fails if the read is moved, doubled or dropped. No file under `api/app/` changed. CI green (backend, agent, frontend, locks). Codex completed on the head with no findings. Greptile reviewed the head with no findings. CodeRabbit skipped. The owner merges.
@@ -103,17 +117,3 @@ Template:
 - **State:** server 1019, agent 898, web 125 tests pass; lint and build clean. CI green and Codex clean on `b45a723`. Greptile last reviewed `c3804f1` (three P1s, all fixed and answered) and needs a manual retrigger. The first briefed round (Codex, GPT-6.1 Sol, on `c72e0a8`) was NO-GO with three P2s and a P3; all are fixed on `b45a723` (call 17). The branch is not merged with `main` at `c28abfb`. Until #22, a new agent is enrolled by hand with the dialog's `curl`; re-enrol is API-only until #23 (the README gives the call).
 - **Waiting on the owner:** the second briefed round on `b45a723` (the orchestrator starts it), a Greptile retrigger, then merge.
 - **Next:** #22 (the agent exchanges `IPAM_ENROL_TOKEN` itself; the systemd installer) and #23 (guided install, Re-enrol button, pending enrolments). PR #123's files were not touched.
-
-## 2026-11-24 — Claude Code (Opus 5.5) — #121: packet slots measured from the hand-off; PR #123 open
-- **Done:** PR #123 (head `2875149`), which closes #121.
-  - On `main` the pacer measured each slot from the grant before it, so a hand-off delayed past a slot let the next packet go at once. New tests show it for all three kinds (gap 0 s). An in-process sweep with no packet sent showed it on `main` (0.045 ms apart in a Linux container); this head has no gap under 5.08 ms.
-  - The fix, in `scan.py`: `Pacer` holds its turn until a `call_soon` callback after the step the slot was granted in, and measures the next slot from then. Each probe takes its own slot in `_Pool`. `PACE_YIELD_EVERY` is removed, since the loop now turns between any two grants.
-  - Documents: spec §5.6, the README's `MAX_PPS` row, `agent/README.md`, `AGENTS.md` (the budget sentences only) and the brief §2.
-  - Merged: `d067821`, squash, on the owner's go-ahead; the remote branch is deleted. CI green and Codex clean on `2875149`. Greptile reviewed only the first head (`01bcf3f`, the same P1 as Codex) and was not retriggered. Briefed round (Codex, GPT-6.1 Sol) at `2875149`: GO with one P3, filed as #125; it would overrule none of the seven deliberate calls, and measured a larger cost than the one below for a mixed job (about 5 to 6% at 200 pps, single runs). The orchestrator ran 921 agent tests on the head merged with `main`, on Python 3.13 and 3.11, and saw the 18 stall tests of the first head fail against `main`'s `scan.py`; it re-measured none of the timings. Nothing from this entry is waiting on the owner any more, and #120 is merged.
-- **Decisions:** the owner's fork, option 1, with one rule for all three kinds. The PR's Deliberate calls give why it is a step-end callback rather than a stamp from each sender, and why the 64-send yield went.
-- **State:** CI green on `2875149`. 920 agent tests (897 on `main`); server and web untouched; no schema change.
-  - Codex: one P1 on `01bcf3f` (the pool hung when a lookup failure cancelled a task before its first step). Fixed in `2875149` with a test, both threads answered and resolved, and Codex clean on `2875149`.
-  - Greptile reviewed `01bcf3f` (the same P1), so it reviews again after its cap; it needs a manual retrigger on `2875149`.
-  - Cost of the fix: a 254-address sweep at 200 pps takes under 1% longer (4.41 s to 4.44 s for ICMP, 9.52 s to 9.59 s for ICMP and ARP, in a Linux container).
-- **Waiting on the owner:** the briefed review round for #123 (a different model family; the orchestrator briefs it), the Greptile retrigger, and the merge. Older items as in the 2026-11-23 entry: #100, #91, #5, #25.
-- **Next:** #120 (tests only, in `test_probe.py`). Then #20 as an M2a stretch, then M2b and M3 as listed in the 2026-11-23 entry.
