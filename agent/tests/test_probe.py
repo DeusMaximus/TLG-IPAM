@@ -1389,7 +1389,8 @@ async def test_the_loop_turns_while_the_servers_are_chosen(monkeypatch, tmp_path
         await no_read_thread_left()
 
 
-async def test_the_choice_of_servers_ends_with_the_jobs_deadline(monkeypatch, tmp_path):
+@pytest.mark.parametrize("late_s", [0.0, 1.5], ids=["thread-on-time", "thread-1.5s-late"])
+async def test_the_choice_of_servers_ends_with_the_jobs_deadline(monkeypatch, tmp_path, late_s):
     """Order against the deadline, not a time taken: the job has one second, the read of
     resolv.conf is held on an event, and the loop's clock is made to pass the job's
     deadline (`skew`) while the scan waits for the choice of servers. The scan must
@@ -1397,19 +1398,33 @@ async def test_the_choice_of_servers_ends_with_the_jobs_deadline(monkeypatch, tm
     after the cancellation (a sleep in the cancelled call) would need the clock to pass
     again, and the scan is still running after those turns. The loop's timers and the
     turns are the whole clock here, so the host's scheduler does not decide it; the
-    job's own clock is untouched."""
+    job's own clock is untouched.
+
+    The wait for the choice is a timer of the job's time left, set on the loop's clock,
+    so that clock is frozen from before the scan starts and moved only once the read is
+    held (#120): a read thread that starts late (`late_s`, held before the read says it
+    has begun; 1.5 s is more than the job's whole second) moves neither the clock nor
+    the timer, and the scan is still waiting when it enters. A timed sleep never fires
+    on a frozen clock, so the test waits for the thread with turns of the loop and puts
+    the real clock back before its clean-up."""
     release = threading.Event()
     entered = threading.Event()
 
     def stalled(path):
+        time.sleep(late_s)
         entered.set()
         release.wait(STALL)
         return ("127.0.0.1",)
 
+    async def turns(n=50):
+        for _ in range(n):
+            await asyncio.sleep(0)  # a turn of the loop; no timer of real time is involved
+
     loop = asyncio.get_running_loop()
     real_time = loop.time
+    frozen = real_time()
     skew = [0.0]
-    monkeypatch.setattr(loop, "time", lambda: real_time() + skew[0])
+    monkeypatch.setattr(loop, "time", lambda: frozen + skew[0])
     monkeypatch.setattr(probe, "read_resolv_conf", stalled)
     resolver = DnsResolver(resolv_conf=str(tmp_path / "resolv.conf"), read_timeout=PATIENT)
     raw = job(ranges=[{"start": "10.0.0.9", "end": "10.0.0.9"}], dns_servers=[], timeout_s=1)
@@ -1419,11 +1434,17 @@ async def test_the_choice_of_servers_ends_with_the_jobs_deadline(monkeypatch, tm
         resolver=resolver, max_pps=200, clock=scan.Clock(),
     ))
     try:
-        assert await until(entered.is_set)  # the scan is waiting for the choice of servers
-        assert not run.done()
-        skew[0] += 1.5  # the job's second has passed on the loop's clock; PATIENT has not
-        for _ in range(50):
-            await asyncio.sleep(0)  # turns of the loop, no timer
+        end = time.monotonic() + PATIENT
+        while not entered.is_set() and time.monotonic() < end:
+            await asyncio.sleep(0)  # the scan is waiting for the choice of servers
+        assert entered.is_set()
+        await turns()
+        assert not run.done(), "the scan ended before the job's deadline on the loop's clock"
+        skew[0] += 0.5  # half of the job's second
+        await turns()
+        assert not run.done(), "the scan ended before the job's deadline on the loop's clock"
+        skew[0] += 1.0  # the job's second has passed on the loop's clock; PATIENT has not
+        await turns()
         assert run.done(), "the scan did not end with the job's deadline"
         result = run.result()
         assert result["complete"] is False
@@ -1431,7 +1452,7 @@ async def test_the_choice_of_servers_ends_with_the_jobs_deadline(monkeypatch, tm
         assert result["observations"] == [{"ip": "10.0.0.9"}]
         assert resolv_conf_threads()  # the read is still held, as it was
     finally:
-        skew[0] += 100  # whatever the scan still waits for is due
+        monkeypatch.setattr(loop, "time", real_time)  # the clean-up polls with timed sleeps
         release.set()
         if not run.done():
             run.cancel()
