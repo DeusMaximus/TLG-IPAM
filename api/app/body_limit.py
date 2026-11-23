@@ -34,7 +34,9 @@ refused before the body was read): otherwise the server would keep the connectio
 open to read and discard what is left of the body, for as long as the sender trickles
 it. When a body the route is reading is refused, the middleware sends its refusal
 itself (unless the route has already started a response), tells the route the client
-has gone (`http.disconnect`), and drops whatever the route sends after it.
+has gone (`http.disconnect`), and drops whatever the route sends after it. A body is
+kept in one buffer here, and handed to a route that reads it in blocks of at least
+64 KiB, so what it costs is its bytes, not the number of chunks it was sent in.
 
 What this does not bound is left to the reverse proxy or tunnel in front of the server
 (brief §4.3, spec §5.7): how many connections there are and how many one client opens,
@@ -71,6 +73,12 @@ BODIES_MAX = 8 * BODY_MAX
 # (`client.REQUEST_TIMEOUT_S`, 30 s), so the agent gives up first; it admits a body at
 # the cap sent at 35 KB/s, a full result set at 21 KB/s.
 BODY_TIMEOUT_S = 60
+
+# A body a route reads is handed to it in blocks of at least this many bytes (the last
+# excepted), and one read here is kept in one buffer: a sender that splits its body into
+# many small chunks would otherwise cost a Python object per chunk, held by the route's
+# list of them (Starlette's `Request.body`), on top of the bytes the budget counts.
+_BLOCK = 64 * 1024
 
 _CONTENT_LENGTH = b"content-length"
 _TRANSFER_ENCODING = b"transfer-encoding"
@@ -185,13 +193,21 @@ class _Body:
         return None
 
     async def receive(self):
-        """The app's `receive`: the body through `read`, then the server's own messages."""
+        """The app's `receive`: the body through `read`, merged into blocks of at least
+        `_BLOCK` bytes but the last, then the server's own messages."""
         if self.cut:
             return {"type": "http.disconnect"}
         if self.complete:
             return await self._receive()
-        message = await self.read()
-        return {"type": "http.disconnect"} if message is None else message
+        block = bytearray()
+        while True:
+            message = await self.read()
+            if message is None or message["type"] != "http.request":
+                # refused, or the client went away: what was merged is no use to anyone
+                return {"type": "http.disconnect"} if message is None else message
+            block += message.get("body", b"")
+            if self.complete or len(block) >= _BLOCK:
+                return {"type": "http.request", "body": bytes(block), "more_body": not self.complete}
 
     async def send(self, message) -> None:
         """The app's `send`: dropped once the middleware's refusal has gone instead, and
@@ -262,18 +278,18 @@ class BodyLimitMiddleware:
 
     async def _read_whole(self, scope, body: _Body) -> None:
         """A body with no declared length: read here, whole, before the app is called."""
-        chunks = []
+        buffer = bytearray()  # one buffer, however many chunks the body came in
         while True:
             message = await body.read()
             if message is None:
                 return  # refused, and answered
             if message["type"] != "http.request":
                 return  # the client went away mid-body: there is no one to answer
-            chunks.append(message.get("body", b""))
+            buffer += message.get("body", b"")
             if not message.get("more_body", False):
                 break
-        whole = b"".join(chunks)
-        chunks.clear()
+        whole = bytes(buffer)
+        del buffer
 
         async def replay():
             # the body once, whole; after it, the server's own messages (a disconnect)

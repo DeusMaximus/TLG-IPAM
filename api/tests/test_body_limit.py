@@ -789,12 +789,65 @@ async def test_a_route_reading_a_refused_body_is_told_the_client_has_gone():
     middleware = BodyLimitMiddleware(inner, cap=100, timeout=0.2)
     request = Stalled(chunks=[b"abc"], declared=10)
     await asyncio.wait_for(request.run(middleware), 5)
-    assert seen == [
-        {"type": "http.request", "body": b"abc", "more_body": True},
-        {"type": "http.disconnect"},
-        "sent",
-    ]
+    # the three bytes were waiting to be merged into a block, and are dropped with it
+    assert seen == [{"type": "http.disconnect"}, {"type": "http.disconnect"}, "sent"]
     assert (request.answer.status, request.answer.json()) == (408, timed_out(0.2))
+
+
+def one_byte_at_a_time(size: int, declared: bool):
+    """A scope and a `receive` that deliver a `size`-byte body one byte per message, the
+    event loop turning between them, as a sender that splits it into tiny chunks can."""
+    sent = 0
+
+    async def receive():
+        nonlocal sent
+        await asyncio.sleep(0)
+        if sent == size:
+            return {"type": "http.disconnect"}
+        sent += 1
+        return {"type": "http.request", "body": b"x", "more_body": sent < size}
+
+    headers = {"content-length": str(size)} if declared else {"transfer-encoding": "chunked"}
+    return http_scope("/", headers), receive
+
+
+@pytest.mark.parametrize("declared", [False, True], ids=["chunked", "content-length"])
+async def test_a_body_in_tiny_chunks_costs_its_bytes_not_its_chunks(declared):
+    """100,000 one-byte chunks. Kept one object per chunk, they took about 9 MB for a
+    100 KB body (Codex, on #131); here the body is one buffer, and a route reading it
+    gets it in blocks of at least 64 KiB, so its own list of them stays short."""
+    import tracemalloc
+
+    size = 100_000
+    seen = []
+
+    async def counts(scope, receive, send):
+        while True:
+            message = await receive()
+            seen.append(len(message.get("body", b"")))
+            if not message.get("more_body", False):
+                break
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    scope, receive = one_byte_at_a_time(size, declared)
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    middleware = BodyLimitMiddleware(counts, cap=BODY_MAX, timeout=60)
+    tracemalloc.start()
+    try:
+        await middleware(scope, receive, send)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert sent[0]["status"] == 204
+    assert sum(seen) == size
+    assert seen == ([65536, size - 65536] if declared else [size])
+    assert peak < 4 * size, peak
+    assert middleware.held == 0
 
 
 async def test_a_client_that_really_went_away_is_still_the_routes_to_handle():
