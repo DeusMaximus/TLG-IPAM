@@ -1675,6 +1675,29 @@ async def test_a_result_set_authenticated_before_its_credential_was_withdrawn_is
     assert (await target_row(target["id"])).current_job_id == job["job_id"]
 
 
+async def test_ingest_reads_the_credential_only_while_it_holds_the_write_lock(
+    client, agent_api, monkeypatch
+):
+    """The case above shows the credential is read again, not that the read is made
+    under the lock. Without the lock an owner's revoke can commit between the read and
+    the first lease update, and the result set is accepted. So the read itself is held
+    to it: when `_credential_live` runs, another connection cannot begin a write
+    transaction (the same probe as for the scope read)."""
+    agent, token, subnet, target, job = await setup(client, agent_api)
+    seen = []
+    real = results._credential_live
+
+    async def probe(session, agent_row_):
+        seen.append(_write_locked())
+        return await real(session, agent_row_)
+
+    monkeypatch.setattr(results, "_credential_live", probe)
+    await accepted(agent_api, token, job, [obs("10.0.0.10")])
+    assert seen == [True], "the credential was read without SQLite's write lock held"
+    # the probe's own connection left no lock behind
+    assert not _write_locked()
+
+
 async def test_an_accepted_result_set_records_its_tokens_use(client, agent_api):
     """Token use is recorded in the result set's own transaction, conditionally in SQL
     (`agents.record_token_use`); a refused result set writes nothing, its token's use
