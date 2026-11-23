@@ -27,6 +27,27 @@ Template:
 
 ---
 
+## 2026-11-23 — Claude Code (Fable 5.2) — #88 run on the owner's test host: every check that could be run passes; #121 filed
+- **Done:** the real-network checks of #88, on a Linux host the owner gave access to, with the owner setting one host to drop ping and then powering it off. No file in the repository changed. The results are [a comment on #88](https://github.com/DeusMaximus/TLG-IPAM/issues/88#issuecomment-7101806047); its boxes are ticked except the two hardware ones.
+  - Set-up: the agent image and a throwaway server, both built from `main` at `ccd6ceb`, on the same host; the server behind a private CA, so no production data was involved. Nine sweeps (one of a routed /24, eight of the agent's own), each captured with `tcpdump`.
+  - Passed: the sweep by the container with `CAP_NET_RAW`; PTR through the subnet's `dns_servers` and through the host's `resolv.conf`; TLS with a private CA, and a refusal without it or with the wrong host name; the agent suite on Python 3.11.18 (897 passed, the dev lock installed there); a host that drops ping found by ARP with its real MAC; a host that left not reported while the kernel still listed it `STALE` (its observation turned not alive, `last_seen_at` kept, its finding gone); the agent host's own MAC; a routed subnet given `icmp`, `rdns` and no ARP.
+  - Not run: a parent interface with hardware VLAN offload or a bond (the host's interface is a container veth), and a segment with proxy ARP (none showed). "Complete" was read from the API; nobody looked at the Scanning section in a browser. A certificate from a public CA was not tried.
+  - Rate at `MAX_PPS` 200: the agent's own packets never passed 195 in any second. The kernel's ARP during the ICMP sweep of the agent's own subnet (three requests for each silent address) reached 206 a second by itself and 273 with the agent's, the exception spec §5.6 names. On its own subnet the ICMP sweep put 20 to 22 echo requests on the wire, not 254: the kernel sends one only to an address it resolved.
+  - Filed, on the owner's go-ahead: #121. In the routed sweep two echo requests left 0.15 ms apart, one of them about 5 ms late. The capture cannot say whether the delay was before the hand-off to the kernel (the agent's side, which the spec bounds) or after it (which it does not).
+- **Decisions (the owner's):** an agent session ran #88, which the issue reserved for the owner. Results go on the public issue with no address, MAC or host name of the network. The test set-up was removed after the run.
+- **State:** green and unchanged: `main` is `a8b58ec` plus hand-off commits (955 server, 897 agent and 118 web tests measured there; CI green). No PR is open and nothing is running. An agent built from `main` has now run on a real network. The test host holds nothing of the run but Docker build cache.
+  - Still true from the entry below: ARP is on by default for a new target; since #87 a scan takes longer than before and one that only just fitted its timeout can end incomplete; a stuck `resolv.conf` read leaves later scans that rely on the host's resolvers incomplete until the agent restarts, and no README says so.
+  - Greptile's monthly cap ended 2026-11-22. Whether it reviews again is not known until the next PR opens; if it does not, one outside read (Codex, GPT-6.1 Sol) stands in.
+- **Waiting on the owner:**
+  - #88: close it, or keep it open for the two hardware checks.
+  - #100 (whether a scan in which no DNS server gave a usable answer clears stored names) and #91 (the 2 MiB bound on a bulk import): decisions.
+  - #5 and #25 (`owner` label). #25 comes before the rest of M3.
+  - Three lines proposed for the worker brief in `.agents/orchestration.md` (how a clean Codex result arrives; a worker never changes git config; a worker never edits `HANDOFF.md`), used in every brief since 2026-11-20 and not yet in the file.
+- **Next:**
+  - #120: tests only, one test in `agent/tests/test_probe.py`, automatic reviews. Not started; the owner has not given the go-ahead for it.
+  - #121: first a test that holds a probe's first step back for more than a slot after its grant, to see whether two hand-offs can come closer than a slot. A briefed round if `agent/src/` changes.
+  - #20 is a stretch in M2a. Then M2b (#21 to #24, with #92 and #94 beside #23 and #24; #93 a stretch) and M3 (#26 to #32). #86 and #90 close before #26 exposes `/mcp`; no OAuth grant may be issued before #28's write-scope checks are in force.
+
 ## 2026-11-21 — Claude Code (Fable 5.2), orchestrator — eighteen PRs merged since 2026-11-20; nothing in flight; M2a waits on the owner
 - **Done:** eighteen PRs squash-merged on the owner's go-ahead, fourteen implemented by Opus 5.5 and four (#108, #114, #117, #119) by Sonnet 5.5. The remote branches are deleted. Worker entries are below or in the archive (`grep -n '^## ' .agents/handoff/2026-11.md`).
   - Wave 1, from `main` at `b481075`: #82 (#65) `3cbfa63`, #83 (#79) `1987465`, #84 (#14) `7014b58`.
@@ -98,25 +119,3 @@ Template:
 - **State:** server 955 (+11), agent 890, web 118 (+7); lint and build pass. No schema or protocol change. A run during the #115 stress run (load ~195) produced timeout failures (at least some in `test_body_limit.py`) and vitest worker-start timeouts; it was clean once the load dropped.
 - **Waiting on the owner:** the briefed round (it edits the scope reader check-in and ingest use), then merge.
 - **Next:** none from this issue. Not covered: a real 250,001-target request, SQLite builds older than 3.32, a real browser's layout of the longer time text.
-
-## 2026-11-21 — Claude Code (Sonnet 5.5) — #107: a test of its own for each tripwire restriction, the pacer's lock, icmplib's send order
-- **Done:** PR #114, closes #107, tests and wording only. No file under `agent/src/` changed.
-  - **Item 1, `test_invariants.py`:** one refused source per forbidden name, prefix and file keyword. They are written out, not read from the lists, each asserting its own exact reason in three modules (snippet, `arp.py`, `probe.py`). `test_every_entry_of_each_list_has_a_case` makes a new entry need a case.
-  - **Item 1, mutations:** 71 per-entry mutations (60 names, 6 prefixes, 5 keywords), all red on their own cases and reasons, none red on another entry's.
-  - **Item 2:** `PREFIX_EXCEPTIONS` removed.
-  - **Item 3:** one `AGENTS.md` sentence.
-  - **Item 4, `test_e2e.py`:** the test's assumptions stated in its docstring, nothing loosened.
-  - **Item 5, `test_pacing.py`:** `HeldClock` tests for the pacer's lock, with the lock removed they fail on the ordering.
-  - **Item 6, `test_icmplib_send.py`:** a new file running `IcmpProber` through the installed `icmplib.async_ping`, replacing only `ICMPv4Socket._create_socket`. It has a control with an injected `await`, and an `await` injected into icmplib or removed from `_Pool.run` turns it red.
-  - **Reviews:** outside review by Codex GPT-6.1 Sol, GO at `127f4a6`, one P3 answered by `045ebc5`. Codex's automatic review is clean on `045ebc5`.
-  - **Merged:** `e78c531`, by the orchestrator (Fable 5.2) on the owner's go-ahead; #107 closed. The once-failed FIFO test is filed as #115. The head moved twice after the outside read: `045ebc5` (one docstring; the orchestrator checked `test_e2e.py` parses to the same tree) and `4a6d40f`, a merge of `main` at `80bce03` for one `AGENTS.md` conflict with #113, which the orchestrator checked identical to an automatic merge outside `AGENTS.md`, with the agent bullet the branch's and every other line `main`'s. CI was green and Codex clean on `4a6d40f`. The orchestrator re-measured: 890 agent tests on `4a6d40f`; at `127f4a6`, the pacer's lock removed (exactly the two new tests fail), five forbidden names exempted in turn (each fails only its own three cases) and two prefixes removed. Its own server run on the merge commit did not finish, the machine being loaded by #115's worker; CI's backend job passed on that tree.
-- **Decisions:**
-  - The checker's behaviour is unchanged.
-  - A new list entry now needs a case (equality, not subset).
-  - `exec` and `exec_module` in `FORBIDDEN` are redundant with the `exec` prefix; left as they are.
-  - Item 4 changed no code, only the docstring.
-- **State:** green. Agent 890 (was 650); server 824 and web 111 untouched. CI green on `045ebc5`, Codex clean, Greptile not run (cap until 2026-11-22). Linux aarch64 container passed 890.
-  - **100 full-suite runs:** 99 passed. Run 33 failed `test_probe.py::test_a_fifo_put_at_the_path_after_the_look_holds_one_thread_until_a_writer_comes`, which looks like a load flake from the 0.3 s read timeout. It is not filed.
-  - **The once-failed e2e test:** passed 100 of 100 in the suite and 360 of 360 alone under load about 40. A 2.2 s process stall after the first send makes it fail, with the scan complete and no error.
-- **Waiting on the owner:** merge #114. Whether to file the `test_probe.py` FIFO test flake (a read timeout of 0.3 s under load).
-- **Next:** #97 and #89 (in flight, other workers). The merge takes `main` in with a merge commit; this PR touches none of their files except the one `AGENTS.md` sentence.
