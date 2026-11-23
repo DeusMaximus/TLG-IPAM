@@ -136,10 +136,50 @@ class Host:
     def code_not_root_only(self, interpreter: str) -> str | None:
         return not_root_only(interpreter)
 
+    def code_unreachable(self, interpreter: str) -> str | None:
+        return unreachable(interpreter)
+
 
 def _changeable(path: Path, owner: int) -> bool:
     info = os.stat(path)
     return info.st_uid != owner or bool(info.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
+def unreachable(
+    interpreter: str,
+    *,
+    prefix: str = sys.prefix,
+    package: str = str(Path(__file__).resolve().parent),
+    top: str = "/",
+) -> str | None:
+    """The first path the service user could not use, or None. It is no member of any
+    group these paths have, so their bits for others are what it gets: every directory
+    above the interpreter (as the unit names it and as resolved) must let others
+    through (`x`) and the interpreter run (`x`); every directory of the virtual
+    environment and the package must let others list and enter it (`r`, `x`: the
+    import system lists them), and every file in them must be readable (`r`). A virtual
+    environment made under a umask such as 077 fails here, before the install changes
+    anything or spends the token (Codex on #130)."""
+    resolved = Path(interpreter).resolve()
+    if not os.stat(resolved).st_mode & stat.S_IXOTH:
+        return str(resolved)
+    stop = Path(top)
+    for start in (Path(interpreter).parent, resolved.parent):
+        for directory in (start, *start.parents):
+            if not os.stat(directory).st_mode & stat.S_IXOTH:
+                return str(directory)
+            if directory == stop:
+                break
+    for tree in (Path(prefix), Path(package)):
+        for directory, _dirs, names in os.walk(tree):
+            if os.stat(directory).st_mode & (stat.S_IROTH | stat.S_IXOTH) != stat.S_IROTH | stat.S_IXOTH:
+                return directory
+            for name in names:
+                path = os.path.join(directory, name)
+                info = os.lstat(path)
+                if stat.S_ISREG(info.st_mode) and not info.st_mode & stat.S_IROTH:
+                    return path
+    return None
 
 
 def not_root_only(
@@ -342,6 +382,14 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out) -> No
             f"{unsafe} can be changed by a user other than root, and the unit would run the "
             "code under it with CAP_NET_RAW. Install the agent into a virtual environment "
             "only root can write, such as /opt/tlg-ipam-agent"
+        )
+    hidden = host.code_unreachable(interpreter)
+    if hidden is not None:
+        raise InstallError(
+            f"{hidden} is not readable by other users, so the unit's user, {SERVICE_USER}, "
+            "could not run the agent (a virtual environment made under a restrictive "
+            "umask, say). Make the environment readable, as with `chmod -R o+rX "
+            f"{sys.prefix}`, and run install again"
         )
     url = config.parse_url(options.url, "--url")
     allowed = None if options.allowed_cidrs is None else config.parse_allowed(options.allowed_cidrs, "--allowed-cidrs")

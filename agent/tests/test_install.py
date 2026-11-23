@@ -43,6 +43,7 @@ class FakeHost(install.Host):
         self.group_stays = group_stays
         self.fail = fail or {}
         self.unsafe = unsafe
+        self.hidden = None
         self.commands: list[tuple[str, ...]] = []
 
     def euid(self):
@@ -60,6 +61,10 @@ class FakeHost(install.Host):
     def code_not_root_only(self, interpreter):
         assert interpreter == PYTHON
         return self.unsafe
+
+    def code_unreachable(self, interpreter):
+        assert interpreter == PYTHON
+        return self.hidden
 
     def run(self, *argv):
         self.commands.append(argv)
@@ -411,6 +416,51 @@ def test_code_others_could_change_is_refused(tmp_path, path):
     layout = _venv(tmp_path)
     (tmp_path / path).chmod(0o775 if (tmp_path / path).is_dir() else 0o664)
     assert _changeable_paths(tmp_path, layout) == str(tmp_path / path)
+
+
+def _unreachable(root, layout):
+    return install.unreachable(layout["interpreter"], prefix=layout["prefix"], package=layout["package"], top=str(root))
+
+
+def test_code_the_service_user_can_reach_passes(tmp_path):
+    layout = _venv(tmp_path)
+    for path in tmp_path.rglob("*"):
+        if path.is_file():
+            path.chmod(0o755 if path.name.startswith("python") else 0o644)
+    assert _unreachable(tmp_path, layout) is None
+
+
+@pytest.mark.parametrize(
+    "path, mode",
+    [
+        ("opt/tlg-ipam-agent", 0o700),  # a venv made under umask 077
+        ("opt/tlg-ipam-agent/bin", 0o711),  # enterable but not listable, inside the venv
+        ("opt/tlg-ipam-agent/lib/python3.13/site-packages/tlg_ipam_agent", 0o750),
+        ("opt/tlg-ipam-agent/lib/python3.13/site-packages/tlg_ipam_agent/cli.py", 0o600),
+        ("usr/bin/python3.13", 0o744),  # the interpreter others cannot run
+        ("usr/bin", 0o700),
+        ("opt", 0o700),
+    ],
+)
+def test_code_the_service_user_cannot_reach_is_refused(tmp_path, path, mode):
+    """Codex on #130: root's check alone passed a venv the service user could not
+    enter, and the install spent the token on a unit that could not start."""
+    layout = _venv(tmp_path)
+    for each in tmp_path.rglob("*"):
+        if each.is_file():
+            each.chmod(0o755 if each.name.startswith("python") else 0o644)
+    (tmp_path / path).chmod(mode)
+    assert _unreachable(tmp_path, layout) == str(tmp_path / path)
+
+
+def test_an_environment_the_service_user_cannot_reach_stops_the_install_first(root):
+    host = FakeHost()
+    host.hidden = "/opt/tlg-ipam-agent"
+    before = tree(root)
+    code, said = run_install(root, host, exchange=lambda *a: pytest.fail("no exchange"))
+    assert code == 1 and "/opt/tlg-ipam-agent is not readable by other users" in said[-1]
+    assert "chmod -R o+rX" in said[-1]
+    assert host.commands == [] and tree(root) == before
 
 
 # --- uninstall ---
