@@ -133,17 +133,44 @@ class Host:
         print("+ " + " ".join(argv), flush=True)
         return subprocess.run(list(argv), env=COMMAND_ENV, stdin=subprocess.DEVNULL, check=False).returncode
 
-    def code_not_root_only(self) -> str | None:
-        """The first directory of the agent's code or interpreter, or one above it,
-        that a user other than root owns or could write to, or None. The unit runs
-        that code with CAP_NET_RAW, so whoever can change it can use the capability."""
-        starts = (Path(sys.prefix), Path(__file__).resolve().parent, Path(sys.executable).resolve().parent)
-        for start in starts:
-            for directory in (start, *start.parents):
-                info = os.stat(directory)
-                if info.st_uid != 0 or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-                    return str(directory)
-        return None
+    def code_not_root_only(self, interpreter: str) -> str | None:
+        return not_root_only(interpreter)
+
+
+def _changeable(path: Path, owner: int) -> bool:
+    info = os.stat(path)
+    return info.st_uid != owner or bool(info.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
+def not_root_only(
+    interpreter: str,
+    *,
+    prefix: str = sys.prefix,
+    package: str = str(Path(__file__).resolve().parent),
+    owner: int = 0,
+    top: str = "/",
+) -> str | None:
+    """The first path a user other than `owner` (root) owns or could write to, among
+    what the unit runs with CAP_NET_RAW, or None: the interpreter it names (followed
+    to its file) and the agent's modules, and every directory from each of these up
+    to `top`: the interpreter's own directory as the unit names it (a venv's `bin`,
+    which a link to the system Python would otherwise skip) and as resolved, the
+    virtual environment, and the package. Whoever can change one of them can run
+    their own code with the capability. `owner` and `top` are for a test."""
+    package_dir = Path(package)
+    files = [Path(interpreter).resolve(), *sorted(package_dir.glob("*.py"))]
+    for path in files:
+        if _changeable(path, owner):
+            return str(path)
+    starts = (Path(interpreter).parent, Path(interpreter).resolve().parent, Path(prefix), package_dir)
+    stop = Path(top)
+    for start in starts:
+        for directory in (start, *start.parents):
+            if _changeable(directory, owner):
+                return str(directory)
+            if directory == stop:
+                break
+    return None
 
 
 def read_token_line() -> str:
@@ -309,7 +336,7 @@ def install(
 
 def _install(options, host, paths, exchange, read_stdin, interpreter, out) -> None:
     _preflight(host)
-    unsafe = host.code_not_root_only()
+    unsafe = host.code_not_root_only(interpreter)
     if unsafe is not None:
         raise InstallError(
             f"{unsafe} can be changed by a user other than root, and the unit would run the "
@@ -360,7 +387,12 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out) -> No
             store.write_file(path, content.encode("ascii"), FILE_MODE)
             if not existed:
                 undo.append(partial(store.remove_file, path))
-        if token is not None:
+        if token is None:
+            # an update: the token stays, written again so that its owner is the
+            # service user and its mode 0600 whatever wrote it before (an agent run as
+            # root, a service user since recreated with another uid)
+            store.write_file(paths.token, stored.encode("ascii"), enrol.TOKEN_MODE, owner=user)
+        else:
             with store.PendingFile(paths.token, enrol.TOKEN_MODE, owner=user) as pending:
                 answer = exchange(url, token, ca_file)
                 if answer.kind is not Kind.OK:

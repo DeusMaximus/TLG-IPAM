@@ -197,3 +197,23 @@ def test_a_directory_that_holds_anything_is_not_removed(tmp_path):
     with pytest.raises(StoreError, match="cannot be removed"):
         store.remove_dir(str(tmp_path / "d"))
     assert (tmp_path / "d" / "mine").read_bytes() == b"the operator's"
+
+
+# --- the directory lock ---
+
+
+def test_the_directory_lock_is_held_by_one_holder_at_a_time(tmp_path):
+    """Greptile on #130: two processes enrolling into one directory. Each `DirLock`
+    opens its own descriptor, so two in one process exclude each other as two
+    processes would."""
+    first, second = store.DirLock(str(tmp_path)), store.DirLock(str(tmp_path))
+    assert first.acquire() is True
+    assert second.acquire() is False
+    first.release()
+    assert second.acquire() is True
+    second.release()
+
+
+def test_a_directory_that_cannot_be_locked_is_refused(tmp_path):
+    with pytest.raises(StoreError, match="cannot be locked"):
+        store.DirLock(str(tmp_path / "none")).acquire()

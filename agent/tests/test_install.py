@@ -57,7 +57,8 @@ class FakeHost(install.Host):
     def service_group(self):
         return self.group
 
-    def code_not_root_only(self):
+    def code_not_root_only(self, interpreter):
+        assert interpreter == PYTHON
         return self.unsafe
 
     def run(self, *argv):
@@ -322,6 +323,73 @@ def test_an_install_without_an_enrolment_token_keeps_the_stored_one_and_updates_
     assert host.commands == SYSTEMD_START
     assert "MAX_PPS=20" in (root / "etc/tlg-ipam-agent/agent.env").read_text()
     assert (root / "var/lib/tlg-ipam-agent/token").read_bytes() == TOKEN.encode()
+
+
+def test_an_update_gives_the_stored_token_to_the_service_user_again(root, monkeypatch):
+    """Codex on #130: a token written by something else (an agent run as root, a
+    service user recreated with another uid) is rewritten with the service user as its
+    owner and mode 0600, its value unchanged."""
+    state = root / "var/lib/tlg-ipam-agent"
+    state.mkdir()
+    (state / "token").write_bytes(TOKEN.encode())
+    (state / "token").chmod(0o644)
+    owners = []
+    real = store.write_file
+    monkeypatch.setattr(
+        install.store, "write_file", lambda path, data, mode, owner=None: owners.append((path, owner)) or real(path, data, mode, owner)
+    )
+    host = FakeHost(user=True)
+    code, said = run_install(root, host, Options(url=URL), exchange=lambda *a: pytest.fail("no exchange"))
+    assert code == 0, said
+    assert stat.S_IMODE(os.stat(state / "token").st_mode) == 0o600
+    assert (state / "token").read_bytes() == TOKEN.encode()
+    assert (str(state / "token"), (os.getuid(), os.getgid())) in owners
+
+
+def _venv(root: Path) -> dict:
+    """A virtual environment's layout: `bin/python3` a link to an interpreter outside
+    it, and a package with a module."""
+    system = root / "usr/bin"
+    system.mkdir(parents=True)
+    (system / "python3.13").write_bytes(b"")
+    venv = root / "opt/tlg-ipam-agent"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin/python3").symlink_to(system / "python3.13")
+    package = venv / "lib/python3.13/site-packages/tlg_ipam_agent"
+    package.mkdir(parents=True)
+    (package / "cli.py").write_bytes(b"")
+    for directory in (root, *[p for p in root.rglob("*") if p.is_dir()]):
+        directory.chmod(0o755)
+    return dict(interpreter=str(venv / "bin/python3"), prefix=str(venv), package=str(package))
+
+
+def _changeable_paths(root, layout):
+    return install.not_root_only(layout["interpreter"], prefix=layout["prefix"], package=layout["package"],
+                                 owner=os.getuid(), top=str(root))
+
+
+def test_code_only_its_owner_can_change_passes(tmp_path):
+    assert _changeable_paths(tmp_path, _venv(tmp_path)) is None
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "opt/tlg-ipam-agent/bin",  # the directory the unit names, behind a link to the real file
+        "usr/bin",  # where the link leads
+        "usr/bin/python3.13",
+        "opt/tlg-ipam-agent",
+        "opt",
+        "opt/tlg-ipam-agent/lib/python3.13/site-packages/tlg_ipam_agent",
+        "opt/tlg-ipam-agent/lib/python3.13/site-packages/tlg_ipam_agent/cli.py",
+    ],
+)
+def test_code_others_could_change_is_refused(tmp_path, path):
+    """Greptile on #130: a writable `bin` passed, since only the link's target was
+    looked at. Every path the unit runs, or a directory above one, is checked."""
+    layout = _venv(tmp_path)
+    (tmp_path / path).chmod(0o775 if (tmp_path / path).is_dir() else 0o664)
+    assert _changeable_paths(tmp_path, layout) == str(tmp_path / path)
 
 
 # --- uninstall ---

@@ -34,11 +34,13 @@ MODULES = sorted(PACKAGE.glob("*.py"))
 # none of it. #22 added `subprocess`, for `install.py` alone (`IMPORTED_ONLY_IN`): it
 # runs useradd, userdel, groupdel and systemctl with fixed arguments. `pwd` and `grp`
 # came with it, to look the service user and its group up (they read the user
-# database and change nothing), `functools`, for `partial`, and `termios`, for
-# `install.py` alone, to turn echo off while the enrolment token is typed.
+# database and change nothing), `functools`, for `partial`, `termios`, for
+# `install.py` alone, to turn echo off while the enrolment token is typed, and
+# `fcntl`, for `store.py` alone, to `flock` the state directory so that two agent
+# processes sharing it never enrol into it at once.
 ALLOWED_IMPORTS = {
     "argparse", "asyncio", "collections.abc", "dataclasses", "datetime", "enum",
-    "functools", "grp", "ipaddress", "json", "logging", "os", "pathlib", "platform",
+    "fcntl", "functools", "grp", "ipaddress", "json", "logging", "os", "pathlib", "platform",
     "pwd", "random", "re", "signal", "socket", "ssl", "stat", "struct", "subprocess",
     "sys", "termios", "threading", "time", "typing", "urllib.parse",
     "httpx", "icmplib",
@@ -90,7 +92,7 @@ NAMES_WHERE = {
     "install.py": {"subprocess"},
 }
 # an allowed import that one module alone may make
-IMPORTED_ONLY_IN = {"subprocess": "install.py", "termios": "install.py"}
+IMPORTED_ONLY_IN = {"subprocess": "install.py", "termios": "install.py", "fcntl": "store.py"}
 
 # The spellings of having a library open a file to read that the checks enumerate
 # (the agent's own ways of opening one are forbidden names above): pathlib's read_text

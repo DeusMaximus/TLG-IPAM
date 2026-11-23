@@ -16,6 +16,7 @@ before any byte goes in, flushed to disk, and renamed into place, so a reader se
 old file or the whole new one; the directory is flushed after the rename.
 """
 
+import fcntl
 import os
 import stat
 
@@ -83,6 +84,39 @@ def check_dir(path: str, owner: int) -> None:
         raise StoreError(f"{path} is not owned by uid {owner}")
     if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise StoreError(f"{path} is writable by users other than its owner")
+
+
+class DirLock:
+    """An exclusive `flock(2)` on a directory, so that two agent processes sharing one
+    state directory (two containers on one volume) never exchange and write at once:
+    each would remove the other's pending file. It is held from before the stored token
+    is looked for to after the new one is in place, and released when the process ends
+    however it ends. `acquire` does not wait: it says whether it got the lock."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._fd: int | None = None
+
+    def acquire(self) -> bool:
+        try:
+            fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        except OSError as exc:
+            raise StoreError(f"{self.path} cannot be locked: {_reason(exc)}") from None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return False
+        except OSError as exc:
+            os.close(fd)
+            raise StoreError(f"{self.path} cannot be locked: {_reason(exc)}") from None
+        self._fd = fd
+        return True
+
+    def release(self) -> None:
+        if self._fd is not None:
+            os.close(self._fd)  # closing the descriptor releases the lock
+            self._fd = None
 
 
 def _sync_dir(path: str) -> None:

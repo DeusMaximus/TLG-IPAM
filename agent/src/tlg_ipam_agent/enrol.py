@@ -47,6 +47,8 @@ STATE_DIR = "/var/lib/tlg-ipam-agent"
 TOKEN_NAME = "token"
 # the token file's mode: its owner reads it, nobody else can
 TOKEN_MODE = 0o600
+# how often an agent waiting on another's enrolment in its directory looks again
+LOCK_RETRY_S = 1.0
 
 
 def token_path(state_dir: str) -> str:
@@ -126,23 +128,40 @@ async def enrol_and_store(
             "volume there (-v tlg-ipam-agent:/var/lib/tlg-ipam-agent)",
             state_dir,
         )
+    lock = store.DirLock(state_dir)
+    waiting = False
     while not stop.is_set():
+        if not lock.acquire():
+            # another agent process enrolling in the same directory: wait for it, then
+            # take the token it stored
+            if not waiting:
+                log.warning("another agent process is enrolling in %s; waiting for it", state_dir)
+                waiting = True
+            await _pause(clock, LOCK_RETRY_S, stop)
+            continue
         try:
-            pending = store.PendingFile(token_path(state_dir), TOKEN_MODE)
-        except store.StoreError as exc:
-            raise ConfigError(f"the agent token cannot be stored: {exc}") from None
-        with pending:
-            async with http(settings.url, settings.enrol_token) as client:
-                answer = await exchange(client)
-            if answer.kind is Kind.OK:
-                token = answer.data["agent_token"]
-                _store(state_dir, token, pending)
-                log.info(
-                    "enrolled as agent %s; the agent token is stored in %s",
-                    answer.data["agent_id"],
-                    token_path(state_dir),
-                )
-                return token
+            stored = stored_token(state_dir)
+            if stored is not None:
+                log.info("the agent token another agent process stored in %s is used", state_dir)
+                return stored
+            try:
+                pending = store.PendingFile(token_path(state_dir), TOKEN_MODE)
+            except store.StoreError as exc:
+                raise ConfigError(f"the agent token cannot be stored: {exc}") from None
+            with pending:
+                async with http(settings.url, settings.enrol_token) as client:
+                    answer = await exchange(client)
+                if answer.kind is Kind.OK:
+                    token = answer.data["agent_token"]
+                    _store(state_dir, token, pending)
+                    log.info(
+                        "enrolled as agent %s; the agent token is stored in %s",
+                        answer.data["agent_id"],
+                        token_path(state_dir),
+                    )
+                    return token
+        finally:
+            lock.release()
         if answer.kind is Kind.RETRY:
             wait = backoff.next()
             log.warning("enrolment not accepted (%s); retrying in %.0f s", answer.message, wait)

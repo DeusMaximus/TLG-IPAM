@@ -268,6 +268,40 @@ async def test_an_answer_not_in_the_enrol_shape_writes_nothing(tmp_path, data):
     assert os.listdir(directory) == []
 
 
+async def test_two_first_starts_on_one_directory_enrol_once(tmp_path):
+    """Greptile on #130: two processes sharing one empty volume. The second waits on
+    the directory lock while the first exchanges, then takes the token the first
+    stored: one request, one token, and no pending file removed from under the first."""
+    directory = state(tmp_path)
+    release = asyncio.Event()
+    requests = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        await release.wait()
+        return httpx.Response(ENROLLED[0], json=ENROLLED[1])
+
+    def http(url, token):
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url=url)
+
+    def start():
+        return asyncio.ensure_future(
+            enrol.agent_token(settings(enrol_token=ENROL_TOKEN), directory, stop=asyncio.Event(), http=http)
+        )
+
+    first = start()
+    while not requests:
+        await asyncio.sleep(0)
+    second = start()
+    for _ in range(50):
+        await asyncio.sleep(0)
+    assert not second.done() and len(requests) == 1
+    release.set()
+    assert await first == TOKEN and await second == TOKEN
+    assert len(requests) == 1
+    assert os.listdir(directory) == ["token"]
+
+
 async def test_a_token_issued_but_not_stored_stops_the_agent(tmp_path, monkeypatch):
     directory = state(tmp_path)
     server = Scripted(ENROLLED)
