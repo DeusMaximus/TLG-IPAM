@@ -178,7 +178,12 @@ class _Pool:
                     break
                 await self._sem.acquire()
                 started = loop.create_future()
-                tasks.append(asyncio.create_task(one(item, started)))
+                task = asyncio.create_task(one(item, started))
+                # a task cancelled before its first step (a failing lookup cancels the
+                # rest) never runs `one`, so its finally never settles `started`; its
+                # done callback does, however it ended
+                task.add_done_callback(lambda _, s=started: s.done() or s.set_result(False))
+                tasks.append(task)
                 # the next item waits until this one has its slot and its work's first
                 # step has run (an echo request handed to the kernel), or it will not
                 # start: so the pacer has one waiter from the pool at a time, and no

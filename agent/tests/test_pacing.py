@@ -518,3 +518,33 @@ async def test_a_timer_that_falls_due_runs_before_the_next_late_send(due_after):
     assert pacer_sleeps(clock) == 0, "every slot must be overdue, or this tests nothing"
     assert due_at == [due_after]
     assert len(ran_at) == 1 and ran_at[0] - due_at[0] <= 1
+
+
+# --- 4. the pool's start handshake (the review of PR #123) ---
+
+
+@pytest.mark.parametrize("paced", [False, True])
+async def test_an_item_cancelled_before_its_first_step_does_not_hold_the_pool(paced):
+    """The pool waits for each item to start before it starts the next. A failing item
+    that cancels the rest (`cancel_on_failure`, the PTR lookups') can cancel the newest
+    one before its first step has run, so its coroutine never runs: the pool must still
+    see that it did not start, and raise the failure, rather than wait for ever (until
+    the scan's backstop discards everything the job saw). Found by Codex and Greptile
+    on PR #123: item 1 waits on a future, item 2 fails it and item 3 is cancelled
+    unstarted."""
+    trigger = asyncio.get_running_loop().create_future()
+    ran: list[int] = []
+
+    async def work(item, timeout):
+        ran.append(item)
+        if item == 1:
+            await trigger
+        elif item == 2:
+            trigger.set_exception(scan.ProbeError("no query sent"))
+            await asyncio.sleep(0)
+
+    pacer = scan.Pacer(1000, scan.Clock()) if paced else None
+    pool = scan._Pool(16, 5.0, pacer, scan.Clock(), deadline=time.monotonic() + 60, cancel_on_failure=True)
+    with pytest.raises(scan.ProbeError, match="no query sent"):
+        await asyncio.wait_for(pool.run(range(1, 6), work), timeout=2)
+    assert ran[:2] == [1, 2] and 4 not in ran and 5 not in ran
