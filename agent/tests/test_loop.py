@@ -70,7 +70,9 @@ async def test_429_then_503_backs_off_within_bounds_and_sends_nothing_until_acce
 
     def checkin():
         sent_before_accepted.append(len(prober.sent))
-        if len(server.checkins_posted) >= 10:
+        # once the job is reported: stopping cancels a scan still running, and how many
+        # turns of the loop a scan takes against a check-in's is no part of this test
+        if len(server.checkins_posted) >= 10 and server.results_posted:
             stop.set()
 
     stop = asyncio.Event()

@@ -5,9 +5,10 @@ Every packet goes to an address `guard.plan` returned, or, for a PTR lookup, to 
 the job's DNS servers (the host's own resolvers when the job names none). Every packet
 takes a slot of the agent's one `MAX_PPS` budget (`Pacer`), carried from job to job:
 each echo request, each ARP request (a retry included), and each DNS query, a failover
-to the next server included, each handed to the kernel at its grant. The
-result set is `complete` only when every issued method ran over every address before
-the timeout; otherwise it reports what it saw, which the server only adds (spec §5.7).
+to the next server included, each handed to the kernel in the step its slot is
+granted in, and the next slot measured from the end of that step. The result set is
+`complete` only when every issued method ran over every address before the timeout;
+otherwise it reports what it saw, which the server only adds (spec §5.7).
 A PTR lookup with no server to ask, or whose every attempt failed before its query went
 out, did not run; one the deadline stops before its first attempt is the timeout.
 """
@@ -36,9 +37,6 @@ ARP_ATTEMPTS = 2
 ARP_TIMEOUT_S = 1.0
 # how often a round's wait looks whether every reply is in
 ARP_POLL_S = 0.05
-# grants in a row that come without a sleep before the pacer lets every other task run
-# (`Pacer`), as the ARP listener does after `probe.ARP_RECEIVE_BATCH` frames
-PACE_YIELD_EVERY = 64
 
 
 @dataclass
@@ -52,51 +50,62 @@ class Clock:
 
 
 class Pacer:
-    """The agent's packet budget (spec §5.6): `wait` grants one slot, and each packet
-    the agent sends is handed to the kernel at its grant, before the next one: an ARP
-    request in the same step, an echo request in its probe's first step (`_Pool`), a
-    DNS query in the same step, on a socket made before the slot was asked for
-    (`probe.QuerySocket`). `loop.Agent` keeps one for all its jobs.
+    """The agent's packet budget (spec §5.6): `wait` grants one slot to the task that
+    awaits it, and that task hands its packet to the kernel in the same step, before
+    its next await: an ARP request, an echo request (`_Pool` has the probe take its
+    own slot, and icmplib sends before its first await), a DNS query on a socket made
+    before the slot was asked for (`probe.QuerySocket`). `loop.Agent` keeps one for all
+    its jobs.
 
-    A slot is granted no sooner than 1 / `pps` after the one before, measured on the
-    clock when each is granted, so no window of one second holds more than `pps`
-    grants. Nothing is caught up: a sleep that wakes late moves every later slot with
-    it, and one that wakes early sleeps again. Waiters are served one at a time, in the
-    order they came. A waiter cancelled before its grant takes no slot.
+    A slot ends when the step it was granted in ends, so after the packet was handed
+    over, however long that took (#121): the turn is held until then, and the next
+    slot is granted no sooner than 1 / `pps` after the clock read once it has ended. So
+    no two packets are handed over less than 1 / `pps` apart, and no window of one
+    second holds more than `pps` of them. Nothing is caught up: a sleep or a hand-off
+    that comes late moves every later slot with it, and a sleep that wakes early sleeps
+    again. Waiters are served one at a time, in the order they came. A waiter cancelled
+    before its grant takes no slot.
 
-    A grant that comes without a sleep (the previous send already took longer than the
-    interval) does not let other tasks run, and a send that never waits does not
-    either. So after PACE_YIELD_EVERY grants in a row without one, the next grant first
-    lets every other task run: the listener, the check-ins, the job's deadline and a
-    cancellation wait at most a few of those batches, never a whole sweep."""
+    The end of a slot is a callback the event loop runs after the granting step, so a
+    turn of the loop (its timers and ready sockets among it) comes between any two
+    grants, even when every slot is overdue and no send ever waits: the ARP listener,
+    the check-ins, the job's deadline and a cancellation are not held back by a sweep."""
 
     def __init__(self, pps: int, clock: Clock):
         self._interval = 1.0 / pps
         self._clock = clock
         self._last: float | None = None
         self._turn = asyncio.Lock()
-        self._unbroken = 0
 
     async def wait(self) -> None:
-        async with self._turn:
-            if self._unbroken >= PACE_YIELD_EVERY:
-                await asyncio.sleep(0)
-                self._unbroken = 0
-            slept = False
+        await self._turn.acquire()
+        try:
             while True:
                 now = self._clock.monotonic()
                 if self._last is None or now >= self._last + self._interval:
                     break
                 await self._clock.sleep(self._last + self._interval - now)
-                slept = True
             self._last = now
-            self._unbroken = 0 if slept else self._unbroken + 1
+            # runs once the step that holds this grant has ended, its packet handed over
+            asyncio.get_running_loop().call_soon(self._ended)
+        except BaseException:
+            self._turn.release()
+            raise
+
+    def _ended(self) -> None:
+        self._last = max(self._last, self._clock.monotonic())
+        self._turn.release()
 
 
 class _Pool:
     """Runs `work(item, timeout)` on each item, at most `limit` at once, each start
     paced, none started after `deadline`, and none given longer than what is left
     before it. Returns whether every item started and finished before the deadline.
+
+    Items start one at a time, in order. With a pacer, an item's task takes its own
+    slot and runs the work's first step in the step the slot is granted in, so the
+    packet that step hands to the kernel (the echo request) goes before the slot ends
+    (`Pacer`); the next item is started only after that.
 
     When a work item raises, no further item is started and the exception is raised
     once the items in flight are done. With `cancel_on_failure` those items are
@@ -118,8 +127,8 @@ class _Pool:
         deadline: float,
         cancel_on_failure: bool = False,
     ):
-        """`pacer` paces each start, for work that sends its one packet in its first
-        step (the echo request); None when the work paces its own sends."""
+        """`pacer` paces each start, for work that hands its one packet to the kernel
+        in its first step (the echo request); None when the work paces its own sends."""
         self._sem = asyncio.Semaphore(limit)
         self._item_timeout = item_timeout
         self._pacer, self._clock, self._deadline = pacer, clock, deadline
@@ -129,11 +138,26 @@ class _Pool:
         tasks: list[asyncio.Task] = []
         finished = True
         failed = False
+        loop = asyncio.get_running_loop()
 
-        async def one(item, timeout):
-            nonlocal failed
+        async def one(item, started: asyncio.Future):
+            nonlocal failed, finished
             try:
-                await work(item, timeout)
+                if self._pacer is not None:
+                    await self._pacer.wait()
+                # from the grant to the work's first await, one step: nothing else runs
+                left = self._deadline - self._clock.monotonic()
+                # a ProbeError in a running task stops the sweep before the next send;
+                # `started` is already done only when the pool itself was cancelled
+                if failed or started.done():
+                    return
+                if left <= 0:
+                    finished = False
+                    return
+                started.set_result(True)
+                # a probe started near the deadline waits only until the deadline, so
+                # the work in flight never carries the job past it
+                await work(item, min(self._item_timeout, left))
             except BaseException as exc:
                 if self._cancel_on_failure and not failed and isinstance(exc, Exception):
                     # the first failure: the rest of the work in flight goes now
@@ -144,33 +168,28 @@ class _Pool:
                 failed = True
                 raise
             finally:
+                if not started.done():
+                    started.set_result(False)
                 self._sem.release()
 
         try:
             for item in items:
-                # a ProbeError in a running task stops the sweep before the next send
                 if failed:
                     break
                 await self._sem.acquire()
-                if self._pacer is not None:
-                    await self._pacer.wait()
-                if failed:
-                    self._sem.release()
+                started = loop.create_future()
+                task = asyncio.create_task(one(item, started))
+                # a task cancelled before its first step (a failing lookup cancels the
+                # rest) never runs `one`, so its finally never settles `started`; its
+                # done callback does, however it ended
+                task.add_done_callback(lambda _, s=started: s.done() or s.set_result(False))
+                tasks.append(task)
+                # the next item waits until this one has its slot and its work's first
+                # step has run (an echo request handed to the kernel), or it will not
+                # start: so the pacer has one waiter from the pool at a time, and no
+                # item starts after the deadline or a failure
+                if not await started:
                     break
-                left = self._deadline - self._clock.monotonic()
-                if left <= 0:
-                    self._sem.release()
-                    finished = False
-                    break
-                # a probe started near the deadline waits only until the deadline, so
-                # the work in flight never carries the job past it
-                tasks.append(asyncio.create_task(one(item, min(self._item_timeout, left))))
-                if self._pacer is not None:
-                    # the new task's first step runs before this one resumes (the loop
-                    # runs ready tasks in turn), and an echo request is handed to the
-                    # kernel in that step: so it goes before the next slot is granted,
-                    # never in a burst with the ones after it
-                    await asyncio.sleep(0)
         except BaseException:
             # cancelled (`loop.SCAN_GRACE_S`, or the agent stopping): the work in
             # flight goes too, so the wait for it below cannot outlast the cancel

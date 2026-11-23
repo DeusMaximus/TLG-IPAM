@@ -181,16 +181,25 @@ def test_network_and_broadcast_are_skipped():
     assert len(addresses) == 254
 
 
+class SecondProbeSlow(FakeProber):
+    """The first probe takes 0.1 s of the fake clock, the second 0.9 s."""
+
+    async def ping(self, address, timeout):
+        self.delay = 0.9 if self.sent else 0.1
+        return await super().ping(address, timeout)
+
+
 async def test_probes_that_run_past_the_deadline_make_the_result_incomplete():
-    """Both sends start inside a 1 s job, but the probes take 0.4 s each: the job
+    """Both sends start inside a 1 s job, but the second probe takes 0.9 s: the job
     ends after its deadline, so it is not complete (Codex and Greptile on PR #70).
 
-    The fake clock adds sleeps up, concurrent ones too: the first probe's 0.4 s and
-    the pacer's 0.5 s put the second send at 0.9 s, and the second probe ends at 1.3 s.
-    (With 0.75 s, the pacer, which looks at the clock again after it sleeps, would put
-    the second send past the deadline, and the test would not reach its point.)"""
+    The fake clock adds sleeps up, concurrent ones too, in the order the tasks run, so
+    where the second send lands depends on whether the first probe's sleep or the
+    pacer's runs first: 0.5 s or 0.6 s into the job here, and the second probe ends
+    at 1.4 s or 1.5 s either way. (With both probes taking the same time, no one delay
+    keeps the second send inside the deadline and the end past it in both orders.)"""
     clock = FakeClock()
-    prober = FakeProber(alive=["10.0.0.1", "10.0.0.2"], clock=clock, delay=0.4)
+    prober = SecondProbeSlow(alive=["10.0.0.1", "10.0.0.2"], clock=clock)
     parsed, addresses = planned(ranges=[{"start": "10.0.0.1", "end": "10.0.0.2"}], methods=["icmp"], timeout_s=1)
     result = await sweep(parsed, addresses, prober=prober, clock=clock, max_pps=2)
     assert len(prober.sent) == 2

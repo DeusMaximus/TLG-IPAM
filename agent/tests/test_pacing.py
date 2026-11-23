@@ -192,9 +192,8 @@ async def test_a_later_waiter_does_not_overtake_the_one_holding_the_turn():
     """The lock `Pacer.wait` serves waiters behind, held to its own test (#107): with
     the first waiter's sleep held, a second waiter starts no sleep of its own. Without
     the lock it does, that sleep (which here ends at once) advances the clock, and the
-    second waiter is granted its slot before the first, which is a slot taken twice
-XX The additive
-    fake sleeps of the test above keep arrival order without a lock; this clock does
+    second waiter is granted its slot before the first, which is a slot taken twice.
+    The additive fake sleeps of the test above keep arrival order without a lock; this clock does
     not."""
     clock = HeldClock()
     pacer = scan.Pacer(1, clock)
@@ -262,10 +261,11 @@ async def test_a_sleep_that_ends_early_is_slept_again():
 
 
 async def test_each_echo_request_is_made_before_the_next_slot_is_granted():
-    """A pacer whose every slot is overdue, so its grants come without a sleep: the
-    pool still runs each probe's first step, where the echo request is handed to the
-    kernel, before it asks for the next slot. Without that, the probes started while
-    the pacer did not sleep would all send together once the pool next waited."""
+    """A pacer whose every slot is overdue, so its grants come without a sleep: each
+    probe's first step, where the echo request is handed to the kernel, still runs
+    before the next slot is asked for (since #121 the next probe asks for it, once the
+    pool has seen this one start). Without that, the probes started while the pacer
+    did not sleep would all send together once the pool next waited."""
 
     class Overdue:
         grants = 0
@@ -284,14 +284,150 @@ async def test_each_echo_request_is_made_before_the_next_slot_is_granted():
     assert seen == list(range(1, 201))
 
 
+# --- 2. a packet handed over late moves the next slot (#121) ---
+#
+# In a real sweep two echo requests left 0.15 ms apart at MAX_PPS=200, one of them
+# about 5 ms late (#121). These fakes put time between a grant and its hand-off, as
+# the process not running would (the host's scheduler, a garbage collection, other
+# callbacks ahead of the probe): `stall(n)` is how far the clock moves on before the
+# n-th packet of that kind is handed over, in the step that hands it over.
+
+
+class StalledProber(FakeProber):
+    def __init__(self, stall, **kwargs):
+        super().__init__(**kwargs)
+        self.stall, self.count = stall, 0
+
+    async def ping(self, address, timeout):
+        self.count += 1
+        self.clock.t += self.stall(self.count)
+        return await super().ping(address, timeout)
+
+
+class StalledLink(FakeArp):
+    def __init__(self, stall, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stall, self.count = stall, 0
+
+    async def send(self, frame: bytes) -> None:
+        self.count += 1
+        self.clock.t += self.stall(self.count)
+        await super().send(frame)
+
+
+class StalledResolver(FakeResolver):
+    def __init__(self, stall, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stall, self.count = stall, 0
+
+    async def ptr(self, address, servers, slot):
+        async def stalled():
+            left = await slot()
+            self.count += 1
+            self.clock.t += self.stall(self.count)
+            return left
+
+        return await super().ptr(address, servers, stalled)
+
+
+def nth(n: int, by: float):
+    return lambda count: by if count == n else 0.0
+
+
+SLOT_200 = 1 / 200
+
+
+def stalled_sweep(kind: str, stall):
+    """The fakes for a job of `kind`, with `stall` on that kind's sends only: what to
+    run, and every send of the job, in the order they went."""
+    clock = FakeClock()
+    alive = [f"10.0.0.{i}" for i in range(1, 7)]
+    prober = (StalledProber(stall, alive=alive, clock=clock) if kind == "icmp"
+              else FakeProber(alive=alive, clock=clock))
+    link = (StalledLink(stall, clock=clock) if kind == "arp" else FakeArp(clock=clock))
+    names = {a: "host.home.arpa" for a in alive}
+    resolver = (StalledResolver(stall, names, clock=clock) if kind == "rdns"
+                else FakeResolver(names, clock=clock))
+    methods = {"icmp": ["icmp"], "arp": ["arp"], "rdns": ["icmp", "rdns"]}[kind]
+    parsed, addresses = planned(
+        methods=methods, ranges=[{"start": "10.0.0.1", "end": "10.0.0.6"}], dns_servers=["10.0.0.53"],
+    )
+
+    async def go():
+        result = await sweep(
+            parsed, addresses, clock=clock, max_pps=200, prober=prober, resolver=resolver, arp_link=link,
+        )
+        return result, sorted(prober.times + link.times + resolver.times)
+
+    return go
+
+
+@pytest.mark.parametrize("kind", ["icmp", "arp", "rdns"])
+@pytest.mark.parametrize("late", [3 * SLOT_200, 0.4 * SLOT_200])
+async def test_a_packet_handed_over_late_moves_the_next_slot(kind, late):
+    """The first packet of one kind handed to the kernel `late` after its grant, by
+    three slots or by less than one: the next packet still goes a slot or more after
+    it, and the ones after that keep their spacing. Before #121 the pacer measured each
+    slot from the grant before it, so the next grant was already due, or nearly, and
+    the two packets went closer than a slot (0 s apart after a stall of three slots)."""
+    result, sends = await stalled_sweep(kind, nth(1, late))()
+    assert result["complete"] is True
+    assert len(sends) > 3
+    assert shortest_gap(sends) >= SLOT_200 - 1e-9
+
+
+@pytest.mark.parametrize("kind", ["icmp", "arp", "rdns"])
+async def test_every_packet_handed_over_late_moves_the_slot_after_it(kind):
+    """Every packet of one kind handed over between nothing and two slots after its
+    grant, at random: no two sends of the job come less than a slot apart."""
+    rng = random.Random(121)
+    result, sends = await stalled_sweep(kind, lambda count: rng.uniform(0, 2 * SLOT_200))()
+    assert result["complete"] is True
+    assert shortest_gap(sends) >= SLOT_200 - 1e-9
+
+
+@pytest.mark.parametrize("pps", [20, 200, 1000])
+@pytest.mark.parametrize("seed", [1, 2, 3])
+async def test_no_second_holds_more_than_max_pps_when_hand_offs_and_wakes_are_late(pps, seed):
+    """The job of the jittered test above (`icmp`, `arp`, `rdns` over 40 addresses,
+    every pacing sleep late or early at random), with every send of all three kinds
+    also handed over up to two slots after its grant: no two sends less than a slot
+    apart, and no second holding more than MAX_PPS of them."""
+    clock = OffClock(jittered(pps, seed))
+    rng = random.Random(seed + 121)
+
+    def stall(count):
+        return rng.uniform(0, 2 / pps)
+
+    alive = [f"10.0.0.{i}" for i in range(1, 41, 3)]
+    prober = StalledProber(stall, alive=alive, clock=clock)
+    link = StalledLink(stall, {f"10.0.0.{i}": f"02:00:00:00:00:{i:02x}" for i in range(2, 41, 4)}, clock=clock)
+    resolver = StalledResolver(stall, {a: "host.home.arpa" for a in alive}, clock=clock)
+    parsed, addresses = planned(
+        methods=["icmp", "arp", "rdns"], ranges=[{"start": "10.0.0.1", "end": "10.0.0.40"}],
+        dns_servers=["10.0.0.53"],
+    )
+    result = await sweep(
+        parsed, addresses, clock=clock, max_pps=pps, prober=prober, resolver=resolver, arp_link=link,
+    )
+    assert result["complete"] is True
+    assert len(prober.times) == 40 and len(link.times) == 39 + (39 - 10)
+    sends = prober.times + link.times + resolver.times
+    assert shortest_gap(sends) >= 1 / pps - 1e-9
+    assert most_in_one_second(sends) <= pps
+
+
 # --- 3. a sender that is always late still lets the rest of the agent run ---
 
 
 class SlowLink(FakeArp):
-    """An ARP link whose send never waits and takes `cost` seconds of the fake clock,
-    so at MAX_PPS=1000 every slot is overdue before it is asked for (the review of PR
-    #84, round 2: a 2 ms send and `Pacer(1000)`). `first_receive` is how many requests
-    had gone when the listener first read the link."""
+    """An ARP link whose send never waits, on a loop whose every turn after a send
+    takes `cost` seconds of the fake clock (a callback the send leaves behind), so at
+    MAX_PPS=1000 every slot is overdue before it is asked for (the review of PR #84,
+    round 2: a 2 ms send and `Pacer(1000)`) and the pacer never sleeps. The time passes
+    after the slot has ended: time spent inside the send moves the next slot instead
+    (section 2). `first_receive` is how many requests had gone when the listener first
+    read the link; `pacer_sleeps` counts the sleeps shorter than a slot."""
 
     def __init__(self, clock, cost=0.002, on_send=None):
         super().__init__(clock=clock)
@@ -301,9 +437,12 @@ class SlowLink(FakeArp):
 
     async def send(self, frame: bytes) -> None:
         await super().send(frame)
-        self.clock.t += self.cost
+        asyncio.get_running_loop().call_soon(self._spend)
         if self.on_send is not None:
             self.on_send(len(self.requests))
+
+    def _spend(self) -> None:
+        self.clock.t += self.cost
 
     async def receive(self):
         if self.first_receive is None:
@@ -311,12 +450,20 @@ class SlowLink(FakeArp):
         return await super().receive()
 
 
-async def test_a_ready_task_runs_within_a_batch_of_late_sends():
-    """Every slot overdue and every send synchronous: before, a whole round of 253
-    requests went without the event loop turning, and the listener first read the
-    link after all of them. Now the pacer lets every other task run after
-    PACE_YIELD_EVERY grants in a row without a sleep: a task that is ready, the
-    listener among them, waits for at most that many sends."""
+def pacer_sleeps(clock) -> int:
+    # every other sleep of an ARP-only job is a round's wait for replies, in steps of
+    # ARP_POLL_S, or what is left of it, which is never under a slot here
+    return sum(1 for s in clock.sleeps if s <= 1 / 1000)
+
+
+async def test_a_ready_task_runs_between_any_two_late_sends():
+    """Every slot overdue and every send synchronous: before #87's review, a whole
+    round of 253 requests went without the event loop turning, and the listener first
+    read the link after all of them; #87 let every other task run after 64 grants in a
+    row without a sleep. Since #121 a slot ends in a callback after the step it was
+    granted in, and the next grant waits for it, so the loop turns between any two
+    grants: a task that is ready, the listener among them, waits for at most one
+    send."""
     clock = FakeClock()
     link = SlowLink(clock)
     seen: list[int] = []
@@ -336,23 +483,23 @@ async def test_a_ready_task_runs_within_a_batch_of_late_sends():
         done = True
         await beside
     assert result["complete"] is True and len(link.requests) == 2 * 253
-    # the bound the spec states, written out: the constant itself could be changed
-    assert scan.PACE_YIELD_EVERY == 64
-    assert max(b - a for a, b in zip(seen, seen[1:])) == 64
-    assert link.first_receive is not None and link.first_receive <= 64
+    assert pacer_sleeps(clock) == 0, "every slot must be overdue, or this tests nothing"
+    assert max(b - a for a, b in zip(seen, seen[1:])) == 1
+    assert link.first_receive is not None and link.first_receive <= 1
 
 
-async def test_a_timer_that_falls_due_runs_within_three_batches_of_late_sends():
+@pytest.mark.parametrize("due_after", [1, 10, 64, 300])
+async def test_a_timer_that_falls_due_runs_before_the_next_late_send(due_after):
     """A timer that falls due while the sends go on (a check-in, the job's deadline,
-    a cancellation: anything a timer or a readable socket wakes) is seen by the loop
-    only once the batch it fell due in ends, and the task it wakes runs a turn of the
-    loop after that: fewer than 3 x PACE_YIELD_EVERY sends after it fell due."""
+    a cancellation: anything a timer or a readable socket wakes) is seen at the loop's
+    next turn, which comes before the next grant. The task it wakes runs a turn after
+    that, behind the waiter the slot's end released: after one more send at most."""
     clock = FakeClock()
     woke = asyncio.Event()
     due_at: list[int] = []
 
     def on_send(sent):
-        if sent == 10:
+        if sent == due_after:
             due_at.append(sent)
             asyncio.get_running_loop().call_later(0, woke.set)
 
@@ -368,5 +515,36 @@ async def test_a_timer_that_falls_due_runs_within_three_batches_of_late_sends():
     result = await sweep(parsed, addresses, clock=clock, max_pps=1000, arp_link=link)
     await beside
     assert result["complete"] is True
-    assert due_at == [10]
-    assert ran_at[0] - due_at[0] < 3 * 64
+    assert pacer_sleeps(clock) == 0, "every slot must be overdue, or this tests nothing"
+    assert due_at == [due_after]
+    assert len(ran_at) == 1 and ran_at[0] - due_at[0] <= 1
+
+
+# --- 4. the pool's start handshake (the review of PR #123) ---
+
+
+@pytest.mark.parametrize("paced", [False, True])
+async def test_an_item_cancelled_before_its_first_step_does_not_hold_the_pool(paced):
+    """The pool waits for each item to start before it starts the next. A failing item
+    that cancels the rest (`cancel_on_failure`, the PTR lookups') can cancel the newest
+    one before its first step has run, so its coroutine never runs: the pool must still
+    see that it did not start, and raise the failure, rather than wait for ever (until
+    the scan's backstop discards everything the job saw). Found by Codex and Greptile
+    on PR #123: item 1 waits on a future, item 2 fails it and item 3 is cancelled
+    unstarted."""
+    trigger = asyncio.get_running_loop().create_future()
+    ran: list[int] = []
+
+    async def work(item, timeout):
+        ran.append(item)
+        if item == 1:
+            await trigger
+        elif item == 2:
+            trigger.set_exception(scan.ProbeError("no query sent"))
+            await asyncio.sleep(0)
+
+    pacer = scan.Pacer(1000, scan.Clock()) if paced else None
+    pool = scan._Pool(16, 5.0, pacer, scan.Clock(), deadline=time.monotonic() + 60, cancel_on_failure=True)
+    with pytest.raises(scan.ProbeError, match="no query sent"):
+        await asyncio.wait_for(pool.run(range(1, 6), work), timeout=2)
+    assert ran[:2] == [1, 2] and 4 not in ran and 5 not in ran
