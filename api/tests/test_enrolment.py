@@ -472,6 +472,40 @@ async def test_two_re_enrols_that_meet_leave_one_exchangeable_token(client, agen
     assert statuses == [200, 403]
 
 
+@pytest.mark.parametrize("owner_write", ["revoke", "delete"])
+async def test_an_owner_revoke_or_delete_waiting_on_an_exchange_acts_on_its_token(
+    client, agent_api, monkeypatch, owner_write
+):
+    """Greptile on PR #124: the owner's write reads the agent's tokens only under the
+    write lock. Here it reaches the lock, an exchange commits a new agent token, and
+    only then does it read: the new token is revoked (or deleted with the agent)
+    rather than left live."""
+    agent, _ = await make_enrolled_agent(client, "vlan10")
+    renewed = (await re_enrol(client, agent["id"])).json()["data"]
+    arrived, release = asyncio.Event(), asyncio.Event()
+    real = agents_svc.scans.take_write_lock
+
+    async def after_the_exchange(session):
+        arrived.set()
+        await asyncio.wait_for(release.wait(), timeout=10)
+        return await real(session)
+
+    monkeypatch.setattr(agents_svc.scans, "take_write_lock", after_the_exchange)
+    if owner_write == "revoke":
+        owner = asyncio.create_task(client.post(f"/api/v1/agents/{agent['id']}/revoke"))
+    else:
+        owner = asyncio.create_task(client.delete(f"/api/v1/agents/{agent['id']}"))
+    await asyncio.wait_for(arrived.wait(), timeout=10)
+    res = await enrol(agent_api, renewed["enrol_token"])
+    assert res.status_code == 200, res.text
+    new = res.json()["data"]["agent_token"]
+    release.set()
+    assert (await owner).status_code in (200, 204)
+    assert (await checkin(agent_api, new)).status_code == 403
+    live = [t for t in await tokens_of(agent["id"]) if agents_svc.live(t, _now())]
+    assert live == []
+
+
 async def test_re_enrol_of_a_disabled_agent_is_409_and_of_an_unknown_one_404(client):
     agent, _ = await make_enrolled_agent(client, "vlan10")
     await client.put(f"/api/v1/agents/{agent['id']}", json={"enabled": False})

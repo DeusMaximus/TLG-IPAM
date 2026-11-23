@@ -1,7 +1,12 @@
 import { useRef, useState } from 'react'
 import { Check, Copy, TriangleAlert } from 'lucide-react'
 import { createAgent } from '../api/ipam'
-import { containerCommand, enrolCommand } from '../utils/agents'
+import {
+  agentServerUrl,
+  containerCommand,
+  enrolCommand,
+  SERVER_URL_PLACEHOLDER,
+} from '../utils/agents'
 import { parseServerTime } from '../utils/time'
 import Modal, { inputCls, labelCls, primaryBtn, secondaryBtn } from './Modal'
 
@@ -74,7 +79,13 @@ function CopyBlock({ label, text, testId }) {
 // Until the agent exchanges the enrolment token itself (#22) and this dialog
 // becomes the guided install (#23), the exchange is shown as a command to run by
 // hand, and the container command takes the agent token that command prints.
-export default function AddAgentModal({ serverVersion, onClose, onCreated }) {
+// `location` is the page's own (`window.location`); a test passes another.
+export default function AddAgentModal({
+  serverVersion,
+  onClose,
+  onCreated,
+  location = window.location,
+}) {
   const [name, setName] = useState('')
   const [error, setError] = useState(null)
   const [saving, setSaving] = useState(false)
@@ -103,7 +114,9 @@ export default function AddAgentModal({ serverVersion, onClose, onCreated }) {
   }
 
   if (created) {
-    const url = window.location.origin
+    // never a plain-http address the tokens would cross a network over in clear
+    const secure = agentServerUrl(location)
+    const url = secure ?? SERVER_URL_PLACEHOLDER
     const exchange = enrolCommand({ url, token: created.token })
     const command = containerCommand({ url, version: serverVersion })
     return (
@@ -118,6 +131,14 @@ export default function AddAgentModal({ serverVersion, onClose, onCreated }) {
           </span>
         </div>
         <CopyBlock label="Enrolment token" text={created.token} testId="agent-token" />
+        {!secure && (
+          <p className="mt-3 text-xs text-amber-200" data-testid="agent-needs-https">
+            This page is served over plain HTTP, which would carry both tokens across the
+            network in clear. The commands below use <code>{SERVER_URL_PLACEHOLDER}</code>: put
+            the server&apos;s HTTPS address in its place. The agent refuses a plain-HTTP server
+            address anyway, unless it is on the agent&apos;s own host.
+          </p>
+        )}
         <p className="mt-3 text-xs text-slate-400">
           1. On the agent&apos;s host, exchange it for the agent token. The answer carries it as{' '}
           <code>agent_token</code> (<code>tlga_…</code>); it is shown nowhere else.

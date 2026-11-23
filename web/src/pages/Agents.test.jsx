@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../api/client'
 import * as ipam from '../api/ipam'
 import { ToastProvider } from '../context'
+import AddAgentModal from '../components/AddAgentModal'
 import Agents from './Agents'
 
 vi.mock('../api/ipam', () => ({
@@ -227,6 +228,8 @@ describe('Agents page', () => {
     expect(ipam.createAgent).toHaveBeenCalledWith({ name: 'lab-vlan20' })
     expect(await screen.findByTestId('agent-token')).toHaveTextContent(ENROL_TOKEN)
     // step 1, the exchange by hand, until the agent makes it itself (#22)
+    // served from loopback here (jsdom), so the page's own origin is used
+    expect(screen.queryByTestId('agent-needs-https')).toBeNull()
     const exchange = screen.getByTestId('agent-enrol-command').textContent
     expect(exchange).toContain(`POST ${window.location.origin}/api/v1/agent/enrol`)
     expect(exchange).toContain(`'Authorization: Bearer ${ENROL_TOKEN}'`)
@@ -259,6 +262,23 @@ describe('Agents page', () => {
     expect(screen.getByLabelText('Name')).toHaveValue('')
     expect(document.body.innerHTML).not.toContain(ENROL_TOKEN)
     expect(ipam.createAgent).toHaveBeenCalledTimes(1)
+  })
+
+  it('never builds a command that sends a token over plain http across a network', async () => {
+    const user = userEvent.setup()
+    ipam.createAgent.mockResolvedValue(created())
+    const location = { protocol: 'http:', hostname: '10.0.0.2', origin: 'http://10.0.0.2:8080' }
+    render(
+      <AddAgentModal serverVersion="0.2.0" onClose={vi.fn()} onCreated={vi.fn()} location={location} />
+    )
+    await user.type(screen.getByLabelText('Name'), 'lab-vlan20')
+    await user.click(screen.getByRole('button', { name: 'Create agent' }))
+    expect(await screen.findByTestId('agent-needs-https')).toBeInTheDocument()
+    const exchange = screen.getByTestId('agent-enrol-command').textContent
+    const command = screen.getByTestId('agent-command').textContent
+    expect(exchange).toContain("'https://<server>/api/v1/agent/enrol'")
+    expect(command).toContain("-e IPAM_URL='https://<server>'")
+    for (const text of [exchange, command]) expect(text).not.toContain('http://10.0.0.2')
   })
 
   it('drops the token when the dialog is closed with its close button too', async () => {

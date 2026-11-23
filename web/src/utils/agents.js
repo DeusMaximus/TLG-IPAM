@@ -107,6 +107,18 @@ export function containerCommand({ url, token, version }) {
   ].join('\n')
 }
 
+// The server URL an agent may be given (the agent's own `config.parse_url` rule):
+// `https`, or plain `http` only to a loopback host, where nothing crosses a network.
+// A page served over plain `http` from any other host gets null, so no command built
+// from it sends a token in clear.
+const LOOPBACK_HOST = /^(localhost|127(\.\d{1,3}){3}|\[::1\])$/i
+export const SERVER_URL_PLACEHOLDER = 'https://<server>'
+export function agentServerUrl({ protocol, hostname, origin }) {
+  if (protocol === 'https:') return origin
+  if (protocol === 'http:' && LOOPBACK_HOST.test(hostname)) return origin
+  return null
+}
+
 // The enrolment exchange by hand (spec §5.7, POST /api/v1/agent/enrol), until the
 // agent makes it itself on first start (#22). Its answer carries the agent token,
 // `{"data": {"agent_id": …, "agent_token": "tlga_…"}}`.

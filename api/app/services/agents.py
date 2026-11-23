@@ -195,18 +195,10 @@ async def re_enrol(
     (`409`): enable it first, so that the exchange cannot hand a token to an agent the
     owner has stopped.
 
-    The write lock is taken before the agent's tokens are read, so two re-enrols of
-    one agent run one after the other and the second revokes the token the first
-    issued, never just the one both read."""
-    await scans.take_write_lock(session)
-    agent = await session.scalar(
-        select(Agent)
-        .options(selectinload(Agent.tokens))
-        .where(Agent.id == agent_id)
-        .execution_options(populate_existing=True)
-    )
-    if agent is None:
-        raise not_found("Agent", agent_id)
+    The agent is read under the write lock (`_locked_agent`), so two re-enrols of one
+    agent run one after the other and the second revokes the token the first issued,
+    never just the one both read."""
+    agent = await _locked_agent(session, agent_id)
     if agent.state == "disabled":
         raise conflict(f"Agent {agent.name} is disabled; enable it before re-enrolling it")
     now = _now()
@@ -288,10 +280,28 @@ def revoke_live_tokens(
     return revoked
 
 
+async def _locked_agent(session: AsyncSession, agent_id: str) -> Agent:
+    """The agent and its tokens, read once this session holds SQLite's write lock, for
+    an owner write that revokes or replaces tokens: no enrolment exchange or other
+    owner write can commit between the read and the commit, so the tokens it acts on
+    are the agent's tokens as they then are, not a list read before one was issued."""
+    await scans.take_write_lock(session)
+    agent = await session.scalar(
+        select(Agent)
+        .options(selectinload(Agent.tokens))
+        .where(Agent.id == agent_id)
+        .execution_options(populate_existing=True)
+    )
+    if agent is None:
+        raise not_found("Agent", agent_id)
+    return agent
+
+
 async def revoke_tokens(session: AsyncSession, agent_id: str, source: str) -> Agent:
     """Revoke every live token of the agent: its agent token and an enrolment token it
-    has not exchanged. The agent itself is kept."""
-    agent = await get_agent(session, agent_id)
+    has not exchanged. The agent itself is kept. Read under the write lock
+    (`_locked_agent`), so an agent token an exchange has just issued is revoked too."""
+    agent = await _locked_agent(session, agent_id)
     if not revoke_live_tokens(session, agent, source):
         raise conflict(f"Agent {agent.name} has no unrevoked token")
     await session.commit()
@@ -301,8 +311,10 @@ async def revoke_tokens(session: AsyncSession, agent_id: str, source: str) -> Ag
 async def delete_agent(session: AsyncSession, agent_id: str, source: str) -> None:
     """Delete the agent. Its unrevoked tokens are revoked first, each with its own
     change-log entry; its token rows are then deleted with it (cascade). Its scan
-    targets keep their settings and become unassigned, each with its own entry."""
-    agent = await get_agent(session, agent_id)
+    targets keep their settings and become unassigned, each with its own entry. Read
+    under the write lock (`_locked_agent`), so a token an exchange has just issued is
+    among those revoked and deleted."""
+    agent = await _locked_agent(session, agent_id)
     revoke_live_tokens(session, agent, source, " (agent deleted)")
     await scans.unassign_agent(session, agent, source)
     changes.record(
