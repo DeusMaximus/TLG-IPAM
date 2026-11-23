@@ -193,8 +193,20 @@ async def re_enrol(
     agent keeps running on it until the new enrolment token is exchanged, which
     revokes it. Its identity and scan targets are kept. A disabled agent is refused
     (`409`): enable it first, so that the exchange cannot hand a token to an agent the
-    owner has stopped."""
-    agent = await get_agent(session, agent_id)
+    owner has stopped.
+
+    The write lock is taken before the agent's tokens are read, so two re-enrols of
+    one agent run one after the other and the second revokes the token the first
+    issued, never just the one both read."""
+    await scans.take_write_lock(session)
+    agent = await session.scalar(
+        select(Agent)
+        .options(selectinload(Agent.tokens))
+        .where(Agent.id == agent_id)
+        .execution_options(populate_existing=True)
+    )
+    if agent is None:
+        raise not_found("Agent", agent_id)
     if agent.state == "disabled":
         raise conflict(f"Agent {agent.name} is disabled; enable it before re-enrolling it")
     now = _now()

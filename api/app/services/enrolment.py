@@ -167,6 +167,10 @@ async def _exchange(
         raise validation_error(_validation_message(exc)) from None
     # the token as it was: the compare-and-set below proves it was unused and unrevoked
     token_before = changes.snapshot(token)
+    # The claim is judged at its own time, not the lookup's: the body may have taken
+    # long to arrive (a declared Content-Length is streamed, not buffered), and a token
+    # that expired meanwhile must not be spent.
+    now = _now()
 
     try:
         if not await _claim(session, token.id, now):

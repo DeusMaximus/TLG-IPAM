@@ -216,6 +216,21 @@ async def test_an_expired_enrolment_token_is_refused(client, agent_api, monkeypa
         assert (await get_agent(client, created["id"]))["state"] == "pending"
 
 
+async def test_a_token_that_expires_while_its_body_arrives_is_refused(client, agent_api, monkeypatch):
+    """Codex on PR #124: the claim is judged at its own time. The lookup sees the token
+    a second before `expires_at`; by the time the body has been read it has expired,
+    and the claim refuses it."""
+    created = await create(client)
+    [token] = await tokens_of(created["id"])
+    expires = token.expires_at.replace(tzinfo=timezone.utc)
+    times = iter([expires - timedelta(seconds=1), expires])
+    monkeypatch.setattr(enrolment, "_now", lambda: next(times))
+    before = every_row()
+    res = await enrol(agent_api, created["enrol_token"])
+    assert res.status_code == 403, res.text
+    assert every_row() == before
+
+
 async def test_an_expired_token_is_refused_by_the_compare_and_set_too(client, agent_api, monkeypatch):
     """Expiry between the read and the claim: the service's check lets the token
     through and the claim, under the write lock, refuses it."""
@@ -429,6 +444,32 @@ async def test_re_enrol_after_the_token_expired_or_was_spent(client, agent_api):
     expired = next(t for t in await tokens_of(created["id"]) if t.id == token.id)
     assert expired.revoked_at is None
     assert (await enrol(agent_api, renewed["enrol_token"])).status_code == 200
+
+
+async def test_two_re_enrols_that_meet_leave_one_exchangeable_token(client, agent_api, monkeypatch):
+    """Codex on PR #124: both requests reach the write lock together; the second reads
+    the agent's tokens only once the first has committed, so it revokes the token the
+    first issued and one enrolment token is left that can be exchanged."""
+    created = await create(client)
+    barrier = asyncio.Barrier(2)
+    real = agents_svc.scans.take_write_lock
+
+    async def together(session):
+        await asyncio.wait_for(barrier.wait(), timeout=10)
+        return await real(session)
+
+    monkeypatch.setattr(agents_svc.scans, "take_write_lock", together)
+    results = await asyncio.gather(*(re_enrol(client, created["id"]) for _ in range(2)))
+    assert [r.status_code for r in results] == [201, 201]
+    plains = [r.json()["data"]["enrol_token"] for r in results]
+    now = _now()
+    open_tokens = [
+        t for t in await tokens_of(created["id"])
+        if t.kind == "enrol" and agents_svc.live(t, now)
+    ]
+    assert len(open_tokens) == 1
+    statuses = sorted([(await enrol(agent_api, p)).status_code for p in plains])
+    assert statuses == [200, 403]
 
 
 async def test_re_enrol_of_a_disabled_agent_is_409_and_of_an_unknown_one_404(client):
