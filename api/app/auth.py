@@ -38,17 +38,27 @@ async def require_api_key(x_api_key: str | None = Header(default=None)):
         raise ApiError("FORBIDDEN", "Invalid API key", 403)
 
 
+def bearer_token(authorization: str | None) -> str | None:
+    """The token of an `Authorization: Bearer <token>` header (the scheme in any case),
+    or None when there is none."""
+    scheme, _, presented = (authorization or "").partition(" ")
+    presented = presented.strip()
+    if scheme.lower() != "bearer" or not presented:
+        return None
+    return presented
+
+
 async def require_agent(
     authorization: str | None = Header(default=None),
     session: AsyncSession = Depends(get_session),
 ) -> Agent:
-    """Auth for `/api/v1/agent/*`: an agent token as `Authorization: Bearer`, and
-    nothing else. The owner key is not an agent token, so it is refused here, and
-    owner routes (`X-API-Key`) and `/mcp` never accept an agent token.
+    """Auth for `/api/v1/agent/*` but `enrol`: an agent token as `Authorization:
+    Bearer`, and nothing else. The owner key is not an agent token, so it is refused
+    here, and owner routes (`X-API-Key`) and `/mcp` never accept an agent token. The
+    enrol route takes an enrolment token instead (`services/enrolment`).
     """
-    scheme, _, presented = (authorization or "").partition(" ")
-    presented = presented.strip()
-    if scheme.lower() != "bearer" or not presented:
+    presented = bearer_token(authorization)
+    if presented is None:
         raise ApiError("UNAUTHORIZED", "Missing agent token (Authorization: Bearer)", 401)
     agent = await agents_svc.authenticate(session, presented)
     if agent is None:

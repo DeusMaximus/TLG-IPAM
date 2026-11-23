@@ -16,6 +16,7 @@ import { useToast, useTree } from '../context'
 import { useFetch } from '../hooks/useFetch'
 import {
   activeToken,
+  openEnrolment,
   agentStatus,
   relativeTime,
   STATUS_LABELS,
@@ -88,6 +89,8 @@ function Covered({ targets, subnets }) {
 
 function AgentRow({ agent, targets, subnets, now, onToggle, onRevoke, onDelete }) {
   const token = activeToken(agent)
+  const enrolment = token ? null : openEnrolment(agent, now)
+  const revocable = token || enrolment
   const disabled = agent.state === 'disabled'
   return (
     <tr className="border-t border-slate-700/60 align-top" data-testid={`agent-${agent.id}`}>
@@ -123,6 +126,10 @@ function AgentRow({ agent, targets, subnets, now, onToggle, onRevoke, onDelete }
       <td className="px-3 py-2.5">
         {token ? (
           <code className="text-slate-400">{token.token_prefix}…</code>
+        ) : !(agent.tokens || []).some((t) => t.kind === 'agent') ? (
+          <span className="text-slate-400" title="It has never exchanged an enrolment token">
+            not enrolled
+          </span>
         ) : (
           <span className="text-amber-400">revoked</span>
         )}
@@ -139,9 +146,15 @@ function AgentRow({ agent, targets, subnets, now, onToggle, onRevoke, onDelete }
           </button>
           <button
             onClick={() => onRevoke(agent)}
-            disabled={!token}
+            disabled={!revocable}
             className="flex items-center gap-1 rounded px-2 py-1 text-amber-400 hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
-            title={token ? 'Revoke its token' : 'It has no token to revoke'}
+            title={
+              token
+                ? 'Revoke its token'
+                : enrolment
+                  ? 'Revoke its enrolment token'
+                  : 'It has no token to revoke'
+            }
           >
             <Ban size={12} /> Revoke
           </button>

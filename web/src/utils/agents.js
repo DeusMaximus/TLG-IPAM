@@ -76,6 +76,18 @@ export const STATUS_LABELS = {
 export const activeToken = (agent) =>
   (agent.tokens || []).find((t) => t.kind === 'agent' && !t.revoked_at) || null
 
+// An enrolment token the agent can still exchange: unrevoked, unused and, by this
+// browser's clock, unexpired (the server decides; this only guides the page)
+export function openEnrolment(agent, now = Date.now()) {
+  return (
+    (agent.tokens || []).find((t) => {
+      if (t.kind !== 'enrol' || t.revoked_at || t.used_at) return false
+      const expires = parseServerTime(t.expires_at)
+      return !expires || expires.getTime() > now
+    }) || null
+  )
+}
+
 // Leave a value bare when it has no shell metacharacters; single-quote it otherwise
 export function shellQuote(value) {
   const s = String(value)
@@ -83,13 +95,37 @@ export function shellQuote(value) {
 }
 
 // The M2a container command (spec §5.6): host networking and CAP_NET_RAW, the
-// server URL and the agent token. ALLOWED_CIDRS and MAX_PPS keep their defaults.
+// server URL and the agent token, or a placeholder for it when the page does not hold
+// it. ALLOWED_CIDRS and MAX_PPS keep their defaults.
 export function containerCommand({ url, token, version }) {
   return [
     'docker run -d --name tlg-ipam-agent --restart unless-stopped \\',
     '  --network host --cap-add NET_RAW \\',
     `  -e IPAM_URL=${shellQuote(url)} \\`,
-    `  -e IPAM_AGENT_TOKEN=${shellQuote(token)} \\`,
+    `  -e IPAM_AGENT_TOKEN=${token ? shellQuote(token) : '<agent token>'} \\`,
     `  ${AGENT_IMAGE}:${version ? shellQuote(version) : '<version>'}`,
+  ].join('\n')
+}
+
+// The server URL an agent may be given (the agent's own `config.parse_url` rule):
+// `https`, or plain `http` only to a loopback host, where nothing crosses a network.
+// A page served over plain `http` from any other host gets null, so no command built
+// from it sends a token in clear.
+const LOOPBACK_HOST = /^(localhost|127(\.\d{1,3}){3}|\[::1\])$/i
+export const SERVER_URL_PLACEHOLDER = 'https://<server>'
+export function agentServerUrl({ protocol, hostname, origin }) {
+  if (protocol === 'https:') return origin
+  if (protocol === 'http:' && LOOPBACK_HOST.test(hostname)) return origin
+  return null
+}
+
+// The enrolment exchange by hand (spec §5.7, POST /api/v1/agent/enrol), until the
+// agent makes it itself on first start (#22). Its answer carries the agent token,
+// `{"data": {"agent_id": …, "agent_token": "tlga_…"}}`.
+export function enrolCommand({ url, token }) {
+  return [
+    `curl -fsS -X POST ${shellQuote(`${url}/api/v1/agent/enrol`)} \\`,
+    `  -H ${shellQuote(`Authorization: Bearer ${token}`)} \\`,
+    `  -H 'Content-Type: application/json' -d '{}'`,
   ].join('\n')
 }

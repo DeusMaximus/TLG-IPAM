@@ -23,7 +23,7 @@ from app.config import settings
 from app.database import SessionLocal, _configure_connection, engine, get_session
 from app.main import app
 from app.models import Base, Subnet
-from app.services import jobs
+from app.services import enrolment, jobs
 from app.services.device_types import seed_defaults
 
 
@@ -47,6 +47,36 @@ def unlimited_checkins(monkeypatch):
     gap is never inside); `test_checkin.py` restores `jobs.DEFAULT_CHECKIN_GAP` where it
     tests the limit itself."""
     monkeypatch.setattr(jobs, "MIN_CHECKIN_GAP", -timedelta(hours=1))
+
+
+@pytest.fixture(autouse=True)
+def fresh_enrol_throttle():
+    """The enrolment throttle is process memory (`services/enrolment.throttle`): each test
+    starts with it empty, so one test's refused attempts never refuse another's."""
+    enrolment.throttle.reset()
+    yield
+    enrolment.throttle.reset()
+
+
+async def enrol(client, enrol_token: str, **body):
+    """`POST /api/v1/agent/enrol` with the enrolment token as the bearer."""
+    return await client.post(
+        "/api/v1/agent/enrol", json=body, headers={"Authorization": f"Bearer {enrol_token}"}
+    )
+
+
+async def make_enrolled_agent(client, name: str) -> tuple[dict, str]:
+    """An agent created over the owner route and enrolled with its enrolment token, as
+    the agent does on first start (#22). Returns the agent as `GET /agents/{id}` gives
+    it, now `active`, and its plain agent token."""
+    res = await client.post("/api/v1/agents", json={"name": name})
+    assert res.status_code == 201, res.text
+    created = res.json()["data"]
+    res = await enrol(client, created["enrol_token"])
+    assert res.status_code == 200, res.text
+    token = res.json()["data"]["agent_token"]
+    res = await client.get(f"/api/v1/agents/{created['id']}")
+    return res.json()["data"], token
 
 
 @contextmanager

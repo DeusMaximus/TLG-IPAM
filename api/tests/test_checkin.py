@@ -39,6 +39,7 @@ from app.services import jobs, scans
 from .conftest import (
     PADDED_CIDR,
     app_database,
+    make_enrolled_agent,
     make_section,
     make_subnet,
     store_cidr_as,
@@ -75,10 +76,7 @@ async def agent_api():
 
 
 async def make_agent(client, name="vlan10") -> tuple[dict, str]:
-    res = await client.post("/api/v1/agents", json={"name": name})
-    assert res.status_code == 201, res.text
-    data = res.json()["data"]
-    return data, data["token"]
+    return await make_enrolled_agent(client, name)
 
 
 async def lab(client, cidr="10.0.0.0/24", name="lab", **extra) -> dict:
@@ -135,8 +133,18 @@ async def agent_row(agent_id) -> Agent:
 
 
 async def agent_changes() -> list[Change]:
+    """The entries agents' check-ins wrote: every `source="agent"` entry but the
+    enrolment's (`make_agent` enrols each agent first; `test_enrolment.py` tests those)."""
     async with SessionLocal() as session:
-        query = select(Change).where(Change.source == "agent").order_by(Change.ts)
+        query = (
+            select(Change)
+            .where(
+                Change.source == "agent",
+                Change.entity_type == "agent",
+                Change.summary.not_like("% enrolled"),
+            )
+            .order_by(Change.ts)
+        )
         return list((await session.scalars(query)).all())
 
 
@@ -164,7 +172,12 @@ def _operations() -> list[tuple[str, str]]:
 async def test_agent_routes_take_the_agent_token_and_never_the_owner_key(client, agent_api):
     _, token = await make_agent(client)
     agent_bearer = {"Authorization": f"Bearer {token}"}
-    agent_ops = [(m, p) for m, p in _operations() if p.startswith("/api/v1/agent/")]
+    # every agent route but enrol, which takes an enrolment token (`test_enrolment.py`)
+    enrol_op = ("POST", "/api/v1/agent/enrol")
+    assert enrol_op in _operations()
+    agent_ops = [
+        (m, p) for m, p in _operations() if p.startswith("/api/v1/agent/") and (m, p) != enrol_op
+    ]
     assert {("POST", "/api/v1/agent/checkin"), ("POST", "/api/v1/agent/results")} <= set(agent_ops)
     for method, path in agent_ops:
         # the owner key alone is refused, and the agent token alone is enough
@@ -174,7 +187,9 @@ async def test_agent_routes_take_the_agent_token_and_never_the_owner_key(client,
         assert res.status_code not in (401, 403), (method, path, res.text)
     # and every owner route refuses the agent token, as a bearer and as X-API-Key
     owner_ops = [
-        (m, p) for m, p in _operations() if p.startswith("/api/v1/") and (m, p) not in agent_ops
+        (m, p)
+        for m, p in _operations()
+        if p.startswith("/api/v1/") and (m, p) not in agent_ops and (m, p) != enrol_op
     ]
     assert len(owner_ops) > 20
     for method, path in owner_ops:
@@ -187,6 +202,18 @@ async def test_agent_routes_take_the_agent_token_and_never_the_owner_key(client,
 def test_agent_router_itself_requires_the_agent_token():
     # on the router, so that a route added to it later is guarded without asking
     assert [d.dependency for d in agent_router.router.dependencies] == [require_agent]
+
+
+def test_the_one_agent_route_without_the_agent_token_is_enrol():
+    """`enrol_router` takes no agent token, so it holds `enrol` and nothing else, and
+    every other `/api/v1/agent/*` route the app serves comes from the guarded router."""
+    assert agent_router.enrol_router.dependencies == []
+    assert [(r.methods, r.path) for r in agent_router.enrol_router.routes] == [
+        ({"POST"}, "/agent/enrol")
+    ]
+    guarded = {r.path for r in agent_router.router.routes}
+    served = {p for _, p in _operations() if p.startswith("/api/v1/agent/")}
+    assert served == {f"/api/v1{p}" for p in guarded} | {"/api/v1/agent/enrol"}
 
 
 async def test_unauthenticated_checkin_changes_nothing(client, agent_api):
@@ -1115,7 +1142,7 @@ async def test_agent_reported_text_does_not_reach_an_assistant(client, agent_api
     for hostile in (HOSTILE_HOSTNAME, HOSTILE_PLATFORM, "run delete_host", "ignore-all"):
         assert hostile not in text
     by_action = {(c["source"], c["action"]): c for c in over_mcp}
-    reported = by_action[("agent", "update")]
+    [reported] = [c for c in over_mcp if "check-in" in c["summary"]]
     assert reported["summary"] == "agent vlan10 check-in changed version, platform, hostname, interfaces"
     assert reported["actor"] == "agent:vlan10"
     assert reported["after"]["hostname"] == WITHHELD
@@ -1318,8 +1345,12 @@ def statements(target_engine=None):
 
 
 async def token_row(agent_id) -> Token:
+    """The agent's agent token (`make_agent` enrols it, so it also holds a spent
+    enrolment token)."""
     async with SessionLocal() as session:
-        return await session.scalar(select(Token).where(Token.agent_id == agent_id))
+        return await session.scalar(
+            select(Token).where(Token.agent_id == agent_id, Token.kind == "agent")
+        )
 
 
 async def set_times(agent_id, *, checked_in=None, used=None):
@@ -1538,7 +1569,9 @@ async def test_the_prune_keeps_an_agents_entries_of_another_entity_type(client, 
         await session.commit()
     for i in range(jobs.AGENT_AUDIT_KEEP + 5):
         assert (await checkin(agent_api, token, hostname=f"h{i}")).status_code == 200
-    mine = await agent_changes()
+    async with SessionLocal() as session:
+        query = select(Change).where(Change.source == "agent", Change.entity_id == agent["id"])
+        mine = list((await session.scalars(query)).all())
     assert [c.entity_type for c in mine].count("token") == 1
     assert [c.entity_type for c in mine].count("agent") == jobs.AGENT_AUDIT_KEEP
 

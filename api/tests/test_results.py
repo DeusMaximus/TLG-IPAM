@@ -31,7 +31,7 @@ from app.errors import ApiError
 from app.services import agents as agents_svc
 from app.services import jobs, results, scans, subnets
 
-from .conftest import app_database, make_host, write_lock
+from .conftest import app_database, enrol, make_host, write_lock
 from .test_checkin import (  # noqa: F401 (agent_api is a fixture)
     ROUTED,
     agent_api,
@@ -1636,6 +1636,45 @@ def test_a_short_ascii_printable_ip_is_echoed_as_sent():
     assert echo_ip({"ip": "not an address"}) == "not an address"
 
 
+@pytest.mark.parametrize("owner_write", ["re-enrol", "revoke", "disable", "delete"])
+async def test_a_result_set_authenticated_before_its_credential_was_withdrawn_is_refused(
+    client, agent_api, monkeypatch, owner_write
+):
+    """Briefed review of PR #124, finding 3 (the gap was on `main` before #21 for the
+    owner's revoke): a result set that authenticated, then waited while the owner
+    revoked, disabled or deleted the agent, or a re-enrol exchange revoked its token,
+    is refused `403` under the write lock, and nothing of it is stored: no observation,
+    and the lease where it was."""
+    agent, token, subnet, target, job = await setup(client, agent_api)
+    arrived, release = asyncio.Event(), asyncio.Event()
+    real = results._accept
+
+    async def after_the_owner(*args):
+        arrived.set()
+        await asyncio.wait_for(release.wait(), timeout=10)
+        return await real(*args)
+
+    monkeypatch.setattr(results, "_accept", after_the_owner)
+    report = asyncio.create_task(post_results(agent_api, token, job, [obs("10.0.0.10")]))
+    await asyncio.wait_for(arrived.wait(), timeout=5)
+    aid = agent["id"]
+    if owner_write == "re-enrol":
+        renewed = (await client.post(f"/api/v1/agents/{aid}/re-enrol")).json()["data"]
+        assert (await enrol(agent_api, renewed["enrol_token"])).status_code == 200
+    elif owner_write == "revoke":
+        assert (await client.post(f"/api/v1/agents/{aid}/revoke")).status_code == 200
+    elif owner_write == "disable":
+        assert (await client.put(f"/api/v1/agents/{aid}", json={"enabled": False})).status_code == 200
+    else:
+        assert (await client.delete(f"/api/v1/agents/{aid}")).status_code == 204
+    release.set()
+    res = await report
+    assert res.status_code == 403, res.text
+    assert res.json()["error"] == {"code": "FORBIDDEN", "message": "Invalid agent token"}
+    assert await observations(subnet["id"]) == {}
+    assert (await target_row(target["id"])).current_job_id == job["job_id"]
+
+
 async def test_an_accepted_result_set_records_its_tokens_use(client, agent_api):
     """Token use is recorded in the result set's own transaction, conditionally in SQL
     (`agents.record_token_use`); a refused result set writes nothing, its token's use
@@ -1646,13 +1685,15 @@ async def test_an_accepted_result_set_records_its_tokens_use(client, agent_api):
     async def set_used(when):
         async with SessionLocal() as session:
             await session.execute(
-                update(Token).where(Token.agent_id == agent["id"]).values(last_used_at=when)
+                update(Token)
+                .where(Token.agent_id == agent["id"], Token.kind == "agent")
+                .values(last_used_at=when)
             )
             await session.commit()
 
     async def used():
         async with SessionLocal() as session:
-            return _utc(await session.scalar(select(Token.last_used_at)))
+            return _utc(await session.scalar(select(Token.last_used_at).where(Token.kind == "agent")))
 
     await set_used(stale)
     res = await post_results(agent_api, token, {**job, "job_id": "not-the-job"})

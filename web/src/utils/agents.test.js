@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import {
   activeToken,
+  agentServerUrl,
   AHEAD_WITHIN_MS,
   agentStatus,
   containerCommand,
+  enrolCommand,
+  openEnrolment,
   relativeTime,
   shellQuote,
 } from './agents'
@@ -91,6 +94,11 @@ describe('containerCommand', () => {
     expect(cmd).toMatch(/tlg-ipam-agent:0\.2\.0$/)
   })
 
+  it('leaves a placeholder for a token the page does not hold', () => {
+    const cmd = containerCommand({ url: 'https://ipam.home.arpa', version: '0.2.0' })
+    expect(cmd).toContain('-e IPAM_AGENT_TOKEN=<agent token> \\')
+  })
+
   it('leaves a placeholder when the server version is unknown', () => {
     expect(containerCommand({ url: 'http://x', token: 't', version: undefined })).toMatch(
       /:<version>$/
@@ -101,5 +109,55 @@ describe('containerCommand', () => {
     expect(shellQuote('plain-1.2')).toBe('plain-1.2')
     expect(shellQuote("a b'c")).toBe(`'a b'\\''c'`)
     expect(shellQuote('$(id)')).toBe(`'$(id)'`)
+  })
+})
+
+describe('enrolCommand', () => {
+  it('posts the enrolment token as the bearer to the enrol route', () => {
+    const cmd = enrolCommand({ url: 'https://ipam.home.arpa', token: 'tlge_abc-DEF_123' })
+    expect(cmd).toContain('curl -fsS -X POST https://ipam.home.arpa/api/v1/agent/enrol \\')
+    expect(cmd).toContain("-H 'Authorization: Bearer tlge_abc-DEF_123'")
+    expect(cmd).toContain("-H 'Content-Type: application/json' -d '{}'")
+  })
+})
+
+describe('openEnrolment', () => {
+  const now = Date.parse('2026-11-16T06:30:00Z')
+  const enrol = (over) => ({
+    kind: 'enrol',
+    expires_at: '2026-11-16T07:00:00',
+    used_at: null,
+    revoked_at: null,
+    ...over,
+  })
+
+  it('is an enrolment token that is unrevoked, unused and unexpired', () => {
+    const open = enrol()
+    expect(openEnrolment({ tokens: [{ kind: 'agent', revoked_at: null }, open] }, now)).toBe(open)
+    expect(openEnrolment({ tokens: [enrol({ used_at: '2026-11-16T06:10:00' })] }, now)).toBeNull()
+    expect(openEnrolment({ tokens: [enrol({ revoked_at: '2026-11-16T06:10:00' })] }, now)).toBeNull()
+    expect(openEnrolment({ tokens: [enrol({ expires_at: '2026-11-16T06:30:00' })] }, now)).toBeNull()
+    expect(openEnrolment({ tokens: [] }, now)).toBeNull()
+  })
+})
+
+describe('agentServerUrl', () => {
+  const at = (url) => {
+    const u = new URL(url)
+    return agentServerUrl({ protocol: u.protocol, hostname: u.hostname, origin: u.origin })
+  }
+
+  it('gives an https origin, or a plain-http one only on a loopback host', () => {
+    expect(at('https://ipam.home.arpa')).toBe('https://ipam.home.arpa')
+    expect(at('https://10.0.0.2:8443')).toBe('https://10.0.0.2:8443')
+    expect(at('http://localhost:8080')).toBe('http://localhost:8080')
+    expect(at('http://127.0.0.1:8080')).toBe('http://127.0.0.1:8080')
+    expect(at('http://[::1]:8080')).toBe('http://[::1]:8080')
+  })
+
+  it('gives nothing for plain http across a network', () => {
+    expect(at('http://ipam.home.arpa')).toBeNull()
+    expect(at('http://10.0.0.2:8080')).toBeNull()
+    expect(at('http://127.0.0.1.example.com')).toBeNull()
   })
 })

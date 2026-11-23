@@ -67,8 +67,26 @@ This release does ICMP, ARP and reverse DNS. Reverse DNS asks the subnet's DNS s
 
 ### Run one
 
-1. In the UI, open **Agents → Add agent**, name it, and copy the command it shows. The token in it (`tlga_…`) is shown once.
-2. Run the command on a Linux host on the target VLAN, with rootful Docker or Podman. It looks like this:
+1. In the UI, open **Agents → Add agent** and name it. The dialog shows the agent's enrolment token (`tlge_…`) once; it can be exchanged once, within an hour.
+2. On the Linux host on the target VLAN, run the enrolment command the dialog shows. It exchanges the enrolment token for the agent token and prints it, once, as `agent_token` (`tlga_…`):
+
+   ```sh
+   curl -fsS -X POST https://ipam.home.arpa/api/v1/agent/enrol \
+     -H 'Authorization: Bearer tlge_…' \
+     -H 'Content-Type: application/json' -d '{}'
+   ```
+
+   A used, expired or revoked enrolment token is refused (`403`); so, for a minute, is every attempt after ten that failed (`429`). A later release of the agent makes this exchange itself on first start.
+
+   If the answer is lost, or the token runs out before it is used, issue a new enrolment token for the same agent. Its id is in `GET /api/v1/agents`, and it keeps its scan targets:
+
+   ```sh
+   curl -fsS -X POST https://ipam.home.arpa/api/v1/agents/<agent id>/re-enrol \
+     -H 'X-API-Key: <owner key>'
+   ```
+
+   The answer's `enrol_token` is the new one; exchange it as above. Exchanging it also revokes the agent token the agent held before, which is the way to replace a lost or leaked one. (Deleting the agent and adding it again works too, but leaves its subnets unassigned.) The Agents page gains a Re-enrol button in a later release.
+3. Run the container command the dialog shows, with that agent token in place of `<agent token>`, using rootful Docker or Podman. It looks like this:
 
    ```sh
    docker run -d --name tlg-ipam-agent --restart unless-stopped \
@@ -79,7 +97,7 @@ This release does ICMP, ARP and reverse DNS. Reverse DNS asks the subnet's DNS s
    ```
 
    Host networking puts the agent on the VLAN itself, and `NET_RAW` lets it send ICMP echo requests and ARP requests. `--cap-add NET_RAW` adds that capability to Docker's default set rather than leaving the container with it alone; add `--cap-drop ALL` before it if you want only that one. Rootless container runtimes cannot grant a usable `NET_RAW` on the host network and are not supported.
-3. Assign the subnet to the agent in the subnet's **Scanning** section, and save. `docker logs tlg-ipam-agent` shows each check-in refusal, each job and how it ended.
+4. Assign the subnet to the agent in the subnet's **Scanning** section, and save. `docker logs tlg-ipam-agent` shows each check-in refusal, each job and how it ended.
 
 The image is not published yet. Until it is, build it from this repository and tag it with the version in the command:
 
@@ -92,7 +110,7 @@ docker build -f agent/Dockerfile -t ghcr.io/deusmaximus/tlg-ipam-agent:<version>
 | Variable | Default | |
 |----------|---------|---|
 | `IPAM_URL` | (required) | The server's URL. Must be `https://`: the token is a credential, and the server's certificate is always verified, with no setting to turn that off. Plain `http://` is accepted only for a server on the agent host's own loopback address (`http://127.0.0.1:8080`). |
-| `IPAM_AGENT_TOKEN` | (required) | The `tlga_…` token from the Agents page. |
+| `IPAM_AGENT_TOKEN` | (required) | The `tlga_…` agent token the enrolment exchange printed. |
 | `ALLOWED_CIDRS` | `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10` | The agent's own limit on what it will scan, whatever the server asks. A job for a subnet outside it is refused without a packet being sent, and the subnet's Scanning section shows why. Set it to your own networks if they use other ranges. |
 | `MAX_PPS` | `200` | The most packets a second the agent sends (1–1000): echo requests, ARP requests and DNS queries together, each ARP retry and each failover to another DNS server counted, from one scan into the next. The agent hands each to the kernel at least a slot (`1/MAX_PPS`) after it handed over the one before, and a slot that comes late is not made up for. What the kernel and the network card do after that hand-off is outside the agent's control and can put two packets closer together on the wire. The host's kernel also sends ARP of its own to reach an address it pings on the agent's subnet (up to 3 requests for an address that does not answer); that is not counted. |
 

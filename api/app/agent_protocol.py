@@ -87,6 +87,50 @@ def printable(value: str, cap: int) -> str:
     return value
 
 
+# --- Enrolment ---
+
+# The two kinds of token an agent holds (spec §4.2), each the prefix followed by 43
+# URL-safe random characters. An enrolment token is exchanged once, at
+# `POST /api/v1/agent/enrol`, for the agent token every other agent route takes.
+AGENT_TOKEN_PREFIX = "tlga_"
+ENROL_TOKEN_PREFIX = "tlge_"
+
+
+class EnrolRequest(BaseModel):
+    """`POST /api/v1/agent/enrol`, with the enrolment token as `Authorization: Bearer`.
+    Unknown fields are ignored. Each field is optional, so the exchange can be made by
+    hand (`-d '{}'`); a field that is sent is checked as check-in checks it and stored
+    on the agent. The body carries no `protocol`: the agent's first check-in, which
+    follows at once, is where a mismatch is refused."""
+
+    version: str | None = None
+    hostname: str | None = None
+    platform: str | None = None
+
+    @field_validator("version")
+    @classmethod
+    def _version(cls, v: str | None) -> str | None:
+        return None if v is None else printable(v, VERSION_MAX)
+
+    @field_validator("hostname")
+    @classmethod
+    def _hostname(cls, v: str | None) -> str | None:
+        return None if v is None else printable(v, HOSTNAME_MAX)
+
+    @field_validator("platform")
+    @classmethod
+    def _platform(cls, v: str | None) -> str | None:
+        return None if v is None else printable(v, PLATFORM_MAX)
+
+
+class EnrolResponse(BaseModel):
+    """The enrol answer, inside the usual `{"data": ...}` envelope: the agent's id and
+    its long-lived agent token, which no other response carries."""
+
+    agent_id: str
+    agent_token: str
+
+
 # --- Check-in ---
 
 

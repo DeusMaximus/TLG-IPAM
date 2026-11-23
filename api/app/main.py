@@ -109,8 +109,11 @@ for router in (
     app.include_router(router, prefix="/api/v1", dependencies=[Depends(require_api_key)])
 
 # `/api/v1/agent/*` is guarded by `auth.require_agent` alone (on the router itself),
-# never `require_api_key`: it must not join the loop above.
+# never `require_api_key`: it must not join the loop above. Its one exception is
+# `enrol`, on a router of its own, which takes an enrolment token
+# (`services/enrolment`) and neither key.
 app.include_router(agent.router, prefix="/api/v1")
+app.include_router(agent.enrol_router, prefix="/api/v1")
 
 # Bearer auth for /mcp is the FastMCP server's own `auth=` (mcp_server.py).
 app.mount("/mcp", mcp_app)

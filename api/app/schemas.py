@@ -395,10 +395,13 @@ class AgentOut(BaseModel):
     tokens: list[TokenOut]
 
 
-class AgentCreated(AgentOut):
-    """The create response, the only one that carries the plain token."""
+class AgentEnrolment(AgentOut):
+    """The create and re-enrol responses, the only ones that carry an enrolment token:
+    the plain `tlge_…` value, shown once, and when it stops being accepted. The agent
+    exchanges it for its agent token at `POST /api/v1/agent/enrol`."""
 
-    token: str
+    enrol_token: str
+    enrol_token_expires_at: UtcDatetime
 
 
 # --- Scan targets ---
