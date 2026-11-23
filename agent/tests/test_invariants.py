@@ -3,9 +3,15 @@ updates from anything the server sends.
 
 What this shows, and no more: the agent's own modules import only the modules listed
 here, and contain none of the names listed here (as a call, an attribute, a bare name,
-or a string that could be handed to `getattr` or an importer). The names are ways to
-start a process, load or evaluate code, reach an object's attributes by computed name,
-or write a file. It proves the absence of those names, not the invariant: code that
+or a string that could be handed to `getattr` or an importer), but for the few listed
+names a module is allowed (`NAMES_WHERE`). The names are ways to start a process, load
+or evaluate code, reach an object's attributes by computed name, or write a file.
+
+Two modules are allowed some of them, since #22: `store.py` opens, writes, renames and
+removes files (the stored agent token, and what `install` puts on the host), and
+`install.py` starts the fixed programs that create the service user and drive systemd.
+Every other module is held to the lists whole, and only `enrol.py` and `install.py`
+may use `store` (`test_only_the_enrolment_and_the_installer_write_files`). It proves the absence of those names, not the invariant: code that
 reaches the same effect without one of them passes (an uncalled
 `os.__getattribute__("sy" + "stem")(command)` does), and so would anything inside the
 three dependencies. It is a tripwire for review; review holds the invariant.
@@ -25,12 +31,16 @@ MODULES = sorted(PACKAGE.glob("*.py"))
 # it: `stat.S_ISREG` on what `os.stat` says refuses a path that is not a regular file
 # before anything opens it, and a daemon thread keeps a blocked read off the event
 # loop. `io` is not here: its `FileIO` and `open_code` open files, and the agent needs
-# none of it.
+# none of it. #22 added `subprocess`, for `install.py` alone (`IMPORTED_ONLY_IN`): it
+# runs useradd, userdel, groupdel and systemctl with fixed arguments. `pwd` and `grp`
+# came with it, to look the service user and its group up (they read the user
+# database and change nothing), `functools`, for `partial`, and `termios`, for
+# `install.py` alone, to turn echo off while the enrolment token is typed.
 ALLOWED_IMPORTS = {
     "argparse", "asyncio", "collections.abc", "dataclasses", "datetime", "enum",
-    "ipaddress", "json", "logging", "os", "pathlib", "platform", "random", "re",
-    "signal", "socket", "ssl", "stat", "struct", "sys", "threading", "time", "typing",
-    "urllib.parse",
+    "functools", "grp", "ipaddress", "json", "logging", "os", "pathlib", "platform",
+    "pwd", "random", "re", "signal", "socket", "ssl", "stat", "struct", "subprocess",
+    "sys", "termios", "threading", "time", "typing", "urllib.parse",
     "httpx", "icmplib",
     "dns.asyncquery", "dns.exception", "dns.flags", "dns.message", "dns.rcode", "dns.rdatatype",
     "dns.resolver", "dns.reversename",
@@ -42,7 +52,12 @@ ALLOWED_IMPORTS = {
 # probe.py, which an alias of `os` turned into a writer). The second block (#99) names
 # spellings of the allowed modules that open a file to write, create one, or set an
 # attribute by name, which the agent uses none of; `FileIO` and `open_code` stay listed
-# though `io` is not importable.
+# though `io` is not importable. The third block (#22) names the ways of making,
+# renaming, removing and changing the owner or mode of a file or directory that
+# `os` and `pathlib` name, which `store.py` alone may use (`NAMES_WHERE`). Two such
+# names are not listed, since harmless code shares them: `replace` (`os.replace`, a
+# rename; every `str.replace`) and `link` (`os.link`; the ARP link in scan.py and
+# probe.py). Review holds those two.
 FORBIDDEN = {
     "exec", "eval", "compile", "__import__", "breakpoint", "getattr", "setattr",
     "delattr", "globals", "locals", "vars", "__builtins__", "__dict__", "__globals__",
@@ -53,12 +68,29 @@ FORBIDDEN = {
     "ensurepip", "venv", "shutil", "pty", "zipimport", "urlopen", "urlretrieve",
     "FileIO", "open_code", "fdopen", "openpty", "mkfifo", "mknod", "touch", "truncate",
     "symlink_to", "hardlink_to", "link_to", "FileHandler", "__setattr__", "__delattr__",
+    "mkdir", "makedirs", "rename", "renames", "unlink", "remove", "rmdir", "removedirs",
+    "chown", "fchown", "lchown", "fchmod", "lchmod", "ftruncate", "mkdtemp", "mkstemp",
 }
 # and any identifier with these beginnings: os.exec*, os.spawn*, os.fork*,
 # os.posix_spawn*, asyncio.create_subprocess_*, loop.subprocess_*
 FORBIDDEN_PREFIXES = ("exec", "spawn", "fork", "posix_spawn", "create_subprocess", "subprocess_")
-# a forbidden name that is harmless on this one module: `re.compile` builds a pattern
-ALLOWED_QUALIFIED = {"re.compile"}
+# a forbidden name that is harmless on this one module: `re.compile` builds a pattern,
+# and `sys.executable` is the interpreter's path, which the unit's `ExecStart` names
+# (#22; `executable` starts with `exec`)
+ALLOWED_QUALIFIED = {"re.compile", "sys.executable"}
+
+# The listed names one module may use, and no other (#22). `store.py` opens files
+# with `os.open` (reading the token file without following a link or waiting on a
+# FIFO, and creating a file exclusively), sets the new file's owner and mode on its
+# descriptor before writing it, renames it into place, and makes and removes the
+# install's directories and files. `install.py` names `subprocess`, to run its fixed
+# programs. What each does with them is in its docstring; review holds the rest.
+NAMES_WHERE = {
+    "store.py": {"open", "fchown", "fchmod", "rename", "unlink", "rmdir", "mkdir"},
+    "install.py": {"subprocess"},
+}
+# an allowed import that one module alone may make
+IMPORTED_ONLY_IN = {"subprocess": "install.py", "termios": "install.py"}
 
 # The spellings of having a library open a file to read that the checks enumerate
 # (the agent's own ways of opening one are forbidden names above): pathlib's read_text
@@ -144,26 +176,97 @@ def _file_opens(tree) -> set[str]:
     return found
 
 
+def _refused_imports(tree, module: str) -> set[str]:
+    imported = set(_imports(tree))
+    confined = {m for m in imported if IMPORTED_ONLY_IN.get(m, module) != module}
+    return (imported - ALLOWED_IMPORTS) | confined
+
+
+def _refused_names(tree, module: str) -> set[str]:
+    allowed = NAMES_WHERE.get(module, set())
+    return {n for n in _identifiers(tree) if _forbidden(n) and n not in allowed}
+
+
 def _violations(tree, module: str) -> list[str]:
     """Everything the checks in this file refuse in one module's source, each with the
-    check that refuses it: `import ...` (the allowlist), `name ...` (a listed name),
-    `opens a file with ...` (an enumerated opener outside OPENED_WHERE)."""
-    found = [f"import {m}" for m in sorted(set(_imports(tree)) - ALLOWED_IMPORTS)]
-    found += sorted({f"name {n}" for n in _identifiers(tree) if _forbidden(n)})
+    check that refuses it: `import ...` (the allowlist, and IMPORTED_ONLY_IN), `name
+    ...` (a listed name, but those NAMES_WHERE allows the module), `opens a file with
+    ...` (an enumerated opener outside OPENED_WHERE)."""
+    found = [f"import {m}" for m in sorted(_refused_imports(tree, module))]
+    found += sorted({f"name {n}" for n in _refused_names(tree, module)})
     found += [f"opens a file with {o}" for o in sorted(_file_opens(tree) - OPENED_WHERE.get(module, set()))]
     return found
 
 
 @pytest.mark.parametrize("path", MODULES, ids=lambda p: p.name)
 def test_only_listed_modules_are_imported(path):
-    imported = set(_imports(ast.parse(path.read_text())))
-    assert imported <= ALLOWED_IMPORTS, f"{path.name}: {sorted(imported - ALLOWED_IMPORTS)}"
+    refused = _refused_imports(ast.parse(path.read_text()), path.name)
+    assert refused == set(), f"{path.name}: {sorted(refused)}"
 
 
 @pytest.mark.parametrize("path", MODULES, ids=lambda p: p.name)
 def test_nothing_that_could_run_load_or_fetch_code_is_named(path):
-    found = sorted({n for n in _identifiers(ast.parse(path.read_text())) if _forbidden(n)})
+    found = sorted(_refused_names(ast.parse(path.read_text()), path.name))
     assert found == [], f"{path.name}: {found}"
+
+
+def test_each_name_a_module_is_allowed_is_one_it_uses():
+    """NAMES_WHERE allows no more than the module uses, so a name dropped from the code
+    cannot stay allowed unnoticed; and every name in it is a listed one."""
+    for module, names in NAMES_WHERE.items():
+        used = {n for n in _identifiers(ast.parse((PACKAGE / module).read_text())) if _forbidden(n)}
+        assert used == names, module
+        assert all(_forbidden(n) for n in names)
+
+
+@pytest.mark.parametrize(
+    "source, module, reasons",
+    [
+        # what store.py may do, refused anywhere else
+        ("import os\nfd = os.open('x', os.O_WRONLY | os.O_CREAT)\n", "loop.py", ["name open"]),
+        ("import os\nos.rename('x', 'y')\n", "install.py", ["name rename"]),
+        ("from pathlib import Path\nPath('x').unlink()\n", "enrol.py", ["name unlink"]),
+        ("from pathlib import Path\nPath('x').mkdir()\n", "cli.py", ["name mkdir"]),
+        ("import os\nos.fchown(3, 0, 0)\n", "probe.py", ["name fchown"]),
+        # what install.py may do, refused anywhere else, in every spelling of the import
+        ("import subprocess\nsubprocess.run(['x'])\n", "store.py", ["import subprocess", "name subprocess"]),
+        ("from subprocess import run\nrun(['x'])\n", "enrol.py", ["import subprocess"]),
+        ("import subprocess as s\ns.run(['x'])\n", "loop.py", ["import subprocess", "name subprocess"]),
+        # and neither is given the other's
+        ("import os\nos.unlink('x')\n", "install.py", ["name unlink"]),
+        # what neither is given
+        ("import os\nos.chown('x', 0, 0)\n", "store.py", ["name chown"]),
+        ("import os\nos.execv('x', ['x'])\n", "install.py", ["name execv"]),
+        ("import os\nos.makedirs('x')\n", "store.py", ["name makedirs"]),
+    ],
+)
+def test_a_name_allowed_in_one_module_is_refused_in_any_other(source, module, reasons):
+    """NAMES_WHERE and IMPORTED_ONLY_IN place each allowance in one module: appended to
+    another real module, the same source is refused for exactly its reasons."""
+    base = (PACKAGE / module).read_text() + "\n"
+    assert _violations(ast.parse(base + source), module) == reasons
+
+
+def _relative_imports(path) -> set[str]:
+    """The agent's own modules a module imports (`from . import store`, `from .store
+    import ...`)."""
+    found = set()
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.ImportFrom) and node.level == 1:
+            if node.module:
+                found.add(node.module.split(".")[0])
+            else:
+                found.update(alias.name for alias in node.names)
+    return found
+
+
+def test_only_the_enrolment_and_the_installer_write_files():
+    """`store` is how a file is written, and `install` how a process is started: who
+    imports them is who can (#22). The container's first start stores its token
+    through `enrol`; `install` is reached only from the command line."""
+    users = {p.name: _relative_imports(p) for p in MODULES}
+    assert {name for name, used in users.items() if "store" in used} == {"enrol.py", "install.py"}
+    assert {name for name, used in users.items() if "install" in used} == {"cli.py"}
 
 
 def test_files_are_opened_only_where_listed():
@@ -265,6 +368,8 @@ FORBIDDEN_NAME_CASES = (
     "ensurepip", "venv", "shutil", "pty", "zipimport", "urlopen", "urlretrieve",
     "FileIO", "open_code", "fdopen", "openpty", "mkfifo", "mknod", "touch", "truncate",
     "symlink_to", "hardlink_to", "link_to", "FileHandler", "__setattr__", "__delattr__",
+    "mkdir", "makedirs", "rename", "renames", "unlink", "remove", "rmdir", "removedirs",
+    "chown", "fchown", "lchown", "fchmod", "lchmod", "ftruncate", "mkdtemp", "mkstemp",
 )
 # a name that is on no list but its prefix, on an attribute of `os`
 FORBIDDEN_PREFIX_CASES = {

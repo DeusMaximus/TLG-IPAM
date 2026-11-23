@@ -7,7 +7,8 @@ system trust store is used; a private CA is added by mounting its bundle and poi
 Every answer is sorted into one of three kinds, which is all the loop acts on:
 `OK` (a 200 whose `data` has the route's shape), `RETRY` (429, any 5xx, a 200 that is
 too large or not that shape, or no complete answer in time), and `REFUSED` (every
-other status). Only an `OK` check-in answer carries jobs.
+other status). Only an `OK` check-in answer carries jobs, and only an `OK` enrol answer
+carries an agent token (checked for a token's shape before anything keeps it).
 """
 
 import asyncio
@@ -21,7 +22,9 @@ from typing import Any
 import httpx
 
 from . import __version__
-from .config import Config
+from .config import ConfigError, parse_token
+
+ENROL_PATH = "/api/v1/agent/enrol"
 CHECKIN_PATH = "/api/v1/agent/checkin"
 RESULTS_PATH = "/api/v1/agent/results"
 # one deadline for the whole of a request: connecting, sending, headers and body
@@ -32,6 +35,8 @@ RESPONSE_MAX = 1024 * 1024
 _CODE = re.compile(r"[A-Z][A-Z0-9_]{0,39}")
 # no count the server returns can be larger than a result set's records
 _COUNT_MAX = 4096
+# the server's ids are UUIDs (models._uuid)
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 class Kind(enum.Enum):
@@ -64,11 +69,13 @@ def tls_context() -> ssl.SSLContext:
     return ctx
 
 
-def make_http(config: Config) -> httpx.AsyncClient:
+def make_http(url: str, token: str) -> httpx.AsyncClient:
+    """A client for the server at `url` that presents `token`: the agent token, or for
+    the enrolment exchange alone, the enrolment token."""
     return httpx.AsyncClient(
-        base_url=config.url,
+        base_url=url,
         headers={
-            "Authorization": f"Bearer {config.token}",
+            "Authorization": f"Bearer {token}",
             "User-Agent": f"tlg-ipam-agent/{__version__}",
             # nothing is decompressed (`_bounded_body`), so nothing compressed is asked for
             "Accept-Encoding": "identity",
@@ -124,6 +131,22 @@ def checkin_data(data: dict) -> dict | None:
     return {"checkin_interval_s": interval, "jobs": jobs}
 
 
+def enrol_data(data: dict) -> dict | None:
+    """The enrol answer, when it has the shape agent_protocol.EnrolResponse gives it: an
+    agent id that is a UUID and an agent token that has a token's shape
+    (`config.parse_token`). The token is checked before the agent writes it anywhere."""
+    agent_id, token = data.get("agent_id"), data.get("agent_token")
+    if not isinstance(agent_id, str) or not _UUID.fullmatch(agent_id):
+        return None
+    if not isinstance(token, str):
+        return None
+    try:
+        parse_token(token, "agent_token")
+    except ConfigError:
+        return None
+    return {"agent_id": agent_id, "agent_token": token}
+
+
 def results_data(data: dict) -> dict | None:
     """The results acknowledgment, as counts, when it has the shape
     agent_protocol.ResultsResponse gives it; nothing of it but these integers is kept."""
@@ -150,6 +173,11 @@ class AgentClient:
     def __init__(self, http: httpx.AsyncClient, request_timeout: float = REQUEST_TIMEOUT_S):
         self.http = http
         self.request_timeout = request_timeout
+
+    async def enrol(self, body: dict) -> Answer:
+        """The enrolment exchange: `http` presents the enrolment token. An `OK` answer's
+        `data` is `enrol_data`'s."""
+        return await self._post(ENROL_PATH, body, self.request_timeout, enrol_data)
 
     async def checkin(self, body: dict) -> Answer:
         return await self._post(CHECKIN_PATH, body, self.request_timeout, checkin_data)

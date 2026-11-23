@@ -5,12 +5,16 @@ import importlib
 import tomllib
 from pathlib import Path
 
+import uuid
+from datetime import datetime, timezone
+
 import pytest
 from app import agent_protocol as server
-from app.services import jobs
+from app.models import Agent as AgentRow
+from app.services import agents, jobs
 
 from conftest import FakeClock, FakeProber, FakeResolver, job
-from tlg_ipam_agent import config, guard, loop, probe, protocol, scan
+from tlg_ipam_agent import client, config, guard, loop, probe, protocol, scan
 from tlg_ipam_agent.config import parse_allowed
 
 AGENT = Path(__file__).resolve().parents[1]
@@ -44,6 +48,45 @@ def test_the_agent_token_prefix_is_the_servers():
     which is not an enrolment token's (#21)."""
     assert config.TOKEN_PREFIX == server.AGENT_TOKEN_PREFIX
     assert not server.ENROL_TOKEN_PREFIX.startswith(config.TOKEN_PREFIX)
+
+
+def test_the_enrolment_token_prefix_is_the_servers():
+    """`IPAM_ENROL_TOKEN` and `install --enrol-token` take what the server issues (#22)."""
+    assert config.ENROL_TOKEN_PREFIX == server.ENROL_TOKEN_PREFIX
+    assert not server.AGENT_TOKEN_PREFIX.startswith(config.ENROL_TOKEN_PREFIX)
+
+
+class _Session:
+    def add(self, row):
+        pass
+
+
+def _issued(kind: str) -> str:
+    """A plain token as the server's own `agents.issue_token` makes it."""
+    _row, plain = agents.issue_token(_Session(), AgentRow(name="x"), kind, datetime.now(timezone.utc))
+    return plain
+
+
+@pytest.mark.parametrize("kind, prefix", [("agent", config.TOKEN_PREFIX), ("enrol", config.ENROL_TOKEN_PREFIX)])
+def test_every_token_the_server_issues_has_the_shape_the_agent_takes(kind, prefix):
+    """The agent checks a token's shape (`config.parse_token`) before it uses one, or
+    writes one to disk; a token the server issues always passes."""
+    for _ in range(200):
+        plain = _issued(kind)
+        assert config.parse_token(plain, "token", prefix) == plain
+        assert len(plain) <= config.TOKEN_MAX
+
+
+def test_the_enrol_body_is_what_the_server_accepts_and_stores_unchanged():
+    body = loop.reported()
+    parsed = server.EnrolRequest.model_validate(body)
+    assert parsed.model_dump() == body
+
+
+def test_the_servers_enrol_answer_is_in_the_shape_the_agent_takes():
+    plain = _issued("agent")
+    answer = server.EnrolResponse(agent_id=str(uuid.uuid4()), agent_token=plain).model_dump(mode="json")
+    assert client.enrol_data(answer) == answer
 
 
 def test_the_shortest_retry_is_not_inside_the_servers_checkin_gap():
