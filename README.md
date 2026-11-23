@@ -77,6 +77,15 @@ This release does ICMP, ARP and reverse DNS. Reverse DNS asks the subnet's DNS s
    ```
 
    A used, expired or revoked enrolment token is refused (`403`); so, for a minute, is every attempt after ten that failed (`429`). A later release of the agent makes this exchange itself on first start.
+
+   If the answer is lost, or the token runs out before it is used, issue a new enrolment token for the same agent. Its id is in `GET /api/v1/agents`, and it keeps its scan targets:
+
+   ```sh
+   curl -fsS -X POST https://ipam.home.arpa/api/v1/agents/<agent id>/re-enrol \
+     -H 'X-API-Key: <owner key>'
+   ```
+
+   The answer's `enrol_token` is the new one; exchange it as above. Exchanging it also revokes the agent token the agent held before, which is the way to replace a lost or leaked one. (Deleting the agent and adding it again works too, but leaves its subnets unassigned.) The Agents page gains a Re-enrol button in a later release.
 3. Run the container command the dialog shows, with that agent token in place of `<agent token>`, using rootful Docker or Podman. It looks like this:
 
    ```sh

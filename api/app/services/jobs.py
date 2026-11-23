@@ -63,7 +63,8 @@ _AGENT_LEASE = ("current_job_id", "job_issued_at")
 # not writes or audit entries.
 DEFAULT_CHECKIN_GAP = timedelta(seconds=10)
 MIN_CHECKIN_GAP = DEFAULT_CHECKIN_GAP
-# the newest audit entries an agent's own check-ins keep (`_prune_agent_audit`)
+# the newest audit entries an agent's own writes keep, check-ins and enrolment alike
+# (`prune_agent_audit`)
 AGENT_AUDIT_KEEP = 100
 # the protocol value quoted back in an error, when it is a small integer
 _QUOTABLE_PROTOCOL = range(0, 10_000)
@@ -318,7 +319,7 @@ async def _claim(session: AsyncSession, agent: Agent, now: datetime) -> None:
     set_committed_value(agent, "last_checkin_at", now)
 
 
-async def _prune_agent_audit(session: AsyncSession, agent: Agent) -> None:
+async def prune_agent_audit(session: AsyncSession, agent: Agent) -> None:
     """Keep the agent's own audit entries (`source="agent"`) to the newest
     AGENT_AUDIT_KEEP. A report alternating between values must not grow the log
     without bound; owner entries are never touched."""
@@ -357,7 +358,7 @@ async def _store(session: AsyncSession, agent: Agent, fields: dict) -> None:
         after=changes.snapshot(agent),
     )
     await session.flush()
-    await _prune_agent_audit(session, agent)
+    await prune_agent_audit(session, agent)
 
 
 async def checkin(session: AsyncSession, agent: Agent, body: dict) -> dict:

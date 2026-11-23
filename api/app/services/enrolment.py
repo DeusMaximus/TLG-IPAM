@@ -33,7 +33,7 @@ from ..agent_protocol import EnrolRequest, EnrolResponse
 from ..errors import ApiError, database_unavailable, validation_error
 from ..models import Agent, Token
 from ..times import utc
-from . import agents, changes
+from . import agents, changes, jobs, scans
 
 # The throttle (spec §5.6): at most THROTTLE_ATTEMPTS attempts that did not enrol in any
 # THROTTLE_WINDOW_S, across every caller. An attempt that enrols gives its place back.
@@ -123,10 +123,11 @@ def _validation_message(exc: ValidationError) -> str:
 
 async def _claim(session: AsyncSession, token_id: str, now: datetime) -> bool:
     """Mark the enrolment token used, if it still can be: a compare-and-set that
-    requires it unused, unrevoked and unexpired and its agent not disabled. It is the
-    exchange's first write, so it takes SQLite's write lock and everything after it
-    reads the database as committed: two exchanges of one token cannot both pass, and
-    an owner's revoke, re-enrol or disable that commits first refuses it."""
+    requires it unused, unrevoked and unexpired and its agent not disabled. The caller
+    holds SQLite's write lock, so everything after it reads the database as committed:
+    two exchanges of one token cannot both pass, and an owner's revoke, re-enrol or
+    disable that commits first refuses it. `kind` is defensive: no API changes a
+    token's kind, and the lookup has already checked it."""
     agent_usable = exists().where(Agent.id == Token.agent_id, Agent.state != "disabled")
     result = await session.execute(
         update(Token)
@@ -167,12 +168,16 @@ async def _exchange(
         raise validation_error(_validation_message(exc)) from None
     # the token as it was: the compare-and-set below proves it was unused and unrevoked
     token_before = changes.snapshot(token)
-    # The claim is judged at its own time, not the lookup's: the body may have taken
-    # long to arrive (a declared Content-Length is streamed, not buffered), and a token
-    # that expired meanwhile must not be spent.
-    now = _now()
 
     try:
+        # The claim is judged at its own time, not the lookup's: the body may have taken
+        # long to arrive (a declared Content-Length is streamed, not buffered), and the
+        # wait for SQLite's writer may be long too (its busy timeout). So the write lock
+        # is taken first, inside this block (a refused lock is a 503 with nothing
+        # written), and the time is read once it is held: a token that expired while
+        # the exchange queued is not spent.
+        await scans.take_write_lock(session)
+        now = _now()
         if not await _claim(session, token.id, now):
             await session.rollback()
             raise _refused()
@@ -225,6 +230,9 @@ async def _exchange(
             before=agent_before,
             after=changes.snapshot(agent),
         )
+        # the agent's own entries keep their cap, enrolment's as check-ins' (spec §5.7)
+        await session.flush()
+        await jobs.prune_agent_audit(session, agent)
         answer = EnrolResponse(agent_id=agent.id, agent_token=plain).model_dump(mode="json")
         await session.commit()
     except OperationalError as exc:

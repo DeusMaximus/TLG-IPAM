@@ -223,7 +223,10 @@ def _enabled_state(agent: Agent) -> str:
 async def update_agent(
     session: AsyncSession, agent_id: str, payload: AgentUpdate, source: str
 ) -> Agent:
-    agent = await get_agent(session, agent_id)
+    # under the write lock: the state an enable returns to (`_enabled_state`) and the
+    # audit snapshots are read from the agent and its tokens as committed, never from a
+    # read an enrolment exchange has since overtaken
+    agent = await _locked_agent(session, agent_id)
     before = changes.snapshot(agent)
     data = payload.model_dump(exclude_unset=True)
     parts = []

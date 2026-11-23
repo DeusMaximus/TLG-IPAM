@@ -1,7 +1,11 @@
 """Scan results ingest, `POST /api/v1/agent/results` (v0.2 spec §5.4, §5.7).
 
-A result set is for one job. It is accepted only while that job is current on both
-sides of the lease: the target's `current_job_id` and the reporting agent's own. A
+A result set is for one job, and is accepted only from an agent that is still
+`active`, presenting an agent token that is still unrevoked, both read under SQLite's
+write lock before anything is written (`_credential_live`): authentication read them
+before the request waited, and a disable, revoke, delete or re-enrol exchange may have
+committed since. Otherwise it is `403` and changes nothing. It is accepted only while
+that job is current on both sides of the lease: the target's `current_job_id` and the reporting agent's own. A
 superseded job, a target that is gone, and a second result set for the same job are
 refused whole (`409 JOB_NOT_CURRENT`) and change nothing. Accepting one clears both
 copies of the lease in one transaction, each as a compare-and-set on this job, so two
@@ -24,7 +28,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from pydantic import ValidationError
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, exists, select, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,9 +45,9 @@ from ..agent_protocol import (
 )
 from ..errors import ApiError, database_unavailable, internal_error, validation_error
 from ..ipnet import parse_cidr
-from ..models import Agent, Observation, ScanTarget, Subnet
+from ..models import Agent, Observation, ScanTarget, Subnet, Token
 from . import scans
-from .agents import record_token_use
+from .agents import record_token_use, token_in_use, token_refused
 from .scans import utc
 
 # spec §5.4: observations unseen for this long are pruned at ingest
@@ -85,12 +89,31 @@ def _duration_ms(report: ResultsRequest) -> int:
     return min(ms, _DURATION_MS_MAX)
 
 
+async def _credential_live(session: AsyncSession, agent: Agent) -> bool:
+    """Whether the agent is still `active` and the token that authenticated this
+    request still unrevoked, as committed. The caller holds the write lock."""
+    token_live = exists().where(Token.id == token_in_use(session), Token.revoked_at.is_(None))
+    found = await session.scalar(
+        select(Agent.id).where(Agent.id == agent.id, Agent.state == "active", token_live)
+    )
+    return found is not None
+
+
 async def _release(
     session: AsyncSession, agent: Agent, target: ScanTarget, report: ResultsRequest
 ) -> None:
     """Clear both copies of the lease and record the scan on the target. Each update
     applies only while the copy still names this job, so a second result set for it,
-    or one racing this, is refused; nothing is written then."""
+    or one racing this, is refused; nothing is written then.
+
+    First, under the write lock, the request's credential is checked again: a result
+    set authenticated before the owner disabled, revoked or deleted the agent, or
+    before a re-enrol exchange revoked its token, is refused `403` with nothing
+    written, as check-in's claim refuses a check-in (`jobs._claim`)."""
+    await scans.take_write_lock(session)
+    if not await _credential_live(session, agent):
+        await session.rollback()
+        raise token_refused()
     issued = utc(target.job_issued_at) or _now()
     cleared = await session.execute(
         update(ScanTarget)

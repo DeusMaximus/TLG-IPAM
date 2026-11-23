@@ -19,9 +19,9 @@ from app.agent_protocol import ENROL_TOKEN_PREFIX, HOSTNAME_MAX, EnrolRequest
 from app.config import settings
 from app.database import SessionLocal, engine
 from app.main import app
-from app.models import Agent, Token
+from app.models import Agent, Change, Token
 from app.services import agents as agents_svc
-from app.services import enrolment
+from app.services import enrolment, jobs
 from app.services.changes import WITHHELD
 
 from .conftest import app_database, enrol, make_enrolled_agent, write_lock
@@ -231,6 +231,34 @@ async def test_a_token_that_expires_while_its_body_arrives_is_refused(client, ag
     assert every_row() == before
 
 
+async def test_a_token_that_expires_while_the_exchange_waits_for_the_writer_is_refused(
+    client, agent_api, monkeypatch
+):
+    """Briefed review of PR #124, finding 2: the time is read once the write lock is
+    held. Another connection holds SQLite's writer (`BEGIN IMMEDIATE`) while the token
+    is still live; the exchange looks the token up, reads its body and queues for the
+    writer; the token expires; the writer is released. No service clock is replaced."""
+    created = await create(client)
+    [token] = await tokens_of(created["id"])
+    await set_token(token.id, expires_at=_now() + timedelta(seconds=1))
+    queued = asyncio.Event()
+    real = enrolment.scans.take_write_lock
+
+    async def queue(session):
+        queued.set()  # the lookup and the body read passed: the token was live then
+        return await real(session)
+
+    monkeypatch.setattr(enrolment.scans, "take_write_lock", queue)
+    before = every_row()
+    with write_lock():
+        exchange = asyncio.create_task(enrol(agent_api, created["enrol_token"]))
+        await asyncio.wait_for(queued.wait(), timeout=5)
+        await asyncio.sleep(1.5)  # past expiry, inside the 5-second busy timeout
+    res = await exchange
+    assert res.status_code == 403, res.text
+    assert every_row() == before
+
+
 async def test_an_expired_token_is_refused_by_the_compare_and_set_too(client, agent_api, monkeypatch):
     """Expiry between the read and the claim: the service's check lets the token
     through and the claim, under the write lock, refuses it."""
@@ -247,6 +275,36 @@ async def test_an_expired_token_is_refused_by_the_compare_and_set_too(client, ag
     res = await enrol(agent_api, created["enrol_token"])
     assert res.status_code == 403
     assert every_row() == before
+
+
+@pytest.mark.parametrize("owner_write", ["revoke", "disable"])
+async def test_an_owner_write_between_the_lookup_and_the_claim_refuses_the_exchange(
+    client, agent_api, monkeypatch, owner_write
+):
+    """Briefed review of PR #124: the claim's own `revoked_at` and agent-state
+    conditions. The service's check passes; the owner's revoke or disable then commits
+    before the exchange takes the write lock; the claim refuses it."""
+    created = await create(client)
+    real = enrolment.scans.take_write_lock
+    done = []
+
+    async def owner_first(session):
+        if not done:  # the exchange's lock; the owner's own lock passes through
+            done.append(True)
+            if owner_write == "revoke":
+                res = await client.post(f"/api/v1/agents/{created['id']}/revoke")
+            else:
+                res = await client.put(f"/api/v1/agents/{created['id']}", json={"enabled": False})
+            assert res.status_code == 200, res.text
+        return await real(session)
+
+    monkeypatch.setattr(enrolment.scans, "take_write_lock", owner_first)
+    res = await enrol(agent_api, created["enrol_token"])
+    assert done and res.status_code == 403, res.text
+    assert [t.kind for t in await tokens_of(created["id"])] == ["enrol"]
+    [token] = await tokens_of(created["id"])
+    assert token.used_at is None
+    assert (await get_agent(client, created["id"]))["state"] != "active"
 
 
 async def test_a_revoked_enrolment_token_is_refused(client, agent_api):
@@ -460,6 +518,7 @@ async def test_two_re_enrols_that_meet_leave_one_exchangeable_token(client, agen
 
     monkeypatch.setattr(agents_svc.scans, "take_write_lock", together)
     results = await asyncio.gather(*(re_enrol(client, created["id"]) for _ in range(2)))
+    monkeypatch.setattr(agents_svc.scans, "take_write_lock", real)  # the exchanges below
     assert [r.status_code for r in results] == [201, 201]
     plains = [r.json()["data"]["enrol_token"] for r in results]
     now = _now()
@@ -486,8 +545,9 @@ async def test_an_owner_revoke_or_delete_waiting_on_an_exchange_acts_on_its_toke
     real = agents_svc.scans.take_write_lock
 
     async def after_the_exchange(session):
-        arrived.set()
-        await asyncio.wait_for(release.wait(), timeout=10)
+        if not arrived.is_set():  # the owner's write; the exchange's own lock passes
+            arrived.set()
+            await asyncio.wait_for(release.wait(), timeout=10)
         return await real(session)
 
     monkeypatch.setattr(agents_svc.scans, "take_write_lock", after_the_exchange)
@@ -504,6 +564,67 @@ async def test_an_owner_revoke_or_delete_waiting_on_an_exchange_acts_on_its_toke
     assert (await checkin(agent_api, new)).status_code == 403
     live = [t for t in await tokens_of(agent["id"]) if agents_svc.live(t, _now())]
     assert live == []
+
+
+def hold_owner_write_at_the_lock(monkeypatch):
+    """Patch the write lock so the first caller (the owner's write) waits at it until
+    `release` is set, after `arrived`; every later caller (the exchange) passes."""
+    arrived, release = asyncio.Event(), asyncio.Event()
+    real = agents_svc.scans.take_write_lock
+
+    async def held(session):
+        if not arrived.is_set():
+            arrived.set()
+            await asyncio.wait_for(release.wait(), timeout=10)
+        return await real(session)
+
+    monkeypatch.setattr(agents_svc.scans, "take_write_lock", held)
+    return arrived, release
+
+
+async def test_a_stale_enable_does_not_return_an_enrolled_agent_to_pending(
+    client, agent_api, monkeypatch
+):
+    """Briefed review of PR #124, finding 1: Enable A reaches the lock; Enable B
+    returns the disabled, never-enrolled agent to `pending`; the agent exchanges its
+    token; A then reads the agent as committed, active with an agent token, and leaves
+    it active. Before the fix A decided from tokens it read before the exchange."""
+    created = await create(client)
+    await client.put(f"/api/v1/agents/{created['id']}", json={"enabled": False})
+    arrived, release = hold_owner_write_at_the_lock(monkeypatch)
+    enable_a = asyncio.create_task(
+        client.put(f"/api/v1/agents/{created['id']}", json={"enabled": True})
+    )
+    await asyncio.wait_for(arrived.wait(), timeout=5)
+    res = await client.put(f"/api/v1/agents/{created['id']}", json={"enabled": True})
+    assert res.json()["data"]["state"] == "pending"
+    res = await enrol(agent_api, created["enrol_token"])
+    assert res.status_code == 200, res.text
+    token = res.json()["data"]["agent_token"]
+    release.set()
+    assert (await enable_a).status_code == 200
+    assert (await get_agent(client, created["id"]))["state"] == "active"
+    assert (await checkin(agent_api, token)).status_code == 200
+
+
+async def test_a_disable_waiting_on_an_exchange_logs_the_agent_as_the_exchange_left_it(
+    client, agent_api, monkeypatch
+):
+    """Briefed review of PR #124, finding 1's second case: the Disable's `before`
+    snapshot is the agent as committed after the exchange, report included."""
+    created = await create(client)
+    arrived, release = hold_owner_write_at_the_lock(monkeypatch)
+    disable = asyncio.create_task(
+        client.put(f"/api/v1/agents/{created['id']}", json={"enabled": False})
+    )
+    await asyncio.wait_for(arrived.wait(), timeout=5)
+    assert (await enrol(agent_api, created["enrol_token"], **REPORT)).status_code == 200
+    release.set()
+    assert (await disable).status_code == 200
+    entry = (await client.get("/api/v1/changes?entity_type=agent&limit=1")).json()["data"][0]
+    assert entry["summary"] == "agent vlan10 disabled"
+    assert (entry["before"]["state"], entry["before"]["hostname"]) == ("active", "scanner-20")
+    assert entry["after"]["state"] == "disabled"
 
 
 async def test_re_enrol_of_a_disabled_agent_is_409_and_of_an_unknown_one_404(client):
@@ -581,6 +702,43 @@ async def test_the_exchange_is_logged_as_the_agent(client, agent_api):
     assert mine["after"]["hostname"] == WITHHELD
 
 
+async def test_the_exchange_keeps_the_agents_own_entries_to_their_cap(client, agent_api):
+    """Briefed review of PR #124, finding 4: the exchange's agent entry counts towards
+    the newest `AGENT_AUDIT_KEEP` (100) of the agent's own entries, pruned in its own
+    transaction; owner entries and token entries are not touched."""
+    created = await create(client)
+    async with SessionLocal() as session:
+        for i in range(jobs.AGENT_AUDIT_KEEP):
+            session.add(
+                Change(
+                    ts=_now() - timedelta(days=1, seconds=i),
+                    entity_type="agent",
+                    entity_id=created["id"],
+                    action="update",
+                    summary="an older entry of the agent's own",
+                    source="agent",
+                )
+            )
+        await session.commit()
+    assert (await enrol(agent_api, created["enrol_token"])).status_code == 200
+    async with SessionLocal() as session:
+        mine = list(
+            (
+                await session.scalars(
+                    select(Change)
+                    .where(Change.source == "agent", Change.entity_type == "agent")
+                    .order_by(Change.ts.desc())
+                )
+            ).all()
+        )
+        others = list((await session.scalars(select(Change).where(Change.source != "agent"))).all())
+        tokens = list((await session.scalars(select(Change).where(Change.entity_type == "token"))).all())
+    assert len(mine) == jobs.AGENT_AUDIT_KEEP
+    assert mine[0].summary == "agent vlan10 enrolled"
+    assert [c.action for c in others] == ["create", "create"]  # the owner's create
+    assert len(tokens) == 3  # issued, exchanged, agent token issued: none pruned
+
+
 async def test_re_enrol_is_logged_as_the_owner(client):
     created = await create(client)
     logged = len((await client.get("/api/v1/changes?limit=200")).json()["data"])
@@ -604,17 +762,17 @@ async def test_re_enrol_is_logged_as_the_owner(client):
 
 
 async def test_two_exchanges_of_one_token_pass_once(client, agent_api, monkeypatch):
-    """Both requests have read the token as usable before either claims it: only the
-    compare-and-set can tell them apart."""
+    """Both requests have read the token as usable before either takes the write lock
+    and claims it: only the compare-and-set, under the lock, can tell them apart."""
     created = await create(client)
     barrier = asyncio.Barrier(2)
-    real = enrolment._claim
+    real = enrolment.scans.take_write_lock
 
-    async def together(*args):
+    async def together(session):
         await asyncio.wait_for(barrier.wait(), timeout=10)
-        return await real(*args)
+        return await real(session)
 
-    monkeypatch.setattr(enrolment, "_claim", together)
+    monkeypatch.setattr(enrolment.scans, "take_write_lock", together)
     results = await asyncio.gather(*(enrol(agent_api, created["enrol_token"]) for _ in range(2)))
     assert sorted(r.status_code for r in results) == [200, 403]
     agent_tokens = [t for t in await tokens_of(created["id"]) if t.kind == "agent"]
