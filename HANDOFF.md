@@ -27,37 +27,73 @@ Template:
 
 ---
 
-## 2026-11-24 — Claude Code (Fable 5.2), orchestrator — six PRs merged; #86 in a fix after a NO-GO; #22's review handed to the owner
-- **Done:** six PRs squash-merged on the owner's go-ahead, remote branches deleted. The newest worker entries are below; older ones are in the archive.
+## 2026-11-24 — Claude Code (Fable 5.2), orchestrator — seven PRs merged; PR #130 (#22) held at a NO-GO; session ended on an unstable network
+- **Done:** seven PRs squash-merged on the owner's go-ahead, remote branches deleted. The newest worker entries are below; older ones are in the archive.
   - First wave: #122 (#120) `ed4a7d6`; #123 (#121) `d067821`, a packet slot ends with the event-loop step it was granted in; #124 (#21) `0226262`, enrolment tokens, `POST /api/v1/agent/enrol`, re-enrol.
-  - Second wave: #127 (#125) `45712d5` and #128 (#126) `ded8622`, Sonnet 5.5, tests only. #131 (#90) `c5d7139`, Opus 5.5: a 16 MiB budget and a 60 s deadline on request bodies; one briefed round (Codex, GPT-6.1 Sol), GO with no findings.
-  - #92 is narrowed to what #124 left of it: the plain-HTTP warning comes only after the enrolment token has been issued, and should come before.
+  - Second wave: #127 (#125) `45712d5` and #128 (#126) `ded8622`, tests only. #131 (#90) `c5d7139`: a 16 MiB budget and a 60 s deadline on request bodies; one briefed round, GO with no findings. #129 (#86) `e8cfe1e`: `list_scan_findings` bounded per call and per finding; two briefed rounds, NO-GO (one P2) then GO with two P3s.
+  - Filed on the owner's go-ahead: #132 (request headers and idle connections below the app; blocks #26; from #131's round) and #133 (a call with `subnet_id` loads the subnet's whole row; from #129's round 2). #92 is narrowed to what #124 left of it.
 - **Decisions (the owner's, 2026-11-24):**
-  - Go-ahead for both waves. The second ran five workers at once against the file's limit of three; the owner was told.
   - #100: option 4. The result set reports name lookups separately from liveness; a name is cleared only on an answered "no name"; `PROTOCOL_VERSION` rises. Recorded on the issue.
-  - #91: the 2 MiB bound on an import stands and the dialog does not batch. Length limits on write: `domain` 253 characters (PR #129 has it), `notes` 4,096; a row over one is that row's `error`. Recorded on the issue.
+  - #91: the 2 MiB bound on an import stands and the dialog does not batch. `domain` is at most 253 characters (in since #129), `notes` at most 4,096; a row over one is that row's `error`. Recorded on the issue.
+  - Merging #129 accepted its new limit: a subnet holds at most 100 reserved ranges, on every path that adds one. A subnet already over it keeps its ranges and cannot add.
   - #5 and #25 (`owner` label): the owner runs them later, after rebuilding the deployment. Do not raise them in every report. #25 still comes before the rest of M3.
-- **State:** `main` is `c5d7139` plus hand-off commits. Measured on each PR head merged with `main` before its merge: 1,059 server tests with #131; 924 agent tests since #127.
-  - **PR #129 (#86), in a fix.** Briefed round 1 at `591b8bf`: NO-GO, one P2 and two P3s (`.dev/86/review-1.md`, and on the PR). The P2: the scope read (`scans._scopes_of_chunk`) scans all of `reserved_ranges` and returns every excluded range, outside the call's bound. The worker (thread "#86 — bound list_scan_findings…", branch `86-bound-findings-call`) has all three and may answer with a limit on reserved ranges per subnet: bring that to the owner before the merge. Then `@codex review` and round 2 on the new head.
-  - **PR #130 (#22), waiting on the owner's manual review.** Head `fb39dd7`, CI green, Codex clean. Two Sol sessions failed: one on the network, one on an access gate ("not authenticated with one of your authorized hardware keys") while it tested who can change the unit's code. `.dev/22/manual-handover.md` has the message word for word and what the session established; its logs are in `.dev/22/review-1-partial/`. Two leads it left unrated: `install.not_root_only` does not check the venv's other packages or the links between the unit's interpreter and its file. They have **not** been sent to the worker; the owner chose to wait for the review.
-  - The main checkout was found detached at `fb39dd7` (the review of #130 is being run there). This entry was committed from a separate worktree; do not move the main checkout's HEAD while that review runs.
-  - Both open PRs merge cleanly with `main` at `c5d7139`. Measured on the merges before #131 landed: #129 1,028 server tests; #130 1,137 agent and 1,020 server tests, and the container path (first start enrols, a recreated container on the same volume ignores the spent token) repeated with no network.
-  - Since #131: a body has 60 s to arrive whole (`408`), and all bodies in progress share 16 MiB (`503`). One sender that keeps the budget full holds every other body off; per-client limits, header size and idle connections are left to the proxy (brief §4.3).
-  - Until #22 merges a new agent is enrolled by hand: the Add dialog shows the `tlge_` token and a `curl` for the exchange. Re-enrol is API-only until #23.
-  - The enrol throttle is global and in memory: 10 attempts that did not enrol per 60 s.
+  - The owner ended the session with PR #130 at its NO-GO: its findings were **not** sent to the worker, because the network was too unstable to finish a fix and another round.
+- **State:** `main` is `e8cfe1e` plus hand-off commits. CI was green on `c5d7139`; it had just started on `e8cfe1e` when this was written, so check it. Measured on #129's head merged with `main` at `c5d7139`: 1,069 server tests. Agent tests: 924 since #127.
+  - **PR #130 (#22) is open and held.** Head `fb39dd7`, CI green, Codex clean, merges cleanly with `main` at `e8cfe1e`. Briefed round 1, run by the owner by hand (Codex, GPT-6 with Daybreak Blue): **NO-GO, three P2s and two P3s**, on the PR thread and in `.dev/22/review-1.md`. All five are in the systemd installer; the container path is not touched by any.
+    - P2: `install.not_root_only` misses the venv's dependencies, `.pth` files and intermediate symlinks, and the CLI imports venv code as root before the check runs.
+    - P2: `--enrol-token tlge_…` on the command line is readable by another local user in `/proc/<pid>/cmdline` during the exchange. The reviewer wants only the stdin form (`--enrol-token -`).
+    - P2: a `--ca-file` root can read and the service user cannot passes the check; the install spends the token and the service then cannot authenticate.
+    - P3: a malformed agent token in a `200` answer (`tlga_!`) is stored as usable. P3: `uninstall` deletes a `tlg-ipam-agent` account it did not create.
+    - The worker's thread is "#22 — agent enrolment exchange and systemd installer (worker, Opus 5.5)", branch `22-agent-enrol-install`. Send it the review, then `@codex review` and a round 2 on the new head.
+  - **Reviewing #22 needs the owner.** Two sessions of the roster's reviewer (GPT-6.1 Sol) failed on it: one on the network, one on an access gate ("not authenticated with one of your authorized hardware keys") while it tested who can change the unit's code. Expect round 2 to meet the same gate: brief it, and hand it to the owner if it does (`.dev/22/manual-handover.md` is the model for the hand-over file; the brief is `.dev/22/review-brief-1.md`).
+  - Since #131: a body has 60 s to arrive whole (`408`), and all bodies in progress share 16 MiB (`503`). One sender that keeps the budget full holds every other body off; per-client limits, header size and idle connections are left to the proxy (brief §4.3; #132).
+  - Since #129: one `list_scan_findings` call runs at most 100 statements and may return an empty page with a cursor; three address indexes and one on reserved ranges are created at start-up; a finding is at most 5,000 bytes.
+  - Until #22 merges a new agent is enrolled by hand: the Add dialog shows the `tlge_` token and a `curl` for the exchange. Re-enrol is API-only until #23. The enrol throttle is global and in memory: 10 attempts that did not enrol per 60 s.
   - Since #121 scans take longer (a 254-address `icmp,arp,rdns` job at 200 pps: 7.2 s to 7.7 s on macOS in single runs). One that only just fitted its timeout can end incomplete.
   - Still true from earlier entries: ARP is on by default for a new target; a stuck `resolv.conf` read leaves later scans that rely on the host's resolvers incomplete until the agent restarts; a subnet's CIDR stored before #97 keeps its spelling until its next edit.
-  - Reviews: Greptile reviews only the first head of a PR. Codex's state is in its summary comment (`codex-review-state:v1`). On 2026-11-24 the owner's network was on a hotspot and three review sessions died on "Connection failed"; each was restarted once, with its findings written to disk as it went.
+  - Reviews: Greptile reviews only the first head of a PR. Codex's state is in its summary comment (`codex-review-state:v1`). Three Sol sessions died on "Connection failed" on 2026-11-24; a restarted session told to write its findings to disk as it goes loses less.
   - Nothing wakes the orchestrator when a worker opens its PR: look for open PRs at the start of each turn.
-- **Waiting on the owner:**
-  - The manual review of PR #130 (Codex app, GPT-6 with Daybreak Blue, hardware key).
-  - Whether to file a follow-up from #131's round: uvicorn takes unbounded request headers on httptools and never closes idle connections. The reviewer says it may follow the merge but must be closed, in the image or by verified proxy settings, before #26 exposes `/mcp`.
+  - Review briefs and reviews of this wave are in `.dev/86/`, `.dev/90/` and `.dev/22/` in the main checkout (not committed).
+- **Waiting on the owner:** a go-ahead to resume, when the network is stable. Nothing else.
 - **Next:**
-  - Round 2 on #129 when its fix lands. Verify #130 again when its review is posted; a P1 or P2 goes to the worker (thread "#22 — agent enrolment exchange…").
-  - #100 after #22 merges (same agent files; Opus 5.5, briefed). #91 after #86 merges (adds `notes` only; Opus 5.5, automatic reviews).
-  - #23 after #22: its systemd tab shows `--enrol-token -` (the token on standard input), its container tab a volume and `IPAM_ENROL_TOKEN`. Then #92 on the same dialog. #24 waits on #22; #94 goes with #24. #93 and #20 are stretches.
-  - Then M3 (#26 to #32) after #25. No OAuth grant may be issued before #28's write-scope checks are in force.
+  - First: send #130's review to its worker; round 2 on the fix; merge on a GO.
+  - Ready now, none started: #132 (Opus 5.5, briefed; the image's start command and the documents), #91 (adds `notes` only; Opus 5.5, automatic reviews) and #133 (tests and one narrow read; Sonnet 5.5 or Opus 5.5, automatic reviews). #91 and #133 both touch the findings and MCP tests: run them one after the other.
+  - After #22 merges: #100 (same agent files; Opus 5.5, briefed), then #23, whose systemd tab shows the stdin form of the command and whose container tab shows a volume and `IPAM_ENROL_TOKEN`, then #92 on the same dialog. #24 waits on #22; #94 goes with #24. #93 and #20 are stretches.
+  - Then M3 (#26 to #32) after #25. #26 also waits on #132. No OAuth grant may be issued before #28's write-scope checks are in force.
   - No real-network test is planned. The owner's permission to send packets on the test host covered 2026-11-23 only: ask again first.
+
+## 2026-11-24 — Claude Code (Opus 5.5), worker — #86: bound list_scan_findings' work per call and the size of one finding (PR #129)
+- **Done:** [PR #129](https://github.com/DeusMaximus/TLG-IPAM/pull/129) (`86-bound-findings-call`, head `f77e53f`) closes #86.
+  - `findings.list_named` reads each subnet in chunks (`_read_chunk`) along `(subnet_id, ip_int)` indexes on hosts, observations and dismissals.
+    - At most `CALL_STATEMENTS` (100) statements per call, each returning at most `SCAN_CHUNK` (250) rows per table.
+    - Inside a scanned DHCP pool, observations are read only at the chunk's hosts' addresses.
+    - Subnets that cannot hold a finding cost no statement. A call that hits the limit returns a short or empty page with a cursor.
+  - The scope read uses a covering index on reserved ranges `(subnet_id, scan_excluded, start_int, end_int)`. A subnet holds at most `schemas.SUBNET_RESERVED_RANGES_MAX` (100) reserved ranges on every add path, counted under the write lock.
+  - A domain is at most 253 characters (`ipnet.DOMAIN_MAX`), so a finding is at most `FINDING_MAX` (5,000) bytes; the largest built is 4,880. A host whose domain was stored longer is listed with `host_fqdn` null.
+  - The page budget counts brackets and commas. A cursor address above 64 bits never reaches SQL.
+  - Startup creates declared indexes missing from existing tables (`database._add_missing_indexes`).
+  - Docs:
+    - brief: tool row, §3 domain and range rules, the `add_reserved_range` row;
+    - spec: §5.8 and new §7.2 invariant 9;
+    - `AGENTS.md`: the MCP bullet and the schema bullet;
+    - the tool docstrings.
+  - Merged: `e8cfe1e`, squash, on the owner's go-ahead, which accepted the 100-range limit; the remote branch is deleted. CI green and Codex clean on `f77e53f`. Greptile reviewed only the first head (`6870cae`, nothing raised) and was not retriggered. Briefed rounds (Codex, GPT-6.1 Sol): NO-GO at `591b8bf` (one P2, two P3s), GO at `f77e53f` with two P3s. The first is filed as #133; the second, contradictory figures in the PR body, the orchestrator corrected in the body without a commit. The orchestrator ran 1,069 server tests on the head merged with `main` at `c5d7139`, disabled the limit (its one test went red), and on the earlier head removed the observations index (the plan and work tests went red). Nothing from this entry is waiting on the owner any more.
+- **Decisions:** PR body Deliberate calls 1–9.
+  - The bound is on statements, each with a row bound and an index.
+  - It has two exceptions: the subnet list, and the excluded ranges of a subnet stored with more than 100 before the limit, which its scope reads whole.
+  - Cursors from a stop never name an unhosted pool address.
+  - A stored over-long domain is refused when a write resends it.
+  - An over-long stored domain gives null `host_fqdn`, not a cut value.
+  - Schema: four new indexes, no column or table change.
+- **State:** CI green on `f77e53f`; Codex clean on it.
+  - Earlier Codex P1s on `6870cae` and `6e3e6f1` are fixed and answered on their threads.
+  - Greptile reviewed only `6870cae` (no findings).
+  - Briefed round 1 at `591b8bf` was NO-GO (P2 scope read, P3 walk fixture, P3 figures); all three are fixed at `f77e53f`.
+  - Locally: 1,029 server and 922 agent tests pass. The head merges cleanly with `main` at `b391e84`.
+- **Waiting on the owner:**
+  - The 100-range limit and its legacy exception (Deliberate call 9): accept or overrule.
+  - The Greptile retrigger, the briefed round 2 (the orchestrator runs it on `f77e53f`), and the merge.
+- **Next:** #91 adds only the `notes` limit, since `domain` is at 253 here. #26 can expose `/mcp` once #129 and #90 are in.
 
 ## 2026-11-24 — Claude Code (Opus 5.5), worker — #90: a budget and a deadline on request bodies (PR #131)
 - **Done:** [PR #131](https://github.com/DeusMaximus/TLG-IPAM/pull/131) (`90-bound-unauthenticated-bodies`, head `4efe69d`) closes #90.
@@ -94,26 +130,3 @@ Template:
 - **State:** green. Agent suite: 924 passed on Python 3.13.12 and on 3.11.18 (922 on `main` at `a8534eb`, plus 2). CI is green on `6559de8`. Codex and Greptile both reviewed the head with no findings, and none are open. Mutation (a `sleep(0)` before `dns.asyncquery.udp`): the new test fails on the open-slot assertion and the control passes. Control with a blind check: the control fails. The mutation worktree was removed and never committed. No schema change.
 - **Waiting on the owner:** the merge.
 - **Next:** nothing from this entry. #22 owns the rest of `agent/`; the one new file in `agent/tests/` and the `Pacer` docstring edit should not conflict with it.
-
-## 2026-11-24 — Claude Code (Opus 5.5), worker — #21: enrolment tokens, the enrol exchange and re-enrol (PR #124)
-- **Done:** [PR #124](https://github.com/DeusMaximus/TLG-IPAM/pull/124) (`21-enrolment-tokens`, head `b45a723`) closes #21.
-  - "Add agent" creates the agent `pending` with a single-use `tlge_` token good for an hour.
-  - `POST /api/v1/agent/enrol` (`services/enrolment`, on its own `enrol_router`, outside `require_agent`) exchanges the bearer for the agent token. One transaction, under the write lock, with the time read after the lock: a compare-and-set on `used_at`, the old agent token revoked, the new one issued, the agent `active`, the agent's own audit entries pruned to 100.
-  - `POST /agents/{id}/re-enrol` issues a new enrolment token.
-  - A global throttle sits in front: 10 failed attempts per 60 s, in memory.
-  - The exchange is logged `source="agent"` with `actor`.
-  - Re-enrol, update, revoke and delete read the agent under the write lock (`agents._locked_agent`).
-  - Scope extension decided by the orchestrator: results ingest rechecks the agent's state and its token under the write lock (`results._credential_live`), which also closes the owner-revoke race that was on `main`.
-  - Docs: brief (new §4.8, §4.6), spec §4.2/§5.4/§5.6/§5.7, `AGENTS.md`, README.
-  - No schema change; `PROTOCOL_VERSION` unchanged.
-  - Merged: `0226262`, squash, on the owner's go-ahead, after #123; the remote branch is deleted. CI green and Codex clean on `b45a723`. Greptile reviewed only the first head (`c3804f1`: three findings, all fixed and answered) and was not retriggered. Briefed rounds (Codex, GPT-6.1 Sol): NO-GO at `c72e0a8`, GO at `b45a723` with one P3, filed as #126. The orchestrator ran 1019 server, 899 agent and 125 web tests on the head merged with `main`, removed the ingest credential check (its four cases went red), and on an earlier head the claim's fresh timestamp and its `used_at` condition (each caught). Nothing from this entry is waiting on the owner any more.
-- **Decisions:** PR body Deliberate calls 1–17.
-  - Optional body fields; null leaves the stored value.
-  - One 403 for every refusal; the body is read only for a usable token.
-  - Only live tokens are revoked.
-  - Re-enrol is refused for a disabled agent and leaves leases to run out.
-  - The create response field `token` became `enrol_token` plus `enrol_token_expires_at`.
-  - The interim dialog never builds a plain-http command across a network.
-- **State:** server 1019, agent 898, web 125 tests pass; lint and build clean. CI green and Codex clean on `b45a723`. Greptile last reviewed `c3804f1` (three P1s, all fixed and answered) and needs a manual retrigger. The first briefed round (Codex, GPT-6.1 Sol, on `c72e0a8`) was NO-GO with three P2s and a P3; all are fixed on `b45a723` (call 17). The branch is not merged with `main` at `c28abfb`. Until #22, a new agent is enrolled by hand with the dialog's `curl`; re-enrol is API-only until #23 (the README gives the call).
-- **Waiting on the owner:** the second briefed round on `b45a723` (the orchestrator starts it), a Greptile retrigger, then merge.
-- **Next:** #22 (the agent exchanges `IPAM_ENROL_TOKEN` itself; the systemd installer) and #23 (guided install, Re-enrol button, pending enrolments). PR #123's files were not touched.
