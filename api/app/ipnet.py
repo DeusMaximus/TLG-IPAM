@@ -8,6 +8,11 @@ from .errors import validation_error
 
 _MAC_RE = re.compile(r"^[0-9a-f]{12}$")
 _DOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$")
+# The longest domain suffix a subnet or a host takes: the longest a DNS name can be in
+# text (RFC 1035's 255 octets on the wire). Until #86 only the request-body cap bounded
+# it, so a row stored before then can hold a longer one; it keeps it until a write sends
+# its domain, and `findings.list_named` leaves such a host's `host_fqdn` null.
+DOMAIN_MAX = 253
 
 
 def parse_cidr(cidr: str) -> ipaddress.IPv4Network:
@@ -51,6 +56,9 @@ def ip_in_subnet(ip: str, cidr: str) -> ipaddress.IPv4Address:
 
 def normalise_domain(domain: str) -> str:
     cleaned = domain.strip().strip(".").lower()
+    if len(cleaned) > DOMAIN_MAX:
+        # the value is not repeated: it can be as long as the request-body cap
+        raise validation_error(f"Domain suffix is longer than {DOMAIN_MAX} characters")
     if not _DOMAIN_RE.match(cleaned):
         raise validation_error(f"Domain suffix {domain!r} is invalid")
     return cleaned

@@ -39,7 +39,16 @@ def _add_missing_columns(conn):
                 conn.execute(text(ddl))
 
 
+def _add_missing_indexes(conn):
+    """New indexes on existing tables: `create_all` makes a table's indexes only with
+    the table, so one declared later is created here, once (`checkfirst`)."""
+    for table in Base.metadata.sorted_tables:
+        for index in table.indexes:
+            index.create(conn, checkfirst=True)
+
+
 async def init_models(target: AsyncEngine = engine):
     async with target.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_add_missing_columns)
+        await conn.run_sync(_add_missing_indexes)

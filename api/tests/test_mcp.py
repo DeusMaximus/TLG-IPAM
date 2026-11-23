@@ -1,14 +1,18 @@
 import base64
+import ipaddress
 import json
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastmcp import Client
-from sqlalchemy import func, select
+from sqlalchemy import delete, event, func, select, update
 
-from app.database import SessionLocal
+from app.database import SessionLocal, engine
 from app.mcp_server import mcp
-from app.models import Change
+from app import ipnet
+from app.models import Base, Change, Host, Observation, ReservedRange, ScanTarget, Subnet
+from app.schemas import SUBNET_RESERVED_RANGES_MAX
 from app.services import findings as findings_svc
 from app.services import scans
 
@@ -21,7 +25,17 @@ from .test_checkin import (  # noqa: F401 (agent_api is a fixture)
     set_target,
     target_row,
 )
-from .test_findings import HOSTILE, MAC, OTHER_MAC, dismiss, key, observe
+from .test_findings import (
+    HOSTILE,
+    LONG_AGO,
+    MAC,
+    OTHER_MAC,
+    backdate,
+    dismiss,
+    key,
+    observe,
+    statements,
+)
 from app.ipnet import parse_ip
 from .test_findings import findings as rest_findings
 
@@ -175,34 +189,52 @@ async def call(name: str, args: dict):
         return await mcp_client.call_tool(name, args, raise_on_error=False)
 
 
+def findings_array(text: str) -> str:
+    """The `findings` array exactly as a result's text block carries it: the last key of
+    the compact JSON object, measured on the bytes sent, not summed per finding."""
+    marker = '"findings":'
+    assert text.endswith("]}"), text[-40:]
+    array = text[text.index(marker) + len(marker) : -1]
+    assert json.loads(array) == json.loads(text)["findings"]
+    return array
+
+
+def encoded(value) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode())
+
+
 async def scan_page(**args) -> dict:
     """One page of list_scan_findings, checked as every page must be."""
-    result = await call("list_scan_findings", args)
+    with statements() as count:
+        result = await call("list_scan_findings", args)
     assert not result.is_error, result.content[0].text
+    # the work one call does is bounded, whatever the data (#86)
+    assert count[0] <= findings_svc.CALL_STATEMENTS
     page = result.data
     assert set(page) == {"findings", "returned", "next_cursor", "note"}
     assert page["returned"] == len(page["findings"]) <= findings_svc.PAGE_SIZE
     # the warning travels with every page, not only the first
     assert page["note"] == findings_svc.NETWORK_REPORTED_NOTE
-    # within the size budget, unless one finding alone is larger
-    used = sum(findings_svc._encoded_size(f) + 1 for f in page["findings"])
-    assert used <= findings_svc.PAGE_BUDGET or page["returned"] == 1
-    # a page that says there is more is never empty
-    if page["next_cursor"] is not None:
-        assert page["returned"] >= 1
+    # within the size budget, measured on the array as sent, and every finding within
+    # its own bound: no page is an exception (#86)
+    assert len(findings_array(result.content[0].text).encode()) <= findings_svc.PAGE_BUDGET
+    assert all(encoded(f) <= findings_svc.FINDING_MAX for f in page["findings"])
     return page
 
 
 async def scan_pages(**args) -> list[list[dict]]:
-    """Every page, following next_cursor to the end."""
+    """Every page, following next_cursor to the end. A page can be short or empty and
+    still have a cursor (a call stops at the work bound); every cursor moves on."""
     pages = []
     cursor = None
     while True:
         page = await scan_page(**args, **({"cursor": cursor} if cursor else {}))
         pages.append(page["findings"])
-        cursor = page["next_cursor"]
-        if cursor is None:
+        if page["next_cursor"] is None:
             return pages
+        assert page["next_cursor"] != cursor
+        assert len(pages) < 2000
+        cursor = page["next_cursor"]
 
 
 async def scan_findings(**args) -> list[dict]:
@@ -453,6 +485,14 @@ async def test_a_well_formed_cursor_is_read_as_a_position(client):
     page = await scan_page(cursor=_cursor(made_up))
     assert [f["ip"] for f in page["findings"]] == ["10.0.0.30"]
     assert (await scan_page(cursor=_cursor(["x" * 1000, *GOOD_CURSOR[1:]])))["findings"] == []
+    # an address past what a row can hold is a position after every stored one: the
+    # subnet is done, never an internal error from SQLite's 64-bit integers
+    for ip_int in (2**63, 2**100, 2**128 - 1):
+        beyond = ["lab", subnet["cidr"], subnet["id"], ip_int, "unknown_host"]
+        page = await scan_page(cursor=_cursor(beyond))
+        assert (page["findings"], page["next_cursor"]) == ([], None)
+    edge = ["lab", subnet["cidr"], subnet["id"], 2**63 - 1, "unknown_host"]
+    assert (await scan_page(cursor=_cursor(edge)))["findings"] == []
 
 
 @pytest.mark.parametrize("name", ["😀" * 120, '"' * 120, "\\" * 120, "\x01" * 120])
@@ -475,8 +515,11 @@ async def test_paging_through_a_subnet_with_a_long_unicode_name(client):
 
 
 async def test_a_page_at_every_field_maximum_fits_a_client(client):
-    """The page size holds against the largest finding the API can make: every name at
-    its maximum length (the measurement behind `findings.PAGE_SIZE`)."""
+    """The page size holds against ASCII names at their maximum length, the measurement
+    behind `findings.PAGE_SIZE`: a page of 25 of them fits a client. Not the largest
+    finding: control characters, which JSON writes in 6 bytes each, make larger ones,
+    and the size budget cuts their pages short
+    (`test_pages_of_accepted_long_values_fit_a_client`)."""
     label = "a" * 63
     ptr = ".".join([label, label, label, "b" * 61])
     domain = ".".join([label, label, label, "c" * 61])
@@ -574,11 +617,9 @@ async def test_pages_order_subnets_stored_with_other_spellings_by_their_canonica
 
 
 # The review's accepted values (Codex's briefed round on #83), each through the REST API
-# the owner uses: names JSON escapes six characters at a time, and a domain far longer
-# than any finding the count was measured with.
+# the owner uses: names JSON escapes six characters at a time, and a domain at its limit.
 ACCEPTED_LONG = {
     "control-character hostnames": ("s" * 120, "example.com", "\x01" * 253),
-    "a 5,058-character domain": ("lab", ".".join(["d" * 63] * 79) + ".dd", "h" * 253),
     "control characters in subnet name and hostname": (
         "\x01" * 120,
         ".".join(["a" * 63] * 3) + "." + "c" * 61,
@@ -604,8 +645,10 @@ async def test_pages_of_accepted_long_values_fit_a_client(client, case):
         assert not result.is_error, result.content[0].text
         assert len(result.content[0].text) < CLIENT_TEXT_MAX
         assert len(result.content[0].text.encode()) < CLIENT_TEXT_MAX
-        seen += [f["ip"] for f in result.data["findings"]]
-        cursor = result.data["next_cursor"]
+        page = await scan_page(**args)
+        assert page["returned"] < findings_svc.PAGE_SIZE or page["next_cursor"] is None
+        seen += [f["ip"] for f in page["findings"]]
+        cursor = page["next_cursor"]
         if cursor is None:
             break
     assert seen == [f"10.0.0.{octet}" for octet in range(10, 36)]
@@ -615,47 +658,637 @@ def long_domain(labels: int) -> str:
     return ".".join(f"{i:03d}" + "d" * 60 for i in range(labels))
 
 
-async def test_pages_of_long_domains_stay_inside_the_budget(client):
-    """Codex on #83: a domain suffix has no length limit, so 25 findings could pass a
-    client's limit. The size budget cuts the page short; paging still sees each finding
-    once, and every page's text stays under what Claude Code keeps."""
-    domain = long_domain(32)  # 32 labels of 63: 2,047 characters, as Codex measured
+async def test_a_domain_suffix_is_at_most_253_characters(client):
+    """The limit that bounds `host_fqdn` (#86): a DNS name's longest, on every write that
+    sends a domain, for a subnet and for a host, and refused without repeating it."""
+    at_limit = ".".join(["a" * 63] * 3) + "." + "c" * 61
+    over = at_limit + "c"
+    assert (len(at_limit), len(over)) == (ipnet.DOMAIN_MAX, ipnet.DOMAIN_MAX + 1)
     section = await make_section(client)
-    subnet = await make_subnet(client, section["id"], name="lab", domain=domain)
+    subnet = await make_subnet(client, section["id"], domain=at_limit)
+    host = await make_host(client, subnet["id"], "10.0.0.10", domain=at_limit)
+    refusal = f"Domain suffix is longer than {ipnet.DOMAIN_MAX} characters"
+    for res in (
+        await client.post(
+            "/api/v1/subnets",
+            json={"section_id": section["id"], "cidr": "10.0.1.0/24", "name": "x", "domain": over},
+        ),
+        await client.put(f"/api/v1/subnets/{subnet['id']}", json={"domain": over}),
+        await client.post(
+            "/api/v1/hosts", json={"subnet_id": subnet["id"], "ip": "10.0.0.11", "domain": over}
+        ),
+        await client.put(f"/api/v1/hosts/{host['id']}", json={"domain": over}),
+    ):
+        assert res.status_code == 422, res.text
+        assert res.json()["error"]["message"] == refusal
+    imported = await client.post(
+        f"/api/v1/subnets/{subnet['id']}/hosts/bulk",
+        json={"hosts": [{"ip": "10.0.0.12", "domain": over}, {"ip": "10.0.0.13"}]},
+    )
+    assert imported.status_code == 200, imported.text
+    results = imported.json()["data"]["results"]
+    assert [r["status"] for r in results] == ["error", "created"]
+    assert results[0]["reason"] == refusal
+
+
+async def store_domain(model, row_id: str, domain: str) -> None:
+    """Write a domain as a row stored before #86 may hold it: longer than the limit."""
+    async with SessionLocal() as session:
+        await session.execute(update(model).where(model.id == row_id).values(domain=domain))
+        await session.commit()
+
+
+async def test_a_host_with_a_domain_stored_before_the_limit_is_listed_without_its_fqdn(client):
+    """Codex on #83 stored a 2,097,139-character domain and got a finding of 2,101,766
+    bytes. A row stored before the limit keeps its domain, but the listing never carries
+    it: such a host's `host_fqdn` is null, so its finding is inside `FINDING_MAX` and a
+    page of them is cut by count, not size. The host's own record is unchanged, and a
+    write that sends the domain must meet the limit."""
+    section = await make_section(client)
+    lab = await make_subnet(client, section["id"], "10.0.0.0/24", name="lab", domain="home.arpa")
+    iot = await make_subnet(client, section["id"], "10.0.1.0/24", name="iot", domain="home.arpa")
     for octet in range(10, 40):
-        ip = f"10.0.0.{octet}"
-        await make_host(client, subnet["id"], ip, hostname=f"host-{octet}")
-        await observe(subnet["id"], ip, mac=MAC)
+        await make_host(client, lab["id"], f"10.0.0.{octet}", hostname=f"h{octet}")
+        await observe(lab["id"], f"10.0.0.{octet}", mac=MAC)
+    override = await make_host(client, iot["id"], "10.0.1.10", hostname="cam")
+    plain = await make_host(client, iot["id"], "10.0.1.11", hostname="tv")
+    for ip in ("10.0.1.10", "10.0.1.11"):
+        await observe(iot["id"], ip, mac=MAC)
+    huge = long_domain(800)  # 51,199 characters: over the whole page budget on its own
+    await store_domain(Subnet, lab["id"], huge)
+    await store_domain(Host, override["id"], long_domain(32))  # 2,047, as Codex measured
+
+    pages = await scan_pages()
+    assert [len(p) for p in pages] == [25, 7]  # cut by count again
+    every = [f for p in pages for f in p]
+    by_ip = {f["ip"]: f for f in every}
+    assert by_ip["10.0.1.10"]["host_fqdn"] is None  # its own override is too long
+    assert by_ip["10.0.1.11"]["host_fqdn"] == "tv.home.arpa"
+    for octet in range(10, 40):
+        f = by_ip[f"10.0.0.{octet}"]
+        assert (f["host_name"], f["host_fqdn"]) == (f"h{octet}", None)
+        assert f["host_id"] is not None
+    # the rest of each finding is the REST one, unchanged
+    for subnet in (lab, iot):
+        listed = [
+            {k: v for k, v in f.items() if k not in NAMES}
+            for f in every
+            if f["subnet_id"] == subnet["id"]
+        ]
+        assert listed == await rest_findings(client, subnet["id"])
+    # the records keep their domains; a write that does not send one goes through
+    host = (await client.get(f"/api/v1/hosts/{override['id']}")).json()["data"]
+    assert host["fqdn"] == "cam." + long_domain(32)
+    res = await client.put(f"/api/v1/hosts/{override['id']}", json={"notes": "edited"})
+    assert res.status_code == 200, res.text
+    res = await client.put(f"/api/v1/hosts/{override['id']}", json={"domain": long_domain(32)})
+    assert res.status_code == 422, res.text
+
+
+async def test_the_largest_finding_fits_its_bound(client):
+    """`FINDING_MAX` against the largest finding the write limits allow: the subnet name
+    and the hostname in control characters (6 bytes each as JSON), the domain at
+    `ipnet.DOMAIN_MAX`, and a 253-character PTR name outside it, so the name finding
+    proposes both a hostname and a domain, at an address as wide as IPv4 text gets
+    (`192.168.255.254`, ten digits as an integer; briefed round 1 on #129 found the
+    earlier `10.0.0.254` fixture 11 bytes short of it)."""
+    domain = ".".join(["a" * 63] * 3) + "." + "c" * 61
+    ptr = ".".join(["p" * 63] * 3) + "." + "q" * 61
+    assert len(domain) == len(ptr) == 253
+    section = await make_section(client)
+    subnet = await make_subnet(
+        client, section["id"], "192.168.255.0/24", name="\x01" * 120, domain=domain
+    )
+    target = await client.post("/api/v1/scan-targets", json={"subnet_id": subnet["id"]})
+    assert target.status_code == 201, target.text
+    await backdate(ScanTarget, target.json()["data"]["id"])
+    host = await make_host(
+        client, subnet["id"], "192.168.255.254", hostname="\x01" * 253, domain=domain
+    )
+    await observe(
+        subnet["id"], "192.168.255.254", mac=MAC, rdns=ptr, seen=LONG_AGO, alive=False
+    )
+    await observe(subnet["id"], "192.168.255.253", mac=MAC, rdns=ptr)
+    every = await scan_findings()
+    assert {f["type"] for f in every} == {
+        "unknown_host", "mac_missing", "name_mismatch", "stale"
+    }
+    largest = max(encoded(f) for f in every)
+    [name] = [f for f in every if f["type"] == "name_mismatch"]
+    assert encoded(name) == largest == 4_880  # the figure the brief and spec give
+    assert name["host_id"] == host["id"]
+    assert name["proposed"] == {"hostname": "p" * 63, "domain": ptr[64:]}
+    assert largest <= findings_svc.FINDING_MAX
+    # and the bound leaves the page budget for several of them
+    assert findings_svc.FINDING_MAX * 5 < findings_svc.PAGE_BUDGET
+
+
+async def test_the_page_budget_is_held_at_its_exact_boundary(client, monkeypatch):
+    """Codex's round 2 on #83: the budget summed each finding plus one, while the array
+    is that plus the brackets less a comma, so a page could be one byte over. With the
+    budget set to the exact size of the first three findings' array, three come; one
+    byte less, two do; the rest follow on the next pages, each once."""
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"], name="lab", domain="home.arpa")
+    for octet, length in ((10, 5), (11, 17), (12, 40), (13, 3)):
+        await make_host(client, subnet["id"], f"10.0.0.{octet}", hostname="h" * length)
+        await observe(subnet["id"], f"10.0.0.{octet}", mac=MAC)
+    every = await scan_findings()
+    assert len(every) == 4
+    exact = encoded(every[:3])
+    assert exact == sum(encoded(f) for f in every[:3]) + 2 + 2  # brackets, two commas
+    for budget, sizes in ((exact, [3, 1]), (exact - 1, [2, 2]), (exact + 1, [3, 1])):
+        monkeypatch.setattr(findings_svc, "PAGE_BUDGET", budget)
+        pages = await scan_pages()  # each array measured against the budget as sent
+        assert [len(p) for p in pages] == sizes
+        assert [f for p in pages for f in p] == every
+
+
+async def test_the_cursor_and_the_note_come_before_the_findings(client):
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"], name="lab")
+    await unknown_hosts(subnet["id"], "10.0.0", range(10, 10 + findings_svc.PAGE_SIZE + 1))
+    first = await call("list_scan_findings", {})
+    assert first.data["next_cursor"] is not None
+    # so a client that cuts a long result keeps them
+    text = first.content[0].text
+    assert text.index('"next_cursor"') < text.index('"note"') < text.index('"findings"')
+
+
+# --- Work per call (#86) ---
+
+
+async def add_subnets(section_id: str, count: int, prefix: str, *, scanned: bool) -> None:
+    """`count` subnets named `prefix…`, written directly. With `scanned`, each has a scan
+    target and a host that has no finding: the listing must visit it to know so."""
+    async with SessionLocal() as session:
+        for i in range(count):
+            subnet = Subnet(
+                section_id=section_id,
+                name=f"{prefix}{i:03d}",
+                cidr=f"10.{100 + i // 256}.{i % 256}.0/24",
+            )
+            session.add(subnet)
+            await session.flush()
+            if scanned:
+                session.add(ScanTarget(subnet_id=subnet.id, methods=["icmp"]))
+                ip = f"10.{100 + i // 256}.{i % 256}.10"
+                session.add(Host(subnet_id=subnet.id, ip=ip, ip_int=int(parse_ip(ip))))
+        await session.commit()
+
+
+@contextmanager
+def statement_texts():
+    texts = []
+
+    def before(_conn, _cursor, statement, *_args):
+        texts.append(" ".join(statement.split()))
+
+    event.listen(engine.sync_engine, "before_cursor_execute", before)
+    try:
+        yield texts
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", before)
+
+
+async def first_page_cost(**args) -> tuple[int, dict]:
+    with statements() as count:
+        result = await call("list_scan_findings", args)
+    assert not result.is_error, result.content[0].text
+    return count[0], result.data
+
+
+async def test_one_call_costs_at_most_the_statement_bound(client):
+    """The issue's measurement: 500 subnets that hold nothing, between one with 25
+    findings and one with 1, cost 4,521 statements in one call before #86. A subnet
+    that can hold no finding now costs none, so the first page costs what it costs
+    without them; and subnets that must be visited to learn they hold none (a scan
+    target and a host each) stop the call at `CALL_STATEMENTS`, with a cursor, and the
+    walk still lists every finding once, in order."""
+    section = await make_section(client)
+    alpha = await make_subnet(client, section["id"], "10.0.0.0/24", name="alpha")
+    zeta = await make_subnet(client, section["id"], "10.0.1.0/24", name="zeta")
+    await unknown_hosts(alpha["id"], "10.0.0", range(10, 35))
+    await unknown_hosts(zeta["id"], "10.0.1", range(10, 11))
+    expected = [("alpha", f"10.0.0.{o}") for o in range(10, 35)] + [("zeta", "10.0.1.10")]
+
+    without, page = await first_page_cost()
+    assert page["returned"] == 25 and page["next_cursor"] is not None
+    await add_subnets(section["id"], 500, "m", scanned=False)
+    with_empty, page = await first_page_cost()
+    assert with_empty == without <= findings_svc.CALL_STATEMENTS
+    pages = await scan_pages()
+    assert [(f["subnet_name"], f["ip"]) for p in pages for f in p] == expected
+
+    await add_subnets(section["id"], 300, "s", scanned=True)
+    pages = await scan_pages()  # each call within the bound (scan_page checks it)
+    assert [(f["subnet_name"], f["ip"]) for p in pages for f in p] == expected
+    # 300 visits of 8 statements do not fit one call: some pages are empty, with a cursor
+    assert len(pages) > 2 and [] in pages[1:-1]
+
+
+async def test_a_large_subnet_is_read_a_chunk_at_a_time(client):
+    """Codex on #83: a subnet of 4,096 observations computed all of its findings to
+    return 25. The first page now reads one chunk of each table; and with every address
+    reconciled, so that nothing is listed, no call passes the bound."""
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"], "10.1.0.0/19", name="big")
+    base = int(parse_ip("10.1.0.0"))
+    addresses = [str(ipaddress.IPv4Address(base + i)) for i in range(1, 4097)]
+    async with SessionLocal() as session:
+        for ip in addresses:
+            session.add(
+                Observation(
+                    subnet_id=subnet["id"], ip=ip, ip_int=int(parse_ip(ip)), mac=MAC,
+                    last_seen_at=datetime.now(timezone.utc),
+                )
+            )
+        await session.commit()
+    with statement_texts() as texts:
+        cost, page = await first_page_cost()
+    # the subnets, the subnet (its row, target, scope), one chunk (hosts, observations,
+    # dismissals)
+    assert cost == 1 + 5 + 3
+    assert page["returned"] == 25
+    # and the chunk's reads of hosts and observations are limited to SCAN_CHUNK rows
+    reads = [t for t in texts if t.startswith(("SELECT hosts.", "SELECT observations."))]
+    assert len(reads) == 2
+    assert all(t.rstrip().endswith("LIMIT ? OFFSET ?") for t in reads), reads
+
+    async with SessionLocal() as session:
+        for ip in addresses:
+            session.add(Host(subnet_id=subnet["id"], ip=ip, ip_int=int(parse_ip(ip)), mac=MAC))
+        await session.commit()
+    assert await scan_pages() == [[]]  # one call, inside the bound
+
+
+@contextmanager
+def statements_with_parameters():
     seen = []
+
+    def before(_conn, _cursor, statement, parameters, *_args):
+        seen.append((statement, parameters))
+
+    event.listen(engine.sync_engine, "before_cursor_execute", before)
+    try:
+        yield seen
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", before)
+
+
+async def add_ranges(subnet_id: str, count: int, *, excluded: bool, first: str) -> None:
+    """`count` one-address reserved ranges from `first` up, written directly: the most a
+    subnet can hold now, or more, as a subnet stored before the limit may."""
+    low = int(parse_ip(first))
+    async with SessionLocal() as session:
+        for i in range(count):
+            ip = str(ipaddress.IPv4Address(low + i))
+            session.add(
+                ReservedRange(
+                    subnet_id=subnet_id, start_ip=ip, end_ip=ip,
+                    start_int=low + i, end_int=low + i, scan_excluded=excluded,
+                )
+            )
+        await session.commit()
+
+
+def call_reads(seen: list) -> list:
+    """Every statement of a call but the one listing the subnets, the bound's one
+    exception."""
+    return [(sql, params) for sql, params in seen if "FROM subnets" not in sql or
+            "WHERE subnets.id" in sql]
+
+
+async def plan_of(sql: str, params) -> list[str]:
+    async with engine.connect() as conn:
+        rows = await conn.exec_driver_sql("EXPLAIN QUERY PLAN " + sql, params)
+        return [row[-1] for row in rows.all()]
+
+
+async def test_no_statement_of_a_call_scans_or_sorts(client):
+    """Codex on #129: without an index on the address, each chunk statement scanned and
+    sorted the whole subnet. Briefed round 1: the scope's read of excluded ranges
+    scanned the whole reserved-range table. Every statement of a call but the subnet
+    list is a SEARCH on an index, with no temporary sort, whatever the subnet and the
+    other subnets hold, before and after ANALYZE; the chunk reads use their
+    `(subnet_id, ip_int)` index and the scope its excluded-range one."""
+    section = await make_section(client)
+    subnet = await make_subnet(
+        client, section["id"], "10.1.0.0/20", name="big",
+        dhcp_start="10.1.8.1", dhcp_end="10.1.15.254",
+    )
+    other = await make_subnet(client, section["id"], "10.2.0.0/20", name="other")
+    res = await client.post(
+        "/api/v1/scan-targets", json={"subnet_id": subnet["id"], "scan_dhcp_pool": True}
+    )
+    assert res.status_code == 201, res.text
+    base = int(parse_ip("10.1.0.0"))
+    async with SessionLocal() as session:
+        for i in range(1, 4001):
+            ip = str(ipaddress.IPv4Address(base + i))
+            session.add(Observation(subnet_id=subnet["id"], ip=ip, ip_int=base + i, mac=MAC))
+            if i % 2:
+                session.add(Host(subnet_id=subnet["id"], ip=ip, ip_int=base + i, mac=MAC))
+        await session.commit()
+    await add_ranges(subnet["id"], 50, excluded=False, first="10.1.15.100")
+    await add_ranges(subnet["id"], 50, excluded=True, first="10.1.15.200")
+    await add_ranges(other["id"], 3000, excluded=True, first="10.2.0.1")
+    for analyse in (False, True):
+        if analyse:
+            async with engine.begin() as conn:
+                await conn.exec_driver_sql("ANALYZE")
+        with statements_with_parameters() as seen:
+            await scan_page()
+        reads = call_reads(seen)
+        tables = " ".join(sql for sql, _ in reads)
+        for table in ("hosts", "observations", "finding_dismissals", "reserved_ranges"):
+            assert f"FROM {table}" in tables, table
+        for sql, params in reads:
+            plan = await plan_of(sql, params)
+            assert not [step for step in plan if "TEMP B-TREE" in step], (sql, plan)
+            assert not [step for step in plan if step.startswith("SCAN")], (sql, plan)
+            searches = [step for step in plan if step.startswith("SEARCH")]
+            assert searches, (sql, plan)
+            if "FROM reserved_ranges" in sql:
+                assert all("ix_reserved_ranges_subnet_excluded" in s for s in searches), plan
+            for table in ("hosts", "observations", "finding_dismissals"):
+                if f"FROM {table} " in sql + " " and "EXISTS" not in sql:
+                    assert all("_subnet_ip_int" in s for s in searches), (sql, plan)
+
+
+async def vm_instructions(statements: list) -> int:
+    """SQLite virtual-machine instructions to run the given reads again, counted by its
+    progress handler: the work a statement does, rows passed over included, which a
+    query plan does not show (Codex on #129, second round)."""
+    count = [0]
+
+    def tick():
+        count[0] += 1
+        return 0
+
+    async with engine.connect() as conn:
+        raw = (await conn.get_raw_connection()).driver_connection
+        await raw.set_progress_handler(tick, 1)
+        try:
+            for sql, params in statements:
+                (await conn.exec_driver_sql(sql, params)).all()
+        finally:
+            await raw.set_progress_handler(None, 1)
+    return count[0]
+
+
+async def walk_reads(**args) -> tuple[list, list]:
+    """A whole walk's pages, and every statement it ran on hosts, observations or
+    dismissals."""
+    with statements_with_parameters() as seen:
+        pages = await scan_pages(**args)
+    reads = [
+        (sql, params)
+        for sql, params in seen
+        if any(f"FROM {t}" in sql for t in ("hosts", "observations", "finding_dismissals"))
+        and "FROM subnets" not in sql
+    ]
+    return pages, reads
+
+
+async def test_unhosted_pool_observations_cost_no_work(client):
+    """Codex on #129, second round: the observation read passed over every unhosted
+    observation in a scanned pool before its LIMIT, so its work grew with the pool even
+    with the indexes. A pool's observations are now read only at its hosts' addresses:
+    walking a subnet whose pool holds 3,000 unhosted observations does the work of one
+    whose pool holds 100, and lists the same findings."""
+    section = await make_section(client)
+    work = {}
+    for second, unhosted in ((1, 100), (2, 3000)):
+        subnet = await make_subnet(
+            client, section["id"], f"10.{second}.0.0/20", name=f"pool{unhosted}",
+            dhcp_start=f"10.{second}.1.0", dhcp_end=f"10.{second}.14.255",
+        )
+        res = await client.post(
+            "/api/v1/scan-targets", json={"subnet_id": subnet["id"], "scan_dhcp_pool": True}
+        )
+        assert res.status_code == 201, res.text
+        low = int(parse_ip(f"10.{second}.1.0"))
+        async with SessionLocal() as session:
+            for i in range(unhosted):
+                ip = str(ipaddress.IPv4Address(low + i))
+                session.add(
+                    Observation(subnet_id=subnet["id"], ip=ip, ip_int=low + i, mac=MAC)
+                )
+            await session.commit()
+        # a static lease in the pool, and an unknown host on each side of the pool
+        await make_host(client, subnet["id"], f"10.{second}.14.200", hostname="lease")
+        for ip in (f"10.{second}.0.10", f"10.{second}.14.200", f"10.{second}.15.10"):
+            await observe(subnet["id"], ip, mac=OTHER_MAC)
+        pages, reads = await walk_reads(subnet_id=subnet["id"])
+        assert [(f["ip"], f["type"]) for p in pages for f in p] == [
+            (f"10.{second}.0.10", "unknown_host"),
+            (f"10.{second}.14.200", "mac_missing"),
+            (f"10.{second}.15.10", "unknown_host"),
+        ]
+        work[unhosted] = await vm_instructions(reads)
+    # thirty times the pool, the same work give or take the depth of an index
+    assert work[3000] < work[100] * 1.5, work
+
+
+async def first_call_work() -> int:
+    """SQLite instructions for every statement the first call of a walk runs, the
+    subnet list included."""
+    with statements_with_parameters() as seen:
+        await scan_page()
+    return await vm_instructions(seen)
+
+
+async def test_every_read_of_a_call_does_bounded_work(client):
+    """Briefed round 1 on #129: the call's statement count stayed at 17 while the
+    scope's read of reserved ranges grew with every range stored, another subnet's and
+    the scanned ones included (508 to 50,008 instructions for 100 to 10,000). Counted
+    over every statement of a call: thousands of ranges that are not this subnet's
+    excluded ones cost nothing, and a subnet at `SUBNET_RESERVED_RANGES_MAX` excluded
+    ranges costs a bounded amount more than one with none."""
+    section = await make_section(client)
+    alpha = await make_subnet(client, section["id"], "10.0.0.0/24", name="alpha")
+    other = await make_subnet(client, section["id"], "10.5.0.0/16", name="other")
+    await unknown_hosts(alpha["id"], "10.0.0", range(10, 40))
+    base = await first_call_work()
+
+    await add_ranges(alpha["id"], 5000 // 50, excluded=False, first="10.0.0.100")
+    await add_ranges(other["id"], 5000, excluded=True, first="10.5.0.1")
+    await add_ranges(other["id"], 5000, excluded=False, first="10.5.100.1")
+    unrelated = await first_call_work()
+    assert unrelated < base * 1.1, (base, unrelated)
+
+    async with SessionLocal() as session:
+        await session.execute(
+            delete(ReservedRange).where(ReservedRange.subnet_id == alpha["id"])
+        )
+        await session.commit()
+    await add_ranges(alpha["id"], SUBNET_RESERVED_RANGES_MAX, excluded=True, first="10.0.0.100")
+    at_limit = await first_call_work()
+    # a few dozen instructions a range, read along the index and merged once
+    assert at_limit - base < SUBNET_RESERVED_RANGES_MAX * 100, (base, at_limit)
+
+
+async def test_a_subnet_holds_at_most_the_reserved_range_limit(client):
+    """The limit that bounds the scope's read (#86), on every write path: the REST
+    create the UI uses and MCP's add_reserved_range. A subnet stored with more before
+    it keeps them, can edit and delete them, and adds one only once it holds fewer."""
+    section = await make_section(client)
+    subnet = await make_subnet(client, section["id"], "10.0.0.0/24", name="lab")
+    refusal = (
+        f"reserved_ranges: a subnet holds at most {SUBNET_RESERVED_RANGES_MAX} reserved "
+        "ranges; delete one before adding another"
+    )
+    await add_ranges(subnet["id"], SUBNET_RESERVED_RANGES_MAX - 1, excluded=False, first="10.0.0.1")
+    url = f"/api/v1/subnets/{subnet['id']}/reserved"
+    res = await client.post(url, json={"start_ip": "10.0.0.200", "end_ip": "10.0.0.200"})
+    assert res.status_code == 201, res.text
+    res = await client.post(url, json={"start_ip": "10.0.0.201", "end_ip": "10.0.0.201"})
+    assert res.status_code == 422 and res.json()["error"]["message"] == refusal, res.text
+    before = await change_count()
+    over = await call(
+        "add_reserved_range",
+        {"subnet_id": subnet["id"], "start_ip": "10.0.0.202", "end_ip": "10.0.0.202"},
+    )
+    assert over.is_error and over.content[0].text == refusal
+    assert await change_count() == before
+
+    # stored over the limit before it: kept, editable, deletable, and full
+    await add_ranges(subnet["id"], 5, excluded=False, first="10.0.0.210")
+    detail = (await client.get(f"/api/v1/subnets/{subnet['id']}")).json()["data"]
+    ranges = detail["reserved_ranges"]
+    assert len(ranges) == SUBNET_RESERVED_RANGES_MAX + 5
+    res = await client.patch(
+        f"{url}/{ranges[0]['id']}", json={"description": "edited", "scan_excluded": True}
+    )
+    assert res.status_code == 200, res.text
+    res = await client.post(url, json={"start_ip": "10.0.0.250", "end_ip": "10.0.0.250"})
+    assert res.status_code == 422, res.text
+    for r in ranges[1:7]:
+        assert (await client.delete(f"{url}/{r['id']}")).status_code == 204
+    res = await client.post(url, json={"start_ip": "10.0.0.250", "end_ip": "10.0.0.250"})
+    assert res.status_code == 201, res.text
+
+
+async def test_start_up_creates_the_address_indexes_on_an_existing_database(tmp_path):
+    """A database made before #86 has none of the three address indexes; start-up
+    creates them, once."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.database import init_models
+
+    names = {
+        "ix_hosts_subnet_ip_int",
+        "ix_observations_subnet_ip_int",
+        "ix_finding_dismissals_subnet_ip_int",
+    }
+    old = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'old.db'}")
+    try:
+        async with old.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            for name in names:
+                await conn.exec_driver_sql(f"DROP INDEX {name}")
+
+        async def indexes() -> set[str]:
+            async with old.connect() as conn:
+                rows = await conn.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                )
+                return {row[0] for row in rows.all()}
+
+        assert not names & await indexes()
+        await init_models(old)
+        assert names <= await indexes()
+        await init_models(old)  # a second start-up creates nothing twice
+        assert names <= await indexes()
+    finally:
+        await old.dispose()
+
+
+async def test_a_walk_that_stops_early_still_lists_every_finding_once(client, monkeypatch):
+    """With the bound at its least (one chunk a call) and chunks of three addresses,
+    paging stops inside subnets, between two findings at one address, beside dismissed
+    and dynamic findings and a host in the pool; the walk, with and without each
+    filter, is still every finding once, in the order of the unbounded listing and of
+    each subnet's REST listing."""
+    section = await make_section(client)
+    lab = await make_subnet(
+        client, section["id"], "10.0.0.0/24", name="lab", domain="home.arpa",
+        dhcp_start="10.0.0.100", dhcp_end="10.0.0.150",
+    )
+    iot = await make_subnet(client, section["id"], "10.0.1.0/24", name="iot")
+    quiet = await make_subnet(client, section["id"], "10.0.2.0/24", name="quiet")
+    await make_host(client, quiet["id"], "10.0.2.10", hostname="unscanned")
+    res = await client.post(
+        "/api/v1/scan-targets", json={"subnet_id": lab["id"], "scan_dhcp_pool": True}
+    )
+    assert res.status_code == 201, res.text
+    await backdate(ScanTarget, res.json()["data"]["id"])
+    await unknown_hosts(lab["id"], "10.0.0", range(10, 18))
+    await make_host(client, lab["id"], "10.0.0.30", hostname="nas")
+    await observe(lab["id"], "10.0.0.30", mac=MAC, rdns="storage.home.arpa")
+    old = await make_host(client, lab["id"], "10.0.0.40", hostname="old")
+    await backdate(Host, old["id"])  # never seen: stale
+    await make_host(client, lab["id"], "10.0.0.50", hostname="quiet", mac=MAC)
+    await observe(lab["id"], "10.0.0.50", mac=MAC)  # nothing to list
+    await make_host(client, lab["id"], "10.0.0.51", hostname="swapped", mac=OTHER_MAC)
+    await observe(lab["id"], "10.0.0.51", mac=MAC)  # mac_mismatch
+    await make_host(client, lab["id"], "10.0.0.52")
+    await observe(lab["id"], "10.0.0.52", rdns="printer.home.arpa")  # name_missing
+    await make_host(client, lab["id"], "10.0.0.53", hostname="both", mac=OTHER_MAC)
+    await observe(lab["id"], "10.0.0.53", mac=MAC, rdns="other.home.arpa")  # two at one
+    await observe(lab["id"], "10.0.0.60", mac=OTHER_MAC)
+    [dismissed] = [f for f in await rest_findings(client, lab["id"]) if f["ip"] == "10.0.0.60"]
+    await dismiss(client, key(dismissed))
+    pool = [f"10.0.0.{octet}" for octet in range(120, 125)]
+    for ip in pool:
+        await observe(lab["id"], ip, mac=OTHER_MAC)  # dynamic: left out, and never read
+    await make_host(client, lab["id"], "10.0.0.130", hostname="lease")
+    await observe(lab["id"], "10.0.0.130", mac=MAC)  # a static lease in the pool
+    await unknown_hosts(iot["id"], "10.0.1", range(10, 17))
+
+    filters = [
+        {**subnet, **kind}
+        for subnet in ({}, {"subnet_id": lab["id"]})
+        for kind in ({}, *({"type": t} for t in findings_svc.FINDING_TYPES))
+    ]
+    unbounded = [await scan_findings(**f) for f in filters]
+    # every type, so a resumed chunk that dropped one would show (briefed round 1)
+    assert {f["type"] for f in unbounded[0]} == set(findings_svc.FINDING_TYPES)
+    assert "10.0.0.60" not in {f["ip"] for f in unbounded[0]}
+    assert not set(pool) & {f["ip"] for f in unbounded[0]}
+    rest = {s["id"]: await rest_findings(client, s["id"]) for s in (iot, lab)}
+    for args, everything in zip(filters, unbounded):
+        expected = [
+            f
+            for s in (iot, lab)
+            if args.get("subnet_id", s["id"]) == s["id"]
+            for f in rest[s["id"]]
+            if args.get("type", f["type"]) == f["type"]
+        ]
+        assert [{k: v for k, v in f.items() if k not in NAMES} for f in everything] == expected
+
+    monkeypatch.setattr(findings_svc, "CALL_STATEMENTS", 10)
+    for chunk in (1, 2, 4):  # at 1, every address is a resume point
+        monkeypatch.setattr(findings_svc, "SCAN_CHUNK", chunk)
+        for args, everything in zip(filters, unbounded):
+            pages = await scan_pages(**args)
+            assert [f for p in pages for f in p] == everything, (chunk, args)
+            assert len(pages) > 2, (chunk, args)
+    monkeypatch.setattr(findings_svc, "SCAN_CHUNK", 3)
+
+    # A cursor from a stop names the last address the call read: never one of the
+    # pool's unhosted addresses, which can only be dynamic findings and are not read.
+    stops = []
     cursor = None
     while True:
-        result = await call("list_scan_findings", {"cursor": cursor} if cursor else {})
-        assert not result.is_error, result.content[0].text
-        assert len(result.content[0].text) < CLIENT_TEXT_MAX
         page = await scan_page(**({"cursor": cursor} if cursor else {}))
-        assert page["returned"] < findings_svc.PAGE_SIZE  # cut short by size, not count
-        seen += [position(f) for f in page["findings"]]
         cursor = page["next_cursor"]
         if cursor is None:
             break
-    assert len(seen) == len(set(seen)) == 30
-    assert seen == [position(f) for f in await scan_findings()]
-
-
-async def test_a_finding_over_the_budget_comes_alone_with_the_cursor_first(client):
-    section = await make_section(client)
-    # a domain longer than the whole budget: only the request-body cap bounds it
-    subnet = await make_subnet(client, section["id"], name="lab", domain=long_domain(800))
-    for octet in (10, 11):
-        await make_host(client, subnet["id"], f"10.0.0.{octet}", hostname="h")
-        await observe(subnet["id"], f"10.0.0.{octet}", mac=MAC)
-    first = await call("list_scan_findings", {})
-    assert first.data["returned"] == 1 and first.data["next_cursor"] is not None
-    # the cursor and the note come before the findings, so a cut keeps them
-    text = first.content[0].text
-    assert text.index('"next_cursor"') < text.index('"note"') < text.index('"findings"')
-    second = await scan_page(cursor=first.data["next_cursor"])
-    assert (second["returned"], second["next_cursor"]) == (1, None)
+        stops.append(findings_svc._decode_cursor(cursor)[3])
+    assert len(stops) > 5
+    assert not {int(parse_ip(ip)) for ip in pool} & set(stops)
 
 
 async def test_list_scan_findings_docstring_gives_the_page_size():
@@ -663,6 +1296,9 @@ async def test_list_scan_findings_docstring_gives_the_page_size():
         tools = {t.name: t.description for t in await mcp_client.list_tools()}
     assert f"at most {findings_svc.PAGE_SIZE} findings per call" in tools["list_scan_findings"]
     assert "next_cursor" in tools["list_scan_findings"]
+    # a page stopped by the work bound can be empty and still have a cursor (#86)
+    assert "even when findings is empty" in " ".join(tools["list_scan_findings"].split())
+    assert f"at most {findings_svc.FINDING_MAX:,} bytes" in tools["list_scan_findings"]
     # the host writes an assistant resolves a finding with say what a copied value is
     for name in ("create_host", "update_host"):
         assert "copied from a list_scan_findings finding" in tools[name], name
