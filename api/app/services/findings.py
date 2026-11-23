@@ -320,8 +320,8 @@ PAGE_BUDGET = 45_000
 FINDING_MAX = 5_000
 # The work one call does is bounded too (#86), whatever the data: at most
 # `CALL_STATEMENTS` SQL statements, each of which reads at most `SCAN_CHUNK` hosts and
-# `SCAN_CHUNK` observations (and the dismissals at those addresses), but the one that
-# lists the subnets. That one reads the order key (id, name, CIDR) of each subnet that
+# `SCAN_CHUNK` observations (and the dismissals at those addresses) along their
+# `(subnet_id, ip_int)` indexes, but the one that lists the subnets. That one reads the order key (id, name, CIDR) of each subnet that
 # can hold a finding at all: one with an observation, or with a scan target and a host
 # (`stale` needs no observation). A subnet with neither costs no statement. A call that
 # reaches the bound stops where it is and returns what it found, possibly nothing, with
@@ -420,19 +420,15 @@ async def _read_chunk(session: AsyncSession, ctx: _Context, start: int):
     statements. Returns the addresses in order, their rows, and the last address read
     in full, or None when the subnet has nothing after them.
 
-    Each table is read up to `SCAN_CHUNK` rows; a table that fills its chunk may have
-    more after it, so only the addresses up to the lower of the full chunks' last ones
-    are taken, and the rest is read again by the next chunk. An observation in the DHCP
-    pool at an address with no host is never read: it can only be a `dynamic`
-    `unknown_host`, which this listing leaves out, so no cursor names its address."""
-    observations = select(*_OBSERVATION_COLUMNS).where(
-        Observation.subnet_id == ctx.id, Observation.ip_int >= start
-    )
-    if ctx.pool is not None:
-        hosted = exists().where(Host.subnet_id == ctx.id, Host.ip_int == Observation.ip_int)
-        observations = observations.where(
-            or_(~Observation.ip_int.between(*ctx.pool), hosted)
-        )
+    Each table is read in address order up to `SCAN_CHUNK` rows, along its
+    `(subnet_id, ip_int)` index, so no statement sorts or scans the rest of the subnet
+    (Codex on #129). A table that fills its chunk may have more after it, so only the
+    addresses up to the lower of the full chunks' last ones are taken, and the rest is
+    read again by the next chunk; observations are read no further than a full host
+    chunk's last address, so the rows a statement passes over are read by one chunk
+    only. An observation in the DHCP pool at an address with no host is never taken:
+    it can only be a `dynamic` `unknown_host`, which this listing leaves out, so no
+    cursor names its address."""
     hosts = (
         await session.execute(
             select(*_HOST_COLUMNS)
@@ -441,6 +437,17 @@ async def _read_chunk(session: AsyncSession, ctx: _Context, start: int):
             .limit(SCAN_CHUNK)
         )
     ).all()
+    host_bound = hosts[-1].ip_int if len(hosts) == SCAN_CHUNK else None
+    observations = select(*_OBSERVATION_COLUMNS).where(
+        Observation.subnet_id == ctx.id, Observation.ip_int >= start
+    )
+    if host_bound is not None:
+        observations = observations.where(Observation.ip_int <= host_bound)
+    if ctx.pool is not None:
+        hosted = exists().where(Host.subnet_id == ctx.id, Host.ip_int == Observation.ip_int)
+        observations = observations.where(
+            or_(~Observation.ip_int.between(*ctx.pool), hosted)
+        )
     seen = (
         await session.execute(observations.order_by(Observation.ip_int).limit(SCAN_CHUNK))
     ).all()

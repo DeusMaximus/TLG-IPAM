@@ -11,7 +11,7 @@ from sqlalchemy import event, func, select, update
 from app.database import SessionLocal, engine
 from app.mcp_server import mcp
 from app import ipnet
-from app.models import Change, Host, Observation, ScanTarget, Subnet
+from app.models import Base, Change, Host, Observation, ScanTarget, Subnet
 from app.services import findings as findings_svc
 from app.services import scans
 
@@ -915,6 +915,102 @@ async def test_a_large_subnet_is_read_a_chunk_at_a_time(client):
             session.add(Host(subnet_id=subnet["id"], ip=ip, ip_int=int(parse_ip(ip)), mac=MAC))
         await session.commit()
     assert await scan_pages() == [[]]  # one call, inside the bound
+
+
+@contextmanager
+def statements_with_parameters():
+    seen = []
+
+    def before(_conn, _cursor, statement, parameters, *_args):
+        seen.append((statement, parameters))
+
+    event.listen(engine.sync_engine, "before_cursor_execute", before)
+    try:
+        yield seen
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", before)
+
+
+async def test_no_chunk_statement_scans_or_sorts_the_subnet(client):
+    """Codex on #129: without an index on the address, each chunk statement scanned and
+    sorted the whole subnet, and the pool's correlated host lookup searched every host
+    for each observation, so a chunk cost grew with the square of the subnet. Every
+    statement of a call that reads hosts, observations or dismissals is a SEARCH on its
+    `(subnet_id, ip_int)` index, with no temporary sort, whatever the subnet holds."""
+    section = await make_section(client)
+    subnet = await make_subnet(
+        client, section["id"], "10.1.0.0/20", name="big",
+        dhcp_start="10.1.8.1", dhcp_end="10.1.15.254",
+    )
+    res = await client.post(
+        "/api/v1/scan-targets", json={"subnet_id": subnet["id"], "scan_dhcp_pool": True}
+    )
+    assert res.status_code == 201, res.text
+    base = int(parse_ip("10.1.0.0"))
+    async with SessionLocal() as session:
+        for i in range(1, 4001):
+            ip = str(ipaddress.IPv4Address(base + i))
+            session.add(Observation(subnet_id=subnet["id"], ip=ip, ip_int=base + i, mac=MAC))
+            if i % 2:
+                session.add(Host(subnet_id=subnet["id"], ip=ip, ip_int=base + i, mac=MAC))
+        await session.commit()
+    with statements_with_parameters() as seen:
+        await scan_page()
+    reads = [
+        (sql, params)
+        for sql, params in seen
+        if any(f"FROM {t}" in sql for t in ("hosts", "observations", "finding_dismissals"))
+        and "FROM subnets" not in sql
+    ]
+    assert len(reads) == 3  # one chunk: hosts, observations, dismissals
+    async with engine.connect() as conn:
+        for sql, params in reads:
+            plan = [
+                row[-1]
+                for row in (
+                    await conn.exec_driver_sql("EXPLAIN QUERY PLAN " + sql, params)
+                ).all()
+            ]
+            assert not [step for step in plan if "TEMP B-TREE" in step], plan
+            assert not [step for step in plan if step.startswith("SCAN")], plan
+            for step in plan:
+                if step.startswith("SEARCH"):
+                    assert "_subnet_ip_int" in step, plan
+
+
+async def test_start_up_creates_the_address_indexes_on_an_existing_database(tmp_path):
+    """A database made before #86 has none of the three address indexes; start-up
+    creates them, once."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from app.database import init_models
+
+    names = {
+        "ix_hosts_subnet_ip_int",
+        "ix_observations_subnet_ip_int",
+        "ix_finding_dismissals_subnet_ip_int",
+    }
+    old = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'old.db'}")
+    try:
+        async with old.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            for name in names:
+                await conn.exec_driver_sql(f"DROP INDEX {name}")
+
+        async def indexes() -> set[str]:
+            async with old.connect() as conn:
+                rows = await conn.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                )
+                return {row[0] for row in rows.all()}
+
+        assert not names & await indexes()
+        await init_models(old)
+        assert names <= await indexes()
+        await init_models(old)  # a second start-up creates nothing twice
+        assert names <= await indexes()
+    finally:
+        await old.dispose()
 
 
 async def test_a_walk_that_stops_early_still_lists_every_finding_once(client, monkeypatch):

@@ -93,7 +93,11 @@ class ReservedRange(Base):
 
 class Host(Base):
     __tablename__ = "hosts"
-    __table_args__ = (UniqueConstraint("subnet_id", "ip", name="uq_hosts_subnet_ip"),)
+    __table_args__ = (
+        UniqueConstraint("subnet_id", "ip", name="uq_hosts_subnet_ip"),
+        # the order `findings.list_named` reads a subnet in, a chunk at a time (#86)
+        Index("ix_hosts_subnet_ip_int", "subnet_id", "ip_int"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     subnet_id: Mapped[str] = mapped_column(ForeignKey("subnets.id"))
@@ -249,7 +253,10 @@ class Observation(Base):
     """
 
     __tablename__ = "observations"
-    __table_args__ = (UniqueConstraint("subnet_id", "ip", name="uq_observations_subnet_ip"),)
+    __table_args__ = (
+        UniqueConstraint("subnet_id", "ip", name="uq_observations_subnet_ip"),
+        Index("ix_observations_subnet_ip_int", "subnet_id", "ip_int"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     subnet_id: Mapped[str] = mapped_column(ForeignKey("subnets.id"), index=True)
@@ -284,6 +291,7 @@ class FindingDismissal(Base):
     __tablename__ = "finding_dismissals"
     __table_args__ = (
         UniqueConstraint("subnet_id", "ip", "type", name="uq_finding_dismissals_subnet_ip_type"),
+        Index("ix_finding_dismissals_subnet_ip_int", "subnet_id", "ip_int"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
