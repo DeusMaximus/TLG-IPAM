@@ -736,29 +736,45 @@ async def test_lookups_that_send_nothing_keep_the_stored_names_at_one_packet_a_s
 
 
 @pytest.mark.parametrize(
-    "action, cleared",
+    "action, outcome",
     [
-        ("silent", False),
-        ("servfail", False),
-        ("refused", False),
-        ("malformed", False),
-        ("cname-referral", False),
-        ("cname-only", False),
-        ("nxdomain", True),
-        ("nodata", True),
-        ("empty", True),
-        ("cname-nodata", True),
+        ("silent", "kept"),
+        ("servfail", "kept"),
+        ("refused", "kept"),
+        ("malformed", "kept"),
+        ("cname-referral", "kept"),
+        ("cname-only", "kept"),
+        ("nxdomain", "cleared"),
+        ("nodata", "cleared"),
+        ("empty", "cleared"),
+        ("cname-nodata", "cleared"),
+        # #144: records that do not answer the question are no answer
+        ("foreign-soa", "kept"),
+        ("cname-foreign-soa", "kept"),
+        ("cname-origin-soa", "kept"),
+        ("foreign-ptr", "kept"),
+        ("foreign-ptr-soa", "kept"),
+        # and the answers that do are read as before
+        ("cname-out-nodata", "cleared"),
+        ("cname-chain-nodata", "cleared"),
+        ("cname-ptr", "replaced"),
+        ("cname-chain-ptr", "replaced"),
     ],
 )
-async def test_what_the_responder_answers_decides_the_names_and_never_the_dead(owner, action, cleared):
-    """Acceptance for #100 (option 4) through the real routes, the real resolver and a
-    DNS responder on loopback. A first scan stores the names of three live addresses.
-    In the second, one of them has left, and the responder gives `action` to every
-    query: silence, SERVFAIL, REFUSED, malformed bytes, a CNAME followed by a
-    delegation (RFC 2317; round 1 of the briefed review, finding 1) or a CNAME left
-    unresolved leave the stored names in place; NXDOMAIN, or a NOERROR whose authority
-    holds the SOA or that carries no record at all, clears them. Either way the scan
-    is complete, its liveness sweep whole, and the departed address is marked dead."""
+async def test_what_the_responder_answers_decides_the_names_and_never_the_dead(owner, action, outcome):
+    """Acceptance for #100 (option 4) and #144 through the real routes, the real
+    resolver and a DNS responder on loopback. A first scan stores the names of three
+    live addresses. In the second, one of them has left, and the responder gives
+    `action` to every query: silence, SERVFAIL, REFUSED, malformed bytes, a CNAME
+    followed by a delegation (RFC 2317; round 1 of the briefed review, finding 1), a
+    CNAME left unresolved, an SOA for a zone that does not hold the name the answer is
+    about (an unrelated zone's, or the question's own zone's beside a CNAME whose
+    target is outside it) or a PTR record at an unrelated owner (#144) leave the
+    stored names in place; NXDOMAIN, or a NOERROR whose authority holds the SOA of the
+    zone that holds that name (the CNAME chain's end, when there is one) or that
+    carries no record at all, clears them; a PTR record at the chain's end replaces
+    them. Either way the scan is complete, its liveness sweep whole, and the departed
+    address is marked dead."""
     from test_probe import ANSWERS, responder
 
     from tlg_ipam_agent.probe import DnsResolver
@@ -793,12 +809,13 @@ async def test_what_the_responder_answers_decides_the_names_and_never_the_dead(o
         assert len(dns_responder.arrivals) == 3 + 2  # one query for each live address
         seen = await observations(subnet["id"])
         names = {ip: seen[ip].rdns_name for ip in live[:2]}
-        assert names == ({ip: None for ip in live[:2]} if cleared else {ip: stored[ip] for ip in live[:2]})
+        expected = {"kept": stored, "cleared": dict.fromkeys(live), "replaced": dict.fromkeys(live, "nas.home.arpa")}
+        assert names == {ip: expected[outcome][ip] for ip in live[:2]}
         assert seen["10.0.0.1"].alive and seen["10.0.0.2"].alive
         assert seen["10.0.0.3"].alive is False
         shown = await target_of(owner, target["id"])
         assert shown["last_scan_complete"] is True
-        assert shown["last_scan_error"] == (None if cleared else scan.no_answer(2, 2))
+        assert shown["last_scan_error"] == (scan.no_answer(2, 2) if outcome == "kept" else None)
     finally:
         transport.close()
         for key in keys.values():
@@ -835,14 +852,19 @@ async def test_a_scan_whose_lookups_had_no_server_still_marks_the_departed_dead(
     assert shown["last_scan_complete"] is False and shown["last_scan_error"] == NO_DNS_SERVER
 
 
-async def test_a_delegated_reverse_zone_keeps_the_name_and_the_next_server_supplies_it(owner):
+@pytest.mark.parametrize("unusable", ["cname-referral", "cname-foreign-soa", "cname-origin-soa", "foreign-ptr"])
+async def test_a_delegated_reverse_zone_keeps_the_name_and_the_next_server_supplies_it(owner, unusable):
     """Round 1 of the briefed review, finding 1, through the real routes. The subnet
     lists its DNS server twice (the owner API takes IPv4 servers only, and loopback has
     one IPv4 address everywhere; `test_probe.py` asks two distinct servers). A first
     scan stores the name. In the second, the first query is answered with a CNAME and
     a delegation, and the lookup goes on to the next server, whose PTR record
     replaces the name; at `dfae349` it stopped there and cleared it. In a third, both
-    answer that way, and the name stays."""
+    answer that way, and the name stays. #144 runs the same scans with a first reply
+    whose records do not answer the question: a CNAME beside an unrelated zone's SOA,
+    or beside the question's own zone's SOA when its target is outside that zone, or a
+    PTR record at an unrelated owner. Until #144 the first two cleared the name and
+    the third replaced it with the unrelated one, and the next server was not asked."""
     from test_probe import ANSWERS, responder
 
     from tlg_ipam_agent.probe import DnsResolver
@@ -871,13 +893,13 @@ async def test_a_delegated_reverse_zone_keeps_the_name_and_the_next_server_suppl
         name, _ = await scan_once(1)
         assert name == "first.home.arpa" and len(dns_responder.arrivals) == 1
 
-        dns_responder.script = ["cname-referral", "answer"]
+        dns_responder.script = [unusable, "answer"]
         ANSWERS[key] = "second.home.arpa."
         name, shown = await scan_once(2)
         assert name == "second.home.arpa" and len(dns_responder.arrivals) == 3
         assert shown["last_scan_complete"] is True and shown["last_scan_error"] is None
 
-        dns_responder.script = ["cname-referral"]
+        dns_responder.script = [unusable]
         ANSWERS[key] = "third.home.arpa."
         name, shown = await scan_once(3)
         assert name == "second.home.arpa" and len(dns_responder.arrivals) == 5
