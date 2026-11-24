@@ -15,7 +15,7 @@ from sqlalchemy import event, func, select, update
 
 from app import mcp_server
 from app.agent_protocol import PROTOCOL_VERSION
-from app.config import settings
+from app.config import Settings
 from app.database import SessionLocal, engine
 from app.models import Agent, Change
 from app.services import agents as agents_svc
@@ -56,9 +56,9 @@ def test_update_available_compares_releases(agent, server, expected):
 
 
 def test_update_available_is_judged_against_the_servers_own_version(monkeypatch):
-    monkeypatch.setattr(settings, "version", "0.3.0")
+    monkeypatch.setattr(Settings, "version", "0.3.0")
     assert agents_svc.update_available("0.2.0") is True
-    monkeypatch.setattr(settings, "version", "0.2.0")
+    monkeypatch.setattr(Settings, "version", "0.2.0")
     assert agents_svc.update_available("0.2.0") is False
 
 
@@ -73,7 +73,7 @@ async def agent_answer(client, agent_id) -> dict:
 
 
 async def test_an_agent_answer_flags_an_older_release(client, agent_api, monkeypatch):
-    monkeypatch.setattr(settings, "version", "0.3.0")
+    monkeypatch.setattr(Settings, "version", "0.3.0")
     agent, token = await make_agent(client)
     # enrolment reports no version here, so nothing is known yet
     answer = await agent_answer(client, agent["id"])
