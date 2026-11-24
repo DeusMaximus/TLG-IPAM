@@ -26,6 +26,17 @@ servers reports the same, and fixing the file is not enough: the stuck read must
 or the agent be restarted. A subnet that lists its own DNS servers is not affected, so
 setting them is the other way out.
 
+**What clears a stored name.** Only a DNS server's answer that an address has no name
+(`NXDOMAIN`, or a `NOERROR` without a PTR record that carries the zone's SOA, or no
+record at all) clears the name the server holds for it. A lookup no server answered
+usably (silence, `SERVFAIL`, `REFUSED`, a malformed or truncated reply, a referral, also
+after a CNAME as in a classless reverse delegation, or a CNAME left unresolved; each
+sends the lookup on to the next configured server) leaves the stored name as it is,
+and the scan reports
+"rdns: no DNS server gave a usable answer for N of M addresses". So a resolver outage
+keeps stale names until a server answers again, and never stops the scan from marking
+a host that has left the network as gone.
+
 **The packet budget (`MAX_PPS`).** Every echo request, ARP request and DNS query the
 agent sends takes a slot of one budget, which it keeps from one scan to the next. Each
 packet is handed to the kernel in the step of the agent's event loop that its slot is

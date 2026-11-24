@@ -27,7 +27,7 @@ from tlg_ipam_agent import enrol
 from tlg_ipam_agent.client import AgentClient, Kind
 from tlg_ipam_agent.config import ConfigError, Settings, parse_allowed
 from tlg_ipam_agent.loop import Agent, reported
-from tlg_ipam_agent.protocol import CHECKIN_REFUSED_RETRY_S, CHECKIN_RETRY_MIN_S
+from tlg_ipam_agent.protocol import CHECKIN_REFUSED_RETRY_S, CHECKIN_RETRY_MIN_S, PROTOCOL_VERSION
 
 AGENT_ID = "0b6f3c1e-1111-4222-8333-444455556666"
 
@@ -364,7 +364,7 @@ async def _checkin(token: str):
             clock=FakeClock(),
             rng=random.Random(1),
         )
-        return await agent.client.checkin({**reported(), "protocol": 1, "interfaces": ETH0, "capabilities": []})
+        return await agent.client.checkin({**reported(), "protocol": PROTOCOL_VERSION, "interfaces": ETH0, "capabilities": []})
 
 
 async def test_first_start_enrols_and_a_recreated_container_starts_on_the_stored_token(owner, tmp_path):

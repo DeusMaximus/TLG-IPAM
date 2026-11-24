@@ -16,6 +16,13 @@ a MAC from a job the server did not issue `arp`, and the like are listed in
 `rejected` without affecting the valid records. What the job could collect is read
 from the methods the server issued (`job_methods`), never from the agent.
 
+Which addresses are marked dead and which stored names are cleared follow the rule of
+the protocol the result set was sent under (`ResultsRequest.protocol`, #100). From
+protocol 2 the liveness sweep's completion (`liveness_complete`) decides the first, and
+each record's own lookup (`rdns_no_name`) the second. A protocol-1 result set, from an
+agent that carried a job leased before the server was upgraded, is judged by
+`complete` for both, as it was when it was sent.
+
 Ingest writes observations and the target's last-scan columns. It never writes
 `hosts` (spec §7.2, invariant 3) and writes nothing to the change log: an agent
 reports every few minutes, and nothing here is owner data. Agent text is sanitised
@@ -32,6 +39,7 @@ from sqlalchemy import delete, exists, select, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..agent_protocol import Observation as ObservationRecord
 from ..agent_protocol import (
     REJECT_DUPLICATE,
     REJECT_MAC_NOT_ISSUED,
@@ -146,6 +154,23 @@ async def _release(
         raise _not_current()
 
 
+def _sets_name(report: ResultsRequest, record: ObservationRecord) -> bool:
+    """Whether a record from a job issued `rdns` writes its `rdns_name` (a name, or
+    None to clear the stored one), by the rule of the result set's protocol.
+
+    A name always sets it. Protocol 2: no name clears it only when the record says its
+    lookup was answered "no name" (`rdns_no_name`); a lookup that got no usable answer,
+    was cut off or did not run leaves it, and so does a name dropped by sanitising.
+    Protocol 1, which could not tell those apart: no name (or one dropped by
+    sanitising) clears it only in a complete result set, since an incomplete one may
+    report an address whose lookup never ran."""
+    if record.rdns_name is not None:
+        return True
+    if report.protocol == 1:
+        return report.complete
+    return record.rdns_no_name
+
+
 async def ingest(session: AsyncSession, agent: Agent, body: object) -> dict:
     """Handle `POST /api/v1/agent/results` for an authenticated agent.
 
@@ -215,7 +240,9 @@ async def _accept(session: AsyncSession, agent: Agent, report: ResultsRequest) -
                 named.add(ip_int)
         if reason is None and record.mac is not None and "arp" not in methods:
             reason = REJECT_MAC_NOT_ISSUED
-        elif reason is None and raw.get("rdns_name") is not None and "rdns" not in methods:
+        elif reason is None and "rdns" not in methods and (
+            raw.get("rdns_name") is not None or record.rdns_no_name
+        ):
             reason = REJECT_RDNS_NOT_ISSUED
         if reason is not None:
             rejected.append({"ip": echo_ip(raw), "reason": reason})
@@ -231,17 +258,14 @@ async def _accept(session: AsyncSession, agent: Agent, report: ResultsRequest) -
         row.agent_id = agent.id
         if record.mac is not None:
             row.mac, row.mac_randomised = record.mac, mac_randomised(record.mac)
-        if "rdns" in methods and (report.complete or record.rdns_name is not None):
-            # A name always sets it. No name (or one dropped by sanitising) clears it
-            # only in a complete result set: an incomplete one may report an address
-            # whose lookup never ran, so there it leaves the stored name alone and
-            # only adds what it saw.
+        if "rdns" in methods and _sets_name(report, record):
             row.rdns_name = record.rdns_name
         accepted += 1
 
     # Only a sweep that finished, with a method that can tell, says an address is down.
-    # An interrupted or timed-out job only adds what it saw.
-    if report.complete and methods & scans.LIVENESS_METHODS:
+    # An interrupted or timed-out job only adds what it saw. From protocol 2 that is
+    # the liveness sweep's own completion: what the PTR lookups did has no part in it.
+    if report.marks_dead() and methods & scans.LIVENESS_METHODS:
         for ip_int, row in existing.items():
             if ip_int not in named and scans.in_scope(scope, ip_int):
                 row.alive = False
