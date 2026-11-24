@@ -29,7 +29,7 @@ The server will not start without a real key: with `API_KEY` unset, empty, still
 
 ## One worker
 
-The image starts uvicorn with `--workers 1`, so the container runs a single worker whatever the environment says: setting `WEB_CONCURRENCY` (or `UVICORN_WORKERS`) does not change it. It should stay that way, so do not change the `CMD`, override it with a different command, or run several replicas behind a load balancer. MCP sessions are held in the memory of the process that opened them, and SQLite allows one writer at a time, so a second process would not share them, and adds no capacity a homelab needs.
+The image starts the server with `python -m app.serve`, which runs uvicorn with one worker whatever the environment says: setting `WEB_CONCURRENCY` (or `UVICORN_WORKERS`) does not change it. The same command sets the limits on request headers and idle connections that keep a client from holding the server's memory before it has sent a request (brief §4.3), which a plain `uvicorn` command line does not have. It should stay that way, so do not change the `CMD`, override it with a different command, or run several replicas behind a load balancer. MCP sessions are held in the memory of the process that opened them, and SQLite allows one writer at a time, so a second process would not share them, and adds no capacity a homelab needs.
 
 ## Connect an AI assistant
 
