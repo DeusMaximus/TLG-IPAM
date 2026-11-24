@@ -572,6 +572,22 @@ def test_what_a_reply_says(case):
     assert got == says if isinstance(says, str) else got is says
 
 
+@pytest.mark.parametrize("chain", [(), (_CNAME,)], ids=["at-the-question", "at-the-chain-end"])
+def test_of_several_ptr_records_at_the_answered_name_the_first_is_read(chain):
+    """#149: a name may hold more than one PTR record (RFC 2181 §10); the one read is
+    the first the reply carries there, so the same two in the other order give the
+    other name. Each reply goes through the wire and back, as a server's would; the two
+    records are written as rrsets of their own, since dnspython shuffles the records
+    of one rrset as it writes them, and its parser joins them in the order sent."""
+    owner = _IN if chain else _Q
+    for first, second in (("nas.home.arpa.", "nas-2.home.arpa."), ("nas-2.home.arpa.", "nas.home.arpa.")):
+        reply = _reply((*chain, _ptr(owner, first), _ptr(owner, second)))
+        reply = dns.message.from_wire(reply.to_wire())
+        assert len(reply.answer[-1]) == 2  # one PTR rrset of two records at that name
+        assert [rdata.target.to_text() for rdata in reply.answer[-1]] == [first, second]  # wire order kept
+        assert probe.read_reply(reply, dns.name.from_text(_Q)) == first
+
+
 def _colliding_names(count, size=20):
     """`count` distinct names made of the same `size` bytes, split into labels at
     different places (`aaaa.`, `a.aaa.`, `aa.aa.`, …): the i-th is split after each
