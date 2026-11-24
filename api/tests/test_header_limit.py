@@ -149,6 +149,25 @@ def still_open(sock, seconds: float) -> bytes:
     return received
 
 
+def one_response(sock) -> bytes:
+    """One whole response read off a connection that stays open: its head, then as
+    many body bytes as its `content-length` says, however the segments fall."""
+    received = b""
+    while b"\r\n\r\n" not in received:
+        chunk = sock.recv(65536)
+        assert chunk, f"the server closed the connection, having sent {received[:200]!r}"
+        received += chunk
+    head, _, body = received.partition(b"\r\n\r\n")
+    fields = dict(line.split(b":", 1) for line in head.split(b"\r\n")[1:])
+    length = int({k.strip().lower(): v for k, v in fields.items()}[b"content-length"])
+    while len(body) < length:
+        chunk = sock.recv(65536)
+        assert chunk, "the server closed the connection inside a response"
+        body += chunk
+    assert len(body) == length, "more than one response arrived"
+    return head + b"\r\n\r\n" + body
+
+
 def status_of(answer: bytes) -> int:
     return int(answer.split(b" ", 2)[1])
 
@@ -162,6 +181,20 @@ def head_of(size: int) -> bytes:
     start = b"GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\nX-Pad: "
     pad = size - len(start) - len(b"\r\n\r\n")
     return start + b"a" * pad + b"\r\n\r\n"
+
+
+def compact_head_over_the_limit() -> bytes:
+    """A complete head that measures one byte over the limit and arrives 1 KiB under it:
+    its fields have no space after the colon, which the measure counts. Only the check
+    of a complete head can refuse it, since fewer than `HEADER_MAX` bytes arrive (with
+    room for the piece a previous request ended in, counted toward this head)."""
+    fields = [(f"x-{i}".encode(), b"a") for i in range(1024)]
+    pad = HEADER_MAX + 1 - _head_size(b"GET", b"/health", [*fields, (b"x-pad", b"")])
+    fields.append((b"x-pad", b"a" * pad))
+    assert _head_size(b"GET", b"/health", fields) == HEADER_MAX + 1
+    head = b"GET /health HTTP/1.1\r\n" + b"".join(n + b":" + v + b"\r\n" for n, v in fields) + b"\r\n"
+    assert len(head) == HEADER_MAX + 1 - len(fields)
+    return head
 
 
 # --- The time (`HEADER_TIMEOUT_S`) ---
@@ -193,8 +226,7 @@ def test_an_unfinished_head_sent_a_byte_at_a_time_is_closed_at_the_deadline(quic
 def test_after_a_response_the_next_head_has_the_same_time(quick):
     with connect(quick) as sock:
         sock.sendall(b"GET /health HTTP/1.1\r\nHost: t\r\n\r\n")
-        answer = sock.recv(65536)
-        assert status_of(answer) == 200
+        assert status_of(one_response(sock)) == 200
         answered = time.monotonic()
         trickle = iter(b"GET /health HTTP/1.1\r\nX-Pad: ")
         try:
@@ -363,6 +395,40 @@ def test_a_pipelined_head_past_the_limit_behind_a_stream_closes_the_connection(q
         received, after = until_closed(sock, 5)
     assert after < 3
     assert b"431" not in received and b"HEADERS_TOO_LARGE" not in received
+
+
+def test_a_complete_head_past_the_limit_pipelined_behind_a_stream_closes_the_connection(quick):
+    """A refusal queued behind an event stream would wait as long as the stream does,
+    with the time for a head already stopped: the connection is closed instead."""
+    session = mcp_session(quick)
+    with connect(quick) as sock:
+        sock.sendall(event_stream(session))
+        head = still_open(sock, 0.5)
+        assert head.startswith(b"HTTP/1.1 200"), head[:300]
+        request = compact_head_over_the_limit()
+        sock.sendall(request)
+        received, after = until_closed(sock, 2 * QUICK_S + 3)
+    assert after < QUICK_S  # at once, not at any deadline
+    assert b"431" not in received and b"HEADERS_TOO_LARGE" not in received
+
+
+def test_on_the_image_a_head_that_follows_a_request_in_the_same_read_is_counted(image):
+    """One write: a whole request, then more than the limit of the next one's head with
+    no end. The bytes after the first request ends count toward the second head, so the
+    connection is refused at once rather than left to the deadline. If the first request
+    is still being answered when the second is refused, nothing is written; if it was
+    answered first (the write arrived in more than one read), its answer is followed by
+    the refusal."""
+    start = b"GET /health HTTP/1.1\r\nHost: t\r\nX-Pad: "
+    request = b"GET /health HTTP/1.1\r\nHost: t\r\n\r\n"
+    with connect(image) as sock:
+        sock.sendall(request + start + b"a" * (HEADER_MAX + 1 - len(start)))
+        received, after = until_closed(sock, HEADER_TIMEOUT_S + 5)
+    assert after < 3, after
+    if received:
+        assert received.startswith(b"HTTP/1.1 200 OK"), received[:300]
+        assert received.endswith(json.dumps(TOO_LARGE).encode()), received[-300:]
+        assert received.count(b"HTTP/1.1 431 ") == 1
 
 
 def test_many_unfinished_heads_past_the_limit_are_each_refused(image):

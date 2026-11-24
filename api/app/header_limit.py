@@ -15,13 +15,15 @@ held below the app:
 - **The size** (`HEADER_MAX`). A head whose bytes received pass it while it is still
   unfinished is refused with `431` in the REST error shape and the connection closed,
   at the read that takes it past (bytes are counted as they are read, so up to one
-  read beyond the limit is held before the refusal). A complete head is measured as it
+  read beyond the limit is held before the refusal; reads go to the parser in pieces
+  of `_PIECE` bytes, so a head that begins in a read after another request ends is
+  counted from there, at most one piece over). A complete head is measured as it
   is spelt with one space after each field's colon (`_head_size`: what was received,
   for a head sent the way clients send it) and refused the same way when it passes the
   limit, however few reads it came in, so no request whose head is larger reaches the
   app. When another request on the connection is still being answered (the head is
-  pipelined behind it), the connection is closed without an answer instead, so no
-  refusal is written into that response.
+  pipelined behind it), the connection is closed without an answer instead, finished
+  head or not, so no refusal is written into that response or waits behind it.
 - **The time** (`HEADER_TIMEOUT_S`). A connection has that long, from when it opens and
   again from when its last request has been both received whole and answered, to
   deliver the next request's head whole. One that has not is closed without an
@@ -59,6 +61,13 @@ HEADER_MAX = 64 * 1024
 # every 10 s.
 HEADER_TIMEOUT_S = 10
 
+# Reads are handed to the parser in pieces of at most this many bytes, so that when a
+# request ends inside a read, the bytes after it, the start of the next request's head,
+# are counted: the parser says that a request has ended, not where, so the whole piece
+# it ended in is counted toward the next head. A head that follows another request in
+# the same read is counted at most this much over its size; one that does not, exactly.
+_PIECE = 4 * 1024
+
 _MESSAGE = f"The request line and headers may be at most {HEADER_MAX} bytes"
 _BODY = json.dumps({"error": {"code": "HEADERS_TOO_LARGE", "message": _MESSAGE}}).encode()
 _HEADERS = [
@@ -91,6 +100,8 @@ class HeaderLimitProtocol(HttpToolsProtocol):
         super().__init__(*args, **kwargs)
         self._awaiting_head = True  # the parser is before or inside a request's head
         self._head_bytes = 0  # bytes read while it was
+        self._piece = 0  # the size of the piece being parsed
+        self._dropped = False  # the connection was closed inside a parse: ignore the rest
         self._head_deadline: asyncio.TimerHandle | None = None
 
     # The connection
@@ -104,11 +115,19 @@ class HeaderLimitProtocol(HttpToolsProtocol):
         super().connection_lost(exc)
 
     def data_received(self, data: bytes) -> None:
-        if self._awaiting_head:
-            self._head_bytes += len(data)
-        super().data_received(data)
-        if self._awaiting_head and self._head_bytes > HEADER_MAX:
-            self._refuse_unfinished_head()
+        for start in range(0, len(data), _PIECE):
+            if self.transport.is_closing():
+                return
+            piece = data[start : start + _PIECE]
+            self._piece = len(piece)
+            if self._awaiting_head:
+                self._head_bytes += len(piece)
+            super().data_received(piece)
+            if self._awaiting_head and self._head_bytes > HEADER_MAX:
+                self._refuse_unfinished_head()
+                return
+            if self.parser is not None and self.parser.should_upgrade():
+                return  # httptools parses nothing after an `Upgrade` request, as before
 
     # The parser's callbacks
 
@@ -119,6 +138,12 @@ class HeaderLimitProtocol(HttpToolsProtocol):
         if _head_size(self.parser.get_method(), self.url, self.headers) <= HEADER_MAX:
             super().on_headers_complete()
             return
+        if self._answering():
+            # pipelined behind a response in progress (an event stream, which may never
+            # end): a refusal queued behind it would hold the connection as long, so
+            # close it, writing nothing into that response
+            self._drop()
+            return
         # uvicorn's own path for a request it will not pass on (as it serves
         # `--limit-concurrency`'s 503), so the refusal is framed, queued behind a
         # pipelined request and closes the connection as any response does
@@ -128,10 +153,16 @@ class HeaderLimitProtocol(HttpToolsProtocol):
         finally:
             self.app = app
 
+    def on_body(self, body: bytes) -> None:
+        if not self._dropped:
+            super().on_body(body)
+
     def on_message_complete(self) -> None:
+        if self._dropped:
+            return
         super().on_message_complete()
         self._awaiting_head = True  # what follows is the next request's head
-        self._head_bytes = 0
+        self._head_bytes = self._piece  # it may have begun in the piece this one ended in
         self._arm_if_waiting()
 
     def on_response_complete(self) -> None:
@@ -164,6 +195,14 @@ class HeaderLimitProtocol(HttpToolsProtocol):
         self._head_deadline = None
         if not self.transport.is_closing() and not self._answering():
             self.transport.close()
+
+    def _drop(self) -> None:
+        """Close the connection without an answer, from inside a parse: the rest of the
+        piece being parsed is ignored."""
+        self._dropped = True
+        self._awaiting_head = False
+        self._cancel_deadline()
+        self.transport.close()
 
     def _refuse_unfinished_head(self) -> None:
         self._awaiting_head = False
