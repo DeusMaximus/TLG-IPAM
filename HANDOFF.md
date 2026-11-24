@@ -27,6 +27,20 @@ Template:
 
 ---
 
+## 2026-11-24 — Claude Code (Opus 5.5), worker — #143: open enrolments by the server's clock, none for a disabled agent; release versions in normal form (PR #150)
+- **Done:** [PR #150](https://github.com/DeusMaximus/TLG-IPAM/pull/150) (`143-agents-page-followups`, head `dabbfce`) closes #143. (Written by the orchestrator from the PR body: the worker's thread was still waiting on CI when the PR merged.)
+  - Server, response only: `services/agents.expires_in_s` and `schemas.TokenOut.expires_in_s`, the whole seconds a live enrolment token has left by the server's clock (`agents.live`), rounded down, null for a token that is not live and for an agent token. Every owner answer for an agent carries it. No MCP tool reads it.
+  - Page (`web/src/utils/agents.js`, `pages/Agents.jsx`): the countdown is the server's number less the time since the request was sent, measured with `performance.now()` (`monotonicNow`), never the wall clock, and it updates on its own timer, not only on the 30-second list refresh. A disabled agent's live token is shown as "enrolment blocked until it is enabled" and is not listed in Pending enrolments; Revoke stays enabled for it.
+  - `web/src/utils/install.js`: `releaseVersion` refuses a leading zero in any numeric part, so `00.02.00` and `0.2.0rc01` render the `<version>` placeholder.
+  - `web/src/utils/install.test.js` reads its accepted and refused version cases from `agent/tests/test_release.py`, strictly: a case in a shape it cannot read exactly as Python does (single quotes, a tuple across lines, an escape) fails the test instead of being skipped. The page and the release check judge one list.
+  - Docs: brief §3.9 (the `expires_in_s` row) and §6.2, spec §5.6 and §5.8, the `AGENTS.md` guided-install bullet.
+  - Merged: `a095c64`, squash, on the owner's go-ahead; the remote branch is deleted. CI green and Codex clean on `dabbfce`. Greptile read only the first head (one finding, fixed), so Sol (GPT-6.1 Sol) read it twice in its place: GO at `24494f4` with two P3s (the countdown used the wall clock and only moved on the refresh; the case reader did not decode Python escapes), both fixed in `89614c9`; GO at `d4fb98e` with one P3 (a fractional timer delay could fire before the clock moved), fixed in `dabbfce` with the reviewer's own one-line remedy. The orchestrator read that last diff against the remedy and ran 179 web tests, lint and build on the head, and 1,340 server and 1,371 agent tests on `d4fb98e`. No follow-ups.
+- **Decisions:** PR body Deliberate calls 1–7. The main ones: the clock item is decided from a duration the server gives, not shown as uncertain; `expires_in_s` follows the token's rule alone, and the page applies the disabled rule from the agent's state; counting from the request errs early by the request's own time.
+- **State:** merged. No schema change; `PROTOCOL_VERSION` unchanged; no command's shape or artefact name changed.
+- **Waiting on the owner:** nothing from this entry.
+- **Untested:** a real browser with its clock set off or stepped (the tests fake the clocks in jsdom).
+- **Next:** #92 (the plain-HTTP warning before a token is issued) is the dialog's remaining open issue. #147 (release pipeline tests) edits `agent/tests/test_release.py`, which this PR also changed, and can start now.
+
 ## 2026-11-24 — Claude Code (Opus 5.5), worker — #149: the CNAME walk keyed by wire bytes; which PTR record wins (PR #151)
 - **Done:** [PR #151](https://github.com/DeusMaximus/TLG-IPAM/pull/151) (`149-cname-walk-keys`, head `ad268e2`) closes #149. (Written by the orchestrator from the PR body: the worker's thread was still finishing when the PR merged.)
   - `probe.answered_name` keys its CNAME map and visited set by `Name.to_digestable()` (the name's wire form, labels lowercased, lengths included), not by `dns.name.Name`, whose hash in dnspython 2.9.2 ignores where labels split. A 512-link chain of colliding names went from about 724,000 `Name.fullcompare` calls to one. The walk visits the same names in the same order.
@@ -97,43 +111,3 @@ Template:
 - **Untested:** any real network or resolver; DNAME; an `NXDOMAIN` carrying an unrelated SOA; DNSSEC and malformed-message fuzzing.
 - **Next:**
   - #149, #20 and #93 are all in `probe.py`, so they run one at a time.
-
-## 2026-11-24 — Claude Code (Opus 5.5), worker — #24: release pipeline for the agent image and wheel (PR #145)
-- **Done:**
-  - [PR #145](https://github.com/DeusMaximus/TLG-IPAM/pull/145) (`24-release-pipeline`, head `5801a18`) closes #24. It includes `main` at `b2ba364` (merge `b8c9469`).
-  - One version: `api/app/version.py` `VERSION` = the agent's `__version__` = `0.2.0.dev0`.
-    - `settings.version` is a `ClassVar`, so `VERSION` in the environment is no longer read.
-    - `agent/tests/test_release.py` and `install.test.js` hold the two literals together.
-  - `.github/workflows/release.yml`. On a tag `v<version>` on `main`:
-    - `build` (`contents: read`): version and tag checks, the wheel (`flit_core` from the new hashed `agent/requirements-build.txt`, reproducible), the image (amd64 and arm64, one OCI archive), start-up checks per platform with `--network none`.
-    - `publish-image` (`packages: write`): `skopeo copy --all --preserve-digests`, only to a tag the registry says is absent.
-    - `publish-release` (`contents: write`): `gh release create`; a draft a re-run finds is published.
-    - `verify`: fetches both artefacts with no credential, as the install commands do.
-    - A PR or a run by hand builds and checks only. Actions are pinned to commits, the BuildKit and binfmt images to digests.
-  - `.github/scripts/release_check.py` and `check-agent-image.sh` (CI's `agent` job uses the script too).
-  - `.agents/releases.md` (the runbook); `AGENTS.md` bullet "One version, released from a tag" and the third agent lock command; brief §2.4 (new), §4.2, §7, §10; spec §5.6; both READMEs.
-  - Review fixes in `5801a18`: Codex P2 and Greptile P1 (draft release never published on a re-run), Greptile P1 (a failed registry read taken as an absent tag). All threads are answered and resolved.
-  - Merged: `50d785f`, squash, on the owner's go-ahead; the remote branch is deleted. Nothing was published: the workflow publishes only on a pushed `v*` tag. CI green and Codex clean on `5801a18`. Greptile read only `b8c9469`, so one outside read by Sol (GPT-6.1 Sol) stood in for its re-run: GO at `5801a18` with two P3s, no Deliberate call overruled; it started both platforms' images from the PR's own build artefact with no network, and ran the publish steps' shell against stub commands. The orchestrator ran 1,295 agent, 1,129 server and 157 web tests on that head. The two P3s are filed as #147 (no test runs the publish steps; the runbook does not cover a retry after the seven-day build artefact has expired).
-- **Decisions:** Deliberate calls 1–12 in the PR body. The main ones:
-  - two version literals and three checks that hold them equal;
-  - the environment no longer overrides the version;
-  - `main` stays at `.dev0` between releases;
-  - arm64 included (QEMU);
-  - build once and publish those files by digest;
-  - skopeo, not docker actions (skopeo 1.13's `docker-daemon:` transport is refused by current Docker, so images go through `docker-archive:`);
-  - no attestations, no `latest` tag, no `environment:` gate.
-- **State:**
-  - merged. Tests: server 1,129; agent 1,295; web 157.
-  - No schema change; `PROTOCOL_VERSION` 2, from #100.
-- **Waiting on the owner:**
-  - The one-time setup in `.agents/releases.md`: give the repository Write access if the ghcr package already exists, and make the package public after the first publish.
-  - Then the release checklist: a bump PR to `0.2.0`, tag `v0.2.0`, push it.
-- **Untested:**
-  - the real push to ghcr.io and the release creation;
-  - what ghcr.io tells the workflow token about a package never pushed (`DENIED` would stop the first release before pushing);
-  - `verify` against real artefacts;
-  - the publish jobs' re-run paths.
-- **Next:**
-  - The owner's first release per `.agents/releases.md`; #147 should land before it.
-  - #94 (pin the agent base image by digest) goes with it.
-  - #143 has a P3 on release versions not in normal form that `install.releaseVersion` accepts (`01.2`); the release check refuses them.
