@@ -202,6 +202,74 @@ def test_the_unit_runs_the_agent_as_the_service_user_with_cap_net_raw_alone(root
     assert "IPAM_AGENT_TOKEN" not in unit and "IPAM_ENROL_TOKEN" not in unit
 
 
+def unit_environment(unit: str, manager: dict[str, str]) -> dict[str, str]:
+    """The environment systemd gives the unit's process, as systemd 257 was measured to
+    build it on Debian 13 (#138; the PR records the runs): the manager's environment,
+    then each `EnvironmentFile=`'s assignments over it, then every name the
+    `UnsetEnvironment=` lines list removed, after all of those and whatever the order
+    of the lines (an empty `UnsetEnvironment=` empties the list). A stand-in for
+    systemd: the unit's own text decides the outcome, so a unit that stops discarding a
+    setting fails here."""
+    env = dict(manager)
+    unset: list[str] = []
+    for line in unit.splitlines():
+        key, _, value = line.partition("=")
+        assert key != "Environment", "the model does not order Environment= against EnvironmentFile="
+        if key == "EnvironmentFile":
+            for assignment in Path(value.removeprefix("-")).read_text().splitlines():
+                if assignment and not assignment.startswith("#"):
+                    name, _, setting = assignment.partition("=")
+                    env[name] = setting
+        elif key == "UnsetEnvironment":
+            unset = unset + value.split() if value else []
+    for name in unset:
+        env.pop(name, None)
+    return env
+
+
+MANAGER_TRUST = [
+    {},
+    {"SSL_CERT_FILE": "/nonexistent-manager-file"},
+    {"SSL_CERT_DIR": "/nonexistent-manager-dir"},
+    {"SSL_CERT_FILE": "/nonexistent-manager-file", "SSL_CERT_DIR": "/nonexistent-manager-dir"},
+]
+
+
+@pytest.mark.parametrize("manager", MANAGER_TRUST, ids=["none", "file", "dir", "both"])
+@pytest.mark.parametrize("ca", [False, True], ids=["no-ca-file", "ca-file"])
+def test_the_unit_discards_the_trust_settings_of_the_system_managers_environment(root, manager, ca):
+    """#138, the third round on #130: a unit also receives the system manager's
+    environment (`systemctl set-environment`), which the installer never sees. With
+    `SSL_CERT_FILE` set there and no `--ca-file`, install spent the token and the unit
+    could not verify the server. The unit is given agent.env's trust and nothing else:
+    `SSL_CERT_DIR` is always unset, `SSL_CERT_FILE` unless `--ca-file` sets it, and
+    then agent.env's value is the one the agent sees."""
+    bundle = root / "ca.pem"
+    bundle.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
+    ca_file = str(bundle) if ca else None
+    code, said = run_install(root, FakeHost(), Options(url=URL, enrol_token="-", ca_file=ca_file))
+    assert code == 0, said
+    unit = (root / "etc/systemd/system/tlg-ipam-agent.service").read_text()
+    lines = unit.splitlines()
+    discarded = "SSL_CERT_DIR" if ca else "SSL_CERT_FILE SSL_CERT_DIR"
+    assert [line for line in lines if line.startswith("UnsetEnvironment")] == [f"UnsetEnvironment={discarded}"]
+    env = unit_environment(unit, {"PATH": "/usr/bin", **manager})
+    assert {name: env[name] for name in install.TRUST_VARIABLES if name in env} == install.service_trust(ca_file)
+    assert env["PATH"] == "/usr/bin"  # nothing else of the manager's is dropped
+
+
+def test_the_unit_discards_exactly_the_trust_settings_agent_env_does_not_give():
+    for ca_file in (None, "/etc/ipam-ca.pem"):
+        given = install.service_trust(ca_file)
+        discarded = install.discarded_trust(ca_file)
+        assert set(given) | set(discarded) == set(install.TRUST_VARIABLES)
+        assert not set(given) & set(discarded)
+        unit = install.render_unit("/etc/tlg-ipam-agent/agent.env", PYTHON, ca_file)
+        assert f"\nUnsetEnvironment={' '.join(discarded)}\n" in unit
+        # the line holds fixed names alone: the bundle's path is agent.env's, not the unit's
+        assert ca_file is None or ca_file not in unit
+
+
 def test_the_enrolment_token_can_come_from_standard_input(root):
     asked = []
     code, _ = run_install(
@@ -940,17 +1008,14 @@ def tls_server(pki):
     server.close()
 
 
-def _as_the_service(root: Path, monkeypatch) -> Kind:
-    """A check-in made the way the unit's agent makes it: with no trust setting but
-    what agent.env gives (a unit inherits nothing of root's environment), and the
-    token the install stored."""
+def _as_the_service(root: Path, monkeypatch, manager=None) -> Kind:
+    """A check-in made the way the unit's agent makes it: with the environment the
+    unit gives it (`unit_environment`: nothing of root's, the system manager's
+    `manager` with the unit's own settings applied), and the token the install stored."""
     from tlg_ipam_agent.client import AgentClient, make_http
 
-    env = dict(
-        line.split("=", 1)
-        for line in (root / "etc/tlg-ipam-agent/agent.env").read_text().splitlines()
-        if line and not line.startswith("#")
-    )
+    unit = (root / "etc/systemd/system/tlg-ipam-agent.service").read_text()
+    env = unit_environment(unit, manager or {})
     for name in install.TRUST_VARIABLES:
         monkeypatch.delenv(name, raising=False)
     for name in install.TRUST_VARIABLES:
@@ -990,6 +1055,16 @@ def test_live_tls_an_install_with_ca_file_gives_the_unit_the_trust_it_enrolled_w
     assert tls_server.seen[0][1].lower() == f"authorization: bearer {ENROL_TOKEN}".lower()
     assert _as_the_service(root, monkeypatch) is Kind.OK
     assert [path for path, _ in tls_server.seen][-1] == "/api/v1/agent/checkin"
+
+
+@pytest.mark.parametrize("manager", MANAGER_TRUST[1:], ids=["file", "dir", "both"])
+def test_live_tls_with_ca_file_the_unit_trusts_it_whatever_the_manager_sets(root, tls_server, pki, monkeypatch, manager):
+    """#138, acceptance 2: the system manager's environment names a bundle and a
+    directory that do not exist; the unit's agent trusts the `--ca-file` and checks in."""
+    code, said = _live(root, tls_server, monkeypatch, ca=str(pki["ca"]))
+    assert code == 0, said
+    assert _as_the_service(root, monkeypatch, manager) is Kind.OK
+    assert [path for path, _ in tls_server.seen] == ["/api/v1/agent/enrol", "/api/v1/agent/checkin"]
 
 
 @pytest.mark.parametrize("name", ["SSL_CERT_FILE", "SSL_CERT_DIR"])
