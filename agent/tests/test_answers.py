@@ -341,7 +341,13 @@ async def _held(*args: str) -> dict:
         sys.executable, "-I", str(ANSWER_MEMORY), *args,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
-    out, err = await asyncio.wait_for(proc.communicate(), timeout=60)
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=60)
+    finally:
+        # a timed-out or cancelled wait leaves no child behind the test
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
     assert proc.returncode == 0, err.decode(errors="replace")
     return json.loads(out)
 
