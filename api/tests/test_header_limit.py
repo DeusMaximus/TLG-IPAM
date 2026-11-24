@@ -27,7 +27,7 @@ import uvicorn
 from uvicorn.server import ServerState
 
 from app import header_limit, serve
-from app.header_limit import HEADER_MAX, HEADER_TIMEOUT_S, STALL_TIMEOUT_S, HeaderLimitProtocol
+from app.header_limit import _PIECE, HEADER_MAX, HEADER_TIMEOUT_S, STALL_TIMEOUT_S, HeaderLimitProtocol
 
 from .test_auth import INITIALIZE, INITIALIZED, MCP_ACCEPT
 from .test_body_limit import Served, exchange, raw_post
@@ -408,7 +408,7 @@ def test_pipelined_requests_are_served_in_turn(quick):
 # --- The size (`HEADER_MAX`) ---
 
 
-def test_on_the_image_an_unfinished_head_past_the_limit_is_refused(image):
+def test_on_the_image_an_unfinished_head_past_the_limit_is_stopped(image):
     """Exactly one byte more than the limit, and no end to the head: the server has read
     all of it when it answers, so its close sends no reset that could drop the answer."""
     start = b"GET /health HTTP/1.1\r\nHost: t\r\nX-Pad: "
@@ -537,7 +537,7 @@ def test_on_the_image_heads_after_a_request_in_the_same_write_are_counted_exactl
     assert received.count(b"HTTP/1.1 200 OK") == 1, received[-300:]
 
 
-def test_many_unfinished_heads_past_the_limit_are_each_refused(image):
+def test_many_unfinished_heads_past_the_limit_are_each_stopped(image):
     socks = [connect(image) for _ in range(50)]
     start = b"GET /health HTTP/1.1\r\nHost: t\r\nX-Pad: "
     try:
@@ -743,7 +743,7 @@ async def test_a_head_after_a_request_with_a_declared_body_counts_from_its_own_f
 
 
 @pytest.mark.parametrize("together", [True, False], ids=["one read", "separate reads"])
-async def test_a_head_one_byte_over_after_a_request_is_refused(together):
+async def test_a_head_one_byte_over_after_a_request_is_stopped(together):
     conn = Connection()
     first = spelt_head(4096, close=False, start=b"GET /first")
     if together:
@@ -770,34 +770,41 @@ CHUNKED = {
 
 
 @pytest.mark.parametrize("body", CHUNKED.values(), ids=CHUNKED.keys())
-@pytest.mark.parametrize("seed", [None, 1, 2], ids=["one read", "split 1", "split 2"])
-@pytest.mark.parametrize("together", [True, False], ids=["in the body's read", "after it"])
-async def test_after_a_chunked_body_a_head_counts_from_its_own_first_byte(body, seed, together):
-    """A chunked body ends in CRLF CRLF, which is a cut, so the next head is counted
-    exactly however the reads fall: 65,536 is served and 65,537 refused. In the body's
-    own read the second request is queued behind the first, so one over the limit
-    drops the connection (behind a response in progress) rather than being answered."""
-    for size in (HEADER_MAX, HEADER_MAX + 1):
+async def test_a_head_after_a_chunked_body_read_apart_is_counted_exactly(body):
+    """A chunked body whose end is the end of a read ends a piece, so the head in the
+    next read is counted from its first byte: 65,536 is served and 65,537 refused."""
+    for size, statuses in ((HEADER_MAX, [200, 200]), (HEADER_MAX + 1, [200, 431])):
         conn = Connection()
-        first = b"POST /first HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" + body
-        head = spelt_head(size)
-        if together:
-            data = first + head
-            conn.feed(data, None if seed is None else splits(len(data), seed))
-        else:
-            conn.feed(first)
-            await conn.settle()
-            conn.feed(head, None if seed is None else splits(len(head), seed))
+        conn.feed(b"POST /first HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" + body)
         await conn.settle()
-        if size == HEADER_MAX:
-            assert conn.statuses() == [200, 200], (size, seed, together)
-            assert conn.seen == ["/first", "/health"]
-        elif together:  # fed without a yield: the first is still being answered
-            assert conn.transport.aborted and 431 not in conn.statuses()
-            assert conn.seen == ["/first"]
+        conn.feed(spelt_head(size))
+        await conn.settle()
+        assert conn.statuses() == statuses, size
+        conn.close()
+
+
+@pytest.mark.parametrize("body", CHUNKED.values(), ids=CHUNKED.keys())
+@pytest.mark.parametrize("split", [None, 1, 2, 3], ids=["one read", "end split 1", "end split 2", "end split 3"])
+async def test_after_a_chunked_body_in_the_same_piece_a_head_is_counted_at_most_a_piece_over(body, split):
+    """The one case not counted exactly (module docstring): a chunked body's end is no
+    cut, so a head that begins in the piece it ended in is counted from that piece's
+    start, at most `_PIECE` bytes over. A head that much under the limit is served, and
+    one byte over the limit never is."""
+    first = b"POST /first HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" + body
+    for size in (HEADER_MAX - _PIECE, HEADER_MAX + 1):
+        conn = Connection()
+        if split is None:
+            conn.feed(first + spelt_head(size))
+        else:  # the body's last bytes arrive with the head
+            conn.feed(first[:-split])
+            await conn.settle()
+            conn.feed(first[-split:] + spelt_head(size))
+        await conn.settle()
+        if size == HEADER_MAX - _PIECE:
+            assert conn.seen == ["/first", "/health"] and conn.statuses() == [200, 200], split
         else:
-            assert conn.statuses() == [200, 431], (seed, together)
-            assert conn.seen == ["/first"]
+            assert conn.seen == ["/first"], split
+            assert conn.transport.closed
         conn.close()
 
 
@@ -900,7 +907,7 @@ async def test_a_declared_body_is_not_timed_as_a_head(monkeypatch):
 
 
 @pytest.mark.parametrize("extra", [1, 3000, 70000])
-async def test_an_unfinished_head_is_refused_with_one_byte_past_the_limit_parsed(monkeypatch, extra):
+async def test_an_unfinished_head_is_stopped_with_one_byte_past_the_limit_parsed(monkeypatch, extra):
     """However much arrives in one read, the parser is handed at most one byte past the
     limit of an unfinished head before it is refused."""
     parsed = []
@@ -938,41 +945,23 @@ def test_on_the_image_an_upgrade_post_with_a_body_is_answered_at_once(image):
     assert status_of(answer) == 422, answer[:300]
 
 
-@pytest.mark.parametrize("split", [1, 2, 3, 4, 5])
-async def test_a_chunked_end_split_across_reads_is_still_a_cut(split):
-    """The CRLF CRLF that ends a chunked body, split across two reads at each place: the
-    bytes kept from the first read find it, so the head after it is counted from its
-    first byte and one byte over the limit is refused."""
-    first = b"POST /first HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
-    for size in (HEADER_MAX, HEADER_MAX + 1):
-        conn = Connection()
-        conn.feed(first[:-split])
-        await conn.settle()
-        conn.feed(first[-split:] + spelt_head(size))
-        await conn.settle()
-        assert conn.seen == (["/first", "/health"] if size == HEADER_MAX else ["/first"]), (split, size)
-        conn.close()
-
-
 @pytest.mark.parametrize("body", CHUNKED.values(), ids=CHUNKED.keys())
-async def test_after_a_chunked_body_in_the_same_read_requests_are_queued_one_at_a_time(body):
-    """The end of a chunked body is a cut like any other end of a request, so of the
-    100 small requests one read brings behind it, one is queued at a time and every one
-    is answered, in turn, on a connection that stays open."""
+async def test_after_a_chunked_body_no_second_request_is_queued(body):
+    """A chunked body's end is no cut, so the piece it ends in can hold many small
+    requests whole. One is queued; the next to complete ends the taking of requests:
+    the two taken are answered, the connection closes after them, and the rest is
+    discarded unanswered and not kept."""
     conn = Connection()
     chunked = b"POST /first HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" + body
     many = b"".join(f"GET /r{i} HTTP/1.1\r\nHost: t\r\n\r\n".encode() for i in range(100))
     conn.feed(chunked + many)
     assert len(conn.protocol.pipeline) == 1
-    deepest = 1
-    for _ in range(40):
-        await asyncio.sleep(0)
-        deepest = max(deepest, len(conn.protocol.pipeline))
+    assert conn.protocol._unparsed == b""  # what was discarded is not kept
+    for _ in range(5):
         await conn.settle()
-    assert deepest == 1
-    assert conn.seen == ["/first", *(f"/r{i}" for i in range(100))]
-    assert conn.statuses() == [200] * 101
-    assert not conn.transport.closed
+    assert conn.seen == ["/first", "/r0"]
+    assert conn.statuses() == [200, 200]
+    assert conn.transport.closed and not conn.transport.aborted
     conn.close()
 
 
@@ -980,9 +969,10 @@ async def test_after_a_chunked_body_in_the_same_read_requests_are_queued_one_at_
 
 
 async def test_a_refusal_after_requests_taken_waits_for_their_answers():
-    """A chunked request held, two requests behind it and malformed bytes, in one read.
-    uvicorn alone wrote its `400` and closed in front of the three answers; here the
-    three are answered, the last with the connection closed, and nothing else."""
+    """Round 3's sequence in process: a chunked request held, two requests behind it and
+    malformed bytes, in one read. uvicorn's parser-error path wrote its `400` and
+    closed in front of every answer; here the requests taken are answered, the last
+    with the connection closed, and nothing else is written."""
     conn = Connection()
     data = (
         b"POST /hold HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
@@ -996,8 +986,10 @@ async def test_a_refusal_after_requests_taken_waits_for_their_answers():
     conn.held[0].set()
     for _ in range(5):
         await conn.settle()
-    assert conn.seen == ["/hold", "/a", "/b"]
-    assert conn.statuses() == [200, 200, 200]
+    # /b completed in the piece the chunked body ended in, behind the queued /a, so it
+    # ended the taking of requests; the malformed bytes after it wrote no `400`
+    assert conn.seen == ["/hold", "/a"]
+    assert conn.statuses() == [200, 200]
     assert b"connection: close" in bytes(conn.transport.written).rpartition(b"HTTP/1.1 200")[2].lower()
     assert conn.transport.closed and not conn.transport.aborted
     conn.close()
@@ -1034,7 +1026,7 @@ async def test_after_a_refusal_nothing_more_is_read_while_the_last_answer_runs(m
     for _ in range(3):
         await conn.settle()
     assert conn.seen == ["/first", "/hold"]  # /hold runs, held; the malformed bytes are refused
-    assert conn.protocol._refused
+    assert conn.protocol._stopped
     assert not conn.transport.reading
     assert conn.protocol._head_deadline is None
     conn.feed(b"GET /late HTTP/1.1\r\nHost: t\r\n\r\n")  # read before the pause took hold
@@ -1050,9 +1042,9 @@ async def test_after_a_refusal_nothing_more_is_read_while_the_last_answer_runs(m
 
 def test_on_the_image_a_committed_write_keeps_its_answer_before_a_malformed_request(image):
     """Round 3's reproduction: a chunked owner write, two requests behind it and
-    malformed bytes, in one write. The write's own answer arrives, then the two
-    requests', then the connection closes; at most uvicorn's `400` follows them, when
-    the malformed bytes are refused after every answer has gone. The write is there."""
+    malformed bytes, in one write. The write's own answer arrives first, then what the
+    design gives the rest, and never a `400` in front of an answer. The write is
+    there."""
     body = json.dumps({"name": "behind-invalid"}).encode()
     chunked = f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n"
     request = (
@@ -1066,10 +1058,98 @@ def test_on_the_image_a_committed_write_keeps_its_answer_before_a_malformed_requ
         sock.sendall(request)
         received, _ = until_closed(sock, 10)
     statuses = [int(s) for s in re.findall(rb"HTTP/1\.1 (\d{3}) ", received)]
-    assert statuses[:3] == [201, 200, 200], received[:600]
-    assert statuses[3:] in ([], [400]), statuses
+    # in one read: the write, the request queued behind it, then the close (the second
+    # request ended the taking of requests); when the kernel splits the write, the
+    # second request may be taken too, and uvicorn's `400` may follow every answer
+    assert statuses in ([201, 200], [201, 200, 200], [201, 200, 200, 400]), (statuses, received[:600])
     listed = exchange(
         image.port,
         f"GET /api/v1/sections HTTP/1.1\r\nHost: t\r\nX-API-Key: {image.key}\r\nConnection: close\r\n\r\n".encode(),
     )
     assert b"behind-invalid" in listed[2]
+
+
+async def test_after_a_chunked_body_reading_stays_paused_while_the_last_taken_runs():
+    """Round 3, finding 2, on its own path: a chunked request, a held one and a third
+    complete head in one read. The third ends the taking of requests; while the held one
+    runs, reading stays paused (uvicorn resumes it as that request starts and asks for
+    its body), no time for a head runs, and what arrives anyway is not parsed."""
+    conn = Connection()
+    conn.feed(
+        b"POST /first HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+        b"GET /hold HTTP/1.1\r\nHost: t\r\n\r\n"
+        b"GET /third HTTP/1.1\r\nHost: t\r\n\r\n"
+    )
+    for _ in range(3):
+        await conn.settle()
+    assert conn.seen == ["/first", "/hold"]
+    assert not conn.transport.reading
+    assert conn.protocol._head_deadline is None
+    conn.feed(b"GET /late HTTP/1.1\r\nHost: t\r\n\r\n")
+    await conn.settle()
+    assert conn.seen == ["/first", "/hold"]
+    conn.held[0].set()
+    await conn.settle()
+    assert conn.statuses() == [200, 200]
+    assert conn.transport.closed and not conn.transport.aborted
+    conn.close()
+
+
+HOSTILE = {
+    "CRLF CRLF repeated": b"\r\n\r\n",
+    "a near miss repeated": b"\r\n0\r\n\r\n",
+    "one-byte chunks": None,
+}
+
+
+def hostile_body(kind: str, size: int) -> bytes:
+    if HOSTILE[kind] is None:  # the parser's own cost: one chunk per byte
+        return b"1\r\na\r\n" * (size // 6) + b"0\r\n\r\n"
+    data = HOSTILE[kind] * (size // len(HOSTILE[kind]))
+    return b"".join(f"{len(data[i:i + 4096]):x}\r\n".encode() + data[i : i + 4096] + b"\r\n" for i in range(0, len(data), 4096)) + b"0\r\n\r\n"
+
+
+@pytest.mark.parametrize("kind", HOSTILE)
+async def test_no_body_a_sender_chooses_costs_more_than_a_piece_per_4_kib(monkeypatch, kind):
+    """The cuts are where requests end and nowhere a sender can multiply: the parser is
+    handed at most one piece per `_PIECE` bytes, plus a few per request (the end of its
+    head, the end of a declared body, one byte at the limit), whatever the body holds."""
+    calls = []
+    original = header_limit.HttpToolsProtocol.data_received
+    monkeypatch.setattr(header_limit.HttpToolsProtocol, "data_received", lambda self, data: (calls.append(len(data)), original(self, data)))
+    body = hostile_body(kind, 1_900_000)
+    request = b"POST /first HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" + body
+    conn = Connection()
+    conn.feed(request)  # one read
+    await conn.settle()
+    assert conn.statuses() == [200]
+    assert sum(calls) == len(request)
+    assert len(calls) <= len(request) // _PIECE + 4, (kind, len(calls))
+    conn.close()
+
+
+async def test_blank_lines_before_a_head_cost_no_more_than_a_piece_per_4_kib(monkeypatch):
+    """The parser skips blank lines before a request line, so a CRLF CRLF there ends no
+    head; a head is cut at one at most once, and by size after it."""
+    calls = []
+    original = header_limit.HttpToolsProtocol.data_received
+    monkeypatch.setattr(header_limit.HttpToolsProtocol, "data_received", lambda self, data: (calls.append(len(data)), original(self, data)))
+    blank = b"\r\n\r\n" * 16000  # 64,000 bytes, under the limit
+    conn = Connection()
+    conn.feed(blank + b"GET /after HTTP/1.1\r\nHost: t\r\n\r\n")
+    await conn.settle()
+    assert conn.statuses() == [200] and conn.seen == ["/after"]
+    assert len(calls) <= len(blank) // _PIECE + 4, len(calls)
+    conn.close()
+
+
+async def test_a_request_stopped_part_way_through_its_own_body_gets_uvicorns_400():
+    """Malformed chunk framing in the body of the one request being answered: nothing is
+    ahead of it, so its answer is uvicorn's `400` at once, not a wait for a body that
+    cannot complete."""
+    conn = Connection()
+    conn.feed(b"POST /broken HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloZZ")
+    await conn.settle()
+    assert conn.statuses() == [400]
+    assert conn.transport.closed
+    conn.close()
