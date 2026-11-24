@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 CHECKIN_INTERVAL_S = 60
 JOB_TIMEOUT_S = 600
 

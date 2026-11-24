@@ -126,30 +126,61 @@ def _server_job(**overrides) -> dict:
 
 
 async def test_the_servers_job_parses_and_the_result_set_is_what_the_server_accepts():
+    """Each of the three things a lookup can find (#100): a name, an answer that there
+    is none (`rdns_no_name`), and no usable answer (neither), each a record the server
+    reads back field for field, in a result set of the server's protocol."""
     raw = _server_job(dns_servers=["10.0.0.53"])
     parsed = protocol.parse_job(protocol.job_ref(raw), raw)
     addresses = guard.plan(parsed, parse_allowed(None))
     result = await scan.run(
         parsed,
         addresses,
-        prober=FakeProber(alive=["10.0.0.1", "10.0.0.7"]),
-        resolver=FakeResolver({"10.0.0.7": "NAS.Home.Arpa."}),
+        prober=FakeProber(alive=["10.0.0.1", "10.0.0.7", "10.0.0.9"]),
+        resolver=FakeResolver({"10.0.0.7": "NAS.Home.Arpa."}, unanswered=["10.0.0.9"]),
         max_pps=200,
         clock=FakeClock(),
     )
     request = server.ResultsRequest.model_validate(result)
-    assert request.complete is True
+    assert request.protocol == server.PROTOCOL_VERSION in server.RESULTS_PROTOCOLS
+    assert request.complete is True and request.liveness_complete is True
+    assert request.marks_dead() is True
+    assert result["observations"] == [
+        {"ip": "10.0.0.1", "rdns_no_name": True},
+        {"ip": "10.0.0.7", "rdns_name": "nas.home.arpa"},
+        {"ip": "10.0.0.9"},
+    ]
     for record in request.observations:
         observation, reason = server.parse_observation(record)
         assert reason is None
-        assert observation.model_dump(exclude_none=True) == record
+        assert observation.model_dump(exclude_defaults=True) == record
+
+
+async def test_an_agent_result_set_whose_lookups_did_not_run_still_marks_the_dead():
+    """No DNS server to ask: the result set is incomplete, its liveness sweep is not,
+    and the server reads it that way (#100)."""
+    raw = _server_job()
+    parsed = protocol.parse_job(protocol.job_ref(raw), raw)
+    result = await scan.run(
+        parsed,
+        guard.plan(parsed, parse_allowed(None)),
+        prober=FakeProber(alive=["10.0.0.1"]),
+        resolver=FakeResolver(host=()),
+        max_pps=200,
+        clock=FakeClock(),
+    )
+    request = server.ResultsRequest.model_validate(result)
+    assert request.complete is False and request.liveness_complete is True
+    assert request.marks_dead() is True
+    assert request.error == probe.NO_DNS_SERVER
 
 
 def test_a_refusal_is_a_result_set_the_server_accepts():
     raw = _server_job()
     result = scan.refusal(protocol.job_ref(raw), "refused: subnet x is outside ALLOWED_CIDRS", FakeClock())
     request = server.ResultsRequest.model_validate(result)
+    assert request.protocol == server.PROTOCOL_VERSION
     assert request.complete is False and request.observations == [] and request.error
+    assert request.liveness_complete is False and request.marks_dead() is False
 
 
 # names of exactly the cap and one past it, with and without the trailing dot the

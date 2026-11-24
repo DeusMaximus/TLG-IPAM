@@ -457,7 +457,8 @@ async def test_the_deadline_stops_the_sweep_and_reports_incomplete():
     # 253 requests at 10 a second take 25 s; the job allows 5
     parsed, addresses = planned(timeout_s=5)
     result = await sweep(parsed, addresses, arp_link=link, clock=clock, max_pps=10)
-    assert result["complete"] is False
+    # a sweep cut short must never let the server mark the silent addresses dead (#100)
+    assert result["complete"] is False and result["liveness_complete"] is False
     assert "during the ARP sweep" in result["error"]
     assert 40 <= len(link.requests) <= 52
     assert all(t < 1000 + 5 for t in link.times)
@@ -474,7 +475,58 @@ async def test_a_reply_wait_cut_by_the_deadline_makes_the_result_incomplete():
     parsed, addresses = planned(ranges=[{"start": "10.0.0.1", "end": "10.0.0.2"}], timeout_s=1)
     result = await sweep(parsed, addresses, arp_link=link, clock=clock, max_pps=4)
     assert link.asked("10.0.0.1") == 1
+    assert result["complete"] is False and result["liveness_complete"] is False
+
+
+@pytest.mark.parametrize("failure", ["deadline", "reply-wait", "unopenable", "unreadable", "unsendable"])
+async def test_an_arp_sweep_interrupted_after_a_whole_icmp_sweep_is_no_whole_liveness_sweep(failure):
+    """#100, round 1 of the briefed review, finding 2: `liveness_complete` is what lets
+    the server mark the silent addresses dead, so the ICMP sweep's having finished
+    must not carry it past an ARP sweep that was cut off or failed, in each way it can
+    be. The ICMP sweep of these jobs finishes first, and its answers are reported."""
+    clock = FakeClock()
+    prober = FakeProber(alive=["10.0.0.3"], clock=clock)
+    timeout_s, pps, end = 600, 200, "10.0.0.20"
+    if failure == "deadline":
+        link = FakeArp(clock=clock)
+        # 20 echo requests take 2 s at 10 a second; the 1 s left takes 10 of the 19
+        # ARP requests
+        timeout_s, pps = 3, 10
+    elif failure == "reply-wait":
+        link = FakeArp(clock=clock)
+        # the 20 echo requests and the 19 ARP requests take under 4 s at 10 a second;
+        # the 1 s wait for their replies does not fit in a 4 s job
+        timeout_s, pps = 4, 10
+    elif failure == "unopenable":
+        link = FakeArp(fail_open=ProbeError("ARP socket unavailable (OSError)"), clock=clock)
+    elif failure == "unreadable":
+        link = FakeArp(fail_receive_after=1, clock=clock)
+    else:
+        class Unsendable(FakeArp):
+            async def send(self, frame):
+                self.requests.append(frame)
+                raise ProbeError("ARP request not sent on eth0 (OSError)")
+
+        link = Unsendable(clock=clock)
+    parsed, addresses = planned(
+        methods=["icmp", "arp"], ranges=[{"start": "10.0.0.1", "end": end}], timeout_s=timeout_s
+    )
+    result = await sweep(parsed, addresses, arp_link=link, prober=prober, clock=clock, max_pps=pps)
+    assert len(prober.sent) == 20  # the ICMP sweep ran whole
+    if failure == "deadline":
+        assert 0 < len(link.requests) < 19  # cut off among its requests
+    elif failure == "reply-wait":
+        assert len(link.requests) == 19  # every request went; the wait was cut
+    assert {"ip": "10.0.0.3"} in result["observations"]
     assert result["complete"] is False
+    assert result["liveness_complete"] is False
+    assert result["error"] == {
+        "deadline": f"timed out after {timeout_s} s during the ARP sweep",
+        "reply-wait": f"timed out after {timeout_s} s during the ARP sweep",
+        "unopenable": "ARP socket unavailable (OSError)",
+        "unreadable": "ARP replies not readable on eth0 (OSError)",
+        "unsendable": "ARP request not sent on eth0 (OSError)",
+    }[failure]
 
 
 async def test_with_every_address_answered_there_is_no_retry_round():
@@ -483,7 +535,7 @@ async def test_with_every_address_answered_there_is_no_retry_round():
     parsed, addresses = planned(ranges=[{"start": "10.0.0.1", "end": "10.0.0.2"}])
     result = await sweep(parsed, addresses, arp_link=link, clock=clock)
     assert link.requests == [ip("10.0.0.1"), ip("10.0.0.2")]
-    assert result["complete"] is True
+    assert result["complete"] is True and result["liveness_complete"] is True
     assert clock.t - 1000 < scan.ARP_TIMEOUT_S
 
 
@@ -492,7 +544,8 @@ async def test_a_socket_that_cannot_be_opened_keeps_the_icmp_results():
     link = FakeArp(fail_open=ProbeError("ARP needs CAP_NET_RAW: run the container with --cap-add NET_RAW"))
     parsed, addresses = planned(methods=["icmp", "arp"])
     result = await sweep(parsed, addresses, arp_link=link, prober=prober)
-    assert result["complete"] is False
+    # the ICMP sweep completed; the ARP sweep did not run, so the sweep is not whole
+    assert result["complete"] is False and result["liveness_complete"] is False
     assert "CAP_NET_RAW" in result["error"]
     assert {"ip": "10.0.0.3"} in result["observations"]
 
@@ -501,7 +554,7 @@ async def test_a_socket_that_fails_mid_sweep_stops_it():
     link = FakeArp({"10.0.0.1": "02:00:00:00:00:01"}, fail_receive_after=3)
     parsed, addresses = planned()
     result = await sweep(parsed, addresses, arp_link=link)
-    assert result["complete"] is False
+    assert result["complete"] is False and result["liveness_complete"] is False
     assert "not readable on eth0" in result["error"]
     # it stops at the next send rather than sweeping on deaf
     assert len(link.requests) <= 4
@@ -519,6 +572,7 @@ async def test_a_failed_send_stops_the_sweep():
     parsed, addresses = planned()
     result = await sweep(parsed, addresses, arp_link=link)
     assert result["complete"] is False and "not sent on eth0" in result["error"]
+    assert result["liveness_complete"] is False
     assert len(link.requests) == 1 and link.closed == 1
 
 
@@ -542,7 +596,7 @@ async def test_without_an_interface_on_the_subnet_nothing_is_sent(interfaces):
     parsed, addresses = planned(methods=["icmp", "arp"])
     result = await sweep(parsed, addresses, arp_link=link, prober=prober, interfaces=interfaces)
     assert link.opened == [] and link.requests == []
-    assert result["complete"] is False
+    assert result["complete"] is False and result["liveness_complete"] is False
     assert result["error"] == "arp not run: no interface of this host with a MAC is on 10.0.0.0/24"
     assert result["observations"] == [{"ip": "10.0.0.3"}]
 

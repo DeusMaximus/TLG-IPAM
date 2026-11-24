@@ -9,7 +9,7 @@ from conftest import ETH0, FakeArp, FakeClock, FakeProber, FakeResolver, job
 from tlg_ipam_agent import guard, scan
 from tlg_ipam_agent.config import parse_allowed
 from tlg_ipam_agent.probe import NO_DNS_SERVER, ProbeError, no_query_sent
-from tlg_ipam_agent.protocol import job_ref, parse_job
+from tlg_ipam_agent.protocol import PROTOCOL_VERSION, job_ref, parse_job
 
 
 def planned(**overrides):
@@ -59,7 +59,7 @@ async def test_timeout_stops_the_sweep_and_reports_incomplete():
     # 254 addresses at 10 a second take 25 s; the job allows 5
     parsed, addresses = planned(timeout_s=5)
     result = await sweep(parsed, addresses, prober=prober, resolver=resolver, clock=clock, max_pps=10)
-    assert result["complete"] is False
+    assert result["complete"] is False and result["liveness_complete"] is False
     assert "timed out after 5 s" in result["error"]
     assert 40 <= len(prober.sent) <= 52
     # nothing past the deadline: the last send is within it
@@ -104,7 +104,42 @@ async def test_a_ptr_answer_that_is_not_a_hostname_is_dropped(name):
     resolver = FakeResolver({"10.0.0.3": name})
     parsed, addresses = planned()
     result = await sweep(parsed, addresses, prober=prober, resolver=resolver)
+    # an answer with a name is not "no name": the record carries neither, and the
+    # server keeps the stored name (#100)
     assert result["observations"] == [{"ip": "10.0.0.3"}]
+    assert result["complete"] is True and result["error"] is None
+
+
+async def test_each_record_says_what_its_own_lookup_found():
+    """#100, option 4: a name; `rdns_no_name` for an answer that there is none; neither
+    for a lookup no server gave a usable answer to, which leaves the scan complete
+    and says so in its error, by counts only. The liveness sweep is whole."""
+    prober = FakeProber(alive=["10.0.0.3", "10.0.0.4", "10.0.0.6", "10.0.0.7"])
+    resolver = FakeResolver({"10.0.0.3": "a.home.arpa"}, unanswered=["10.0.0.6", "10.0.0.7"])
+    parsed, addresses = planned()
+    result = await sweep(parsed, addresses, prober=prober, resolver=resolver)
+    assert result["observations"] == [
+        {"ip": "10.0.0.3", "rdns_name": "a.home.arpa"},
+        {"ip": "10.0.0.4", "rdns_no_name": True},
+        {"ip": "10.0.0.6"},
+        {"ip": "10.0.0.7"},
+    ]
+    assert result["complete"] is True and result["liveness_complete"] is True
+    assert result["error"] == scan.no_answer(2, 4)
+    assert len(resolver.asked) == 4
+
+
+async def test_every_lookup_unanswered_is_still_a_complete_scan():
+    """A resolver that answers nothing: every record carries neither, the scan is
+    complete, so the server marks the silent addresses dead and keeps every name."""
+    live = ["10.0.0.3", "10.0.0.4"]
+    prober = FakeProber(alive=live)
+    resolver = FakeResolver(unanswered=live)
+    parsed, addresses = planned(methods=["icmp", "rdns"])
+    result = await sweep(parsed, addresses, prober=prober, resolver=resolver)
+    assert result["observations"] == [{"ip": ip} for ip in live]
+    assert result["complete"] is True and result["liveness_complete"] is True
+    assert result["error"] == scan.no_answer(2, 2)
 
 
 async def test_no_ptr_lookups_without_rdns():
@@ -124,6 +159,8 @@ async def test_a_method_this_release_cannot_run_makes_the_result_incomplete(meth
     parsed, addresses = planned(methods=methods)
     result = await sweep(parsed, addresses, prober=prober)
     assert result["complete"] is False
+    # `fdns` says nothing about liveness: the sweeps it ran are whole (#100)
+    assert result["liveness_complete"] is True
     assert result["error"] == "not run by this agent release: fdns"
     assert len(prober.sent) == 254
 
@@ -150,7 +187,7 @@ async def test_a_prober_that_cannot_work_stops_the_sweep():
     prober = NoRawSockets()
     parsed, addresses = planned()
     result = await sweep(parsed, addresses, prober=prober)
-    assert result["complete"] is False
+    assert result["complete"] is False and result["liveness_complete"] is False
     assert "CAP_NET_RAW" in result["error"]
     # it stops at once rather than failing 254 times
     assert len(prober.sent) <= 2
@@ -161,15 +198,18 @@ async def test_result_set_shape(clock):
     parsed, addresses = planned()
     result = await sweep(parsed, addresses, prober=prober, clock=clock)
     assert set(result) == {
-        "job_id", "subnet_id", "started_at", "finished_at", "complete", "observations", "fdns", "error"
+        "protocol", "job_id", "subnet_id", "started_at", "finished_at", "complete",
+        "liveness_complete", "observations", "fdns", "error",
     }
+    assert result["protocol"] == PROTOCOL_VERSION
     assert result["started_at"] <= result["finished_at"]
 
 
 def test_refusal_result_set(clock):
     raw = job()
     result = scan.refusal(job_ref(raw), "refused: why\nnot", clock)
-    assert result["complete"] is False
+    assert result["protocol"] == PROTOCOL_VERSION
+    assert result["complete"] is False and result["liveness_complete"] is False
     assert result["observations"] == [] and result["fdns"] == []
     assert result["error"] == "refused: why not"
 
@@ -203,7 +243,7 @@ async def test_probes_that_run_past_the_deadline_make_the_result_incomplete():
     parsed, addresses = planned(ranges=[{"start": "10.0.0.1", "end": "10.0.0.2"}], methods=["icmp"], timeout_s=1)
     result = await sweep(parsed, addresses, prober=prober, clock=clock, max_pps=2)
     assert len(prober.sent) == 2
-    assert result["complete"] is False
+    assert result["complete"] is False and result["liveness_complete"] is False
     assert "timed out after 1 s" in result["error"]
 
 
@@ -215,7 +255,9 @@ async def test_a_ptr_lookup_that_crosses_the_deadline_makes_the_result_incomplet
     result = await sweep(parsed, addresses, prober=prober, resolver=resolver, clock=clock)
     assert len(resolver.asked) == 1
     assert result["complete"] is False
-    assert "during the PTR lookups" in result["error"]
+    # the ICMP sweep ended before the deadline: the dead may be marked (#100)
+    assert result["liveness_complete"] is True
+    assert result["error"] == "timed out after 3 s during the PTR lookups"
 
 
 async def test_no_probe_is_given_longer_than_the_time_left():
@@ -282,7 +324,7 @@ async def test_no_dns_server_anywhere_makes_the_scan_incomplete_and_asks_nothing
     resolver = FakeResolver({"10.0.0.3": "printer.home.arpa"}, host=())
     parsed, addresses = planned(dns_servers=[])
     result = await sweep(parsed, addresses, prober=prober, resolver=resolver)
-    assert result["complete"] is False
+    assert result["complete"] is False and result["liveness_complete"] is True
     assert result["error"] == NO_DNS_SERVER
     # the live addresses are still reported, without names
     assert result["observations"] == [{"ip": "10.0.0.3"}, {"ip": "10.0.0.9"}]
@@ -357,11 +399,12 @@ async def test_a_lookup_that_could_send_nothing_cancels_the_rest_and_the_scan_is
     resolver = UnsendableResolver({a: f"h{a[-1]}.home.arpa" for a in live}, "10.0.0.2", slow=live[2:])
     parsed, addresses = planned()
     result = await sweep(parsed, addresses, prober=FakeProber(alive=live), resolver=resolver)
-    assert result["complete"] is False
+    assert result["complete"] is False and result["liveness_complete"] is True
     assert result["error"] == no_query_sent("OSError")
     assert [o["ip"] for o in result["observations"]] == live
     assert result["observations"][0] == {"ip": "10.0.0.1", "rdns_name": "h1.home.arpa"}
-    assert all("rdns_name" not in o for o in result["observations"][1:])
+    # a lookup that failed or was cancelled found nothing either way: neither field
+    assert result["observations"][1:] == [{"ip": ip} for ip in live[1:]]
     assert resolver.finished == [ipaddress.ip_address("10.0.0.1")]
     assert ipaddress.ip_address("10.0.0.3") in resolver.cancelled
 
