@@ -205,18 +205,44 @@ jobs:
           echo "$ARCHIVE_SHA256  $archive" | sha256sum -c -
           ref="docker://$IMAGE:$VERSION"
           printf '%s' "$TOKEN" | skopeo login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          digest_of() { skopeo inspect --raw "$1" > manifest.json && echo "sha256:$(sha256sum manifest.json | cut -d' ' -f1)"; }
-          if have=$(digest_of "$ref" 2>/dev/null); then
-            # a re-run of this workflow: the tag must already be this build
-            if [ "$have" != "$DIGEST" ]; then
-              echo "::error::$IMAGE:$VERSION is already published as $have, not this build's $DIGEST; a version is published once, so release a new one"
-              exit 1
+          digest_of() { echo "sha256:$(sha256sum "$1" | cut -d' ' -f1)"; }
+          # Push only to a tag the registry says is absent (the distribution spec's
+          # MANIFEST_UNKNOWN, or NAME_UNKNOWN before the first push). Any other failure
+          # to read it is retried, then stops the job with nothing pushed, so a
+          # registry error never lets a version be overwritten.
+          state=unread
+          for attempt in 1 2 3; do
+            if skopeo inspect --raw "$ref" > manifest.json 2> inspect.err; then
+              state=present
+              break
             fi
-            echo "$IMAGE:$VERSION is already this build ($DIGEST)"
-          else
-            skopeo copy --all --preserve-digests "oci-archive:$archive" "$ref"
-          fi
-          test "$(digest_of "$ref")" = "$DIGEST"
+            if grep -qiE 'manifest unknown|name unknown' inspect.err; then
+              state=absent
+              break
+            fi
+            echo "::warning::reading $IMAGE:$VERSION failed (attempt $attempt): $(head -c 300 inspect.err)"
+            sleep $((attempt * 15))
+          done
+          case $state in
+            present)
+              # a re-run of this workflow: the tag must already be this build
+              have=$(digest_of manifest.json)
+              if [ "$have" != "$DIGEST" ]; then
+                echo "::error::$IMAGE:$VERSION is already published as $have, not this build's $DIGEST; a version is published once, so release a new one"
+                exit 1
+              fi
+              echo "$IMAGE:$VERSION is already this build ($DIGEST)"
+              ;;
+            absent)
+              skopeo copy --all --preserve-digests "oci-archive:$archive" "$ref"
+              ;;
+            *)
+              echo "::error::could not tell whether $IMAGE:$VERSION exists, so nothing was pushed; re-run the failed jobs (DENIED: .agents/releases.md, setup step 2)"
+              exit 1
+              ;;
+          esac
+          skopeo inspect --raw "$ref" > manifest.json
+          test "$(digest_of manifest.json)" = "$DIGEST"
           skopeo logout ghcr.io
           echo "pushed $IMAGE:$VERSION@$DIGEST"
 
@@ -242,16 +268,6 @@ jobs:
           tag="v$VERSION"
           name="tlg_ipam_agent-$VERSION-py3-none-any.whl"
           echo "$WHEEL_SHA256  dist/$name" | sha256sum -c -
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            # a re-run of this workflow: the wheel attached must be this build's
-            if gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir attached; then
-              echo "$WHEEL_SHA256  attached/$name" | sha256sum -c - \
-                || { echo "::error::$tag already holds another $name; a version is published once, so release a new one"; exit 1; }
-            else
-              gh release upload "$tag" "dist/$name" --repo "$GITHUB_REPOSITORY"
-            fi
-            exit 0
-          fi
           {
             echo "The TLG-IPAM scan agent at $VERSION, built from $GITHUB_SHA by the release workflow. A server at this tag reports the same version (\`GET /health\`), and its Agents page shows the install and update commands for both artefacts."
             echo
@@ -260,8 +276,25 @@ jobs:
           } > notes.md
           flags=()
           if [ "$PRERELEASE" = true ]; then flags=(--prerelease); fi
-          gh release create "$tag" "dist/$name" --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "$tag" --notes-file notes.md "${flags[@]}"
+          # gh finds a draft by its tag too, which an interrupted create leaves behind
+          if ! draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2> /dev/null); then
+            # gh creates it as a draft, attaches the wheel, then publishes it
+            gh release create "$tag" "dist/$name" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "$tag" --notes-file notes.md "${flags[@]}"
+            exit 0
+          fi
+          # A re-run of this workflow: the wheel attached must be this build's
+          if gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir attached; then
+            echo "$WHEEL_SHA256  attached/$name" | sha256sum -c - \
+              || { echo "::error::$tag already holds another $name; a version is published once, so release a new one"; exit 1; }
+          else
+            gh release upload "$tag" "dist/$name" --repo "$GITHUB_REPOSITORY"
+          fi
+          # and a draft an interrupted run left is published, so the wheel's URL resolves
+          if [ "$draft" = true ]; then
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false \
+              --title "$tag" --notes-file notes.md "${flags[@]}"
+          fi
 
   verify:
     name: The install commands resolve

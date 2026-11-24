@@ -292,3 +292,15 @@ def test_checkout_keeps_no_credential(workflow):
     for _, step in _steps(workflow):
         if step.get("uses", "").startswith("actions/checkout@"):
             assert step["with"]["persist-credentials"] is False
+
+
+def test_the_image_is_pushed_only_to_a_tag_the_registry_says_is_absent(workflow):
+    """A failure to read the tag is not its absence: the push is in the branch the
+    registry's MANIFEST_UNKNOWN or NAME_UNKNOWN leads to, and in no other."""
+    (script,) = [s["run"] for s in workflow["jobs"]["publish-image"]["steps"] if "run" in s]
+    assert script.count("skopeo copy") == 1
+    lines = [line.strip() for line in script.splitlines()]
+    copy = next(i for i, line in enumerate(lines) if line.startswith("skopeo copy"))
+    assert lines.index("absent)") < copy < lines.index("*)")
+    assert lines.index("present)") < lines.index("absent)")
+    assert "grep -qiE 'manifest unknown|name unknown' inspect.err" in script
