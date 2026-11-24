@@ -912,3 +912,22 @@ def test_on_the_image_an_upgrade_post_with_a_body_is_answered_at_once(image):
         answer = one_response(sock)
     assert time.monotonic() - started < 3
     assert status_of(answer) == 422, answer[:300]
+
+
+async def test_after_a_chunked_body_no_second_request_is_queued():
+    """A chunked body's end is no cut, so the piece it ends in can hold many small
+    requests whole. One is queued; the next to complete ends the taking of requests:
+    the two taken are answered, the connection closes after them, and the rest is
+    discarded unanswered."""
+    conn = Connection()
+    chunked = b"POST /first HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+    many = b"".join(f"GET /r{i} HTTP/1.1\r\nHost: t\r\n\r\n".encode() for i in range(100))
+    assert len(many) < _PIECE * 2  # most of them fall in the piece the body ended in
+    conn.feed(chunked + many)
+    assert len(conn.protocol.pipeline) == 1
+    for _ in range(5):
+        await conn.settle()
+    assert conn.seen == ["/first", "/r0"]
+    assert conn.statuses() == [200, 200]
+    assert conn.transport.closed and not conn.transport.aborted
+    conn.close()
