@@ -51,11 +51,28 @@ class Prober(Protocol):
 Slot = Callable[[], Awaitable[float]]
 
 
+class NoName:
+    """What `ptr` returns when a server answered that the address has no name: NXDOMAIN,
+    or NOERROR without a PTR record that is not a referral (`referral`). Unlike None, which is a lookup no server gave a
+    usable answer to, it is the one answer that lets the server clear a stored name
+    (spec §5.7). `NO_NAME` is its one instance."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "NO_NAME"
+
+
+NO_NAME = NoName()
+
+
 class Resolver(Protocol):
     # the servers one job's lookups ask, chosen once as the job's lookups start
     async def servers(self, job_servers: tuple[str, ...]) -> tuple[str, ...]: ...
-    # raises ProbeError when no query of the lookup could be sent: that is no lookup
-    async def ptr(self, address: Address, servers: tuple[str, ...], slot: Slot) -> str | None: ...
+    # the name, NO_NAME when a server said there is none, or None when no server gave
+    # a usable answer; raises ProbeError when no query of the lookup could be sent:
+    # that is no lookup
+    async def ptr(self, address: Address, servers: tuple[str, ...], slot: Slot) -> str | NoName | None: ...
 
 
 class IcmpProber:
@@ -282,6 +299,17 @@ class QuerySocket(asyncio.DatagramProtocol):
             self._transport.abort()
 
 
+def referral(reply: dns.message.Message) -> bool:
+    """A NOERROR reply with no answer that delegates instead (name servers in its
+    authority section and no SOA): a server that does not recurse, pointing at the
+    ones that know. It says nothing about the name, unlike an empty answer carrying
+    the zone's SOA, or none at all, which a resolver gives for a name with no PTR."""
+    if reply.answer:
+        return False
+    kinds = {rrset.rdtype for rrset in reply.authority}
+    return dns.rdatatype.NS in kinds and dns.rdatatype.SOA not in kinds
+
+
 def no_query_sent(cause: str) -> str:
     """The error of a lookup that could send its query to none of its servers."""
     return f"rdns stopped: no DNS query could be sent to any server ({cause})"
@@ -347,7 +375,9 @@ class DnsResolver:
     to ask, or when every attempt failed before the query went out (until the servers
     or the lookup's own time ran out), `ptr` raises ProbeError instead of returning
     None, so the scan reports itself incomplete and the server keeps the names it has
-    (spec §5.7)."""
+    (spec §5.7). Nor is a lookup that got no usable answer one that found no name:
+    `ptr` returns NO_NAME only for a server's answer that there is none, and None for
+    the rest, and only the first lets the server clear a stored name (#100)."""
 
     def __init__(
         self,
@@ -413,13 +443,14 @@ class DnsResolver:
         except TimeoutError:
             return ()
 
-    async def ptr(self, address: Address, servers: tuple[str, ...], slot: Slot) -> str | None:
-        """The PTR name of `address`, or None when a server says there is none (NXDOMAIN,
-        or an answer without a PTR record), when every server asked gave no usable
-        answer, or when the lookup's time ran out after a query was sent (or before
-        its first attempt, which only the job's deadline does). Raises ProbeError when
-        there is no server to ask, or when no query was sent before the servers or the
-        lookup's time ran out."""
+    async def ptr(self, address: Address, servers: tuple[str, ...], slot: Slot) -> str | NoName | None:
+        """The PTR name of `address`, or NO_NAME when a server says there is none
+        (NXDOMAIN, or NOERROR without a PTR record that is not a referral), or None when
+        no server asked gave a usable answer (silence, SERVFAIL, REFUSED, another rcode,
+        a referral, a truncated, malformed or mismatched reply), or when the lookup's
+        time ran out after a query was sent (or before its first attempt, which only
+        the job's deadline does). Raises ProbeError when there is no server to ask, or
+        when no query was sent before the servers or the lookup's time ran out."""
         if not servers:
             raise ProbeError(NO_DNS_SERVER)
         name = dns.reversename.from_address(str(address))
@@ -494,13 +525,15 @@ class DnsResolver:
             asked = True
             rcode = reply.rcode()
             if rcode == dns.rcode.NXDOMAIN:
-                return None
+                return NO_NAME
             if rcode != dns.rcode.NOERROR:
-                continue  # SERVFAIL, REFUSED: the next server
+                continue  # SERVFAIL, REFUSED: no answer about the name, the next server
             for rrset in reply.answer:
                 if rrset.rdtype == dns.rdatatype.PTR and len(rrset):
                     return rrset[0].target.to_text()
-            return None
+            if referral(reply):
+                continue  # a server that does not recurse pointed elsewhere: the next
+            return NO_NAME
         if not asked:
             # every server was tried, and none could be sent the query
             raise ProbeError(no_query_sent(unsent or "unknown"))

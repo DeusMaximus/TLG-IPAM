@@ -40,7 +40,7 @@ from tlg_ipam_agent import scan  # noqa: E402
 from tlg_ipam_agent.client import AgentClient  # noqa: E402
 from tlg_ipam_agent.config import Config, parse_allowed  # noqa: E402
 from tlg_ipam_agent.loop import Agent  # noqa: E402
-from tlg_ipam_agent.probe import NO_DNS_SERVER, ProbeError, usable_servers  # noqa: E402
+from tlg_ipam_agent.probe import NO_DNS_SERVER, NO_NAME, ProbeError, usable_servers  # noqa: E402
 
 TOKEN = "tlga_" + "x" * 43
 ENROL_TOKEN = "tlge_" + "y" * 43
@@ -117,11 +117,18 @@ class FakeResolver:
     - reading resolv.conf (a file, its thread, its time bound);
     - the servers asked in turn, a slot for each, and the kinds of failure a real
       query meets (unsent, timed out, SERVFAIL, truncated).
-    A lookup here takes one slot and answers at once, or after `delay`. The real
+    A lookup here takes one slot and answers at once, or after `delay`: the name in
+    `names`, None (no usable answer) for an address in `unanswered`, and NO_NAME for
+    any other, as a server's NXDOMAIN; a lookup whose slot left it no time is None. The real
     resolver's tests are in test_probe.py."""
 
-    def __init__(self, names=None, clock: FakeClock | None = None, delay: float = 0.0, host=HOST_DNS):
+    def __init__(
+        self, names=None, clock: FakeClock | None = None, delay: float = 0.0, host=HOST_DNS, unanswered=()
+    ):
         self.names = {ipaddress.ip_address(k): v for k, v in (names or {}).items()}
+        # addresses no server gives a usable answer for; any other address not in
+        # `names` is answered "no name" (NO_NAME), as NXDOMAIN is
+        self.unanswered = {ipaddress.ip_address(a) for a in unanswered}
         self.asked: list = []
         self.timeouts: list[float] = []
         self.times: list[float] = []
@@ -146,7 +153,9 @@ class FakeResolver:
             await self.clock.sleep(self.delay)
         else:
             await asyncio.sleep(0)
-        return self.names.get(address)
+        if address in self.unanswered:
+            return None
+        return self.names.get(address, NO_NAME)
 
 
 # ARP frames written out here from RFC 826, not with the agent's own `arp` module, so a

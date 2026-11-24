@@ -8,9 +8,13 @@ each echo request, each ARP request (a retry included), and each DNS query, a fa
 to the next server included, each handed to the kernel in the step its slot is
 granted in, and the next slot measured from the end of that step. The result set is
 `complete` only when every issued method ran over every address before the timeout;
-otherwise it reports what it saw, which the server only adds (spec §5.7).
+otherwise it reports what it saw, which the server only adds (spec §5.7). Apart from
+that, `liveness_complete` says whether the liveness sweeps (ICMP, ARP) did, which alone
+lets the server mark the silent addresses dead, whatever the PTR lookups did (#100).
 A PTR lookup with no server to ask, or whose every attempt failed before its query went
-out, did not run; one the deadline stops before its first attempt is the timeout.
+out, did not run; one the deadline stops before its first attempt is the timeout. Each
+record says what its own lookup found: a name, `rdns_no_name` when a server answered
+that there is none, or neither, and only `rdns_no_name` clears a stored name.
 """
 
 import asyncio
@@ -21,8 +25,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from . import arp
-from .probe import NO_DNS_SERVER, ArpLink, ArpSession, ProbeError, Prober, Resolver
-from .protocol import SUPPORTED, Address, Job, JobRef, Network, rdns_name, scan_error
+from .probe import NO_DNS_SERVER, NO_NAME, ArpLink, ArpSession, ProbeError, Prober, Resolver
+from .protocol import (
+    LIVENESS,
+    PROTOCOL_VERSION,
+    SUPPORTED,
+    Address,
+    Job,
+    JobRef,
+    Network,
+    rdns_name,
+    scan_error,
+)
 
 # one echo request per address, and this long for its reply
 PING_TIMEOUT_S = 1.0
@@ -313,16 +327,27 @@ async def _arp_sweep(
         await asyncio.gather(listener, return_exceptions=True)
 
 
+def no_answer(unanswered: int, asked: int) -> str:
+    """The error of a job some of whose PTR lookups no DNS server gave a usable answer
+    to: counts only, since the server keeps those addresses' stored names (spec §5.2)."""
+    return (
+        f"rdns: no DNS server gave a usable answer for {unanswered} of {asked} "
+        "addresses; their stored names are kept"
+    )
+
+
 def refusal(ref: JobRef, reason: str, clock: Clock) -> dict:
     """The result set for a job the agent would not run: nothing scanned, the reason
     as the error, so the server shows it and clears the lease (spec §5.7)."""
     now = clock.now().isoformat()
     return {
+        "protocol": PROTOCOL_VERSION,
         "job_id": ref.job_id,
         "subnet_id": ref.subnet_id,
         "started_at": now,
         "finished_at": now,
         "complete": False,
+        "liveness_complete": False,
         "observations": [],
         "fdns": [],
         "error": scan_error(reason),
@@ -352,12 +377,16 @@ async def run(
         pacer = Pacer(max_pps, clock)
     errors: list[str] = []
     complete = True
+    # whether every issued liveness method ran over every address before the
+    # deadline: what lets the server mark the silent addresses dead
+    liveness_complete = True
 
     unsupported = sorted(job.methods - SUPPORTED)
     if unsupported:
         # e.g. `fdns` before #20: the rest runs, but a sweep that skipped an issued
         # liveness method must not let the server mark the silent addresses dead
         complete = False
+        liveness_complete = not (LIVENESS & set(unsupported))
         errors.append(f"not run by this agent release: {', '.join(unsupported)}")
 
     alive: set[Address] = set()
@@ -374,14 +403,14 @@ async def run(
                 errors.append(f"timed out after {job.timeout_s} s during the ICMP sweep")
         except ProbeError as exc:
             # what answered before the prober failed is still reported
-            complete = False
+            complete = liveness_complete = False
             errors.append(str(exc))
 
     macs: dict[Address, str] = {}
     if "arp" in job.methods and not timed_out:
         interface = arp_interface(job.network, interfaces)
         if interface is None or arp_link is None:
-            complete = False
+            complete = liveness_complete = False
             errors.append(f"arp not run: no interface of this host with a MAC is on {job.network}")
         else:
             # the kernel answers no ARP request of this host's own: an address the
@@ -402,13 +431,20 @@ async def run(
                     link.close()
             except ProbeError as exc:
                 # what answered before the socket failed is still reported
-                complete = False
+                complete = liveness_complete = False
                 errors.append(str(exc))
             if session is not None:
                 macs.update(session.answers)
         alive.update(macs)
+    if timed_out:
+        # a liveness sweep the deadline cut short, or the ARP sweep it left unrun
+        liveness_complete = False
 
     names: dict[Address, str] = {}
+    # the addresses a server answered have no name, and those no server answered
+    no_name: set[Address] = set()
+    unanswered: set[Address] = set()
+    looked_up = 0  # lookups that returned, whatever they found
     servers: tuple[str, ...] = ()
     if "rdns" in job.methods and alive and not timed_out:
         # chosen once for the job: its own servers, else the host's resolvers as they
@@ -433,6 +469,7 @@ async def run(
     if servers:
 
         async def lookup(address: Address, _timeout: float) -> None:
+            nonlocal looked_up
             end: float | None = None
 
             async def slot() -> float:
@@ -447,9 +484,19 @@ async def run(
                     end = min(now + RDNS_TIMEOUT_S, deadline)
                 return end - now
 
-            name = rdns_name(await resolver.ptr(address, servers, slot))
-            if name is not None:
-                names[address] = name
+            answer = await resolver.ptr(address, servers, slot)
+            looked_up += 1
+            if answer is NO_NAME:
+                no_name.add(address)
+            elif answer is None:
+                # no usable answer, or none in time: says nothing about a name
+                unanswered.add(address)
+            else:
+                # a name that is not a hostname is dropped, and is not "no name": the
+                # record carries neither, so the stored name stays
+                name = rdns_name(answer)
+                if name is not None:
+                    names[address] = name
 
         # unpaced here: the resolver takes a slot for every query it sends. A lookup
         # that could send its query to none of the servers cancels the lookups still
@@ -464,6 +511,9 @@ async def run(
             # the names the lookups that finished found are still reported
             complete = False
             errors.append(str(exc))
+        # a lookup the deadline cut off is in the timeout's error, not counted here
+        if unanswered and not timed_out:
+            errors.append(no_answer(len(unanswered), looked_up))
     if timed_out:
         complete = False
 
@@ -474,13 +524,17 @@ async def run(
             record["mac"] = macs[address]
         if address in names:
             record["rdns_name"] = names[address]
+        elif address in no_name:
+            record["rdns_no_name"] = True
         observations.append(record)
     return {
+        "protocol": PROTOCOL_VERSION,
         "job_id": job.ref.job_id,
         "subnet_id": job.ref.subnet_id,
         "started_at": started.isoformat(),
         "finished_at": max(clock.now(), started).isoformat(),
         "complete": complete,
+        "liveness_complete": liveness_complete,
         "observations": observations,
         "fdns": [],
         "error": scan_error("; ".join(errors)) if errors else None,

@@ -61,7 +61,11 @@ ANSWERS = {
 
 class Responder(asyncio.DatagramProtocol):
     """Answers PTR queries from ANSWERS. `script` gives the rcode (or "silent", or
-    "truncated") for each query in turn; the last entry repeats."""
+    "truncated") for each query in turn; the last entry repeats. #100 adds "refused",
+    "nxdomain", "nodata" (NOERROR with no answer, the zone's SOA in its authority),
+    "empty" (NOERROR with no record in any section), "referral" (NOERROR with no
+    answer, name servers in its authority and no SOA) and "malformed" (bytes that are
+    no DNS message)."""
 
     def __init__(self, script=("answer",)):
         self.script = list(script)
@@ -81,9 +85,24 @@ class Responder(asyncio.DatagramProtocol):
         action = self.script.pop(0) if len(self.script) > 1 else self.script[0]
         if action == "silent":
             return
+        if action == "malformed":
+            self.transport.sendto(data[:2] + b"\x81\x80\xff", addr)
+            return
         reply = dns.message.make_response(query)
         if action == "servfail":
             reply.set_rcode(dns.rcode.SERVFAIL)
+        elif action == "refused":
+            reply.set_rcode(dns.rcode.REFUSED)
+        elif action == "nxdomain":
+            reply.set_rcode(dns.rcode.NXDOMAIN)
+        elif action == "nodata":
+            reply.authority.append(dns.rrset.from_text(
+                "10.in-addr.arpa.", 60, "IN", "SOA", "ns.home.arpa. admin.home.arpa. 1 60 60 60 60"
+            ))
+        elif action == "empty":
+            pass
+        elif action == "referral":
+            reply.authority.append(dns.rrset.from_text("10.in-addr.arpa.", 60, "IN", "NS", "ns.home.arpa."))
         elif action == "truncated":
             reply.flags |= dns.flags.TC
         elif action in ("wrong-source", "wrong-id"):
@@ -179,8 +198,8 @@ async def test_ptr_lookup_against_the_jobs_server():
         resolver = DnsResolver(port=port)
         servers = ("127.0.0.1",)
         assert await resolver.ptr(ipaddress.ip_address("10.0.0.9"), servers, unpaced()) == "nas.home.arpa."
-        # NXDOMAIN is an answer: the next server is not asked
-        assert await resolver.ptr(ipaddress.ip_address("10.0.0.7"), servers * 3, unpaced()) is None
+        # NXDOMAIN is an answer, that there is no name: the next server is not asked
+        assert await resolver.ptr(ipaddress.ip_address("10.0.0.7"), servers * 3, unpaced()) is probe.NO_NAME
         # the raw answer comes back; `scan` drops it with agent_protocol's rule
         assert await resolver.ptr(ipaddress.ip_address("10.0.0.8"), servers, unpaced()) == "Evil\\032name<b>.home.arpa."
         assert proto.questions[0] == ("9.0.0.10.in-addr.arpa.", "PTR")
@@ -311,6 +330,60 @@ async def test_a_silent_server_gets_one_query_and_at_most_three_servers_are_trie
         assert len(proto.arrivals) == MAX_DNS_SERVERS == 3
     finally:
         transport.close()
+
+
+@pytest.mark.parametrize("action", ["nxdomain", "nodata", "empty"])
+async def test_an_answer_that_there_is_no_name_is_no_name_and_ends_the_lookup(action):
+    """#100: NXDOMAIN, or NOERROR without a PTR record that is not a referral, is the
+    one answer that lets the server clear a stored name; no further server is asked."""
+    transport, proto, port = await responder(script=(action,))
+    try:
+        answer = await DnsResolver(port=port).ptr(ipaddress.ip_address("10.0.0.9"), ("127.0.0.1",) * 3, unpaced())
+        assert answer is probe.NO_NAME
+        assert len(proto.arrivals) == 1
+    finally:
+        transport.close()
+
+
+@pytest.mark.parametrize("action", ["silent", "servfail", "refused", "referral", "malformed", "truncated"])
+async def test_a_lookup_no_server_answered_usably_is_no_answer_not_no_name(action):
+    """#100: silence, SERVFAIL, REFUSED, a referral, malformed bytes and a truncated
+    reply say nothing about the name. Every server is asked in turn, once each, and
+    the lookup is None, which leaves a stored name as it is."""
+    transport, proto, port = await responder(script=(action,))
+    try:
+        answer = await DnsResolver(port=port).ptr(ipaddress.ip_address("10.0.0.9"), ("127.0.0.1",) * 3, unpaced(0.3))
+        assert answer is None
+        await asyncio.sleep(0.05)
+        assert len(proto.arrivals) == 3
+    finally:
+        transport.close()
+
+
+@pytest.mark.parametrize("first", ["silent", "servfail", "refused", "referral", "malformed"])
+async def test_a_later_servers_answer_decides_after_one_without_a_usable_one(first):
+    transport, proto, port = await responder(script=(first, "answer", "nxdomain"))
+    try:
+        resolver = DnsResolver(port=port)
+        address = ipaddress.ip_address("10.0.0.9")
+        assert await resolver.ptr(address, ("127.0.0.1",) * 2, unpaced(0.3)) == "nas.home.arpa."
+        assert await resolver.ptr(address, ("127.0.0.1",), unpaced(0.3)) is probe.NO_NAME
+    finally:
+        transport.close()
+
+
+def test_a_referral_is_told_from_an_empty_answer():
+    query = dns.message.make_query("9.0.0.10.in-addr.arpa.", dns.rdatatype.PTR)
+    empty = dns.message.make_response(query)
+    assert not probe.referral(empty)
+    referral = dns.message.make_response(query)
+    referral.authority.append(dns.rrset.from_text("10.in-addr.arpa.", 60, "IN", "NS", "ns.home.arpa."))
+    assert probe.referral(referral)
+    # with the zone's SOA beside its name servers, it is an answer that there is none
+    referral.authority.append(dns.rrset.from_text(
+        "10.in-addr.arpa.", 60, "IN", "SOA", "ns.home.arpa. admin.home.arpa. 1 60 60 60 60"
+    ))
+    assert not probe.referral(referral)
 
 
 async def test_a_truncated_answer_does_not_fall_back_to_tcp():

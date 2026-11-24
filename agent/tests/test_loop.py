@@ -270,8 +270,9 @@ async def test_job_runs_and_reports_live_addresses_with_names():
     [report] = server.results_posted
     assert report["complete"] is True
     assert report["error"] is None
+    # 10.0.0.1's lookup was answered that it has no name (the fake's NXDOMAIN)
     assert report["observations"] == [
-        {"ip": "10.0.0.1"},
+        {"ip": "10.0.0.1", "rdns_no_name": True},
         {"ip": "10.0.0.20", "rdns_name": "nas.home.arpa"},
     ]
 

@@ -334,7 +334,7 @@ async def test_a_complete_icmp_scan_marks_a_quiet_address_dead(owner):
 
 async def test_a_protocol_mismatch_is_not_retried_in_a_tight_loop(owner, monkeypatch):
     agent_row, _, _ = await setup(owner)
-    monkeypatch.setattr(agent_loop, "PROTOCOL_VERSION", 2)
+    monkeypatch.setattr(agent_loop, "PROTOCOL_VERSION", agent_loop.PROTOCOL_VERSION + 1)
     prober = FakeProber()
     agent = make_agent(agent_row["token"], prober=prober)
     wait = await agent.checkin_once()
@@ -697,3 +697,101 @@ async def test_lookups_that_send_nothing_keep_the_stored_names_at_one_packet_a_s
         transport.close()
         for key in keys.values():
             ANSWERS.pop(key, None)
+
+
+# --- a lookup no server answered usably keeps the name; the dead are still marked (#100) ---
+
+
+@pytest.mark.parametrize(
+    "action, cleared",
+    [
+        ("silent", False),
+        ("servfail", False),
+        ("refused", False),
+        ("malformed", False),
+        ("nxdomain", True),
+        ("nodata", True),
+        ("empty", True),
+    ],
+)
+async def test_what_the_responder_answers_decides_the_names_and_never_the_dead(owner, action, cleared):
+    """Acceptance for #100 (option 4) through the real routes, the real resolver and a
+    DNS responder on loopback. A first scan stores the names of three live addresses.
+    In the second, one of them has left, and the responder gives `action` to every
+    query: silence, SERVFAIL, REFUSED or malformed bytes leave the stored names in
+    place, NXDOMAIN or a NOERROR without a PTR record clear them. Either way the scan
+    is complete, its liveness sweep whole, and the departed address is marked dead."""
+    from test_probe import ANSWERS, responder
+
+    from tlg_ipam_agent.probe import DnsResolver
+
+    live = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+    keys = {ip: f"{ip[-1]}.0.0.10.in-addr.arpa." for ip in live}
+    for ip in live:
+        ANSWERS[keys[ip]] = f"kept{ip[-1]}.home.arpa."
+    transport, dns_responder, port = await responder()
+    try:
+        agent_row, subnet, target = await setup(owner, cidr="10.0.0.0/29", dns_servers=["127.0.0.1"])
+        prober = FakeProber(alive=live)
+        agent = make_agent(
+            agent_row["token"],
+            prober=prober,
+            resolver=DnsResolver(port=port),
+            interfaces=[{"name": "eth0", "cidr": "10.0.0.5/29", "mac": None}],
+        )
+        await agent.checkin_once()
+        await run_queued(agent)
+        stored = {ip: f"kept{ip[-1]}.home.arpa" for ip in live}
+        assert await _names(subnet) == stored
+        assert len(dns_responder.arrivals) == 3
+
+        await _ok(await owner.post(f"/api/v1/subnets/{subnet['id']}/scan"), 202)
+        await past_the_checkin_gap(agent_row["id"])
+        prober.alive = {ipaddress.ip_address(ip) for ip in live[:2]}  # 10.0.0.3 has left
+        dns_responder.script = [action]
+        await agent.checkin_once()
+        await run_queued(agent)
+
+        assert len(dns_responder.arrivals) == 3 + 2  # one query for each live address
+        seen = await observations(subnet["id"])
+        names = {ip: seen[ip].rdns_name for ip in live[:2]}
+        assert names == ({ip: None for ip in live[:2]} if cleared else {ip: stored[ip] for ip in live[:2]})
+        assert seen["10.0.0.1"].alive and seen["10.0.0.2"].alive
+        assert seen["10.0.0.3"].alive is False
+        shown = await target_of(owner, target["id"])
+        assert shown["last_scan_complete"] is True
+        assert shown["last_scan_error"] == (None if cleared else scan.no_answer(2, 2))
+    finally:
+        transport.close()
+        for key in keys.values():
+            ANSWERS.pop(key, None)
+
+
+async def test_a_scan_whose_lookups_had_no_server_still_marks_the_departed_dead(owner, tmp_path):
+    """#100: a scan with no DNS server to ask is incomplete and keeps every name (#78),
+    and its liveness sweep, which completed, still marks the address that left dead."""
+    from tlg_ipam_agent.probe import NO_DNS_SERVER
+
+    live = ["10.0.0.1", "10.0.0.2"]
+    agent_row, subnet, target = await setup(owner, cidr="10.0.0.0/29")
+    prober = FakeProber(alive=live)
+    resolver = FakeResolver({ip: f"n{ip[-1]}.home.arpa" for ip in live})
+    agent = make_agent(
+        agent_row["token"],
+        prober=prober,
+        resolver=resolver,
+        interfaces=[{"name": "eth0", "cidr": "10.0.0.5/29", "mac": None}],
+    )
+    await agent.checkin_once()
+    await run_queued(agent)
+    await _ok(await owner.post(f"/api/v1/subnets/{subnet['id']}/scan"), 202)
+    await past_the_checkin_gap(agent_row["id"])
+    prober.alive = {ipaddress.ip_address("10.0.0.1")}
+    resolver.host = ()
+    await agent.checkin_once()
+    await run_queued(agent)
+    seen = await observations(subnet["id"])
+    assert {ip: seen[ip].rdns_name for ip in live} == {ip: f"n{ip[-1]}.home.arpa" for ip in live}
+    assert seen["10.0.0.1"].alive is True and seen["10.0.0.2"].alive is False
+    shown = await target_of(owner, target["id"])
+    assert shown["last_scan_complete"] is False and shown["last_scan_error"] == NO_DNS_SERVER
