@@ -6,6 +6,7 @@ Nothing here leaves 127.0.0.1 or ::1."""
 import asyncio
 import errno
 import ipaddress
+import itertools
 import os
 import socket
 import stat
@@ -1002,23 +1003,27 @@ def _comparisons(wire: bytes) -> tuple[dns.message.Message, int]:
 
 
 def test_the_parse_of_a_reply_the_agent_reads_is_bounded_by_its_size():
-    """The bound #153 buys. dnspython 2.9.2 indexes a reply's records by keys that hold
-    the owner name, hashed as h = 9*h + byte over its labels' bytes from 0, so distinct
-    names can hash alike, and each record is compared with at most every one before it
-    of the same hash. The smallest entry a reply can carry is a question at the root:
-    its 1-byte name, its type and class, 5 bytes (a record of any other section adds a
-    TTL and RDLENGTH, 11 bytes at the least). So a message of DNS_PAYLOAD bytes holds
-    at most (DNS_PAYLOAD - 12) // 5 = 244 entries, and costs at most 244 * 243 / 2 =
-    29,646 name comparisons, whatever the names.
+    """What #153 buys, counted and never timed (the PR gives the times). dnspython
+    2.9.2 indexes a reply's records by keys that hold the owner name, hashed as
+    h = 9*h + byte over its labels' bytes from 0, so distinct names can hash alike and
+    their keys are compared one by one. The smallest entry a reply can carry is a
+    question at the root: its 1-byte name, its type and class, 5 bytes (a record of any
+    other section adds a TTL and RDLENGTH, 11 bytes at the least). So a message of
+    DNS_PAYLOAD bytes holds at most (DNS_PAYLOAD - 12) // 5 = 244 entries.
 
-    Two replies are built to the limit. Of root entries alone, it holds exactly that
-    many. Of a name of 126 zero-byte labels, its suffixes by pointer, the root (leading
-    zero bytes leave h at 0, so all 127 hash alike) and then repeats of the root, it
-    makes more comparisons than any reply the PR measured, and stays under the ceiling.
-    Counted, never timed; the PR gives the times."""
+    No bound on the comparisons follows from that alone: 29,646, one per earlier entry
+    of 244, is an estimate, since the next test shows a record can be compared with an
+    earlier one more than once. It is kept here as a tripwire, not a proof: a reply
+    built to the limit from colliding names that passed it would send the stated
+    figures back for review.
+
+    Two replies are built to the limit. Of root entries alone, it holds exactly 244. Of
+    a name of 126 zero-byte labels, its suffixes by pointer, the root (leading zero
+    bytes leave h at 0, so all 127 hash alike) and then repeats of the root, it makes
+    more comparisons than any reply the PR measured, and stays under the estimate."""
     most = (probe.DNS_PAYLOAD - 12) // 5
-    ceiling = most * (most - 1) // 2
-    assert (most, ceiling) == (244, 29_646)
+    estimate = most * (most - 1) // 2
+    assert (most, estimate) == (244, 29_646)
 
     roots = _question_entries([b"\x00"] * most)
     assert len(roots) == probe.DNS_PAYLOAD  # the entry count is reached exactly
@@ -1036,10 +1041,35 @@ def test_the_parse_of_a_reply_the_agent_reads_is_bounded_by_its_size():
     assert probe.DNS_PAYLOAD - 5 < len(wire) <= probe.DNS_PAYLOAD
     assert len({hash(dns.name.Name((b"\x00",) * i + (b"",))) for i in range(labels + 1)}) == 1  # the premise
     message, compared = _comparisons(wire)
-    entries = len(message.question)
-    assert entries == len(names) and len({rrset.name for rrset in message.question}) == labels + 1
-    assert compared > 13_000  # quadratic in the entries
-    assert compared <= entries * (entries - 1) // 2 <= ceiling
+    assert len(message.question) == len(names) and len({rrset.name for rrset in message.question}) == labels + 1
+    assert 13_000 < compared <= estimate  # quadratic in the entries; under the estimate, a tripwire
+
+
+def test_two_answer_records_whose_owners_hash_alike_can_be_compared_more_than_once():
+    """Why the figure above is an estimate (round 1 of the briefed review of PR #155):
+    each record of the answer section is looked up in dnspython's index and then
+    inserted, two dictionary probes, and one probe can meet the same colliding key more
+    than once. Two answer records at distinct owners of one h (two-letter labels whose
+    9*a + b agree, `aj.` and `ba.` among them) make at least two comparisons, and for
+    some values of h more than two, so "once per earlier record" is not a bound."""
+
+    def record(label: bytes) -> bytes:
+        return bytes((len(label),)) + label + b"\x00" + struct.pack("!HHIH", 65280, 1, 0, 0)
+
+    counts = []
+    letters = range(ord("a"), ord("z") + 1)
+    for first, second in itertools.product(letters, letters):
+        other = (first + 1, second - 9)  # 9*(a+1) + (b-9) == 9*a + b
+        if other[0] not in letters or other[1] not in letters:
+            continue
+        one, two = bytes((first, second)), bytes(other)
+        assert hash(dns.name.Name((one, b""))) == hash(dns.name.Name((two, b"")))  # the premise
+        wire = struct.pack("!HHHHHH", 0, 0x8180, 0, 2, 0, 0) + record(one) + record(two)
+        message, compared = _comparisons(wire)
+        assert len(message.answer) == 2
+        counts.append(compared)
+    assert min(counts) >= 2  # a lookup and an insertion
+    assert max(counts) > 2  # and a probe that compared one key twice
 
 
 # --- no server to ask is not a completed lookup (#78) ---
