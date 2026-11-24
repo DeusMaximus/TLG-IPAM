@@ -266,8 +266,16 @@ async def bulk_create_hosts(subnet_id: str, hosts: list[dict]) -> dict:
     mac, device_type (server|vm|lxc|network|iot|desktop|laptop|phone|other), status
     (active|reserved|dhcp|offline), owner, notes. Records succeed or fail
     individually: duplicates are skipped and invalid records report an error without
-    aborting the batch. Returns created/skipped/error counts and a per-record result
-    list; the whole import is one audit-log entry."""
+    aborting the batch; a record over a length limit (hostname and domain 253
+    characters, owner 120, notes 4096) is one such error. Returns created/skipped/error
+    counts and a per-record result list; the whole import is one audit-log entry.
+    Size of a call: the whole request, as JSON, may be at most 2 MiB (2,097,152 bytes).
+    A larger call is refused whole before any record is read, and the error may reach
+    you without its message, so split a large batch before sending: keep the records
+    of one call under about 2,000,000 bytes of JSON together. 1,000 short records fit;
+    1,000 with long notes do not (at 4,096 characters of notes each they are over
+    4 MB), so send those in smaller calls: 400 records with 4,096 ASCII characters of
+    notes each fit, fewer if the notes use characters outside ASCII."""
     if not hosts:
         raise ToolError("hosts must contain at least one record")
     if len(hosts) > 1000:

@@ -213,6 +213,13 @@ class SubnetOut(BaseModel):
 
 # --- Hosts ---
 
+# The most characters a host's `notes` holds (#91), checked by `services/hosts` on every
+# write that sends notes, a bulk import's rows included (a longer one is that row's
+# `error`). It bounds one host, not an import: 1,000 rows fit the request-body cap only
+# with short notes (brief §4.3). An update that resends notes stored longer before the
+# limit, unchanged, is let through, so such a host can still be edited from the UI.
+HOST_NOTES_MAX = 4096
+
 
 class _HostFields(BaseModel):
     hostname: str | None = Field(default=None, max_length=253)
