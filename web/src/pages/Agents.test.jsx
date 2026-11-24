@@ -484,6 +484,8 @@ describe('Agents page', () => {
     )
     await waitFor(() => expect(ipam.listAgents).toHaveBeenCalledTimes(2))
 
+    // the dialog is taller than a short window: its overlay scrolls, down to Done
+    expect(screen.getByRole('dialog').parentElement).toHaveClass('overflow-y-auto')
     // a stray backdrop click keeps it; Done drops it for good
     await user.click(screen.getByRole('dialog').parentElement)
     expect(screen.getByTestId('agent-token')).toBeInTheDocument()
