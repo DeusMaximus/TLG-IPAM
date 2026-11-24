@@ -27,6 +27,18 @@ Template:
 
 ---
 
+## 2026-11-24 — Claude Code (Opus 5.5), worker — #133: list_scan_findings checks a subnet_id by its id alone (PR #137)
+- **Done:** [PR #137](https://github.com/DeusMaximus/TLG-IPAM/pull/137) (`133-findings-subnet-lookup`, head `ee19d28`) closes #133.
+  - `findings.list_named` checks `subnet_id` with `select(Subnet.id)` and `errors.not_found`, not `subnets.get_subnet`. The refusal and the statement count are unchanged.
+  - `test_mcp.py`: the plan test and the work test run with and without `subnet_id`. New `returned_bytes` and `test_no_read_of_a_call_returns_text_the_listing_does_not_use`: every statement of a call returns the same bytes with 10 or 1,000,000 bytes of subnet notes and section description, and 10 or 4,096 of host notes. The start-up test names `ix_reserved_ranges_subnet_excluded`.
+  - With the wide read put back, the new test fails with `'bytes returned': (100, 1000090)`. The command and output are in the PR body.
+  - `AGENTS.md` (only the parenthesis naming the cost tests, in "MCP tools are hand-curated"), brief §5.2 row, spec §5.8 and the `CALL_STATEMENTS` comment: what is counted is SQLite instructions (the rows read or passed over), not returned bytes or Python's processing.
+  - Merged: `cc0cf6e`, squash, on the owner's go-ahead; the remote branch is deleted. CI green, Codex clean and Greptile clean (5/5) on `ee19d28`, the only head. The orchestrator ran 1,084 server tests on that head. No follow-ups.
+- **Decisions:** PR Deliberate calls 1–3: a byte check rather than a column list; the plan test matches the lookup's SQL text; spec §5.8 gets one clarifying sentence. REST `list_findings` still uses `get_subnet` (owner-only, outside the issue).
+- **State:** merged. 1,084 server and 924 agent tests pass. No schema change. Nothing in #132's or #22's areas touched.
+- **Waiting on the owner:** nothing from this entry.
+- **Next:** #135 and #130 both touch the "MCP tools are hand-curated" bullet's neighbours only; #137 changed one parenthesis in it, so a merge with either stays mechanical.
+
 ## 2026-11-24 — Claude Code (Opus 5.5), worker — #91: a host's notes at most 4,096 characters; a row over a limit is that row's error (PR #134)
 - **Done:** [PR #134](https://github.com/DeusMaximus/TLG-IPAM/pull/134) (`91-notes-length-limit`, head `47e6544`) closes #91, per the owner's decision of 2026-11-24.
   - `schemas.HOST_NOTES_MAX` (4,096), checked by `services/hosts._check_notes` on create, update, next-free and each bulk row: `422` "notes: a host's notes may be at most 4096 characters, not N", never repeating the value; in a bulk import, that row's `error`.
@@ -124,11 +136,3 @@ Template:
   - Measured, not fixed (outside #90): uvicorn's httptools takes unbounded request headers (8 MiB of one unfinished header was accepted), and idle connections stay open on both parsers. Brief §4.3 lists both as the proxy's job.
 - **Waiting on the owner:** the briefed round (an author from a different model family; the orchestrator briefs it), a Greptile retrigger on `4efe69d`, then merge. Whether to file a follow-up for header size and idle connections (uvicorn options in the image, or the proxy's job only).
 - **Next:** #31 can take its proxy guidance from brief §4.3 and the PR body's "Left to the reverse proxy or tunnel". #86 may change the one brief §4.3 sentence that measures an import, which this PR left alone.
-
-## 2026-11-24 — Claude Code (Sonnet 5.5), worker — #126: ingest credential read is held to the write lock (PR #128)
-- **Done:** [PR #128](https://github.com/DeusMaximus/TLG-IPAM/pull/128) (`126-ingest-lock-guard-test`, head `aaac816`) closes #126. One test in `api/tests/test_results.py`, `test_ingest_reads_the_credential_only_while_it_holds_the_write_lock`. It wraps `results._credential_live`, records `_write_locked()` at the read, and asserts `seen == [True]`, so it also fails if the read is moved, doubled or dropped. No file under `api/app/` changed. CI green (backend, agent, frontend, locks). Codex completed on the head with no findings. Greptile reviewed the head with no findings. CodeRabbit skipped. The owner merges.
-  - Merged: `ded8622`, squash, on the owner's go-ahead; the remote branch is deleted. CI green, Codex clean and Greptile clean on `aaac816`, the only head. The orchestrator ran 1020 server tests on that head and repeated the mutation: the new test fails on the lock assertion and the four existing cases pass. No follow-up filed. Nothing from this entry is waiting on the owner any more.
-- **Decisions:** the issue offered two forms of the test; I took the lock assertion at the read, reusing `_write_locked`, not a revoke landed between read and lease update. The four existing cases already cover the second form's outcome. `seen == [True]` rather than `all(seen)`.
-- **State:** green. Measured on this head: 1020 server and 922 agent tests pass (Python 3.13). The mutation (deleting `await scans.take_write_lock(session)` from `results._release`, in a throwaway worktree, never committed) fails only the new test, on the lock assertion; the four existing cases pass on it. The edit and the output are in the PR body. No schema or web change.
-- **Waiting on the owner:** merge of #128.
-- **Next:** #125 (agent tests) is the other open test-gap issue in this wave. #22, #90 and #86 as in the previous entry.
