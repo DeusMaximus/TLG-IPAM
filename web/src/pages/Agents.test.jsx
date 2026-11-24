@@ -551,6 +551,8 @@ describe('Agents page', () => {
     ])
     expect(container.join('\n')).toContain('-v tlg-ipam-agent:/var/lib/tlg-ipam-agent')
     expect(container.join('\n')).not.toMatch(/tlg[ae]_|IPAM_ENROL_TOKEN|IPAM_AGENT_TOKEN/)
+    // a container of the first release's install has no stored token to keep: re-enrol it
+    expect(screen.getByTestId('agent-update-legacy')).toHaveTextContent('Re-enrol that agent instead')
 
     await user.click(screen.getByRole('tab', { name: 'systemd' }))
     expect(screen.getByTestId('agent-update-command').textContent.split('\n')).toEqual([

@@ -24,15 +24,21 @@ export default function UpdateModal({ agent, serverVersion, onClose, location = 
         {(tab) =>
           tab === 'container' ? (
             <>
+              <p className="mt-3 text-xs text-amber-200" data-testid="agent-update-legacy">
+                Before you update: a container started with <code>-e IPAM_AGENT_TOKEN=…</code>{' '}
+                and no <code>tlg-ipam-agent</code> volume (the first release&apos;s install) has no
+                stored token, and the new container would have none to start with. Re-enrol that
+                agent instead, and run the command it gives you.
+              </p>
               <CopyBlock
                 label="Update commands"
                 text={containerUpdate({ url, version: serverVersion })}
                 testId="agent-update-command"
               />
               <p className="mt-3 text-xs text-slate-400">
-                The new container keeps the agent token in the <code>tlg-ipam-agent</code> volume,
-                so it does not enrol again. Give it the same <code>-e</code> settings the old one
-                had.
+                Otherwise the new container uses the agent token stored in the{' '}
+                <code>tlg-ipam-agent</code> volume, so it does not enrol again. Give it the same{' '}
+                <code>-e</code> settings the old one had.
               </p>
             </>
           ) : (
