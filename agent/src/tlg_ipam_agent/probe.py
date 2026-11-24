@@ -307,17 +307,30 @@ def answered_name(reply: dns.message.Message, question: "dns.name.Name") -> "dns
     delegation is such a chain). Records at any other owner are not part of it. None
     when the chain loops. dnspython keeps one CNAME per owner (the last a reply
     carries), so a link has one target. The agent follows the chain only within the
-    reply; it sends no query for a target."""
+    reply; it sends no query for a target.
+
+    The map and the visited set are keyed by each name's case-folded wire form
+    (`Name.to_digestable`, label lengths included), never by the `Name`: dnspython
+    hashes a name by its labels' bytes without their boundaries, so distinct names
+    made of the same bytes split at different places (`aaaa.`, `a.aaa.`, `aa.aa.`, …)
+    hash alike, and a reply whose chain is built from them would be compared name by
+    name, at a cost that grows with the square of its links (#149). Two names in a
+    reply are the same name exactly when their keys are equal, so the walk reads as it
+    did; the cost of reading the reply off the wire is dnspython's."""
     cnames = {
-        rrset.name: rrset for rrset in reply.answer if rrset.rdtype == dns.rdatatype.CNAME and len(rrset)
+        rrset.name.to_digestable(): rrset
+        for rrset in reply.answer
+        if rrset.rdtype == dns.rdatatype.CNAME and len(rrset)
     }
     name = question
-    seen = {name}
-    while name in cnames:
-        name = cnames[name][0].target
-        if name in seen:
+    key = name.to_digestable()
+    seen = {key}
+    while key in cnames:
+        name = cnames[key][0].target
+        key = name.to_digestable()
+        if key in seen:
             return None
-        seen.add(name)
+        seen.add(key)
     return name
 
 
@@ -360,10 +373,13 @@ def read_reply(reply: dns.message.Message, question: "dns.name.Name") -> str | N
 
     - NXDOMAIN: NO_NAME. Any rcode but NOERROR: None.
     - A PTR record is read only at the name the answer is about (`answered_name`: the
-      question's name, or the last target of its CNAME chain in this reply). A PTR
-      record at any other owner, the chain's earlier links included (a name with a
-      CNAME holds no other record), answers some other question, and the reply is
-      None whatever else it holds.
+      question's name, or the last target of its CNAME chain in this reply). One
+      there is the name (its first record, when it holds more than one), whatever
+      else the reply holds, PTR records at other owners included (#149).
+    - A PTR record at any other owner, the chain's earlier links included (a name
+      with a CNAME holds no other record), answers some other question and is never
+      the name. With none at the chain's end, it makes the reply None, never
+      NO_NAME, even beside an SOA that `says_no_name` would count.
     - No PTR record at all: NO_NAME if `says_no_name` for that name, else None."""
     rcode = reply.rcode()
     if rcode == dns.rcode.NXDOMAIN:

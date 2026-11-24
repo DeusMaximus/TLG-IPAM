@@ -9,6 +9,7 @@ import ipaddress
 import os
 import socket
 import stat
+import sys
 import threading
 import time
 
@@ -569,6 +570,74 @@ def test_what_a_reply_says(case):
     reply = _reply(answer, authority, rcode if rcode is not None else dns.rcode.NOERROR)
     got = probe.read_reply(reply, dns.name.from_text(_Q))
     assert got == says if isinstance(says, str) else got is says
+
+
+def _colliding_names(count, size=20):
+    """`count` distinct names made of the same `size` bytes, split into labels at
+    different places (`aaaa.`, `a.aaa.`, `aa.aa.`, …): the i-th is split after each
+    byte whose bit is set in i."""
+    names = []
+    for split in range(count):
+        labels, length = [], 1
+        for at in range(size - 1):
+            if split >> at & 1:
+                labels.append("a" * length)
+                length = 1
+            else:
+                length += 1
+        labels.append("a" * length)
+        names.append(dns.name.from_text(".".join(labels) + "."))
+    return names
+
+
+def _calls_reading(reply):
+    """The Python function calls `read_reply` makes, all of them and those of
+    `Name.fullcompare` (what a name comparison costs), counted by a profiler."""
+    calls = {"all": 0, "fullcompare": 0}
+    fullcompare = dns.name.Name.fullcompare.__code__
+
+    def count(frame, event, arg):
+        if event == "call":
+            calls["all"] += 1
+            calls["fullcompare"] += frame.f_code is fullcompare
+
+    sys.setprofile(count)
+    try:
+        got = probe.read_reply(reply, dns.name.from_text(_Q))
+    finally:
+        sys.setprofile(None)
+    return got, calls
+
+
+@pytest.mark.parametrize("ends", ["ptr", "loop"])
+def test_a_chain_of_colliding_names_costs_work_in_step_with_its_links(ends):
+    """#149: a reply whose CNAME chain runs through distinct names that dnspython hashes
+    alike costs work that grows with the number of links, not with its square. Work is
+    counted as the Python calls `read_reply` makes (a dictionary keyed by such names
+    compares them one by one, in `Name.fullcompare`), never timed. Each reply goes
+    through the wire and back, as a server's would; that parse is dnspython's cost
+    and is not counted."""
+    names = _colliding_names(256)
+    assert len({name.to_digestable() for name in names}) == len(names)  # distinct names
+    assert len({hash(name) for name in names}) == 1  # the premise: they hash alike
+
+    work = {}
+    for links in (64, 256):
+        chain = names[:links]
+        query = dns.message.make_query(_Q, dns.rdatatype.PTR)
+        reply = dns.message.make_response(query)
+        for owner, target in zip([dns.name.from_text(_Q), *chain], chain):
+            reply.answer.append(dns.rrset.from_text(owner, 60, "IN", "CNAME", target.to_text()))
+        if ends == "ptr":
+            reply.answer.append(dns.rrset.from_text(chain[-1], 60, "IN", "PTR", _NAME))
+        else:
+            reply.answer.append(dns.rrset.from_text(chain[-1], 60, "IN", "CNAME", chain[0].to_text()))
+        got, calls = _calls_reading(dns.message.from_wire(reply.to_wire()))
+        assert got == _NAME if ends == "ptr" else got is None
+        assert calls["fullcompare"] <= 1  # the PTR record's owner against the chain's end
+        work[links] = calls["all"]
+    # four times the links, about four times the work (a square would be sixteen)
+    assert work[256] <= 5 * work[64], work
 
 
 async def test_a_truncated_answer_does_not_fall_back_to_tcp():
