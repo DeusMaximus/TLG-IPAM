@@ -276,9 +276,15 @@ async def bulk_create_hosts(subnet_id: str, hosts: list[dict]) -> dict:
     byte count decides, not the number of characters: JSON writes a quote, a backslash
     or a line break in two bytes or more, and a character outside ASCII in up to
     twelve. 1,000 short records fit; 1,000 with long notes do not (at 4,096 characters
-    of notes each they are over 4 MB), so send those in smaller calls: 400 records
-    whose notes are 4,096 characters of plain ASCII text with no quotes, backslashes
-    or line breaks fit, and fewer if the notes hold any of those."""
+    of notes each they are over 4 MB), so send those in smaller calls. 400 records
+    fit when each one's notes are 4,096 characters of plain ASCII text and every other
+    field is plain ASCII too (an ordinary address and MAC, a hostname and domain of up
+    to 253 characters, an owner of up to 120, a device type of up to 40), with no
+    character in any field that JSON escapes: a quote, a backslash or a control
+    character such as a line break or a tab. Fewer fit if any field holds one of those
+    (a hostname and an owner of quotes or tabs alone make those 400 records too
+    large), and fewer still if any field holds a character outside ASCII: with an
+    owner of 120 characters outside the BMP, those same 400 records are refused."""
     if not hosts:
         raise ToolError("hosts must contain at least one record")
     if len(hosts) > 1000:
