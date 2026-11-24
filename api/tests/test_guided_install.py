@@ -14,6 +14,7 @@ import pytest
 from sqlalchemy import event, func, select, update
 
 from app import mcp_server
+from app.agent_protocol import PROTOCOL_VERSION
 from app.config import Settings
 from app.database import SessionLocal, engine
 from app.models import Agent, Change
@@ -97,7 +98,7 @@ async def test_create_and_re_enrol_answers_carry_the_flags(client):
 
 async def test_a_protocol_refusal_is_flagged_until_an_accepted_check_in(client, agent_api):
     agent, token = await make_agent(client)
-    assert (await checkin(agent_api, token, protocol=2)).status_code == 409
+    assert (await checkin(agent_api, token, protocol=PROTOCOL_VERSION + 1)).status_code == 409
     answer = await agent_answer(client, agent["id"])
     assert answer["protocol_mismatch"] is True
     assert answer["last_error"].startswith(agents_svc.PROTOCOL_MISMATCH_PREFIX)
@@ -107,14 +108,14 @@ async def test_a_protocol_refusal_is_flagged_until_an_accepted_check_in(client, 
     answer = await agent_answer(client, agent["id"])
     assert answer["last_error"] and answer["protocol_mismatch"] is False
 
-    assert (await checkin(agent_api, token, protocol="1")).status_code == 409
+    assert (await checkin(agent_api, token, protocol=str(PROTOCOL_VERSION))).status_code == 409
     assert (await agent_answer(client, agent["id"]))["protocol_mismatch"] is True
     await jobs_for(agent_api, token)
     assert (await agent_answer(client, agent["id"]))["protocol_mismatch"] is False
 
 
 def test_every_protocol_refusal_starts_with_the_prefix_the_flag_reads():
-    for body in ({"protocol": 2}, {"protocol": "1"}, {}, {"protocol": 10**30}):
+    for body in ({"protocol": PROTOCOL_VERSION + 1}, {"protocol": str(PROTOCOL_VERSION)}, {}, {"protocol": 10**30}):
         assert jobs._protocol_error(body).startswith(agents_svc.PROTOCOL_MISMATCH_PREFIX)
 
 
@@ -213,7 +214,7 @@ async def test_a_refused_check_in_keeps_the_interfaces_it_had(client, agent_api)
     agent, token = await make_agent(client)
     subnet = await lab(client)
     await jobs_for(agent_api, token)
-    assert (await checkin(agent_api, token, protocol=2)).status_code == 409
+    assert (await checkin(agent_api, token, protocol=PROTOCOL_VERSION + 1)).status_code == 409
     assert await suggestions(client) == [offer(agent, subnet)]
 
 

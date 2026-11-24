@@ -13,11 +13,25 @@ import ipaddress
 import re
 from typing import Any
 
-from pydantic import AwareDatetime, BaseModel, Field, StrictBool, field_validator, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 # The protocol this server speaks. A check-in with any other value gets no jobs and
 # `409 PROTOCOL_MISMATCH`, and the error is recorded on the agent (spec §5.6).
-PROTOCOL_VERSION = 1
+# 2 (#100): a result set says whether its liveness sweep completed apart from
+# `complete`, and a record says when its PTR lookup was answered "no name".
+PROTOCOL_VERSION = 2
+# The protocols whose result sets ingest takes, each by its own rule (spec §5.7). A
+# result set without `protocol` is protocol 1's, which carried none: a job leased
+# before the server was upgraded is still reported by an agent of that protocol.
+RESULTS_PROTOCOLS = (1, 2)
 
 # spec §5.1: the agent checks in every minute by default
 CHECKIN_INTERVAL_S = 60
@@ -333,6 +347,20 @@ class Observation(BaseModel):
     mac: str | None = None
     # the PTR name; only from a job issued `rdns`. Not a hostname: dropped (`rdns_name`)
     rdns_name: str | None = None
+    # Protocol 2: true when a DNS server answered this address's PTR lookup that it has
+    # no name (NXDOMAIN, or NOERROR without a PTR record). Only such a record clears a
+    # stored name; one with neither this nor a name leaves it (the lookup got no usable
+    # answer, was cut off, or did not run). Only from a job issued `rdns`; a record that
+    # carries a name as well is rejected (`invalid`).
+    rdns_no_name: StrictBool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _one_answer(cls, data: Any) -> Any:
+        # read before sanitising: a name that sanitising would drop is still a name
+        if isinstance(data, dict) and data.get("rdns_no_name") is True and data.get("rdns_name") is not None:
+            raise ValueError("a record carries either rdns_name or rdns_no_name")
+        return data
 
     @field_validator("ip", mode="before")
     @classmethod
@@ -403,14 +431,22 @@ class FdnsAnswer(BaseModel):
 class ResultsRequest(BaseModel):
     """`POST /api/v1/agent/results`: what one job found. Unknown fields are ignored."""
 
+    # the protocol the result set is sent under, one of RESULTS_PROTOCOLS; absent is 1
+    protocol: StrictInt = 1
     # the job's id from the check-in answer; it must still be this agent's current job
     job_id: str = Field(max_length=_ID_MAX)
     subnet_id: str = Field(max_length=_ID_MAX)
     # by the agent's clock; used only for the scan's duration
     started_at: AwareDatetime
     finished_at: AwareDatetime
-    # true only when every range of the job was swept before the timeout
+    # true only when every issued method ran over every address of the job before the
+    # timeout
     complete: StrictBool
+    # Protocol 2, and required there: true when every issued liveness method (icmp,
+    # arp) ran over every address before the timeout, whatever the PTR lookups did.
+    # It alone decides whether the silent addresses are marked dead. Never false when
+    # `complete` is true. Protocol 1 has no such field: `complete` decides it.
+    liveness_complete: StrictBool | None = None
     # live addresses only; each record is checked on its own (`parse_observation`)
     observations: list[Any] = Field(max_length=OBSERVATIONS_MAX)
     fdns: list[FdnsAnswer] = Field(default=[], max_length=FDNS_MAX)
@@ -422,11 +458,32 @@ class ResultsRequest(BaseModel):
     def _error(cls, v: str | None) -> str | None:
         return scan_error(v)
 
+    @field_validator("protocol")
+    @classmethod
+    def _protocol(cls, v: int) -> int:
+        if v not in RESULTS_PROTOCOLS:
+            raise ValueError(f"must be one of {', '.join(map(str, RESULTS_PROTOCOLS))}")
+        return v
+
     @model_validator(mode="after")
     def _times(self):
         if self.finished_at < self.started_at:
             raise ValueError("finished_at must not be earlier than started_at")
         return self
+
+    @model_validator(mode="after")
+    def _liveness(self):
+        if self.protocol >= 2:
+            if self.liveness_complete is None:
+                raise ValueError("liveness_complete is required from protocol 2")
+            if self.complete and not self.liveness_complete:
+                raise ValueError("liveness_complete must be true when complete is")
+        return self
+
+    def marks_dead(self) -> bool:
+        """Whether this result set's liveness sweep completed, by the rule of the
+        protocol it was sent under: protocol 1 knew only `complete`."""
+        return self.complete if self.protocol == 1 else bool(self.liveness_complete)
 
 
 class Rejected(BaseModel):

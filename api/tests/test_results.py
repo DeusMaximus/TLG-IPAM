@@ -578,6 +578,167 @@ async def test_a_complete_result_set_still_clears_a_name_its_lookup_did_not_retu
     assert seen["10.0.0.11"].rdns_name == "tv.home.arpa"
 
 
+# --- Protocol 2: names by each record's lookup, the dead by the liveness sweep (#100) ---
+
+V2 = {"protocol": 2}
+
+
+async def test_from_protocol_2_only_an_answer_of_no_name_clears_a_stored_name(client, agent_api):
+    """Acceptance for #100, option 4: in a complete result set, a record whose lookup
+    got no usable answer (neither field) keeps the stored name; `rdns_no_name` clears
+    it; a name replaces it; a name dropped by sanitising keeps it."""
+    token, job = await _named_then_rescanned(client, agent_api)
+    await accepted(agent_api, token, job, [obs("10.0.0.10"), obs("10.0.0.11", rdns_no_name=True)],
+                   liveness_complete=True, **V2)
+    seen = await observations()
+    assert seen["10.0.0.10"].rdns_name == "nas.home.arpa"
+    assert seen["10.0.0.11"].rdns_name is None
+
+
+async def test_from_protocol_2_a_name_replaces_and_a_dropped_one_keeps_the_stored_name(
+    client, agent_api
+):
+    token, job = await _named_then_rescanned(client, agent_api)
+    await accepted(
+        agent_api, token, job,
+        [obs("10.0.0.10", rdns_name="<b>x</b>"), obs("10.0.0.11", rdns_name="tv-2.home.arpa")],
+        liveness_complete=True, **V2,
+    )
+    seen = await observations()
+    assert seen["10.0.0.10"].rdns_name == "nas.home.arpa"
+    assert seen["10.0.0.11"].rdns_name == "tv-2.home.arpa"
+
+
+async def test_from_protocol_2_an_incomplete_set_still_clears_on_an_answer_of_no_name(
+    client, agent_api
+):
+    """`complete` has no part in the name rule from protocol 2: a lookup answered "no
+    name" in a scan cut short later is still that answer."""
+    token, job = await _named_then_rescanned(client, agent_api)
+    await accepted(agent_api, token, job, [obs("10.0.0.10", rdns_no_name=True), obs("10.0.0.11")],
+                   complete=False, liveness_complete=True, error="timed out", **V2)
+    seen = await observations()
+    assert seen["10.0.0.10"].rdns_name is None
+    assert seen["10.0.0.11"].rdns_name == "tv.home.arpa"
+
+
+async def test_from_protocol_2_a_whole_liveness_sweep_marks_the_dead_in_an_incomplete_set(
+    client, agent_api
+):
+    """The PTR lookups did not finish (no server, a timeout in them): the result set
+    is incomplete, its liveness sweep is not, and the address that left is dead."""
+    agent, token, subnet, target, job = await setup(client, agent_api)
+    await _seed(agent_api, token, job, ["10.0.0.10", "10.0.0.11"])
+    job = await _next_job(agent_api, token, target["id"])
+    await accepted(agent_api, token, job, [obs("10.0.0.10")], complete=False,
+                   liveness_complete=True, error="rdns not run", **V2)
+    rows = await observations()
+    assert rows["10.0.0.10"].alive is True and rows["10.0.0.11"].alive is False
+    row = await target_row(target["id"])
+    assert row.last_scan_complete is False and row.last_scan_error == "rdns not run"
+
+
+async def test_from_protocol_2_a_liveness_sweep_cut_short_marks_nothing_dead(client, agent_api):
+    agent, token, subnet, target, job = await setup(client, agent_api)
+    await _seed(agent_api, token, job, ["10.0.0.10", "10.0.0.11"])
+    job = await _next_job(agent_api, token, target["id"])
+    await accepted(agent_api, token, job, [obs("10.0.0.10")], complete=False,
+                   liveness_complete=False, **V2)
+    assert all(row.alive for row in (await observations()).values())
+
+
+async def test_from_protocol_2_only_an_issued_liveness_method_marks_the_dead(client, agent_api):
+    agent, token, subnet, target, job = await setup(client, agent_api)
+    await _seed(agent_api, token, job, ["10.0.0.10", "10.0.0.11"])
+    job = await _next_job(agent_api, token, target["id"])
+    await set_target(target["id"], job_methods=["rdns"])
+    await accepted(agent_api, token, job, [obs("10.0.0.10")], liveness_complete=True, **V2)
+    assert all(row.alive for row in (await observations()).values())
+
+
+async def test_a_protocol_1_result_set_is_ingested_by_the_rule_it_was_sent_under(
+    client, agent_api
+):
+    """Acceptance for #100: a result set with no `protocol`, as an agent of protocol 1
+    sends it for a job leased before the server was upgraded, is judged by `complete`
+    alone, and so is one that says `protocol: 1`. The fields of protocol 2 in it are
+    not read."""
+    agent, token, subnet, target, job = await setup(client, agent_api)
+    named = [obs("10.0.0.10", rdns_name="nas.home.arpa"), obs("10.0.0.11", rdns_name="tv.home.arpa")]
+    await accepted(agent_api, token, job, [*named, obs("10.0.0.12")])
+    job = await _next_job(agent_api, token, target["id"])
+    await accepted(
+        agent_api, token, job,
+        [obs("10.0.0.10"), obs("10.0.0.11", rdns_no_name=True)],
+        complete=False, liveness_complete=True,
+    )
+    seen = await observations()
+    assert seen["10.0.0.10"].rdns_name == "nas.home.arpa"
+    assert seen["10.0.0.11"].rdns_name == "tv.home.arpa"
+    assert all(row.alive for row in seen.values())
+    # protocol 1's complete result set clears a name its record does not carry, and
+    # marks the rest of the scope dead
+    job = await _next_job(agent_api, token, target["id"])
+    await accepted(agent_api, token, job, [obs("10.0.0.10")], protocol=1)
+    seen = await observations()
+    assert seen["10.0.0.10"].rdns_name is None
+    assert seen["10.0.0.11"].alive is False and seen["10.0.0.12"].alive is False
+
+
+@pytest.mark.parametrize(
+    "body, field",
+    [
+        ({"protocol": 2}, "liveness_complete is required"),
+        ({"protocol": 2, "liveness_complete": False}, "liveness_complete must be true"),
+        ({"protocol": 2, "liveness_complete": "yes"}, "liveness_complete"),
+        ({"protocol": 3, "liveness_complete": True}, "protocol"),
+        ({"protocol": 0}, "protocol"),
+        ({"protocol": "2", "liveness_complete": True}, "protocol"),
+        ({"protocol": True, "liveness_complete": True}, "protocol"),
+        ({"protocol": 2.0, "liveness_complete": True}, "protocol"),
+    ],
+)
+async def test_a_result_set_of_no_protocol_ingest_knows_is_refused_whole(client, agent_api, body, field):
+    agent, token, subnet, target, job = await setup(client, agent_api)
+    res = await post_results(agent_api, token, job, [obs("10.0.0.10")], **body)
+    assert res.status_code == 422, res.text
+    assert field in res.json()["error"]["message"]
+    assert await observations() == {}
+    assert (await target_row(target["id"])).current_job_id == job["job_id"]
+
+
+async def test_rdns_no_name_is_checked_on_its_record(client, agent_api):
+    agent, token, subnet, target, job = await setup(client, agent_api)
+    data = await accepted(
+        agent_api, token, job,
+        [
+            obs("10.0.0.10", rdns_no_name=True, rdns_name="nas.home.arpa"),
+            obs("10.0.0.11", rdns_no_name=True, rdns_name="<b>x</b>"),
+            obs("10.0.0.12", rdns_no_name="true"),
+            obs("10.0.0.13", rdns_no_name=False, rdns_name="tv.home.arpa"),
+            obs("10.0.0.14", rdns_no_name=True),
+        ],
+        liveness_complete=True, **V2,
+    )
+    assert data["rejected"] == [
+        {"ip": "10.0.0.10", "reason": "invalid"},
+        {"ip": "10.0.0.11", "reason": "invalid"},
+        {"ip": "10.0.0.12", "reason": "invalid"},
+    ]
+    seen = await observations()
+    assert set(seen) == {"10.0.0.13", "10.0.0.14"}
+    assert seen["10.0.0.13"].rdns_name == "tv.home.arpa" and seen["10.0.0.14"].rdns_name is None
+
+
+async def test_rdns_no_name_is_accepted_only_from_a_job_issued_rdns(client, agent_api):
+    agent, token, subnet, target, job = await setup(client, agent_api, methods=["icmp", "arp"])
+    data = await accepted(
+        agent_api, token, job, [obs("10.0.0.10", rdns_no_name=True), obs("10.0.0.11", rdns_no_name=False)],
+        liveness_complete=True, **V2,
+    )
+    assert data["rejected"] == [{"ip": "10.0.0.10", "reason": "rdns_not_issued"}]
+
+
 async def test_an_answer_without_a_mac_keeps_the_known_one(client, agent_api):
     agent, token, subnet, target, job = await setup(client, agent_api)
     await accepted(agent_api, token, job, [obs("10.0.0.10", mac="aa:bb:cc:dd:ee:ff")])
