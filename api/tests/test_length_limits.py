@@ -16,6 +16,7 @@ from app.models import Host
 from app.schemas import HOST_NOTES_MAX
 
 from .conftest import make_host, make_section, make_subnet
+from .test_auth import INITIALIZE, INITIALIZED, MCP_ACCEPT, OWNER_BEARER, running_app
 
 NOTES_REFUSAL = (
     f"notes: a host's notes may be at most {HOST_NOTES_MAX} characters, "
@@ -190,23 +191,39 @@ def encoded(document) -> bytes:
     return json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode()
 
 
-def full_rows(count: int, *, notes: str, owner: str = "\U0001f600" * 120) -> list[dict]:
-    """`count` rows with every length-bounded field at its maximum but `notes`, which
-    is given; the default owner's characters are four bytes each in UTF-8."""
-    addresses = list(ipaddress.ip_network("10.0.0.0/22").hosts())[:count]
-    return [
+# The longest a device type's name can be (`schemas.HostCreate.device_type`).
+DEVICE_TYPE_MAX = 40
+LONG_DEVICE_TYPE = "t" * DEVICE_TYPE_MAX
+# A subnet with room for 1,000 addresses written out at their longest (15 characters).
+FULL_ROWS_CIDR = "100.100.0.0/16"
+
+
+def full_rows(count: int, *, notes: str | None, owner: str = "\U0001f600" * 120) -> list[dict]:
+    """`count` import rows with every field at the longest value it has in normal form:
+    a 15-character address in `FULL_ROWS_CIDR`, hostname and domain of 253 characters,
+    a 17-character MAC, a device type of `DEVICE_TYPE_MAX`, status `reserved` (the
+    longest of the four), `owner` as given (the default's characters are four bytes each
+    in UTF-8) and `notes` as given, or no `notes` key when it is None. The address and
+    the MAC have no length limit and a client can write more of either; the other
+    fields are limited, so this is the widest a row is that the limits permit."""
+    addresses = [f"100.100.{c}.{d}" for c in range(100, 256) for d in range(100, 255)]
+    rows = [
         {
-            "ip": str(address),
+            "ip": address,
             "hostname": LONG_DOMAIN,
             "domain": LONG_DOMAIN,
             "mac": f"aa:bb:cc:dd:{i >> 8:02x}:{i & 255:02x}",
-            "device_type": "other",
+            "device_type": LONG_DEVICE_TYPE,
             "status": "reserved",
             "owner": owner,
-            "notes": notes,
         }
-        for i, address in enumerate(addresses)
+        for i, address in enumerate(addresses[:count])
     ]
+    assert len(rows) == count and all(len(row["ip"]) == 15 for row in rows)
+    if notes is not None:
+        for row in rows:
+            row["notes"] = notes
+    return rows
 
 
 def _longest_notes_that_fit(rows: int, char: str, **owner) -> int:
@@ -222,25 +239,39 @@ def _longest_notes_that_fit(rows: int, char: str, **owner) -> int:
 
 
 def test_a_full_import_fits_the_cap_only_with_short_notes():
-    """The figures the brief gives: with every other field at its maximum, 1,000 rows
-    fit with at most 243 four-byte characters of notes each (1,335 ASCII characters
-    with an ASCII owner); 1,000 rows with notes at the limit are 17.5 MB, or 5.2 MB in
-    ASCII."""
-    assert _longest_notes_that_fit(1000, "\U0001f600") == 243
-    assert _longest_notes_that_fit(1000, "a", owner="a" * 120) == 1335
+    """Every size brief §4.3 states for an import, as the UI encodes it (compact JSON,
+    non-ASCII unescaped), for the rows `full_rows` builds: 1,000 rows without notes are
+    1,151,011 bytes; with every other field at its maximum they fit with at most 233
+    four-byte characters of notes each (1,295 ASCII characters with an ASCII owner);
+    with notes at the limit they are 17,546,011 bytes, or 5,258,011 in ASCII (4,898,011
+    with an ASCII owner as well); at most 119 such rows fit one request, 398 with ASCII
+    notes and 428 with an ASCII owner too."""
     widest = "\U0001f600" * HOST_NOTES_MAX
-    assert len(encoded({"hosts": full_rows(1000, notes=widest)})) == 17_505_573
-    assert len(encoded({"hosts": full_rows(1000, notes="a" * HOST_NOTES_MAX)})) == 5_217_573
-    # the most rows at every limit that fit one request: 119, or 401 with ASCII notes
-    # (431 with an ASCII owner as well)
-    assert len(encoded({"hosts": full_rows(119, notes=widest)})) <= BODY_MAX
-    assert len(encoded({"hosts": full_rows(120, notes=widest)})) > BODY_MAX
-    assert len(encoded({"hosts": full_rows(401, notes="a" * HOST_NOTES_MAX)})) <= BODY_MAX
-    assert len(encoded({"hosts": full_rows(402, notes="a" * HOST_NOTES_MAX)})) > BODY_MAX
+    ascii_notes = "a" * HOST_NOTES_MAX
+    assert len(encoded({"hosts": full_rows(1000, notes=None)})) == 1_151_011
+    assert _longest_notes_that_fit(1000, "\U0001f600") == 233
+    assert _longest_notes_that_fit(1000, "a", owner="a" * 120) == 1295
+    assert len(encoded({"hosts": full_rows(1000, notes=widest)})) == 17_546_011
+    assert len(encoded({"hosts": full_rows(1000, notes=ascii_notes)})) == 5_258_011
+    ascii_all = full_rows(1000, notes=ascii_notes, owner="a" * 120)
+    assert len(encoded({"hosts": ascii_all})) == 4_898_011
+    for count, notes, owner in (
+        (119, widest, {}),
+        (398, ascii_notes, {}),
+        (428, ascii_notes, {"owner": "a" * 120}),
+    ):
+        fits = encoded({"hosts": full_rows(count, notes=notes, **owner)})
+        over = encoded({"hosts": full_rows(count + 1, notes=notes, **owner)})
+        assert len(fits) <= BODY_MAX < len(over), count
+    # a device type of the usual 5 characters, as the rows had before: 35 bytes a row less
+    short_type = full_rows(1000, notes=None)
+    for row in short_type:
+        row["device_type"] = "other"
+    assert len(encoded({"hosts": short_type})) == 1_151_011 - 35 * 1000
 
 
 async def test_a_full_import_with_notes_at_the_limit_is_refused_whole(client):
-    subnet = await _subnet(client, cidr="10.0.0.0/22")
+    subnet = await _subnet(client, cidr=FULL_ROWS_CIDR)
     body = encoded({"hosts": full_rows(1000, notes="a" * HOST_NOTES_MAX)})
     res = await client.post(
         f"/api/v1/subnets/{subnet['id']}/hosts/bulk",
@@ -252,29 +283,86 @@ async def test_a_full_import_with_notes_at_the_limit_is_refused_whole(client):
     assert (await client.get(f"/api/v1/hosts?subnet_id={subnet['id']}")).json()["total"] == 0
 
 
-async def test_the_mcp_call_the_docstring_names_fits_and_is_served(client):
-    """`bulk_create_hosts`' docstring: 400 records whose notes are 4,096 characters of
-    plain ASCII text fit one call, as the JSON-RPC request a client sends, with every
-    other field at its maximum in ASCII (Python's `json` escapes non-ASCII as
-    `\\uXXXX`). The byte count decides, not the characters: the same records with notes
-    of characters JSON escapes (a quote, a backslash, a line break) do not fit."""
-    subnet = await _subnet(client, cidr="10.0.0.0/22")
-    rows = full_rows(400, notes="a" * HOST_NOTES_MAX, owner="a" * 120)
+# --- The example in `bulk_create_hosts`' docstring (brief §5.2) ---
+#
+# "400 records whose notes are 4,096 characters of plain ASCII text with no quotes,
+# backslashes or line breaks fit", the other text fields ASCII too. It is judged as the
+# worst client sends it, Python's `json.dumps`, which writes the separators with spaces.
+
+
+def _tool_call(subnet_id: str, rows: list[dict]) -> bytes:
     call = {
         "jsonrpc": "2.0",
         "id": 2,
         "method": "tools/call",
         "params": {
             "name": "bulk_create_hosts",
-            "arguments": {"subnet_id": subnet["id"], "hosts": rows},
+            "arguments": {"subnet_id": subnet_id, "hosts": rows},
         },
     }
-    assert len(json.dumps(call).encode()) <= BODY_MAX
+    return json.dumps(call).encode()
+
+
+def _sse_data(res) -> dict:
+    if res.headers["content-type"].startswith("application/json"):
+        return res.json()
+    lines = [line for line in res.text.splitlines() if line.startswith("data:")]
+    return json.loads(lines[-1][len("data:") :])
+
+
+async def _post_to_mcp(anon_client, body: bytes):
+    """`body` posted to the real `/mcp` route, behind the body cap, in a session."""
+    headers = {**OWNER_BEARER, "Accept": MCP_ACCEPT}
+    async with running_app():
+        res = await anon_client.post("/mcp", json=INITIALIZE, headers=headers)
+        assert res.status_code == 200, res.text
+        headers["mcp-session-id"] = res.headers["mcp-session-id"]
+        res = await anon_client.post("/mcp", json=INITIALIZED, headers=headers)
+        assert res.status_code == 202, res.text
+        return await anon_client.post(
+            "/mcp", content=body, headers={**headers, "Content-Type": "application/json"}
+        )
+
+
+async def test_the_largest_call_the_docstring_permits_is_served_by_the_route(client, anon_client):
+    """400 rows at every limit, notes 4,096 plain ASCII characters, every other text
+    field ASCII: 1,965,771 bytes, under the 2,000,000 the docstring says to keep to
+    and the cap, and the real route creates all 400 hosts."""
+    created = await client.post("/api/v1/device-types", json={"name": LONG_DEVICE_TYPE})
+    assert created.status_code == 201, created.text
+    subnet = await _subnet(client, cidr=FULL_ROWS_CIDR)
+    rows = full_rows(400, notes="a" * HOST_NOTES_MAX, owner="a" * 120)
+    assert all(all(ord(c) < 128 for c in str(v)) for row in rows for v in row.values())
+    body = _tool_call(subnet["id"], rows)
+    assert len(body) == 1_965_771 < 2_000_000 < BODY_MAX
+    res = await _post_to_mcp(anon_client, body)
+    assert res.status_code == 200, res.text
+    result = _sse_data(res)["result"]
+    assert not result.get("isError"), result
+    assert result["structuredContent"]["created"] == 400
+    assert (await client.get(f"/api/v1/hosts?subnet_id={subnet['id']}")).json()["total"] == 400
+
+
+async def test_the_same_call_with_a_non_ascii_owner_is_refused_by_the_route(client, anon_client):
+    """The example holds for ASCII fields only: with an owner of 120 characters outside
+    the BMP, which `json.dumps` writes as twelve bytes each, the same 400 rows are
+    2,493,771 bytes (2,103,359 as the UI encodes them) and the real route answers `413`
+    with nothing created."""
+    subnet = await _subnet(client, cidr=FULL_ROWS_CIDR)
+    rows = full_rows(400, notes="a" * HOST_NOTES_MAX)  # the default owner is non-BMP
+    body = _tool_call(subnet["id"], rows)
+    assert len(body) == 2_493_771 > BODY_MAX
+    # and as the UI encodes it (compact, non-ASCII unescaped), still over
+    assert len(encoded(json.loads(body))) == 2_103_359 > BODY_MAX
+    res = await _post_to_mcp(anon_client, body)
+    assert res.status_code == 413, res.text
+    assert res.json()["error"]["code"] == "PAYLOAD_TOO_LARGE"
+    assert (await client.get(f"/api/v1/hosts?subnet_id={subnet['id']}")).json()["total"] == 0
+
+
+def test_notes_json_escapes_take_the_same_call_over_the_cap():
+    """The byte count decides, not the characters: the same 400 rows with notes of
+    characters JSON escapes (a quote, a backslash, a line break) do not fit."""
     for escaped in ('"', "\\", "\n"):
-        heavy = full_rows(400, notes=escaped * HOST_NOTES_MAX, owner="a" * 120)
-        arguments = {"subnet_id": subnet["id"], "hosts": heavy}
-        heavy_call = {**call, "params": {**call["params"], "arguments": arguments}}
-        assert len(json.dumps(heavy_call).encode()) > BODY_MAX, repr(escaped)
-    result = await _mcp("bulk_create_hosts", {"subnet_id": subnet["id"], "hosts": rows})
-    assert not result.is_error, result.content
-    assert result.data["created"] == 400
+        rows = full_rows(400, notes=escaped * HOST_NOTES_MAX, owner="a" * 120)
+        assert len(_tool_call("x" * 36, rows)) > BODY_MAX, repr(escaped)
