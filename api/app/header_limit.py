@@ -1,43 +1,60 @@
-"""The limits on a request's head and on a connection waiting for one (#132).
+"""The limits below the app: a request's head, a connection waiting for one, and a
+connection the client has stopped reading (#132).
 
-uvicorn calls the app only once a request's head (its request line and header fields)
-is complete, so nothing in the app, `BodyLimitMiddleware` included, can see a head
-that is still arriving, or a connection that has sent nothing. Measured at `7063421`
-on uvicorn 0.54 with httptools 0.9, the parser the image runs: 8 MiB of one unfinished
-header was taken and the worker grew by 119 MiB, and a connection that sent nothing,
-or that sent a header a byte at a time, was still open after 75 s. uvicorn's own
-keep-alive timeout is armed only once a response has been sent and is cancelled by
-the first byte that arrives after it, and httptools sets no limit on a head's size.
+uvicorn calls the app only once a request's head (its request line, header lines and
+the blank line that ends them) is complete, so nothing in the app, `BodyLimitMiddleware`
+included, can see a head that is still arriving, or a connection that has sent
+nothing. Measured at `7063421` on uvicorn 0.54 with httptools 0.9, the parser the image
+runs: 8 MiB of one unfinished header was taken and the worker grew by 119 MiB, and a
+connection that sent nothing, or that sent a header a byte at a time, was still open
+after 75 s. uvicorn's own keep-alive timeout is armed only once a response has been
+sent and is cancelled by the first byte that arrives after it, and httptools sets no
+limit on a head's size.
 
-`HeaderLimitProtocol` is uvicorn's httptools protocol with two limits added, both
-held below the app:
+`HeaderLimitProtocol` is uvicorn's httptools protocol with these limits added:
 
-- **The size** (`HEADER_MAX`). A head whose bytes received pass it while it is still
-  unfinished is refused with `431` in the REST error shape and the connection closed,
-  at the read that takes it past (bytes are counted as they are read, so up to one
-  read beyond the limit is held before the refusal; reads go to the parser in pieces
-  of `_PIECE` bytes, so a head that begins in a read after another request ends is
-  counted from there, at most one piece over). A complete head is measured as it
-  is spelt with one space after each field's colon (`_head_size`: what was received,
-  for a head sent the way clients send it) and refused the same way when it passes the
-  limit, however few reads it came in, so no request whose head is larger reaches the
-  app. When another request on the connection is still being answered (the head is
-  pipelined behind it), the connection is closed without an answer instead, finished
-  head or not, so no refusal is written into that response or waits behind it.
-- **The time** (`HEADER_TIMEOUT_S`). A connection has that long, from when it opens and
-  again from when its last request has been both received whole and answered, to
-  deliver the next request's head whole. One that has not is closed without an
-  answer, whether it sent nothing, part of a head, or a byte at a time. The time stops
-  when the head is complete: a body then has `body_limit.BODY_TIMEOUT_S`, and a
-  response (an MCP event stream held open) is never timed here. uvicorn's keep-alive
-  timeout (`serve.KEEP_ALIVE_S`) still closes a connection that sends nothing after a
-  response, sooner.
+- **The size of a head** (`HEADER_MAX`): the bytes of it as received, from the first
+  byte after the request before it ended to the end of its blank line, whatever its
+  spelling. A head that passes it is refused with `431` in the REST error shape and the
+  connection closed, and the app is not called; the server reads at most one byte past
+  the limit before it refuses. To count exactly, reads reach the parser in pieces cut
+  where a head ends (the first CRLF CRLF since it began) and where a body with a
+  declared length ends, of at most `_PIECE` bytes, and of one byte once a head reaches
+  the limit. httptools says that a request has ended, not where, so the cuts are what
+  put the next head's first byte at the start of a piece. A head that follows a chunked
+  body in the same piece is the one case not counted exactly: it is counted from the
+  start of that piece, at most `_PIECE` bytes over.
+- **The time for a head** (`HEADER_TIMEOUT_S`). A connection has that long, from when
+  it opens and again from when its last request has been both received whole and
+  answered, to deliver the next request's head whole. One that has not is closed
+  without an answer, whether it sent nothing, part of a head, or a byte at a time. The
+  time stops when the head is complete: a body then has `body_limit.BODY_TIMEOUT_S`,
+  and a response (an MCP event stream held open) is never timed by it. uvicorn's
+  keep-alive timeout (`serve.KEEP_ALIVE_S`) still closes a connection that sends
+  nothing after a response, sooner.
+- **One request ahead.** While a request is queued behind the one being answered
+  (pipelined), nothing more is parsed and nothing more is read: what has arrived
+  waits unparsed, so a connection holds at most one queued request and what one read
+  brought.
+  Without it, uvicorn queued every request one read held (788 small ones in 64 KiB).
+- **A client that stops reading** (`STALL_TIMEOUT_S`). A response whose send buffer
+  stays full (uvicorn has paused it) for that long without the client taking any of
+  it, and a connection the server has closed whose client takes none of what it still
+  holds for that long, are dropped (`abort`): `close()` alone waits for a flush that
+  never comes. An
+  event stream the client reads is never paused, so never dropped.
+
+A head over the limit that arrives while another request on the connection is still
+being answered (pipelined behind an event stream, say) drops the connection with no
+answer, finished or not, so no refusal is written into that response or queued behind
+it.
 
 This subclasses uvicorn's `HttpToolsProtocol` and relies on its parser callbacks and
-the attributes they set (`url`, `headers`, `cycle`, `pipeline`, `app`): the tests that
-start the image's server on loopback (`test_header_limit.py`) are what show a uvicorn
-upgrade has kept them. What the limits do not bound, how many connections there are
-and how many one client opens, is left to the reverse proxy or tunnel (brief §4.3).
+the attributes they set (`url`, `headers`, `cycle`, `pipeline`, `app`, `flow`), and on
+the transport it is given passing `close` through: the tests in `test_header_limit.py`,
+in process and against the image's server on loopback, are what show a uvicorn upgrade
+has kept them. What the limits do not bound, how many connections there are and how
+many one client opens, is left to the reverse proxy or tunnel (brief §4.3).
 """
 
 import asyncio
@@ -45,7 +62,9 @@ import json
 
 from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
 
-# The most bytes of a request's head the server holds, chosen for #132. A head the
+from .body_limit import _length_digits
+
+# The most bytes of a request's head the server takes, chosen for #132. A head the
 # server's own clients send (the UI, the agent, an MCP client) is under 2 KiB, and a
 # proxy's own fields (forwarding headers, an access proxy's assertion and cookie) add a
 # few KiB; nginx's defaults pass at most 32 KiB in all. Cloudflare passes up to 128 KB,
@@ -61,12 +80,19 @@ HEADER_MAX = 64 * 1024
 # every 10 s.
 HEADER_TIMEOUT_S = 10
 
-# Reads are handed to the parser in pieces of at most this many bytes, so that when a
-# request ends inside a read, the bytes after it, the start of the next request's head,
-# are counted: the parser says that a request has ended, not where, so the whole piece
-# it ended in is counted toward the next head. A head that follows another request in
-# the same read is counted at most this much over its size; one that does not, exactly.
+# How long a client may leave the server's send buffer full, or leave unsent bytes on a
+# connection the server has closed, before the connection is dropped, in seconds
+# (#132). uvicorn pauses a response at 64 KiB unsent and resumes it at 16 KiB, so a
+# client has to take 48 KiB in this time, under 1 KB/s; a proxy in front reads at its
+# own speed. The same as the body deadline (`body_limit.BODY_TIMEOUT_S`).
+STALL_TIMEOUT_S = 60
+
+# The most bytes handed to the parser at once (module docstring): small enough that the
+# one case counted from a piece's start is close, large enough that a body costs a
+# few hundred calls per MB.
 _PIECE = 4 * 1024
+
+_END_OF_HEAD = b"\r\n\r\n"
 
 _MESSAGE = f"The request line and headers may be at most {HEADER_MAX} bytes"
 _BODY = json.dumps({"error": {"code": "HEADERS_TOO_LARGE", "message": _MESSAGE}}).encode()
@@ -77,76 +103,161 @@ _HEADERS = [
 ]
 
 
-def _head_size(method: bytes, target: bytes, headers: list[tuple[bytes, bytes]]) -> int:
-    """A complete head's size in bytes, spelt as clients send it: `METHOD target
-    HTTP/1.1` and one `name: value` line per field, each ending in CRLF, and the blank
-    line. A head received in that spelling measures what was received, so it is held to
-    the limit the same way whether it arrived complete or a read at a time."""
-    request_line = len(method) + 1 + len(target) + len(b" HTTP/1.1\r\n")
-    return request_line + sum(len(name) + 2 + len(value) + 2 for name, value in headers) + 2
-
-
 async def _too_large(scope, receive, send) -> None:
     """The answer to a complete head over the limit, served in the app's place."""
     await send({"type": "http.response.start", "status": 431, "headers": _HEADERS})
     await send({"type": "http.response.body", "body": _BODY})
 
 
+class _Transport:
+    """The connection's transport as uvicorn sees it: every `close`, uvicorn's own (a
+    keep-alive timeout, `Connection: close`, a `400`) and this module's, starts the time
+    the connection has to flush what it still holds."""
+
+    def __init__(self, transport, protocol: "HeaderLimitProtocol") -> None:
+        self._transport = transport
+        self._protocol = protocol
+
+    def close(self) -> None:
+        self._transport.close()
+        self._protocol._closed()
+
+    def __getattr__(self, name):
+        return getattr(self._transport, name)
+
+
 class HeaderLimitProtocol(HttpToolsProtocol):
-    """uvicorn's httptools protocol with a limit on a head's size and on the time a
-    connection has to deliver one (module docstring)."""
+    """uvicorn's httptools protocol with the limits of the module docstring."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._awaiting_head = True  # the parser is before or inside a request's head
-        self._head_bytes = 0  # bytes read while it was
+        self._head_bytes = 0  # the bytes of that head received so far
+        self._tail = b""  # its last bytes, where an end of head may begin
+        self._body_left: int | None = None  # body bytes still due, when declared
         self._piece = 0  # the size of the piece being parsed
-        self._dropped = False  # the connection was closed inside a parse: ignore the rest
+        self._ended_in_piece = False  # a request ended inside it
+        self._unparsed = b""  # what arrived while a request was queued
+        self._holding = False  # reading is paused here while it waits
+        self._dropped = False  # the connection was dropped inside a parse
+        self._lost = False
         self._head_deadline: asyncio.TimerHandle | None = None
+        self._stall: asyncio.TimerHandle | None = None
+        self._flush_deadline: asyncio.TimerHandle | None = None
+        self._flush_left = 0  # unsent bytes when the flush was last checked
 
     # The connection
 
     def connection_made(self, transport) -> None:  # type: ignore[override]
-        super().connection_made(transport)
+        super().connection_made(_Transport(transport, self))
         self._arm_deadline()
 
     def connection_lost(self, exc) -> None:
-        self._cancel_deadline()
+        self._lost = True
+        for timer in (self._head_deadline, self._stall, self._flush_deadline):
+            if timer is not None:
+                timer.cancel()
+        self._head_deadline = self._stall = self._flush_deadline = None
         super().connection_lost(exc)
 
     def data_received(self, data: bytes) -> None:
-        for start in range(0, len(data), _PIECE):
-            if self.transport.is_closing():
+        if self._unparsed:
+            data, self._unparsed = self._unparsed + data, b""
+        self._parse(data)
+
+    def _hold_reading(self) -> None:
+        """Stop reading while bytes wait unparsed. uvicorn pauses reading when it queues
+        a request but resumes it whenever the request being answered asks for its body,
+        so without this what waits could grow by a read each time."""
+        if not self.transport.is_closing():
+            self._holding = True
+            self.transport.pause_reading()  # again each time: uvicorn may have resumed it
+
+    def pause_writing(self) -> None:
+        super().pause_writing()
+        if self._stall is None and not self._lost:
+            self._stall = self.loop.call_later(STALL_TIMEOUT_S, self._stalled)
+
+    def resume_writing(self) -> None:
+        super().resume_writing()
+        if self._stall is not None:
+            self._stall.cancel()
+            self._stall = None
+
+    # Parsing, a piece at a time
+
+    def _parse(self, data: bytes) -> None:
+        view = memoryview(data)
+        offset = 0
+        while offset < len(data):
+            if self._dropped or self.transport.is_closing():
                 return
-            piece = data[start : start + _PIECE]
-            self._piece = len(piece)
+            if self.pipeline:  # a request is queued: parse no further until it runs
+                self._unparsed = bytes(view[offset:])
+                self._hold_reading()
+                return
+            size = self._piece_size(data, offset)
+            piece = view[offset : offset + size]
+            offset += size
+            self._piece, self._ended_in_piece = size, False
             if self._awaiting_head:
-                self._head_bytes += len(piece)
+                self._head_bytes += size
+                self._tail = (self._tail + bytes(piece[-3:]))[-3:]
             super().data_received(piece)
+            if self._dropped or self.transport.is_closing():
+                return
             if self._awaiting_head and self._head_bytes > HEADER_MAX:
                 self._refuse_unfinished_head()
                 return
-            if self.parser is not None and self.parser.should_upgrade():
+            if self.parser.should_upgrade():
                 return  # httptools parses nothing after an `Upgrade` request, as before
+
+    def _piece_size(self, data: bytes, offset: int) -> int:
+        available = len(data) - offset
+        if self._awaiting_head:
+            room = HEADER_MAX - self._head_bytes
+            limit = min(_PIECE, room, available) if room > 0 else 1
+            window = self._tail + data[offset : offset + limit]
+            end = window.find(_END_OF_HEAD)
+            # cut just after the end of the head, so the next byte starts what follows
+            return end + len(_END_OF_HEAD) - len(self._tail) if end >= 0 else limit
+        if self._body_left:
+            return min(_PIECE, self._body_left, available)
+        return min(_PIECE, available)
+
+    def _resume(self) -> None:
+        if self._unparsed and not self.pipeline and not self._lost:
+            data, self._unparsed = self._unparsed, b""
+            self._parse(data)
+        if self._holding and not self._unparsed and not self._lost:
+            self._holding = False
+            if not self.flow.read_paused and not self.transport.is_closing():
+                self.transport.resume_reading()
 
     # The parser's callbacks
 
+    def on_message_begin(self) -> None:
+        super().on_message_begin()
+        if self._ended_in_piece:  # after a chunked body: it began inside this piece
+            self._head_bytes = self._piece
+
     def on_headers_complete(self) -> None:
         self._cancel_deadline()
+        size, self._head_bytes, self._tail = self._head_bytes, 0, b""
         self._awaiting_head = False
-        self._head_bytes = 0
-        if _head_size(self.parser.get_method(), self.url, self.headers) <= HEADER_MAX:
+        self._body_left = self._declared_length()
+        if size <= HEADER_MAX:
             super().on_headers_complete()
             return
         if self._answering():
-            # pipelined behind a response in progress (an event stream, which may never
-            # end): a refusal queued behind it would hold the connection as long, so
-            # close it, writing nothing into that response
+            # behind a response in progress (an event stream, which may never end): a
+            # refusal queued behind it would hold the connection as long, so drop it,
+            # writing nothing into that response
             self._drop()
             return
         # uvicorn's own path for a request it will not pass on (as it serves
-        # `--limit-concurrency`'s 503), so the refusal is framed, queued behind a
-        # pipelined request and closes the connection as any response does
+        # `--limit-concurrency`'s 503), so the refusal is framed and closes the
+        # connection as any response does
         app, self.app = self.app, _too_large
         try:
             super().on_headers_complete()
@@ -154,22 +265,37 @@ class HeaderLimitProtocol(HttpToolsProtocol):
             self.app = app
 
     def on_body(self, body: bytes) -> None:
-        if not self._dropped:
-            super().on_body(body)
+        if self._dropped:
+            return
+        if self._body_left:
+            self._body_left -= len(body)
+        super().on_body(body)
 
     def on_message_complete(self) -> None:
         if self._dropped:
             return
         super().on_message_complete()
-        self._awaiting_head = True  # what follows is the next request's head
-        self._head_bytes = self._piece  # it may have begun in the piece this one ended in
+        self._awaiting_head, self._head_bytes, self._tail = True, 0, b""
+        self._body_left = None
+        self._ended_in_piece = True
         self._arm_if_waiting()
 
     def on_response_complete(self) -> None:
         super().on_response_complete()
         self._arm_if_waiting()
+        if (self._unparsed or self._holding) and not self.pipeline:
+            self.loop.call_soon(self._resume)
 
     # The limits
+
+    def _declared_length(self) -> int | None:
+        """The body's declared length, when one frames it (a single `Content-Length`,
+        no `Transfer-Encoding`), so the piece that ends the body ends with it."""
+        lengths = [value for name, value in self.headers if name == b"content-length"]
+        if len(lengths) != 1 or any(name == b"transfer-encoding" for name, _ in self.headers):
+            return None
+        digits = _length_digits(lengths[0])
+        return int(digits) if digits is not None and len(digits) <= 18 else None
 
     def _answering(self) -> bool:
         return self.cycle is not None and not self.cycle.response_complete
@@ -193,24 +319,49 @@ class HeaderLimitProtocol(HttpToolsProtocol):
 
     def _deadline_passed(self) -> None:
         self._head_deadline = None
-        if not self.transport.is_closing() and not self._answering():
+        if not self.transport.is_closing():
             self.transport.close()
 
+    def _stalled(self) -> None:
+        self._stall = None
+        if not self._lost:
+            self.transport.abort()
+
+    def _closed(self) -> None:
+        """The transport was asked to close: it is dropped once `STALL_TIMEOUT_S` passes
+        in which the client took none of what it still holds."""
+        if not self._lost and self._flush_deadline is None:
+            self._flush_left = self.transport.get_write_buffer_size()
+            self._flush_deadline = self.loop.call_later(STALL_TIMEOUT_S, self._flush_check)
+
+    def _flush_check(self) -> None:
+        self._flush_deadline = None
+        if self._lost:
+            return
+        left = self.transport.get_write_buffer_size()
+        if 0 < left < self._flush_left:  # the client took some: another period
+            self._flush_left = left
+            self._flush_deadline = self.loop.call_later(STALL_TIMEOUT_S, self._flush_check)
+            return
+        self.transport.abort()
+
     def _drop(self) -> None:
-        """Close the connection without an answer, from inside a parse: the rest of the
-        piece being parsed is ignored."""
+        """Drop the connection without an answer, from inside a parse: the rest of the
+        piece being parsed is ignored, and so is anything still unsent."""
         self._dropped = True
         self._awaiting_head = False
         self._cancel_deadline()
-        self.transport.close()
+        self.transport.abort()
 
     def _refuse_unfinished_head(self) -> None:
         self._awaiting_head = False
         self._cancel_deadline()
         if self.transport.is_closing():
             return
-        if not self._answering():
-            status = b"HTTP/1.1 431 Request Header Fields Too Large\r\n"
-            fields = [*self.server_state.default_headers, *_HEADERS]
-            self.transport.write(status + b"".join(n + b": " + v + b"\r\n" for n, v in fields) + b"\r\n" + _BODY)
+        if self._answering():
+            self._drop()
+            return
+        status = b"HTTP/1.1 431 Request Header Fields Too Large\r\n"
+        fields = [*self.server_state.default_headers, *_HEADERS]
+        self.transport.write(status + b"".join(n + b": " + v + b"\r\n" for n, v in fields) + b"\r\n" + _BODY)
         self.transport.close()
