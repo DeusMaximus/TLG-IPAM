@@ -43,7 +43,7 @@ from pydantic import ValidationError
 from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..errors import ApiError, validation_error
+from ..errors import ApiError, not_found, validation_error
 from ..ipnet import DOMAIN_MAX, canonical_cidr, parse_ip
 from ..models import FindingDismissal, Host, Observation, ScanTarget, Subnet
 from ..schemas import FindingKey, FindingOut, FindingType, HostCreate, HostUpdate
@@ -330,9 +330,15 @@ FINDING_MAX = 5_000
 # excluded reserved ranges, along their own index, and a subnet holds at most
 # `schemas.SUBNET_RESERVED_RANGES_MAX`; one stored with more before that limit is read
 # whole, the other exception (`test_mcp.test_every_read_of_a_call_does_bounded_work`,
-# which counts SQLite instructions over every statement of a call). A call that
-# reaches the bound stops where it is and returns what it found, possibly nothing, with
-# a cursor at the last address it examined; the next call goes on from there. Each call
+# which counts SQLite instructions over every statement of a call). What is counted is
+# SQLite's work, the rows a statement reads or passes over, not the bytes it returns or
+# Python's processing of them: a row returns its columns whatever their length for the
+# same instructions. So the reads return only the columns a finding uses, never a whole
+# row (a subnet's notes have no bound; #133), and
+# `test_mcp.test_no_read_of_a_call_returns_text_the_listing_does_not_use` checks the
+# bytes each statement returns. A call that reaches the bound stops where it is and
+# returns what it found, possibly nothing, with a cursor at the last address it
+# examined; the next call goes on from there. Each call
 # reads at least one chunk, so paging always moves on. Measured on the issue's case (500
 # empty subnets between two that hold findings): 4,521 statements before, 17 after, as
 # many as without them; and a call never passes the bound however many subnets it
@@ -558,7 +564,10 @@ async def list_named(
     )
     query = select(Subnet.id, Subnet.name, Subnet.cidr).where(candidate)
     if subnet_id is not None:
-        await get_subnet(session, subnet_id)
+        # that the subnet exists, by its id alone: its whole row would read its notes,
+        # which nothing bounds (#133)
+        if await session.scalar(select(Subnet.id).where(Subnet.id == subnet_id)) is None:
+            raise not_found("Subnet", subnet_id)
         budget -= 1
         query = query.where(Subnet.id == subnet_id)
     # each subnet's place in the order, by its CIDR's canonical spelling: a subnet
