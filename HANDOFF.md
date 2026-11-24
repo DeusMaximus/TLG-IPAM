@@ -27,6 +27,26 @@ Template:
 
 ---
 
+## 2026-11-24 — Claude Code (Opus 5.5), worker — #100: name lookups reported apart from liveness (PR #142)
+- **Done:**
+  - [PR #142](https://github.com/DeusMaximus/TLG-IPAM/pull/142) (`100-name-lookup-state`, head `9b196e2`) closes #100 under option 4.
+  - **Protocol 2:** `PROTOCOL_VERSION` 1 → 2. Results carry `protocol` (absent means 1), `liveness_complete`, and `rdns_no_name` on each record. Ingest marks the dead by `liveness_complete` and clears a stored name only when the record carries `rdns_no_name`. Protocol-1 result sets keep protocol 1's rule.
+  - **Briefed round 1** (Codex GPT-6.1 Sol, NO-GO at `dfae349`) fixed in `217e525`:
+    - P2: `probe.says_no_name` reads the authority section first, so a CNAME followed by a delegation is no answer and the next server is asked.
+    - P3: every ARP interruption path asserts `liveness_complete` false.
+  - `main` at `7beb687` (#23) merged in `d41b7a6`. `9b196e2` makes `test_guided_install.py` send `PROTOCOL_VERSION + 1` as the mismatch.
+  - Merged: `5ecf088`, squash, on the owner's go-ahead; the remote branch is deleted. CI green and Codex clean on `9b196e2`; Greptile read only the first head (5/5), and the briefed rounds were the outside read after it. Briefed round 2 (Codex, GPT-6.1 Sol): GO at `9b196e2`, both round-1 findings closed, no new finding. The orchestrator ran 1,252 agent and 1,129 server tests on that head. Follow-up filed on the owner's say: #144, the resolver reads a PTR or a negative SOA without checking it belongs to the question (older than #100, described in round 2), with an operating note for a subnet whose only DNS server does not recurse.
+- **Decisions:** Deliberate calls 1–10 in the PR body. The reviewer kept 1–9 and revised 4. Call 10 is new: a CNAME with no PTR and an empty authority is no answer.
+- **State:**
+  - merged. Tests on the merged tree: agent 1,252, server 1,129, web 154.
+  - No schema change, no new import or listed name.
+- **Waiting on the owner:** nothing from this entry.
+- **Untested:** any real network or resolver; the built image; a real protocol-1 agent.
+- **Next:**
+  - #24 publishes the first image at protocol 2.
+  - #20 and #93 untouched; #144 is in the same agent file.
+  - `web/src/pages/Agents.test.jsx` keeps a static fixture message that mentions protocols 2 and 1, which is harmless.
+
 ## 2026-11-24 — Claude Code (Opus 5.5), worker — #23: guided install, pending enrolments, version flags, scan offers (PR #141)
 - **Done:**
   - [PR #141](https://github.com/DeusMaximus/TLG-IPAM/pull/141) (`23-ui-guided-install`, head `1718163`) closes #23.
@@ -115,38 +135,3 @@ Template:
 - **State:** merged. Locally: 1,083 server tests, 132 web tests, lint and build pass. No schema change. Nothing in #132's or #22's areas, or in `services/findings.py`, was touched.
 - **Waiting on the owner:** whether to file the two P3 follow-ups.
 - **Next:** #133 can start (it owns `services/findings.py` and the findings tests). #135 and #130 merge `main` before their next review round; #134 and #135 both edit brief §4.3, in different paragraphs.
-
-## 2026-11-24 — Claude Code (Fable 5.2), orchestrator — seven PRs merged; PR #130 (#22) held at a NO-GO; session ended on an unstable network
-- **Done:** seven PRs squash-merged on the owner's go-ahead, remote branches deleted. The newest worker entries are below; older ones are in the archive.
-  - First wave: #122 (#120) `ed4a7d6`; #123 (#121) `d067821`, a packet slot ends with the event-loop step it was granted in; #124 (#21) `0226262`, enrolment tokens, `POST /api/v1/agent/enrol`, re-enrol.
-  - Second wave: #127 (#125) `45712d5` and #128 (#126) `ded8622`, tests only. #131 (#90) `c5d7139`: a 16 MiB budget and a 60 s deadline on request bodies; one briefed round, GO with no findings. #129 (#86) `e8cfe1e`: `list_scan_findings` bounded per call and per finding; two briefed rounds, NO-GO (one P2) then GO with two P3s.
-  - Filed on the owner's go-ahead: #132 (request headers and idle connections below the app; blocks #26; from #131's round) and #133 (a call with `subnet_id` loads the subnet's whole row; from #129's round 2). #92 is narrowed to what #124 left of it.
-- **Decisions (the owner's, 2026-11-24):**
-  - #100: option 4. The result set reports name lookups separately from liveness; a name is cleared only on an answered "no name"; `PROTOCOL_VERSION` rises. Recorded on the issue.
-  - #91: the 2 MiB bound on an import stands and the dialog does not batch. `domain` is at most 253 characters (in since #129), `notes` at most 4,096; a row over one is that row's `error`. Recorded on the issue.
-  - Merging #129 accepted its new limit: a subnet holds at most 100 reserved ranges, on every path that adds one. A subnet already over it keeps its ranges and cannot add.
-  - #5 and #25 (`owner` label): the owner runs them later, after rebuilding the deployment. Do not raise them in every report. #25 still comes before the rest of M3.
-  - The owner ended the session with PR #130 at its NO-GO: its findings were **not** sent to the worker, because the network was too unstable to finish a fix and another round.
-- **State:** `main` is `e8cfe1e` plus hand-off commits. CI was green on `c5d7139`; it had just started on `e8cfe1e` when this was written, so check it. Measured on #129's head merged with `main` at `c5d7139`: 1,069 server tests. Agent tests: 924 since #127.
-  - **PR #130 (#22) is open and held.** Head `fb39dd7`, CI green, Codex clean, merges cleanly with `main` at `e8cfe1e`. Briefed round 1, run by the owner by hand (Codex, GPT-6 with Daybreak Blue): **NO-GO, three P2s and two P3s**, on the PR thread and in `.dev/22/review-1.md`. All five are in the systemd installer; the container path is not touched by any.
-    - P2: `install.not_root_only` misses the venv's dependencies, `.pth` files and intermediate symlinks, and the CLI imports venv code as root before the check runs.
-    - P2: `--enrol-token tlge_…` on the command line is readable by another local user in `/proc/<pid>/cmdline` during the exchange. The reviewer wants only the stdin form (`--enrol-token -`).
-    - P2: a `--ca-file` root can read and the service user cannot passes the check; the install spends the token and the service then cannot authenticate.
-    - P3: a malformed agent token in a `200` answer (`tlga_!`) is stored as usable. P3: `uninstall` deletes a `tlg-ipam-agent` account it did not create.
-    - The worker's thread is "#22 — agent enrolment exchange and systemd installer (worker, Opus 5.5)", branch `22-agent-enrol-install`. Send it the review, then `@codex review` and a round 2 on the new head.
-  - **Reviewing #22 needs the owner.** Two sessions of the roster's reviewer (GPT-6.1 Sol) failed on it: one on the network, one on an access gate ("not authenticated with one of your authorized hardware keys") while it tested who can change the unit's code. Expect round 2 to meet the same gate: brief it, and hand it to the owner if it does (`.dev/22/manual-handover.md` is the model for the hand-over file; the brief is `.dev/22/review-brief-1.md`).
-  - Since #131: a body has 60 s to arrive whole (`408`), and all bodies in progress share 16 MiB (`503`). One sender that keeps the budget full holds every other body off; per-client limits, header size and idle connections are left to the proxy (brief §4.3; #132).
-  - Since #129: one `list_scan_findings` call runs at most 100 statements and may return an empty page with a cursor; three address indexes and one on reserved ranges are created at start-up; a finding is at most 5,000 bytes.
-  - Until #22 merges a new agent is enrolled by hand: the Add dialog shows the `tlge_` token and a `curl` for the exchange. Re-enrol is API-only until #23. The enrol throttle is global and in memory: 10 attempts that did not enrol per 60 s.
-  - Since #121 scans take longer (a 254-address `icmp,arp,rdns` job at 200 pps: 7.2 s to 7.7 s on macOS in single runs). One that only just fitted its timeout can end incomplete.
-  - Still true from earlier entries: ARP is on by default for a new target; a stuck `resolv.conf` read leaves later scans that rely on the host's resolvers incomplete until the agent restarts; a subnet's CIDR stored before #97 keeps its spelling until its next edit.
-  - Reviews: Greptile reviews only the first head of a PR. Codex's state is in its summary comment (`codex-review-state:v1`). Three Sol sessions died on "Connection failed" on 2026-11-24; a restarted session told to write its findings to disk as it goes loses less.
-  - Nothing wakes the orchestrator when a worker opens its PR: look for open PRs at the start of each turn.
-  - Review briefs and reviews of this wave are in `.dev/86/`, `.dev/90/` and `.dev/22/` in the main checkout (not committed).
-- **Waiting on the owner:** a go-ahead to resume, when the network is stable. Nothing else.
-- **Next:**
-  - First: send #130's review to its worker; round 2 on the fix; merge on a GO.
-  - Ready now, none started: #132 (Opus 5.5, briefed; the image's start command and the documents), #91 (adds `notes` only; Opus 5.5, automatic reviews) and #133 (tests and one narrow read; Sonnet 5.5 or Opus 5.5, automatic reviews). #91 and #133 both touch the findings and MCP tests: run them one after the other.
-  - After #22 merges: #100 (same agent files; Opus 5.5, briefed), then #23, whose systemd tab shows the stdin form of the command and whose container tab shows a volume and `IPAM_ENROL_TOKEN`, then #92 on the same dialog. #24 waits on #22; #94 goes with #24. #93 and #20 are stretches.
-  - Then M3 (#26 to #32) after #25. #26 also waits on #132. No OAuth grant may be issued before #28's write-scope checks are in force.
-  - No real-network test is planned. The owner's permission to send packets on the test host covered 2026-11-23 only: ask again first.
