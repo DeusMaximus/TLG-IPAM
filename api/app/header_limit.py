@@ -17,14 +17,13 @@ limit on a head's size.
   byte after the request before it ended to the end of its blank line, whatever its
   spelling. A head that passes it is refused with `431` in the REST error shape and the
   connection closed, and the app is not called; the server reads at most one byte past
-  the limit before it refuses. To count exactly, reads reach the parser in pieces cut
-  where a head ends (the first CRLF CRLF since it began) and where a body with a
-  declared length ends, of at most `_PIECE` bytes, and of one byte once a head reaches
-  the limit. httptools says that a request has ended, not where, so the cuts are what
-  put the next head's first byte at the start of a piece. A head that follows a chunked
-  body in the same piece is the one case not counted exactly: it is counted from the
-  start of that piece, at most `_PIECE` bytes over. That piece is also the one place
-  a second pipelined request can complete before the parse stops (next bullet).
+  the limit before it refuses. To count exactly, reads reach the parser in pieces of at
+  most `_PIECE` bytes, cut where every request can end: where a head ends (the first
+  CRLF CRLF since it began), where a body with a declared length ends, and after every
+  CRLF CRLF inside a body without one, since a chunked body ends in one (its last
+  chunk, any trailer lines, a blank line); and of one byte once a head reaches the
+  limit. httptools says that a request has ended, not where, so the cuts are what put
+  the next head's first byte at the start of a piece, after any request.
 - **The time for a head** (`HEADER_TIMEOUT_S`). A connection has that long, from when
   it opens and again from when its last request has been both received whole and
   answered, to deliver the next request's head whole. One that has not is closed
@@ -36,10 +35,13 @@ limit on a head's size.
 - **One request ahead.** While a request is queued behind the one being answered
   (pipelined), nothing more is parsed and nothing more is read: what has arrived
   waits unparsed, so a connection holds at most one queued request and what one read
-  brought. A piece a chunked body ended in is the one place a second request can
-  complete before the parse stops; the connection then takes no more requests: what
-  is queued is answered, the last with the connection closed, and the rest of what
-  was sent is discarded.
+  brought. Every request ends at a cut, so no second one can complete in the piece
+  that queued the first.
+- **A refusal after requests taken.** When the parser refuses what follows (malformed
+  bytes) while a request taken is still being answered or queued, uvicorn would write
+  its `400` and close at once, in front of their answers, one of which may be a write
+  that has committed. Instead nothing more is read or parsed, the requests taken are
+  answered, and the connection closes after the last (`send_400_response`).
   Without it, uvicorn queued every request one read held (788 small ones in 64 KiB).
 - **A client that stops reading** (`STALL_TIMEOUT_S`). A response whose send buffer
   stays full (uvicorn has paused it) for that long without the client taking any of
@@ -96,7 +98,7 @@ STALL_TIMEOUT_S = 60
 # few hundred calls per MB.
 _PIECE = 4 * 1024
 
-_END_OF_HEAD = b"\r\n\r\n"
+_CRLF_CRLF = b"\r\n\r\n"  # ends a head, and a chunked body
 
 _MESSAGE = f"The request line and headers may be at most {HEADER_MAX} bytes"
 _BODY = json.dumps({"error": {"code": "HEADERS_TOO_LARGE", "message": _MESSAGE}}).encode()
@@ -116,7 +118,8 @@ async def _too_large(scope, receive, send) -> None:
 class _Transport:
     """The connection's transport as uvicorn sees it: every `close`, uvicorn's own (a
     keep-alive timeout, `Connection: close`, a `400`) and this module's, starts the time
-    the connection has to flush what it still holds."""
+    the connection has to flush what it still holds, and uvicorn's `resume_reading` is
+    held back while the protocol keeps reading paused."""
 
     def __init__(self, transport, protocol: "HeaderLimitProtocol") -> None:
         self._transport = transport
@@ -125,6 +128,13 @@ class _Transport:
     def close(self) -> None:
         self._transport.close()
         self._protocol._closed()
+
+    def resume_reading(self) -> None:
+        """uvicorn resumes reading whenever a request being answered asks for its body;
+        not while bytes wait unparsed behind a queued request, or after the parser has
+        refused what follows. The protocol resumes it itself when that ends."""
+        if not (self._protocol._holding or self._protocol._refused):
+            self._transport.resume_reading()
 
     def __getattr__(self, name):
         return getattr(self._transport, name)
@@ -139,12 +149,10 @@ class HeaderLimitProtocol(HttpToolsProtocol):
         self._head_bytes = 0  # the bytes of that head received so far
         self._tail = b""  # its last bytes, where an end of head may begin
         self._body_left: int | None = None  # body bytes still due, when declared
-        self._piece = 0  # the size of the piece being parsed
-        self._ended_in_piece = False  # a request ended inside it
         self._unparsed = b""  # what arrived while a request was queued
         self._holding = False  # reading is paused here while it waits
         self._dropped = False  # the connection was dropped inside a parse
-        self._ignoring = False  # it takes no more requests: the rest is discarded
+        self._refused = False  # the parser refused what follows the requests taken
         self._lost = False
         self._head_deadline: asyncio.TimerHandle | None = None
         self._stall: asyncio.TimerHandle | None = None
@@ -195,7 +203,7 @@ class HeaderLimitProtocol(HttpToolsProtocol):
         view = memoryview(data)
         offset = 0
         while offset < len(data):
-            if self._dropped or self._ignoring or self.transport.is_closing():
+            if self._dropped or self._refused or self.transport.is_closing():
                 return
             if self.pipeline:  # a request is queued: parse no further until it runs
                 self._unparsed = bytes(view[offset:])
@@ -204,12 +212,11 @@ class HeaderLimitProtocol(HttpToolsProtocol):
             size = self._piece_size(data, offset)
             piece = view[offset : offset + size]
             offset += size
-            self._piece, self._ended_in_piece = size, False
             if self._awaiting_head:
                 self._head_bytes += size
-                self._tail = (self._tail + bytes(piece[-3:]))[-3:]
+            self._tail = (self._tail + bytes(piece[-3:]))[-3:]
             super().data_received(piece)
-            if self._dropped or self._ignoring or self.transport.is_closing():
+            if self._dropped or self._refused or self.transport.is_closing():
                 return
             if self._awaiting_head and self._head_bytes > HEADER_MAX:
                 self._refuse_unfinished_head()
@@ -223,38 +230,36 @@ class HeaderLimitProtocol(HttpToolsProtocol):
             room = HEADER_MAX - self._head_bytes
             limit = min(_PIECE, room, available) if room > 0 else 1
             window = self._tail + data[offset : offset + limit]
-            end = window.find(_END_OF_HEAD)
+            end = window.find(_CRLF_CRLF)
             # cut just after the end of the head, so the next byte starts what follows
-            return end + len(_END_OF_HEAD) - len(self._tail) if end >= 0 else limit
+            return end + len(_CRLF_CRLF) - len(self._tail) if end >= 0 else limit
         if self._body_left:
             return min(_PIECE, self._body_left, available)
-        return min(_PIECE, available)
+        # a body with no declared length is chunked, and a chunked body ends in CRLF
+        # CRLF (its last chunk, any trailer lines, a blank line): cut after each, so
+        # its end is a piece's end. One inside the chunk data only adds a cut.
+        limit = min(_PIECE, available)
+        window = self._tail + data[offset : offset + limit]
+        end = window.find(_CRLF_CRLF)
+        return end + len(_CRLF_CRLF) - len(self._tail) if end >= 0 else limit
 
     def _resume(self) -> None:
+        if self._refused:
+            return
         if self._unparsed and not self.pipeline and not self._lost:
             data, self._unparsed = self._unparsed, b""
             self._parse(data)
         if self._holding and not self._unparsed and not self._lost:
             self._holding = False
             if not self.flow.read_paused and not self.transport.is_closing():
-                self.transport.resume_reading()
+                self.transport.resume_reading()  # passes the wrapper: no longer holding
 
     # The parser's callbacks
-
-    def on_message_begin(self) -> None:
-        super().on_message_begin()
-        if self._ended_in_piece:  # after a chunked body: it began inside this piece
-            self._head_bytes = self._piece
 
     def on_headers_complete(self) -> None:
         self._cancel_deadline()
         size, self._head_bytes, self._tail = self._head_bytes, 0, b""
         self._awaiting_head = False
-        if self.pipeline:
-            # a second request ahead, which only a piece a chunked body ended in can
-            # hold (every other end of a request is a cut): take no more requests
-            self._take_no_more()
-            return
         self._body_left = self._declared_length()
         if size <= HEADER_MAX:
             super().on_headers_complete()
@@ -275,19 +280,18 @@ class HeaderLimitProtocol(HttpToolsProtocol):
             self.app = app
 
     def on_body(self, body: bytes) -> None:
-        if self._dropped or self._ignoring:
+        if self._dropped:
             return
         if self._body_left:
             self._body_left -= len(body)
         super().on_body(body)
 
     def on_message_complete(self) -> None:
-        if self._dropped or self._ignoring:
+        if self._dropped:
             return
         super().on_message_complete()
         self._awaiting_head, self._head_bytes, self._tail = True, 0, b""
         self._body_left = None
-        self._ended_in_piece = True
         self._arm_if_waiting()
 
     def on_response_complete(self) -> None:
@@ -295,6 +299,21 @@ class HeaderLimitProtocol(HttpToolsProtocol):
         self._arm_if_waiting()
         if (self._unparsed or self._holding) and not self.pipeline:
             self.loop.call_soon(self._resume)
+
+    def send_400_response(self, msg: str) -> None:
+        """The parser refused what follows the requests already taken. uvicorn writes its
+        `400` and closes at once, which would put it in front of their answers (one may
+        be a write that has committed): while one is still being answered, the
+        connection reads and parses nothing more instead, and closes after the last of
+        them is answered."""
+        if not self._answering():
+            super().send_400_response(msg)
+            return
+        self._refused = True
+        self._awaiting_head = False
+        self._cancel_deadline()
+        self.cycle.keep_alive = False  # the newest taken, queued or being answered
+        self.transport.pause_reading()
 
     # The limits
 
@@ -354,14 +373,6 @@ class HeaderLimitProtocol(HttpToolsProtocol):
             self._flush_deadline = self.loop.call_later(STALL_TIMEOUT_S, self._flush_check)
             return
         self.transport.abort()
-
-    def _take_no_more(self) -> None:
-        """Answer what is already taken, the last of it with the connection closed, and
-        discard the rest: the request being parsed and everything after it."""
-        self._ignoring = True
-        newest, _ = self.pipeline[0]  # uvicorn queues with `appendleft`
-        newest.keep_alive = False
-        self.transport.pause_reading()
 
     def _drop(self) -> None:
         """Drop the connection without an answer, from inside a parse: the rest of the
