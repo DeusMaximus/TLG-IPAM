@@ -38,10 +38,12 @@ has gone (`http.disconnect`), and drops whatever the route sends after it. A bod
 kept in one buffer here, and handed to a route that reads it in blocks of at least
 64 KiB, so what it costs is its bytes, not the number of chunks it was sent in.
 
-What this does not bound is left to the reverse proxy or tunnel in front of the server
-(brief §4.3, spec §5.7): how many connections there are and how many one client opens,
-the time and size of request headers, idle connections, and the HTTP server's own
-buffer per connection (uvicorn stops reading past 64 KiB that the app has not taken).
+A request's head, and a connection that has not sent one, come before this middleware
+runs: the image's server bounds both below the app (`header_limit`, #132). What neither
+bounds is left to the reverse proxy or tunnel in front of the server (brief §4.3, spec
+§8): how many connections there are and how many one client opens, and so what they
+cost together, each with uvicorn's own buffer (it stops reading past 64 KiB that the
+app has not taken) and the kernel's socket buffers.
 
 A declared length is read as the HTTP server passes it on, which is not always plain
 digits (#89). uvicorn's httptools parser accepts a value with whitespace after the

@@ -104,18 +104,37 @@ def _inherited(name):
     return not (upper in _SETTINGS_ENV or upper.startswith("UVICORN_") or upper == "WEB_CONCURRENCY")
 
 
-def _uvicorn(tmp_path, api_key, *args):
-    """Start uvicorn as the image does, on a loopback port it picks; `args` are more of
-    uvicorn's options (`--http httptools`, say)."""
+def _child_env(tmp_path, api_key):
     env = {n: v for n, v in os.environ.items() if _inherited(n)}
     if api_key is not UNSET:
         env["API_KEY"] = api_key
     env["DB_PATH"] = str(tmp_path / "ipam.db")
     env["STATIC_DIR"] = str(tmp_path / "no-static")
+    return env
+
+
+def _uvicorn(tmp_path, api_key, *args):
+    """Start uvicorn from its command line, as the documented commands do, on a loopback
+    port it picks; `args` are more of uvicorn's options (`--http h11`, say)."""
     return subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "0", *args],
         cwd=API_DIR,
-        env=env,
+        env=_child_env(tmp_path, api_key),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _image(tmp_path, api_key, env=None):
+    """Start the server as the image's `CMD` does (`python -m app.serve`), on a loopback
+    port it picks; `env` is added to the child's environment as it is."""
+    child_env = _child_env(tmp_path, api_key)
+    child_env.update(env or {})
+    return subprocess.Popen(
+        [sys.executable, "-m", "app.serve", "--host", "127.0.0.1", "--port", "0"],
+        cwd=API_DIR,
+        env=child_env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
@@ -176,9 +195,13 @@ def _wait_until_serving(lines, deadline):
     return port
 
 
+STARTS = {"command line": _uvicorn, "image": _image}
+
+
+@pytest.mark.parametrize("start", STARTS.values(), ids=STARTS.keys())
 @pytest.mark.parametrize(("value", "reason"), REFUSED.values(), ids=REFUSED.keys())
-def test_uvicorn_refuses_to_start(tmp_path, value, reason):
-    proc = _uvicorn(tmp_path, value)
+def test_uvicorn_refuses_to_start(tmp_path, value, reason, start):
+    proc = start(tmp_path, value)
     try:
         _, stderr = proc.communicate(timeout=START_DEADLINE)
     finally:
@@ -191,14 +214,15 @@ def test_uvicorn_refuses_to_start(tmp_path, value, reason):
     assert not (tmp_path / "ipam.db").exists()
 
 
-def test_uvicorn_starts_and_serves_with_a_real_key(tmp_path, monkeypatch):
+@pytest.mark.parametrize("start", STARTS.values(), ids=STARTS.keys())
+def test_uvicorn_starts_and_serves_with_a_real_key(tmp_path, monkeypatch, start):
     # Inherited uvicorn settings must not reach the child: at `warning` it would not
     # print the lines this test waits for, and the test would fail on a healthy server
     monkeypatch.setenv("UVICORN_LOG_LEVEL", "warning")
     monkeypatch.setenv("WEB_CONCURRENCY", "2")
     key = secrets.token_hex(32)
     deadline = time.monotonic() + START_DEADLINE
-    proc = _uvicorn(tmp_path, key)
+    proc = start(tmp_path, key)
     lines, reader = _read_stderr(proc)
     try:
         port = _wait_until_serving(lines, deadline)
@@ -232,6 +256,30 @@ def test_uvicorn_starts_and_serves_with_a_real_key(tmp_path, monkeypatch):
         assert mcp.status_code == 200, mcp.text
     finally:
         _stop(proc, reader)
+
+
+def test_the_image_runs_one_worker_whatever_the_environment_says(tmp_path):
+    """`app.serve` passes one worker itself (brief §2.2): the variables that set the
+    count on uvicorn's command line reach the child here and change nothing."""
+    key = secrets.token_hex(32)
+    proc = _image(tmp_path, key, {"WEB_CONCURRENCY": "4", "UVICORN_WORKERS": "4"})
+    lines, reader = _read_stderr(proc)
+    try:
+        port = _wait_until_serving(lines, time.monotonic() + START_DEADLINE)
+        with httpx.Client(trust_env=False) as client:
+            assert client.get(f"http://127.0.0.1:{port}/health").status_code == 200
+        children = subprocess.run(["pgrep", "-P", str(proc.pid)], capture_output=True, text=True)
+        assert children.returncode == 1 and children.stdout == "", children.stdout  # no child process
+    finally:
+        _stop(proc, reader)
+
+
+def test_the_dockerfile_starts_the_image_command():
+    """The image's `CMD` is the command `_image` runs, so the tests that start a server
+    as the image does start the one the image runs."""
+    dockerfile = (API_DIR.parent / "Dockerfile").read_text()
+    commands = [line for line in dockerfile.splitlines() if line.startswith("CMD")]
+    assert commands == ['CMD ["python", "-m", "app.serve"]']
 
 
 def test_child_environment_drops_uvicorn_and_settings_variables():

@@ -27,6 +27,41 @@ Template:
 
 ---
 
+## 2026-11-24 — Claude Code (Opus 5.5), worker — #132: bound request heads, idle connections, pipelining and stalled readers below the app (PR #135)
+- **Done:** [PR #135](https://github.com/DeusMaximus/TLG-IPAM/pull/135) (`132-header-idle-bounds`, head `e9855bb`) closes #132. (The worker's own last entry covered round 4 only; the orchestrator has put the whole PR here.)
+  - The image's `CMD` is `python -m app.serve` (`api/app/serve.py`): uvicorn's own command line, so `UVICORN_*` settings still apply, with six pinned over it (`workers=1`, no reload, `http=header_limit.HeaderLimitProtocol`, no HTTP/2, `ws="none"`, 5 s keep-alive).
+  - `api/app/header_limit.py`, a subclass of uvicorn's httptools protocol:
+    - a head (request line and headers) of at most 64 KiB as received, `431 HEADERS_TOO_LARGE`, counted exactly by cutting reads where a head and a declared body end; a head after a chunked body in the same 4 KiB piece is the one stated exception;
+    - 10 s for a connection to deliver a head, closed without an answer;
+    - one pipelined request held ahead, with reading paused meanwhile;
+    - 60 s for a client that stops reading (a paused send buffer, or a closed connection that does not flush), then abort;
+    - a refusal by the parser follows one rule: uvicorn's `400` only when no earlier request is still unanswered; otherwise the refused request is dropped without running and the earlier answers go out in order, the connection closing after the last. Plain uvicorn, and `main` before this, wrote the `400` in front of them, which could hide a committed write;
+    - a stated bound on parser calls a sender can force.
+  - Docs: brief §2.2, §4.3 (the "below the app" paragraph and "Left to the reverse proxy or tunnel"), the `/mcp` refusal table and §9 row; spec §5.7 and §8 (the proxy checklist for nginx, Caddy and Cloudflare Tunnel, every line from documentation); `AGENTS.md` bullets "One uvicorn worker" and "One request-body cap"; README. Four decision comments on #132 record what the image bounds and what stays the proxy's.
+  - Merged: `83e392e`, squash, on the owner's go-ahead; the remote branch is deleted. CI green and Codex clean on `e9855bb`; Greptile last read `e2c2ff3`, and the briefed rounds were the outside read after it. The briefed review took six sessions:
+    - GPT-6.1 Sol at `e2c2ff3` was stopped by its provider's safety filter before a verdict (hand-over in `.dev/132/manual-handover.md`); its five leads went to the worker.
+    - GPT-6 Sol with Daybreak Blue, started from T3 Code, then gave NO-GO at `9ec525c` (two P2s in §8's proxy advice), NO-GO at `48148de` (P2: a committed write lost its answer behind a parser refusal), NO-GO at `4df1508` (P2: the same by another route), and GO at `e9855bb` with no finding. The owner kept the Opus 5.5 worker after the second and third NO-GO.
+    - Between the second and third, the orchestrator measured that a fix it had suggested (cutting chunked bodies at every CRLF CRLF) let a sender hold the worker 1.3 s per 1.9 MB body, and sent it back before the round; `.dev/132/crlf_cost.py` and `lost_answer.py` are the scripts.
+    - The orchestrator ran 1,321 server tests on `e9855bb`. No follow-ups filed.
+- **Decisions:** Deliberate calls in the PR body. A floor in the image plus the proxy in front; httptools kept, not h11; the limit is on bytes as received; 64 KiB although Cloudflare passes 128 KB; no concurrency limit in the image; the subclass relies on uvicorn 0.54 internals (`cycle`, `pipeline`, `flow`, the parser callbacks), held by the tests on both event loops.
+- **State:** merged. Server 1,321 on its head (192 of them this PR's). No schema change.
+- **Waiting on the owner:** the next server image build is the first real start of the new `CMD`: nobody could build the image here.
+- **Untested:** the Docker image; every proxy setting in spec §8 (no proxy ran); a multi-day MCP stream.
+- **Next:** #31 writes the deployment document from spec §8. #132 no longer blocks exposing `/mcp` (#26, which still waits on #25).
+
+## 2026-11-24 — Claude Code (Sonnet 5.5), worker — #139: qualify the bulk_create_hosts size example and the brief's import figures (PR #148)
+- **Done:**
+  - [PR #148](https://github.com/DeusMaximus/TLG-IPAM/pull/148) (`139-import-size-wording`, head `cc6267c`) closes #139. Documentation and tests only: no limit, route or tool result changed. Three files: `api/app/mcp_server.py` (docstring), `TLG-IPAM-Project-Brief.md` (§5.2 row, §4.3 import-size paragraph only), `api/tests/test_length_limits.py`.
+  - The `bulk_create_hosts` docstring and §5.2: the 400-record example holds only when every field is plain ASCII with no character JSON escapes (quote, backslash, a control character such as a line break or a tab) in any field. Non-BMP owner: 2,493,771 bytes as `json.dumps` writes it, `413` at the real `/mcp` route. A hostname and an owner of quotes, backslashes or tabs: 2,114,971.
+  - §4.3: the measured rows (`full_rows`) are named as measured examples, not a ceiling. They are at every character limit and ASCII (15-character address, 40-character device type). Figures re-measured: 1,000 rows without notes 1,151,011; at most 233 four-byte notes characters (1,295 ASCII with an ASCII owner); notes at the limit 17,546,011 (5,258,011 ASCII); at most 119 rows (398 ASCII notes, 428 with an ASCII owner too); 5-character device type 1,116,011. §4.3 also says a hostname and a device type accept non-ASCII (1,000 rows 2,973,011), that a MAC's punctuation, a domain's leading white space and trailing dots and a `last_seen`'s extra digits are accepted and dropped, and that a padded IPv4 address is refused.
+  - Tests: the example's largest call is posted to the real `/mcp` route and creates all 400 hosts; the non-ASCII-owner variant gets `413`; the escaped-ASCII case runs for quote, backslash and tab; the Unicode-row and no-largest-row cases; every §4.3 figure is asserted. The old in-process example test (`fastmcp.Client(mcp)`) skipped the body cap and is replaced.
+  - Review: Codex clean at `62977ac`, `d29492e` and `cc6267c`. Greptile P2 at `62977ac` (escapes outside notes) fixed in `d29492e`. An outside read (Codex, GPT-6.1 Sol) at `d29492e` was GO with two P3s (tabs; rows are examples, not a ceiling), both fixed in `cc6267c`, answered in one numbered PR comment. CI green on `cc6267c`.
+  - Merged: `1a48707`, squash, on the owner's go-ahead; the remote branch is deleted. Sol's GO was at `d29492e`; the orchestrator read `cc6267c`'s diff against its two remedies and ran 1,136 server tests on that head, and no further round was run for a wording-only change. No follow-ups.
+- **Decisions:** PR body Deliberate calls 1–5. The main ones: rebuilt the rows at every character limit instead of describing the old fixture, so all §4.3 figures changed; no row is "the largest" (limits count characters, padding is accepted on MAC, domain and `last_seen`, an IPv4 address is refused padded); the example is judged as `json.dumps` writes it; `test_body_limit.py` and `body_limit.py` untouched (its "about 1.15 MB" comment is accurate for the no-notes rows).
+- **State:** merged. Tests: server 1,136. No schema change; nothing in `web/` or the agent touched.
+- **Waiting on the owner:** nothing from this entry.
+- **Next:** nothing owed on #139. #132 (PR #135) owns the other §4.3 paragraphs and the `AGENTS.md` bullets "One uvicorn worker" and "One request-body cap".
+
 ## 2026-11-24 — Claude Code (Opus 5.5), worker — #144: a PTR or a negative SOA is read only when it answers the question (PR #146)
 - **Done:**
   - [PR #146](https://github.com/DeusMaximus/TLG-IPAM/pull/146) (`144-ptr-soa-owner-check`, head `22967e0`) closes #144.
@@ -110,65 +145,3 @@ Template:
   - #24 publishes the first image at protocol 2.
   - #20 and #93 untouched; #144 is in the same agent file.
   - `web/src/pages/Agents.test.jsx` keeps a static fixture message that mentions protocols 2 and 1, which is harmless.
-
-## 2026-11-24 — Claude Code (Opus 5.5), worker — #23: guided install, pending enrolments, version flags, scan offers (PR #141)
-- **Done:**
-  - [PR #141](https://github.com/DeusMaximus/TLG-IPAM/pull/141) (`23-ui-guided-install`, head `1718163`) closes #23.
-  - The Add agent dialog is now the guided install of spec §5.6: Container and systemd tabs, each with prerequisites and commands pinned to the server's `/health` version. The systemd install reads the enrolment token from standard input (`--enrol-token -`).
-  - Agents page: Re-enrol (with the commands that remove an old token from the host first), a pending-enrolments list, an "update available" flag, a protocol-mismatch line, the update commands, and "Scan *subnet* with this agent?" offers.
-  - Server, read-only:
-    - `agents.agent_out` adds `update_available` (PEP 440, `packaging`) and `protocol_mismatch` (read from the prefix of the stored `last_error`).
-    - `scans.suggestions` serves `GET /api/v1/scan-targets/suggestions` in two statements; REST only.
-  - `packaging` is now a direct dependency. All four locks were regenerated; only their `# via` comments changed.
-  - Spec §5.6 gains the update and re-enrol command table and a paragraph on where the artefact names come from. The brief, README and `AGENTS.md` (one new bullet) are updated.
-  - Review fixes:
-    - `78ef42e` (Codex P2, Greptile P1): a container from the first release's install (`IPAM_AGENT_TOKEN`, no volume) is told to re-enrol rather than update.
-    - `1718163` (Greptile P2): the modal overlay scrolls.
-  - Merged: `a36c153`, squash, on the owner's go-ahead; the remote branch is deleted. CI green and Codex clean on `1718163`. Greptile read only the first head, so one outside read by Sol (GPT-6.1 Sol) stood in for its re-run: GO at `1718163` with three P3s, none of the 13 Deliberate calls overruled. The orchestrator ran 1,112 server and 154 web tests, lint and build on that head. The three P3s are filed as #143 (a disabled agent's enrolment shown as open; the pending list following the browser's clock; release versions not in normal form accepted).
-- **Decisions:** Deliberate calls 1–13 in the PR body. The main ones:
-  - The flags are computed on the server.
-  - The mismatch is read from `last_error`, so `agent_protocol.py` is untouched.
-  - Accepting an offer is `POST /scan-targets` with the server defaults, then one `POST /subnets/{id}/scan`.
-  - Only subnets with no scan target are offered.
-  - "Not now" lasts only while the page is open.
-- **State:**
-  - merged. Tests: server 1,112, agent 1,193, web 154.
-  - No schema change; `PROTOCOL_VERSION` unchanged.
-- **Waiting on the owner:** nothing from this entry.
-- **Untested:** the commands against real artefacts (#24); the dialogs in a real browser.
-- **Next:**
-  - #24 must publish `ghcr.io/deusmaximus/tlg-ipam-agent:<version>` and `releases/download/v<version>/tlg_ipam_agent-<version>-py3-none-any.whl`, and give the server and agent one version. Today they differ: the server's `settings.version` is `0.1.0` and the agent's `__version__` is `0.2.0.dev0`.
-  - #92 (the plain-HTTP warning before a token is issued) and #143 are the dialog's open follow-ups.
-
-## 2026-11-24 — Claude Code (Opus 5.5), worker — #22: the agent's enrolment exchange and the systemd installer (PR #130)
-- **Done:**
-  - [PR #130](https://github.com/DeusMaximus/TLG-IPAM/pull/130) (`22-agent-enrol-install`, head `b7fb4ae`) closes #22.
-  - The branch includes `main` at `211b53f` (merges `181ab1b` and `b7fb4ae`).
-  - Round 1 (NO-GO at `fb39dd7`) was fixed in `ebe385e`, and Codex's P2 on it in `4dc5d6b`.
-  - Round 2 (NO-GO at `4dc5d6b`: one P2, two P3s) was fixed in `eed4f91`:
-    - `install.service_trust` is the one source of the unit's trust and of the exchange's; inherited `SSL_CERT_FILE`/`SSL_CERT_DIR` are dropped, and refused when the unit would not get them;
-    - `uninstall` keeps `created-user` until the account and group are gone, so it can be retried;
-    - each token the install learns is added to `Redact` (`secret=`);
-    - the argument refusal gives re-enrol guidance;
-    - §5.6 and `AGENTS.md` say what holds of `subprocess` (a running agent never imports `install` or `trust`).
-  - Merged: `8081d8c`, squash, on the owner's go-ahead; the remote branch is deleted. CI green and Codex clean on `b7fb4ae`; Greptile read only the first head, and the briefed rounds were the outside read after it. The briefed review (Codex, GPT-6.1 Sol) took three rounds: NO-GO at `fb39dd7`, NO-GO at `4dc5d6b`, GO at `b7fb4ae` with one P3. After the second NO-GO the owner kept the Opus 5.5 worker on the fix. The orchestrator ran 1,193 agent and 1,083 server tests on `b7fb4ae`. Follow-ups filed, on the owner's say:
-    - #136: the CA preflight judges mode bits, not ACLs or supplementary groups (round 2, finding 2);
-    - #138: the unit does not discard CA trust settings the system manager supplies (round 3, finding 1);
-    - #140: argparse's own errors repeat an argument, and the agent token's exact form is stated only on the agent's side.
-- **State:**
-  - merged. Tests on the merged tree: agent 1,193 on 3.13 and 3.11.18, server 1,083.
-  - No change under `api/`, no schema change, `PROTOCOL_VERSION` unchanged.
-  - The container runs (Debian 13 with systemd, `--network none`) are in the PR body:
-    - run A at `ebe385e`;
-    - run B at `eed4f91`;
-    - the round-1 reproductions at `ebe385e`;
-    - the round-2 reproductions at `eed4f91`, HTTPS with a private CA.
-- **Decisions:** Deliberate calls 1–17 in the PR body. Since round 1, calls 13 and 14 changed:
-  - call 14: refusal over carrying inherited trust into the unit, with #136 as the known limit;
-  - call 13: the record goes last, and the crash between `useradd` and writing the record is manual recovery.
-- **Waiting on the owner:** nothing from this entry.
-- **Untested:** unprivileged LXC, non-Debian distributions, OpenSSL variables other than `SSL_CERT_FILE` and `SSL_CERT_DIR`, ACLs and supplementary groups (#136), two containers on one volume.
-- **Next:**
-  - #23 renders `… install --url … --enrol-token -` and the container command with the volume and `IPAM_ENROL_TOKEN`;
-  - #24 publishes the image and the wheel;
-  - #136, #138 and #140 are the installer's open follow-ups.
