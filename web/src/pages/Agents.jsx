@@ -24,11 +24,13 @@ import {
   agentStatus,
   blockedEnrolment,
   liveEnrolment,
+  monotonicNow,
+  nextEnrolmentChange,
   openEnrolment,
   pendingEnrolments,
   received,
   relativeTime,
-  sinceReceived,
+  sinceAsked,
   STATUS_LABELS,
   timeLeft,
 } from '../utils/agents'
@@ -38,9 +40,12 @@ import { parseServerTime } from '../utils/time'
 // How often the list and the status dots refresh while the page is open
 const REFRESH_MS = 30 * 1000
 
-// The agents list with the browser's time it arrived at, which an enrolment token's
-// time left counts from (`agents.enrolmentLeft`)
-const loadAgents = () => listAgents().then((answer) => received(answer))
+// The agents list with the monotonic time it was asked for, which an enrolment
+// token's time left counts from (`agents.enrolmentLeft`, `agents.received`)
+const loadAgents = () => {
+  const askedAt = monotonicNow()
+  return listAgents().then((answer) => received(answer, askedAt))
+}
 
 const DOT = {
   online: 'bg-emerald-500',
@@ -392,6 +397,9 @@ export default function Agents() {
   const suggested = useFetch(listScanSuggestions, [])
   const health = useFetch(getHealth, [])
   const [now, setNow] = useState(() => Date.now())
+  // the monotonic clock the enrolment countdown reads; `now` stays the wall clock the
+  // status dots and check-in ages read
+  const [mono, setMono] = useState(() => monotonicNow())
   const [adding, setAdding] = useState(false)
   const [confirming, setConfirming] = useState(null)
   // offers set aside with "Not now", for as long as the page is open
@@ -405,6 +413,7 @@ export default function Agents() {
   useEffect(() => {
     const id = setInterval(() => {
       setNow(Date.now())
+      setMono(monotonicNow())
       refreshAgents()
       refreshTargets()
       refreshSuggested()
@@ -414,6 +423,7 @@ export default function Agents() {
 
   const reload = () => {
     setNow(Date.now())
+    setMono(monotonicNow())
     refreshAgents()
     refreshTargets()
     refreshSuggested()
@@ -479,7 +489,22 @@ export default function Agents() {
   }
 
   const list = agents.data?.data
-  const elapsed = sinceReceived(agents.data?.receivedAt, now)
+  // the countdown's reading of the monotonic clock: the page's, or the answer's arrival
+  // if that is later; elapsed runs from the request to it
+  const readAt = Math.max(mono, agents.data?.arrivedAt ?? -Infinity)
+  const elapsed = sinceAsked(agents.data, readAt)
+
+  // An enrolment token's label and its running out are scheduled on their own, apart
+  // from the list refresh: the page updates when what it shows of one next changes,
+  // and a token leaves it when its time runs out, whether or not a refresh succeeds.
+  // The delay is less the time since `readAt`, so a late render does not push it later.
+  const nextChange = nextEnrolmentChange(list, elapsed)
+  useEffect(() => {
+    if (nextChange === null) return undefined
+    const delay = Math.max(0, nextChange - (monotonicNow() - readAt))
+    const id = setTimeout(() => setMono(monotonicNow()), delay)
+    return () => clearTimeout(id)
+  }, [nextChange, readAt])
 
   return (
     <div>

@@ -10,7 +10,9 @@ import {
   pendingEnrolments,
   received,
   relativeTime,
-  sinceReceived,
+  monotonicNow,
+  nextEnrolmentChange,
+  sinceAsked,
   timeLeft,
 } from './agents'
 
@@ -115,39 +117,40 @@ describe('enrolmentLeft', () => {
   })
 })
 
-// The server's clock at 12:00 when it answered. The browser's clock does not enter the
-// verdict: only the time since the answer arrived, a difference of two of its readings.
-describe('an open enrolment, whichever side of the server’s clock the browser’s is', () => {
-  const SERVER_AT = Date.parse('2026-11-16T12:00:00Z')
+// The server answered at 12:00 by its own clock. The helpers take no wall-clock time at
+// all: only the time since the list was asked for, by the monotonic clock, so where the
+// browser's wall clock stands, or where it is stepped to, cannot enter the verdict. The
+// page tests set the wall clock either side, and step it.
+describe('an open enrolment, by the server’s count and the monotonic clock', () => {
   const agent = (token, state = 'pending') => ({ id: 'a', state, tokens: [token] })
+  const ASKED_AT = 5000 // a monotonic reading: ms since the page loaded
 
-  // a minute either side, and the issue's cases: a browser at 12:31 with an expiry of
-  // 12:30, and at 11:58 with an expiry of 11:59
-  const MIN = 60 * 1000
-  for (const skew of [-31 * MIN, -2 * MIN, -MIN, 0, MIN, 31 * MIN]) {
-    const browserAt = SERVER_AT + skew
-    const answer = received({ data: [] }, browserAt)
+  it('keeps a live token listed while the server’s time has not run out', () => {
+    // expires 12:30 by the server's clock, which gave it 1800 s at 12:00
+    const live = enrol({ expires_at: '2026-11-16T12:30:00+00:00', expires_in_s: 1800 })
+    const elapsed = sinceAsked(received({}, ASKED_AT, ASKED_AT + 100), ASKED_AT + 60 * 1000)
+    expect(openEnrolment(agent(live), elapsed)).toBe(live)
+    expect(pendingEnrolments([agent(live)], elapsed)).toHaveLength(1)
+    expect(timeLeft(live, elapsed)).toBe('in 29m')
+  })
 
-    it(`keeps a live token listed (browser ${skew / 1000}s off)`, () => {
-      // expires 12:30 by the server's clock
-      const live = enrol({ expires_at: '2026-11-16T12:30:00+00:00', expires_in_s: 1800 })
-      // a minute after the answer: 12:01 by the server's clock, 12:02 or 12:00 by the
-      // browser's, and either way not 12:31
-      const elapsed = sinceReceived(answer.receivedAt, browserAt + 60 * 1000)
-      expect(openEnrolment(agent(live), elapsed)).toBe(live)
-      expect(pendingEnrolments([agent(live)], elapsed)).toHaveLength(1)
-      expect(timeLeft(live, elapsed)).toBe('in 29m')
-    })
+  it('shows an expired token as not open, whatever its expiry says', () => {
+    // expired 11:59 by the server's clock
+    const expired = enrol({ expires_at: '2026-11-16T11:59:00+00:00', expires_in_s: null })
+    expect(openEnrolment(agent(expired), 0)).toBeNull()
+    expect(pendingEnrolments([agent(expired)], 0)).toEqual([])
+    expect(timeLeft(expired, 0)).toBeNull()
+  })
 
-    it(`shows an expired token as not open (browser ${skew / 1000}s off)`, () => {
-      // expired 11:59 by the server's clock: a browser at 11:58 does not keep it
-      const expired = enrol({ expires_at: '2026-11-16T11:59:00+00:00', expires_in_s: null })
-      const elapsed = sinceReceived(answer.receivedAt, browserAt)
-      expect(openEnrolment(agent(expired), elapsed)).toBeNull()
-      expect(pendingEnrolments([agent(expired)], elapsed)).toEqual([])
-      expect(timeLeft(expired, elapsed)).toBeNull()
-    })
-  }
+  it('counts from the request, so a slow answer is not shown with more time than it has', () => {
+    // the server gave it 1 s; the answer took 2 s to arrive
+    const late = enrol({ expires_in_s: 1 })
+    // read at the arrival, or with a page reading from before it, which counts as the arrival
+    const arrived = sinceAsked(received({}, ASKED_AT, ASKED_AT + 2000), ASKED_AT)
+    expect(arrived).toBe(2000)
+    expect(openEnrolment(agent(late), arrived)).toBeNull()
+    expect(pendingEnrolments([agent(late)], arrived)).toEqual([])
+  })
 })
 
 describe('openEnrolment', () => {
@@ -209,11 +212,54 @@ describe('timeLeft', () => {
   })
 })
 
-describe('sinceReceived', () => {
-  it('is the time since the answer arrived, never negative, and 0 when not known', () => {
-    expect(sinceReceived(1000, 61 * 1000)).toBe(60 * 1000)
-    expect(sinceReceived(5000, 1000)).toBe(0)
-    expect(sinceReceived(undefined, 1000)).toBe(0)
-    expect(received({ data: [1] }, 42)).toEqual({ data: [1], receivedAt: 42 })
+describe('sinceAsked', () => {
+  it('is the time since the list was asked for, never negative, and 0 when not known', () => {
+    const answer = received({ data: [1] }, 1000, 1500)
+    expect(answer).toEqual({ data: [1], askedAt: 1000, arrivedAt: 1500 })
+    expect(sinceAsked(answer, 61 * 1000)).toBe(60 * 1000)
+    // a reading from before the answer arrived counts as its arrival
+    expect(sinceAsked(answer, 1200)).toBe(500)
+    expect(sinceAsked({ askedAt: 5000 }, 1000)).toBe(0)
+    expect(sinceAsked(undefined, 1000)).toBe(0)
+    expect(sinceAsked(null, 1000)).toBe(0)
+  })
+
+  it('reads the monotonic clock, not the wall clock', () => {
+    expect(typeof monotonicNow()).toBe('number')
+    const answer = received({}, monotonicNow())
+    expect(answer.arrivedAt).toBeGreaterThanOrEqual(answer.askedAt)
+    expect(sinceAsked(answer)).toBeGreaterThanOrEqual(0)
+  })
+})
+
+describe('nextEnrolmentChange', () => {
+  const agents = (...lefts) => [{ tokens: lefts.map((s) => enrol({ expires_in_s: s })) }]
+  // what the label is just before and at the scheduled instant
+  const around = (s, elapsed = 0) => {
+    const due = nextEnrolmentChange(agents(s), elapsed)
+    const token = enrol({ expires_in_s: s })
+    return [due, timeLeft(token, elapsed + due - 1), timeLeft(token, elapsed + due)]
+  }
+
+  it('is the instant the label next changes, 1 ms past its boundary', () => {
+    expect(around(90)).toEqual([30001, 'in 1m', 'in 59s'])
+    expect(around(60)).toEqual([1, 'in 1m', 'in 59s'])
+    expect(around(45.5)).toEqual([501, 'in 45s', 'in 44s'])
+    expect(around(7300)).toEqual([100001, 'in 2h', 'in 119m'])
+    expect(around(3600)).toEqual([1, 'in 60m', 'in 59m'])
+  })
+
+  it('is the instant a token runs out once it is under a second', () => {
+    const due = nextEnrolmentChange(agents(0.999), 0)
+    expect(due).toBeCloseTo(999)
+    expect(enrolmentLeft(enrol({ expires_in_s: 0.999 }), due)).toBeNull()
+  })
+
+  it('is the earliest of every agent’s, and null with no live token', () => {
+    expect(nextEnrolmentChange([...agents(90), ...agents(45.5)], 0)).toBe(501)
+    expect(nextEnrolmentChange(agents(90), 20 * 1000)).toBe(10001)
+    expect(nextEnrolmentChange([{ tokens: [enrol({ expires_in_s: null })] }], 0)).toBeNull()
+    expect(nextEnrolmentChange(agents(1), 1000)).toBeNull()
+    expect(nextEnrolmentChange(null)).toBeNull()
   })
 })

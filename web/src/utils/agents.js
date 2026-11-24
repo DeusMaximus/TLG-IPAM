@@ -72,15 +72,33 @@ export const STATUS_LABELS = {
 export const activeToken = (agent) =>
   (agent.tokens || []).find((t) => t.kind === 'agent' && !t.revoked_at) || null
 
-// The list answer with the browser's time it arrived at. An enrolment token's time left
-// is the server's `expires_in_s`, less the time since then by this browser: a difference
-// of two readings of one clock, which a browser clock set wrong does not move (#143).
-export const received = (answer, at = Date.now()) => ({ ...answer, receivedAt: at })
+// A clock that only moves forward, at the rate time passes, whatever the wall clock
+// does: an enrolment token's time left is measured with it, never with `Date.now()`,
+// which the owner or NTP can step back or forward (#143). The wall clock stays the one
+// the status dot and the check-in ages read.
+export const monotonicNow = () => performance.now()
 
-// How long it has been since the list arrived, by this browser; never negative (the
-// page reads its clock just before it asks for the list, so `now` can be the earlier)
-export const sinceReceived = (receivedAt, now = Date.now()) =>
-  typeof receivedAt === 'number' ? Math.max(0, now - receivedAt) : 0
+// The list answer with the monotonic time its request was sent (`askedAt`). An
+// enrolment token's time left is the server's `expires_in_s` less the time since then:
+// counting from the request, not the arrival, takes the request's own time off what
+// the server gave, so an answer that was slow to arrive is never shown as having more
+// time left than it has.
+// `arrivedAt`, when it arrived by the same clock, is the least the page's own reading of
+// it can be from then on.
+export const received = (answer, askedAt, arrivedAt = monotonicNow()) => ({
+  ...answer,
+  askedAt,
+  arrivedAt,
+})
+
+// How long it has been since the list was asked for, by the monotonic clock: from
+// `askedAt` to `now`, or to its arrival if `now` is a reading from before it arrived.
+// Never negative, and 0 when not known.
+export function sinceAsked(answer, now = monotonicNow()) {
+  if (!answer || typeof answer.askedAt !== 'number') return 0
+  const at = typeof answer.arrivedAt === 'number' ? Math.max(now, answer.arrivedAt) : now
+  return Math.max(0, at - answer.askedAt)
+}
 
 // The milliseconds an enrolment token has left: what the server said it had when it
 // answered (`expires_in_s`, by the server's own clock, which is the one the exchange
@@ -128,4 +146,36 @@ export function timeLeft(token, elapsed = 0) {
   const m = Math.floor(s / 60)
   if (m < 120) return `in ${m}m`
   return `in ${Math.floor(m / 60)}h`
+}
+
+// How many ms until the label `timeLeft` gives a token with `left` ms left next
+// changes, or the token runs out. The label is a function of the whole seconds left
+// (`s`), so it changes when `s` falls to the next value whose label differs: every
+// second under a minute, at the next whole minute under two hours, at the next whole
+// hour past that. 1 ms past that instant, since `s` is rounded down.
+function labelChangeIn(left) {
+  const s = Math.floor(left / 1000)
+  if (s === 0) return left // "soon", until it runs out
+  const step = s < 60 ? 1 : s < 7200 ? 60 : 3600
+  // the least whole seconds with this label: the next label starts below it
+  const least = Math.floor(s / step) * step
+  return left - least * 1000 + 1
+}
+
+// How many ms from `elapsed` until what the page shows of any agent's enrolment token
+// next changes: a label ("in 42m" → "in 41m") or the token running out. Null when no
+// agent has a live one. The page schedules its next update by it, apart from the list
+// refresh, so a token leaves the page when its time runs out and not at the next
+// refresh, whether that refresh succeeds or not.
+export function nextEnrolmentChange(agents, elapsed = 0) {
+  let next = null
+  for (const agent of agents || []) {
+    for (const token of agent.tokens || []) {
+      const left = enrolmentLeft(token, elapsed)
+      if (left === null) continue
+      const due = labelChangeIn(left)
+      next = next === null ? due : Math.min(next, due)
+    }
+  }
+  return next
 }

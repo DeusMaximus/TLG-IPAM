@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -626,7 +626,7 @@ describe('Agents page', () => {
   it('does not list a disabled agent’s enrolment as open, and calls it blocked (#143)', async () => {
     // created, then disabled before it enrolled: the exchange refuses its token (403)
     ipam.listAgents.mockResolvedValue({
-      data: [agentRow({ id: 'off', name: 'off', state: 'disabled', last_checkin_at: null, tokens: [enrolToken({ id: 'e-off' })] })],
+      data: [agentRow({ id: 'off', name: 'off', state: 'disabled', last_checkin_at: null, tokens: [enrolToken({ id: 'e-off', expires_in_s: 3630 })] })],
       total: 1,
     })
     renderPage()
@@ -639,6 +639,101 @@ describe('Agents page', () => {
     // the token is still live, so it can still be revoked
     expect(within(row).getByRole('button', { name: /Revoke/ })).toBeEnabled()
     expect(within(row).getByRole('button', { name: /Re-enrol/ })).toBeDisabled()
+  })
+
+  // The countdown reads the monotonic clock from when the list was asked for, and is
+  // scheduled on its own: neither a step of the wall clock nor a failed refresh moves it
+  describe('the enrolment countdown, with the wall clock stepped and refreshes failing (#143)', () => {
+    const fresh = (left) =>
+      agentRow({
+        id: 'fresh',
+        name: 'fresh',
+        state: 'pending',
+        last_checkin_at: null,
+        tokens: [enrolToken({ expires_at: '2026-11-16T12:30:00+00:00', expires_in_s: left })],
+      })
+    // in steps of at most a second, each in its own act(), so React commits the effect
+    // that schedules the page's next timer between them, as a browser does
+    async function advance(ms) {
+      let left = ms
+      do {
+        const step = Math.min(left, 1000)
+        await act(() => vi.advanceTimersByTimeAsync(step))
+        left -= step
+      } while (left > 0)
+    }
+    const listed = () => screen.queryByRole('region', { name: 'Pending enrolments' })
+    const cell = () => within(screen.getByTestId('agent-fresh'))
+
+    beforeEach(() => {
+      // the wall clock, the monotonic clock (`performance`) and the timers, all faked
+      vi.useFakeTimers({
+        toFake: ['Date', 'performance', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
+      })
+      vi.setSystemTime(new Date('2026-11-16T12:00:00Z'))
+    })
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    async function loadThenFail(left) {
+      ipam.listAgents.mockResolvedValueOnce({ data: [fresh(left)], total: 1 })
+      renderPage()
+      await advance(0)
+      // every refresh after the first answer fails
+      ipam.listAgents.mockRejectedValue(new Error('server unreachable'))
+    }
+
+    it('drops a token when its time runs out after the wall clock is set back', async () => {
+      await loadThenFail(60)
+      expect(listed()).not.toBeNull()
+      expect(cell().getByText(/enrolment open, expires in 1m/)).toBeInTheDocument()
+      vi.setSystemTime(new Date('2026-11-16T11:00:00Z'))
+      await advance(59 * 1000)
+      expect(cell().getByText(/enrolment open, expires in 1s/)).toBeInTheDocument()
+      await advance(1100)
+      expect(listed()).toBeNull()
+      expect(cell().queryByText(/enrolment open/)).toBeNull()
+      await advance(60 * 1000)
+      expect(listed()).toBeNull()
+    })
+
+    it('keeps a live token listed after the wall clock is set forward', async () => {
+      await loadThenFail(1800)
+      vi.setSystemTime(new Date('2026-11-16T13:00:00Z'))
+      await advance(30 * 1000)
+      expect(within(listed()).getByTestId('pending-fresh')).toHaveTextContent('expires in 29m')
+      expect(cell().getByText(/enrolment open, expires in 29m/)).toBeInTheDocument()
+    })
+
+    it('counts down and drops a token on time, apart from the refresh, while refreshes fail', async () => {
+      await loadThenFail(45)
+      expect(cell().getByText(/expires in 45s/)).toBeInTheDocument()
+      // between two refreshes the label still counts
+      await advance(10 * 1000)
+      expect(cell().getByText(/expires in 35s/)).toBeInTheDocument()
+      await advance(20 * 1000) // the first refresh, which fails
+      expect(cell().getByText(/expires in 15s/)).toBeInTheDocument()
+      // gone at 45 s, not at the next refresh (60 s)
+      await advance(14 * 1000)
+      expect(cell().getByText(/expires in 1s/)).toBeInTheDocument()
+      // gone at 45 s (allowing the test's steps 100 ms), not at the next refresh (60 s)
+      await advance(1100)
+      expect(listed()).toBeNull()
+      expect(cell().queryByText(/enrolment open/)).toBeNull()
+    })
+
+    it('does not show a token as open when the answer took longer to arrive than it had left', async () => {
+      // the server gave it 1 s; the answer arrives 2 s after the request
+      ipam.listAgents.mockImplementation(
+        () => new Promise((resolve) => setTimeout(() => resolve({ data: [fresh(1)], total: 1 }), 2000))
+      )
+      renderPage()
+      await advance(2000)
+      expect(screen.getByTestId('agent-fresh')).toBeInTheDocument()
+      expect(listed()).toBeNull()
+      expect(cell().queryByText(/enrolment open/)).toBeNull()
+    })
   })
 
   describe('with the browser’s clock off the server’s (#143)', () => {
@@ -657,7 +752,7 @@ describe('Agents page', () => {
             name: 'fresh',
             state: 'pending',
             last_checkin_at: null,
-            tokens: [enrolToken({ expires_at: '2026-11-16T12:30:00+00:00', expires_in_s: 1800 })],
+            tokens: [enrolToken({ expires_at: '2026-11-16T12:30:00+00:00', expires_in_s: 1830 })],
           }),
         ],
         total: 1,

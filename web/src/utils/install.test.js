@@ -140,8 +140,10 @@ describe('the install commands match the spec', () => {
 // refuses (#143). The read is strict: every line of the two parametrize blocks is a
 // shape it knows (a case, a comment, or the block's own syntax), so a case written in
 // any other way (single quotes, a tuple over several lines) fails here instead of
-// being left out of one side.
-const STRING = String.raw`"((?:[^"\\]|\\.)*)"`
+// being left out of one side. A string is read only where its text is exactly what
+// Python reads: double quotes, no prefix, no backslash (so no escape, which this read
+// would take literally where Python decodes it), never two literals side by side.
+const STRING = String.raw`"([^"\\]*)"`
 const TAKEN_LIST = new RegExp(String.raw`^\[(${STRING}(?:, ${STRING})*)\],$`)
 const REFUSED_CASE = new RegExp(String.raw`^\(${STRING}, "[^"\\]*"\),$`)
 const unquote = (text) => [...text.matchAll(new RegExp(STRING, 'g'))].map((m) => m[1])
@@ -195,6 +197,13 @@ describe('the version the commands are pinned to', () => {
       // a second list line, or one with a single-quoted case
       source.replace('"0.2.0.post1"],', "'0.2.0.post1'],"),
       source.replace('["0.2.0", "1.0",', '["0.2.0",\n     "1.0",'),
+      // an escape Python decodes: it tests `0.2.0rc001`, a literal read would not
+      source.replace('("00.02.00", "not in normal form"),', '("\\x30.2.0rc001", "not in normal form"),'),
+      source.replace('["0.2.0", "1.0",', '["\\x30.2.0", "1.0",'),
+      // a string prefix, and two literals Python joins into one
+      source.replace('("00.02.00", "not in normal form"),', '(r"00.02.00", "not in normal form"),'),
+      source.replace('("00.02.00", "not in normal form"),', '("00.02" ".00", "not in normal form"),'),
+      source.replace('["0.2.0", "1.0",', '["0.2" ".0", "1.0",'),
     ]
     for (const variant of variants) {
       expect(variant).not.toBe(source)
