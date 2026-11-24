@@ -43,6 +43,7 @@ from tlg_ipam_agent.loop import Agent  # noqa: E402
 from tlg_ipam_agent.probe import NO_DNS_SERVER, ProbeError, usable_servers  # noqa: E402
 
 TOKEN = "tlga_" + "x" * 43
+ENROL_TOKEN = "tlge_" + "y" * 43
 BASE = "https://ipam.example.com"
 
 

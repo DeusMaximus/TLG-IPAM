@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-from conftest import TOKEN, make_config
+from conftest import TOKEN
 from tlg_ipam_agent.client import AgentClient, Kind, make_http
 
 
@@ -118,7 +118,7 @@ async def _serve(cert_and_key):
 
 
 async def _checkin(port: int):
-    async with make_http(make_config(url=f"https://127.0.0.1:{port}", token=TOKEN)) as http:
+    async with make_http(f"https://127.0.0.1:{port}", TOKEN) as http:
         return await AgentClient(http).checkin({})
 
 

@@ -68,36 +68,36 @@ This release does ICMP, ARP and reverse DNS. Reverse DNS asks the subnet's DNS s
 ### Run one
 
 1. In the UI, open **Agents → Add agent** and name it. The dialog shows the agent's enrolment token (`tlge_…`) once; it can be exchanged once, within an hour.
-2. On the Linux host on the target VLAN, run the enrolment command the dialog shows. It exchanges the enrolment token for the agent token and prints it, once, as `agent_token` (`tlga_…`):
+2. On a Linux host on the target VLAN, run the agent in a container or as a systemd unit, as below, with that enrolment token. The agent exchanges it for its long-lived agent token (`tlga_…`) itself and keeps that.
+3. Assign the subnet to the agent in the subnet's **Scanning** section, and save.
 
-   ```sh
-   curl -fsS -X POST https://ipam.home.arpa/api/v1/agent/enrol \
-     -H 'Authorization: Bearer tlge_…' \
-     -H 'Content-Type: application/json' -d '{}'
-   ```
+The dialog still shows the interim install from before the agent could enrol itself: a `curl` command that makes the exchange by hand and prints the agent token, and a container command that takes it as `IPAM_AGENT_TOKEN`. That works too, and needs no volume; a later release of the dialog shows the commands below.
 
-   A used, expired or revoked enrolment token is refused (`403`); so, for a minute, is every attempt after ten that failed (`429`). A later release of the agent makes this exchange itself on first start.
+A used, expired or revoked enrolment token is refused (`403`); so, for a minute, is every attempt after ten that failed (`429`). If the answer to the exchange is lost, or the token runs out before it is used, issue a new enrolment token for the same agent. Its id is in `GET /api/v1/agents`, and it keeps its scan targets:
 
-   If the answer is lost, or the token runs out before it is used, issue a new enrolment token for the same agent. Its id is in `GET /api/v1/agents`, and it keeps its scan targets:
+```sh
+curl -fsS -X POST https://ipam.home.arpa/api/v1/agents/<agent id>/re-enrol \
+  -H 'X-API-Key: <owner key>'
+```
 
-   ```sh
-   curl -fsS -X POST https://ipam.home.arpa/api/v1/agents/<agent id>/re-enrol \
-     -H 'X-API-Key: <owner key>'
-   ```
+The answer's `enrol_token` is the new one. Exchanging it also revokes the agent token the agent held before, which is the way to replace a lost or leaked one. (Deleting the agent and adding it again works too, but leaves its subnets unassigned.) The Agents page gains a Re-enrol button in a later release.
 
-   The answer's `enrol_token` is the new one; exchange it as above. Exchanging it also revokes the agent token the agent held before, which is the way to replace a lost or leaked one. (Deleting the agent and adding it again works too, but leaves its subnets unassigned.) The Agents page gains a Re-enrol button in a later release.
-3. Run the container command the dialog shows, with that agent token in place of `<agent token>`, using rootful Docker or Podman. It looks like this:
+#### In a container
 
-   ```sh
-   docker run -d --name tlg-ipam-agent --restart unless-stopped \
-     --network host --cap-add NET_RAW \
-     -e IPAM_URL=https://ipam.home.arpa \
-     -e IPAM_AGENT_TOKEN=tlga_… \
-     ghcr.io/deusmaximus/tlg-ipam-agent:<version>
-   ```
+Rootful Docker or Podman:
 
-   Host networking puts the agent on the VLAN itself, and `NET_RAW` lets it send ICMP echo requests and ARP requests. `--cap-add NET_RAW` adds that capability to Docker's default set rather than leaving the container with it alone; add `--cap-drop ALL` before it if you want only that one. Rootless container runtimes cannot grant a usable `NET_RAW` on the host network and are not supported.
-4. Assign the subnet to the agent in the subnet's **Scanning** section, and save. `docker logs tlg-ipam-agent` shows each check-in refusal, each job and how it ended.
+```sh
+docker run -d --name tlg-ipam-agent --restart unless-stopped \
+  --network host --cap-add NET_RAW \
+  -v tlg-ipam-agent:/var/lib/tlg-ipam-agent \
+  -e IPAM_URL=https://ipam.home.arpa \
+  -e IPAM_ENROL_TOKEN=tlge_… \
+  ghcr.io/deusmaximus/tlg-ipam-agent:<version>
+```
+
+On its first start the agent exchanges the enrolment token and stores the agent token in the volume (`/var/lib/tlg-ipam-agent/token`, mode 0600). Every later start uses the stored token and ignores `IPAM_ENROL_TOKEN`, so the container can be recreated with the same command and volume, to update the image say, without a new token. Without the volume the token is lost when the container is recreated, and the agent says so in its log when it enrols. If the exchange is refused the log says `enrolment refused (HTTP 403 FORBIDDEN)` and the agent tries again every 15 minutes; it does not exit, so the restart policy does not hammer the server. To enrol a container again with a re-enrol token, remove the old token with its volume first (`docker rm -f tlg-ipam-agent && docker volume rm tlg-ipam-agent`), then run the command with the new token.
+
+Host networking puts the agent on the VLAN itself, and `NET_RAW` lets it send ICMP echo requests and ARP requests. `--cap-add NET_RAW` adds that capability to Docker's default set rather than leaving the container with it alone; add `--cap-drop ALL` before it if you want only that one. Rootless container runtimes cannot grant a usable `NET_RAW` on the host network and are not supported. `docker logs tlg-ipam-agent` shows the enrolment, each check-in refusal, each job and how it ended.
 
 The image is not published yet. Until it is, build it from this repository and tag it with the version in the command:
 
@@ -105,16 +105,35 @@ The image is not published yet. Until it is, build it from this repository and t
 docker build -f agent/Dockerfile -t ghcr.io/deusmaximus/tlg-ipam-agent:<version> agent
 ```
 
+#### Run it as a systemd unit
+
+On an LXC or VM with systemd and Python 3.11 or later (with `venv`), as root:
+
+```sh
+sudo python3 -m venv /opt/tlg-ipam-agent
+sudo /opt/tlg-ipam-agent/bin/pip install <the agent's wheel>
+sudo /opt/tlg-ipam-agent/bin/tlg-ipam-agent install --url https://ipam.home.arpa --enrol-token -
+```
+
+`--enrol-token -` asks for the enrolment token, without echoing it (or reads it from a pipe: `echo tlge_… | sudo … --enrol-token -`). The token itself is never accepted on the command line: any local user can read a command line while it runs, and `sudo` logs it, which on a host with a persistent journal writes the token to disk. `--allowed-cidrs`, `--max-pps` and `--ca-file` set `ALLOWED_CIDRS`, `MAX_PPS` and `SSL_CERT_FILE` for the agent.
+
+`install` creates the system user `tlg-ipam-agent`, exchanges the enrolment token, writes the agent token to `/var/lib/tlg-ipam-agent/token` (owned by that user, mode 0600: nobody else can read it), writes the settings to `/etc/tlg-ipam-agent/agent.env` (no secrets), and installs, enables and starts `tlg-ipam-agent.service`, which runs the agent as that user with `CAP_NET_RAW` as its only capability. The enrolment token is written nowhere. Before it imports anything but its own entry point, it checks that only root can change the code it is about to run: the interpreter and every directory and link on the way to it, and everything on Python's import path (the virtual environment, its dependencies and `.pth` files, the standard library). Anything else is refused, since it would run as root and the unit runs it with that capability. It also refuses a virtual environment the service user could not read (made under `umask 077`, say: `chmod -R o+rX /opt/tlg-ipam-agent` fixes it), and a `--ca-file` the service user could not read. Run it as `/opt/tlg-ipam-agent/bin/tlg-ipam-agent`, not `python -m` from a directory others can write, which Python would put on the import path. If the exchange is refused, it takes back what it created and says whether the token is spent. `journalctl -u tlg-ipam-agent.service` shows the agent.
+
+To update, install the new wheel into the same environment and run `install` again without `--enrol-token`: it keeps the stored token (and makes sure the service user owns it). `sudo /opt/tlg-ipam-agent/bin/tlg-ipam-agent uninstall` stops the unit and removes it, both directories, and the service user if `install` created it (an account it found there is left; if removing the account fails, say because a process still runs as it, the record of it is kept and `uninstall` can simply be run again); then remove `/opt/tlg-ipam-agent` yourself, and revoke or delete the agent on the Agents page. To enrol a host again, uninstall and install with the new token.
+
+The wheel is not published yet. Until it is, build it from this repository (`agent/README.md` says how) and give its path to `pip install`.
+
 ### Settings
 
 | Variable | Default | |
 |----------|---------|---|
 | `IPAM_URL` | (required) | The server's URL. Must be `https://`: the token is a credential, and the server's certificate is always verified, with no setting to turn that off. Plain `http://` is accepted only for a server on the agent host's own loopback address (`http://127.0.0.1:8080`). |
-| `IPAM_AGENT_TOKEN` | (required) | The `tlga_…` agent token the enrolment exchange printed. |
+| `IPAM_ENROL_TOKEN` | | The `tlge_…` enrolment token, for the container's first start. Ignored once an agent token is stored in `/var/lib/tlg-ipam-agent`. |
+| `IPAM_AGENT_TOKEN` | | An agent token you hold (the interim install's `curl` printed it). Used as it is: nothing is read from or stored in `/var/lib/tlg-ipam-agent`. Set this or `IPAM_ENROL_TOKEN`, not both. |
 | `ALLOWED_CIDRS` | `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10` | The agent's own limit on what it will scan, whatever the server asks. A job for a subnet outside it is refused without a packet being sent, and the subnet's Scanning section shows why. Set it to your own networks if they use other ranges. |
 | `MAX_PPS` | `200` | The most packets a second the agent sends (1–1000): echo requests, ARP requests and DNS queries together, each ARP retry and each failover to another DNS server counted, from one scan into the next. The agent hands each to the kernel at least a slot (`1/MAX_PPS`) after it handed over the one before, and a slot that comes late is not made up for. What the kernel and the network card do after that hand-off is outside the agent's control and can put two packets closer together on the wire. The host's kernel also sends ARP of its own to reach an address it pings on the agent's subnet (up to 3 requests for an address that does not answer); that is not counted. |
 
-A server certificate from a private CA: mount the CA's bundle and point `SSL_CERT_FILE` at it, for example `-v /etc/ipam-ca.pem:/etc/ipam-ca.pem:ro -e SSL_CERT_FILE=/etc/ipam-ca.pem`. The bundle replaces the system's trusted CAs for the agent, so it has to contain the CA that signed the server's certificate.
+A server certificate from a private CA: mount the CA's bundle and point `SSL_CERT_FILE` at it, for example `-v /etc/ipam-ca.pem:/etc/ipam-ca.pem:ro -e SSL_CERT_FILE=/etc/ipam-ca.pem`. The bundle replaces the system's trusted CAs for the agent, so it has to contain the CA that signed the server's certificate. For the systemd unit, pass it to `install` as `--ca-file /etc/ipam-ca.pem`, in a place the `tlg-ipam-agent` user can read; the exchange `install` makes trusts it too, and nothing else. `install` refuses to run with `SSL_CERT_FILE` (other than the `--ca-file`) or `SSL_CERT_DIR` set in its own environment, since the unit would not have them; unset them and use `--ca-file`. A directory of CAs is not supported.
 
 ### What it does when the server says no
 
@@ -123,7 +142,7 @@ A server certificate from a private CA: mount the CA's bundle and point `SSL_CER
 - A refused check-in never starts a scan. A scan that runs out of time (10 minutes) reports what it found as incomplete, which only adds to what the server knows.
 - Every request to the server is abandoned after 30 seconds, however slowly the answer arrives, and is retried as above.
 
-The log shows each refusal as its HTTP status and error code (`HTTP 409 PROTOCOL_MISMATCH`), never the server's message. For a check-in the server refused after accepting the token (a protocol mismatch, a report it could not read), the Agents page shows the full reason as the agent's last error. A refused token (`401`/`403`) and a refused result set leave no reason there: the status and code in the log are what there is. The agent's token is replaced with `tlga_[redacted]` in anything it logs.
+The log shows each refusal as its HTTP status and error code (`HTTP 409 PROTOCOL_MISMATCH`), never the server's message. For a check-in the server refused after accepting the token (a protocol mismatch, a report it could not read), the Agents page shows the full reason as the agent's last error. A refused token (`401`/`403`) and a refused result set leave no reason there: the status and code in the log are what there is. The agent's token is replaced with `tlga_[redacted]`, and the enrolment token with `tlge_[redacted]`, in anything it logs.
 
 ## Development
 
