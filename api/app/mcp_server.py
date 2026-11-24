@@ -277,11 +277,12 @@ async def bulk_create_hosts(subnet_id: str, hosts: list[dict]) -> dict:
     or a line break in two bytes or more, and a character outside ASCII in up to
     twelve. 1,000 short records fit; 1,000 with long notes do not (at 4,096 characters
     of notes each they are over 4 MB), so send those in smaller calls. 400 records
-    fit when each one's notes are 4,096 characters of plain ASCII text with no quotes,
-    backslashes or line breaks and every other field is ASCII too (an ordinary address
-    and MAC, a hostname and domain of up to 253 characters, an owner of up to 120, a
-    device type of up to 40). Fewer fit if the notes hold a quote, a backslash or a
-    line break, and fewer still if any field holds a character outside ASCII: with an
+    fit when each one's notes are 4,096 characters of plain ASCII text and every other
+    field is plain ASCII too (an ordinary address and MAC, a hostname and domain of up
+    to 253 characters, an owner of up to 120, a device type of up to 40), none of them
+    holding a quote, a backslash or a line break in any field. Fewer fit if any field
+    holds one of those (a hostname and an owner of quotes alone make those 400 records
+    too large), and fewer still if any field holds a character outside ASCII: with an
     owner of 120 characters outside the BMP, those same 400 records are refused."""
     if not hosts:
         raise ToolError("hosts must contain at least one record")

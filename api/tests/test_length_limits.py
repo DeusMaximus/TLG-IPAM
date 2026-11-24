@@ -332,7 +332,8 @@ async def test_the_largest_call_the_docstring_permits_is_served_by_the_route(cli
     assert created.status_code == 201, created.text
     subnet = await _subnet(client, cidr=FULL_ROWS_CIDR)
     rows = full_rows(400, notes="a" * HOST_NOTES_MAX, owner="a" * 120)
-    assert all(all(ord(c) < 128 for c in str(v)) for row in rows for v in row.values())
+    # plain ASCII in every field: JSON writes each value as itself, with no escape
+    assert all(json.dumps(v) == f'"{v}"' for row in rows for v in row.values())
     body = _tool_call(subnet["id"], rows)
     assert len(body) == 1_965_771 < 2_000_000 < BODY_MAX
     res = await _post_to_mcp(anon_client, body)
@@ -366,3 +367,13 @@ def test_notes_json_escapes_take_the_same_call_over_the_cap():
     for escaped in ('"', "\\", "\n"):
         rows = full_rows(400, notes=escaped * HOST_NOTES_MAX, owner="a" * 120)
         assert len(_tool_call("x" * 36, rows)) > BODY_MAX, repr(escaped)
+
+
+def test_escaped_ascii_outside_the_notes_takes_the_same_call_over_the_cap():
+    """The example's rows are free of escapes in every field, not just the notes: the
+    same 400 rows with a hostname and an owner of quotes (two bytes each in JSON) are
+    2,114,971 bytes, over the cap, though every character is ASCII."""
+    rows = full_rows(400, notes="a" * HOST_NOTES_MAX, owner='"' * 120)
+    for row in rows:
+        row["hostname"] = '"' * 253
+    assert len(_tool_call("x" * 36, rows)) == 2_114_971 > BODY_MAX
