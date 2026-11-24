@@ -11,8 +11,10 @@ from sqlalchemy import delete, event, func, select, update
 from app.database import SessionLocal, engine
 from app.mcp_server import mcp
 from app import ipnet
-from app.models import Base, Change, Host, Observation, ReservedRange, ScanTarget, Subnet
-from app.schemas import SUBNET_RESERVED_RANGES_MAX
+from app.models import (
+    Base, Change, Host, Observation, ReservedRange, ScanTarget, Section, Subnet,
+)
+from app.schemas import HOST_NOTES_MAX, SUBNET_RESERVED_RANGES_MAX
 from app.services import findings as findings_svc
 from app.services import scans
 
@@ -970,7 +972,8 @@ async def test_no_statement_of_a_call_scans_or_sorts(client):
     sorted the whole subnet. Briefed round 1: the scope's read of excluded ranges
     scanned the whole reserved-range table. Every statement of a call but the subnet
     list is a SEARCH on an index, with no temporary sort, whatever the subnet and the
-    other subnets hold, before and after ANALYZE; the chunk reads use their
+    other subnets hold, before and after ANALYZE, with and without `subnet_id` (#133:
+    the check that the subnet exists runs only with it); the chunk reads use their
     `(subnet_id, ip_int)` index and the scope its excluded-range one."""
     section = await make_section(client)
     subnet = await make_subnet(
@@ -993,13 +996,18 @@ async def test_no_statement_of_a_call_scans_or_sorts(client):
     await add_ranges(subnet["id"], 50, excluded=False, first="10.1.15.100")
     await add_ranges(subnet["id"], 50, excluded=True, first="10.1.15.200")
     await add_ranges(other["id"], 3000, excluded=True, first="10.2.0.1")
-    for analyse in (False, True):
+    for analyse, args in (
+        (False, {}), (False, {"subnet_id": subnet["id"]}),
+        (True, {}), (True, {"subnet_id": subnet["id"]}),
+    ):
         if analyse:
             async with engine.begin() as conn:
                 await conn.exec_driver_sql("ANALYZE")
         with statements_with_parameters() as seen:
-            await scan_page()
+            await scan_page(**args)
         reads = call_reads(seen)
+        if args:  # the subnet's lookup is among them
+            assert any(sql.startswith("SELECT subnets.id \nFROM subnets") for sql, _ in reads)
         tables = " ".join(sql for sql, _ in reads)
         for table in ("hosts", "observations", "finding_dismissals", "reserved_ranges"):
             assert f"FROM {table}" in tables, table
@@ -1019,7 +1027,10 @@ async def test_no_statement_of_a_call_scans_or_sorts(client):
 async def vm_instructions(statements: list) -> int:
     """SQLite virtual-machine instructions to run the given reads again, counted by its
     progress handler: the work a statement does, rows passed over included, which a
-    query plan does not show (Codex on #129, second round)."""
+    query plan does not show (Codex on #129, second round). It counts SQLite's work
+    only: not the bytes a statement returns, which do not change its count (a row
+    returned with 10 bytes of notes or 1,000,000 costs the same instructions), nor
+    Python's processing of them. `returned_bytes` counts those bytes (#133)."""
     count = [0]
 
     def tick():
@@ -1091,11 +1102,11 @@ async def test_unhosted_pool_observations_cost_no_work(client):
     assert work[3000] < work[100] * 1.5, work
 
 
-async def first_call_work() -> int:
+async def first_call_work(**args) -> int:
     """SQLite instructions for every statement the first call of a walk runs, the
     subnet list included."""
     with statements_with_parameters() as seen:
-        await scan_page()
+        await scan_page(**args)
     return await vm_instructions(seen)
 
 
@@ -1103,20 +1114,24 @@ async def test_every_read_of_a_call_does_bounded_work(client):
     """Briefed round 1 on #129: the call's statement count stayed at 17 while the
     scope's read of reserved ranges grew with every range stored, another subnet's and
     the scanned ones included (508 to 50,008 instructions for 100 to 10,000). Counted
-    over every statement of a call: thousands of ranges that are not this subnet's
-    excluded ones cost nothing, and a subnet at `SUBNET_RESERVED_RANGES_MAX` excluded
-    ranges costs a bounded amount more than one with none."""
+    as SQLite instructions (`vm_instructions`: the rows a statement reads or passes
+    over, not the bytes it returns) over every statement of a call, with and without
+    `subnet_id`: thousands of ranges that are not this subnet's excluded ones cost
+    nothing, and a subnet at `SUBNET_RESERVED_RANGES_MAX` excluded ranges costs a
+    bounded amount more than one with none."""
     section = await make_section(client)
     alpha = await make_subnet(client, section["id"], "10.0.0.0/24", name="alpha")
     other = await make_subnet(client, section["id"], "10.5.0.0/16", name="other")
     await unknown_hosts(alpha["id"], "10.0.0", range(10, 40))
-    base = await first_call_work()
+    calls = ({}, {"subnet_id": alpha["id"]})
+    base = [await first_call_work(**args) for args in calls]
 
     await add_ranges(alpha["id"], 5000 // 50, excluded=False, first="10.0.0.100")
     await add_ranges(other["id"], 5000, excluded=True, first="10.5.0.1")
     await add_ranges(other["id"], 5000, excluded=False, first="10.5.100.1")
-    unrelated = await first_call_work()
-    assert unrelated < base * 1.1, (base, unrelated)
+    unrelated = [await first_call_work(**args) for args in calls]
+    for args, before, after in zip(calls, base, unrelated):
+        assert after < before * 1.1, (args, before, after)
 
     async with SessionLocal() as session:
         await session.execute(
@@ -1124,9 +1139,80 @@ async def test_every_read_of_a_call_does_bounded_work(client):
         )
         await session.commit()
     await add_ranges(alpha["id"], SUBNET_RESERVED_RANGES_MAX, excluded=True, first="10.0.0.100")
-    at_limit = await first_call_work()
+    at_limit = [await first_call_work(**args) for args in calls]
     # a few dozen instructions a range, read along the index and merged once
-    assert at_limit - base < SUBNET_RESERVED_RANGES_MAX * 100, (base, at_limit)
+    for args, before, after in zip(calls, base, at_limit):
+        assert after - before < SUBNET_RESERVED_RANGES_MAX * 100, (args, before, after)
+
+
+def value_bytes(value) -> int:
+    """A column value's size as SQLite hands it over: text in UTF-8, a number as 8."""
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value.encode())
+    if isinstance(value, (bytes, bytearray)):
+        return len(value)
+    return 8
+
+
+async def returned_bytes(statements: list) -> list[tuple[str, int]]:
+    """Each statement run again, with the bytes of the column values it returns: what
+    the instruction count of `vm_instructions` does not see (#133)."""
+    sizes = []
+    async with engine.connect() as conn:
+        for sql, params in statements:
+            rows = (await conn.exec_driver_sql(sql, params)).all()
+            sizes.append((sql, sum(value_bytes(v) for row in rows for v in row)))
+    return sizes
+
+
+async def test_no_read_of_a_call_returns_text_the_listing_does_not_use(client):
+    """#133: with `subnet_id`, the check that the subnet exists loaded its whole row,
+    notes included, though neither the check nor the page uses them: 100 against
+    1,000,090 bytes of column values for 10 and 1,000,000 bytes of notes, in the same
+    23 SQLite instructions, so the work tests did not see it. Every statement of a
+    call, with and without `subnet_id`, returns the same bytes however long the
+    subnet's notes, its section's description and its hosts' notes are."""
+    section = await make_section(client)
+    lab = await make_subnet(client, section["id"], "10.0.0.0/24", name="lab")
+    res = await client.post("/api/v1/scan-targets", json={"subnet_id": lab["id"]})
+    assert res.status_code == 201, res.text
+    await unknown_hosts(lab["id"], "10.0.0", range(10, 20))
+    for octet in range(30, 35):  # stale: hosts with no observation
+        await make_host(client, lab["id"], f"10.0.0.{octet}", hostname=f"h{octet}")
+
+    async def sizes(text_length: int, args: dict) -> list[tuple[str, int]]:
+        async with SessionLocal() as session:
+            await session.execute(
+                update(Subnet).where(Subnet.id == lab["id"]).values(notes="n" * text_length)
+            )
+            await session.execute(
+                update(Section).where(Section.id == section["id"]).values(
+                    description="d" * text_length
+                )
+            )
+            await session.execute(
+                update(Host).where(Host.subnet_id == lab["id"]).values(
+                    notes="h" * min(text_length, HOST_NOTES_MAX)
+                )
+            )
+            await session.commit()
+        with statements_with_parameters() as seen:
+            page = await scan_page(**args)
+        assert page["findings"], args
+        return await returned_bytes(seen)
+
+    for args in ({}, {"subnet_id": lab["id"]}):
+        short = await sizes(10, args)
+        long = await sizes(1_000_000, args)
+        assert [sql for sql, _ in short] == [sql for sql, _ in long], args
+        grown = [
+            {"statement": sql, "bytes returned": (small, large)}
+            for (sql, small), (_, large) in zip(short, long)
+            if large != small
+        ]
+        assert grown == [], args
 
 
 async def test_a_subnet_holds_at_most_the_reserved_range_limit(client):
@@ -1171,8 +1257,8 @@ async def test_a_subnet_holds_at_most_the_reserved_range_limit(client):
 
 
 async def test_start_up_creates_the_address_indexes_on_an_existing_database(tmp_path):
-    """A database made before #86 has none of the three address indexes; start-up
-    creates them, once."""
+    """A database made before #86 has none of the three address indexes, nor the
+    excluded-range one the scope reads along; start-up creates them, once."""
     from sqlalchemy.ext.asyncio import create_async_engine
 
     from app.database import init_models
@@ -1181,6 +1267,7 @@ async def test_start_up_creates_the_address_indexes_on_an_existing_database(tmp_
         "ix_hosts_subnet_ip_int",
         "ix_observations_subnet_ip_int",
         "ix_finding_dismissals_subnet_ip_int",
+        "ix_reserved_ranges_subnet_excluded",
     }
     old = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'old.db'}")
     try:
