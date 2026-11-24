@@ -42,13 +42,25 @@ not in the kernel's neighbour table makes the kernel ask for it first, up to 3 t
 and `rdns` only sends no echo request, and so draws none of those for the addresses
 it scans.
 
-**What the agent opens.** No file, itself: libraries open what it reads (pathlib an
-interface's MAC under `/sys/class/net`, dnspython `/etc/resolv.conf`, the TLS stack its
-CA bundle), and it writes none. `tests/test_invariants.py` holds that as a tripwire on the source, not a proof:
-it refuses `open` in every spelling and the ways of writing a file the allowed modules
-name, and allows each library read only in the module listed for it. It sees names,
-so code that reaches a file without one it lists passes it, and review holds the rule
-(spec §7.2, invariant 1).
+**What the agent opens and writes.** One module, `store.py`, opens files itself: the
+stored agent token (`/var/lib/tlg-ipam-agent/token`), read on every start without
+following a link or waiting on a FIFO and written once, at enrolment, beside its path
+with its mode and owner set first and then renamed into place; and the files
+`tlg-ipam-agent install` writes and `uninstall` removes. Libraries open what else it
+reads (pathlib an interface's MAC under `/sys/class/net`, dnspython `/etc/resolv.conf`,
+the TLS stack its CA bundle). Only `install.py` starts a process: `useradd`, `userdel`,
+`groupdel` and `systemctl`, with fixed arguments. `tests/test_invariants.py` holds that
+as a tripwire on the source, not a proof: it refuses `open` in every spelling, the ways
+of writing, renaming and removing a file the allowed modules name, and those of
+starting a process, outside the one module each is allowed in, and allows each library
+read only in the module listed for it. It sees names, so code that reaches a file
+without one it lists passes it, and review holds the rule (spec §7.2, invariant 1).
+
+**Building the wheel** (for the systemd install, until releases publish one):
+`.venv/bin/pip wheel --no-deps . -w dist` from this directory. Then, on the host,
+`sudo python3 -m venv /opt/tlg-ipam-agent`, `sudo /opt/tlg-ipam-agent/bin/pip install
+tlg_ipam_agent-<version>-py3-none-any.whl`, and `tlg-ipam-agent install` as the
+[project README](../README.md#run-it-as-a-systemd-unit) shows.
 
 Tests, from this directory (one-time setup:
 `python3 -m venv .venv && .venv/bin/pip install --require-hashes -r requirements-dev.txt`):
@@ -60,5 +72,8 @@ Tests, from this directory (one-time setup:
 The tests send no packet off this machine: the prober and the ARP socket are fakes,
 the resolver is a fake or the real one against DNS responders on loopback, and the
 end-to-end tests run the agent's client against the server's real routes in process.
+The enrolment and install tests write only inside a temporary directory, and the
+install's host (its users and systemd) is a fake that records the programs it would
+run.
 The real resolver reads only the files and FIFOs its tests make in a temporary
 directory, never this machine's own `/etc/resolv.conf`.

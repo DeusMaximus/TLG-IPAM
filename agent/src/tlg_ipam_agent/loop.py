@@ -23,7 +23,7 @@ from collections.abc import Callable
 from . import __version__, guard, scan
 from .backoff import Backoff, refused_wait
 from .client import AgentClient, Kind
-from .config import Config
+from .config import ENROL_TOKEN_PREFIX, Config
 from .probe import ArpLink, Prober, Resolver
 from .protocol import (
     HOSTNAME_MAX,
@@ -41,27 +41,44 @@ from .protocol import (
 log = logging.getLogger("tlg_ipam_agent")
 
 REDACTED = "tlga_[redacted]"
+ENROL_REDACTED = "tlge_[redacted]"
+
+
+def _redacted(token: str) -> str:
+    return ENROL_REDACTED if token.startswith(ENROL_TOKEN_PREFIX) else REDACTED
 
 
 class Redact(logging.Filter):
-    """Takes the agent's token out of every record a handler emits, traceback included.
-    A backstop: the agent logs no text the server wrote (`client.Answer.message`), but
-    an exception or a library's own log line could still carry the token."""
+    """Takes the agent's tokens out of every record a handler emits, traceback
+    included: the agent token, and the enrolment token while the agent holds one. A
+    backstop: the agent logs no text the server wrote (`client.Answer.message`), but an
+    exception or a library's own log line could still carry a token."""
 
-    def __init__(self, token: str):
+    def __init__(self, *tokens: str):
         super().__init__()
-        self.token = token
+        self.tokens: list[str] = []
+        self.add(*tokens)
+
+    def add(self, *tokens: str) -> None:
+        for token in tokens:
+            if token and token not in self.tokens:
+                self.tokens.append(token)
+
+    def _clean(self, text: str) -> str:
+        for token in self.tokens:
+            text = text.replace(token, _redacted(token))
+        return text
 
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
-        if self.token in message:
-            record.msg, record.args = message.replace(self.token, REDACTED), None
+        if any(token in message for token in self.tokens):
+            record.msg, record.args = self._clean(message), None
         if record.exc_info and not record.exc_text:
             record.exc_text = logging.Formatter().formatException(record.exc_info)
-        if record.exc_text and self.token in record.exc_text:
-            record.exc_text = record.exc_text.replace(self.token, REDACTED)
-        if record.stack_info and self.token in record.stack_info:
-            record.stack_info = record.stack_info.replace(self.token, REDACTED)
+        if record.exc_text:
+            record.exc_text = self._clean(record.exc_text)
+        if record.stack_info:
+            record.stack_info = self._clean(record.stack_info)
         return True
 
 # the server's interval is honoured inside these bounds
@@ -78,12 +95,20 @@ CAPABILITIES = sorted(SUPPORTED)
 SCAN_GRACE_S = 30
 
 
-def checkin_body(interfaces: list[dict]) -> dict:
+def reported() -> dict:
+    """What the agent says about itself, at enrolment (the whole enrol body) and at
+    every check-in."""
     return {
         "version": printable(__version__, VERSION_MAX),
-        "protocol": PROTOCOL_VERSION,
         "hostname": printable(socket.gethostname(), HOSTNAME_MAX),
         "platform": printable(platform.platform(), PLATFORM_MAX),
+    }
+
+
+def checkin_body(interfaces: list[dict]) -> dict:
+    return {
+        **reported(),
+        "protocol": PROTOCOL_VERSION,
         "interfaces": interfaces,
         "capabilities": CAPABILITIES,
     }

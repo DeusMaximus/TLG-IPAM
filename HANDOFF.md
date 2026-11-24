@@ -27,6 +27,39 @@ Template:
 
 ---
 
+## 2026-11-24 — Claude Code (Opus 5.5), worker — #22: the agent's enrolment exchange and the systemd installer (PR #130)
+- **Done:**
+  - [PR #130](https://github.com/DeusMaximus/TLG-IPAM/pull/130) (`22-agent-enrol-install`, head `b7fb4ae`) closes #22.
+  - The branch includes `main` at `211b53f` (merges `181ab1b` and `b7fb4ae`).
+  - Round 1 (NO-GO at `fb39dd7`) was fixed in `ebe385e`, and Codex's P2 on it in `4dc5d6b`.
+  - Round 2 (NO-GO at `4dc5d6b`: one P2, two P3s) was fixed in `eed4f91`:
+    - `install.service_trust` is the one source of the unit's trust and of the exchange's; inherited `SSL_CERT_FILE`/`SSL_CERT_DIR` are dropped, and refused when the unit would not get them;
+    - `uninstall` keeps `created-user` until the account and group are gone, so it can be retried;
+    - each token the install learns is added to `Redact` (`secret=`);
+    - the argument refusal gives re-enrol guidance;
+    - §5.6 and `AGENTS.md` say what holds of `subprocess` (a running agent never imports `install` or `trust`).
+  - Merged: `8081d8c`, squash, on the owner's go-ahead; the remote branch is deleted. CI green and Codex clean on `b7fb4ae`; Greptile read only the first head, and the briefed rounds were the outside read after it. The briefed review (Codex, GPT-6.1 Sol) took three rounds: NO-GO at `fb39dd7`, NO-GO at `4dc5d6b`, GO at `b7fb4ae` with one P3. After the second NO-GO the owner kept the Opus 5.5 worker on the fix. The orchestrator ran 1,193 agent and 1,083 server tests on `b7fb4ae`. Follow-ups filed, on the owner's say:
+    - #136: the CA preflight judges mode bits, not ACLs or supplementary groups (round 2, finding 2);
+    - #138: the unit does not discard CA trust settings the system manager supplies (round 3, finding 1);
+    - #140: argparse's own errors repeat an argument, and the agent token's exact form is stated only on the agent's side.
+- **State:**
+  - merged. Tests on the merged tree: agent 1,193 on 3.13 and 3.11.18, server 1,083.
+  - No change under `api/`, no schema change, `PROTOCOL_VERSION` unchanged.
+  - The container runs (Debian 13 with systemd, `--network none`) are in the PR body:
+    - run A at `ebe385e`;
+    - run B at `eed4f91`;
+    - the round-1 reproductions at `ebe385e`;
+    - the round-2 reproductions at `eed4f91`, HTTPS with a private CA.
+- **Decisions:** Deliberate calls 1–17 in the PR body. Since round 1, calls 13 and 14 changed:
+  - call 14: refusal over carrying inherited trust into the unit, with #136 as the known limit;
+  - call 13: the record goes last, and the crash between `useradd` and writing the record is manual recovery.
+- **Waiting on the owner:** nothing from this entry.
+- **Untested:** unprivileged LXC, non-Debian distributions, OpenSSL variables other than `SSL_CERT_FILE` and `SSL_CERT_DIR`, ACLs and supplementary groups (#136), two containers on one volume.
+- **Next:**
+  - #23 renders `… install --url … --enrol-token -` and the container command with the volume and `IPAM_ENROL_TOKEN`;
+  - #24 publishes the image and the wheel;
+  - #136, #138 and #140 are the installer's open follow-ups.
+
 ## 2026-11-24 — Claude Code (Opus 5.5), worker — #133: list_scan_findings checks a subnet_id by its id alone (PR #137)
 - **Done:** [PR #137](https://github.com/DeusMaximus/TLG-IPAM/pull/137) (`133-findings-subnet-lookup`, head `ee19d28`) closes #133.
   - `findings.list_named` checks `subnet_id` with `select(Subnet.id)` and `errors.not_found`, not `subnets.get_subnet`. The refusal and the statement count are unchanged.
@@ -121,18 +154,3 @@ Template:
   - The 100-range limit and its legacy exception (Deliberate call 9): accept or overrule.
   - The Greptile retrigger, the briefed round 2 (the orchestrator runs it on `f77e53f`), and the merge.
 - **Next:** #91 adds only the `notes` limit, since `domain` is at 253 here. #26 can expose `/mcp` once #129 and #90 are in.
-
-## 2026-11-24 — Claude Code (Opus 5.5), worker — #90: a budget and a deadline on request bodies (PR #131)
-- **Done:** [PR #131](https://github.com/DeusMaximus/TLG-IPAM/pull/131) (`90-bound-unauthenticated-bodies`, head `4efe69d`) closes #90.
-  - `body_limit.py`: beside the cap, `BODIES_MAX` (16 MiB) bounds the body bytes of all requests in progress, read by the middleware or by the route, counted until the request ends (`503 UNAVAILABLE` past it). `BODY_TIMEOUT_S` (60 s from the headers, whole body) gives `408 REQUEST_TIMEOUT`.
-  - Every refusal and every response sent before its body has fully arrived closes the connection. Without that, uvicorn keeps reading and discarding a trickled body after an early `401`.
-  - A body the middleware reads is one buffer. A route that reads its own body gets blocks of at least 64 KiB.
-  - Docs: brief §4.3 (limits, measurement, "Left to the reverse proxy or tunnel"), §5.1 table, acceptance list; spec §5.7 and the §6.6 row; the `AGENTS.md` cap bullet.
-  - Merged: `c5d7139`, squash, on the owner's go-ahead; the remote branch is deleted. CI green and Codex clean on `4efe69d`. Greptile reviewed only the first head (`4598df7`, one P2, fixed and resolved) and was not retriggered. Briefed round (Codex, GPT-6.1 Sol): GO with no findings at `4efe69d`; it repeated the memory measurement on Linux (about 63 to 65 MiB before, about 20 MiB after, both parsers) and ran the body-limit tests six times without a failure. The orchestrator ran 1,059 server tests on the head merged with `main` and repeated the real-server run: 9 held and answered `408` at 60 s, 23 refused. The header and idle-connection follow-up is proposed to the owner and not filed. Nothing else from this entry is waiting on the owner.
-- **Decisions:** PR body Deliberate calls 1–11. Budget plus deadline, no spooling. The count runs until the request ends, not until it authenticates, because FastAPI parses a `Body` before the route's dependencies: check-in and the owner routes read a declared-length body before their credential, which the issue had missed. Bytes are counted as they arrive, never reserved. 60 s is twice the agent's 30 s request deadline. A cut body reaches the route as `http.disconnect`, and the middleware swallows the `ClientDisconnect` that follows.
-- **State:** server 1058 and agent 922 pass; CI green on `4efe69d`; no schema change; `PROTOCOL_VERSION` unchanged.
-  - Measured on macOS, loopback, 32 stalled 1.75 MiB bodies: `a8534eb` +60 to +68 MiB on both parsers; the new head +17 to +21 MiB, 9 held, 23 refused, `408` at 60 s.
-  - Codex: one P1 on `4598df7` (per-chunk memory), fixed in `4efe69d`, then clean on `4efe69d` after `@codex review`. Greptile: one P2 on `4598df7` (same finding), fixed and resolved; it has not reviewed `4efe69d`.
-  - Measured, not fixed (outside #90): uvicorn's httptools takes unbounded request headers (8 MiB of one unfinished header was accepted), and idle connections stay open on both parsers. Brief §4.3 lists both as the proxy's job.
-- **Waiting on the owner:** the briefed round (an author from a different model family; the orchestrator briefs it), a Greptile retrigger on `4efe69d`, then merge. Whether to file a follow-up for header size and idle connections (uvicorn options in the image, or the proxy's job only).
-- **Next:** #31 can take its proxy guidance from brief §4.3 and the PR body's "Left to the reverse proxy or tunnel". #86 may change the one brief §4.3 sentence that measures an import, which this PR left alone.

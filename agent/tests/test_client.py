@@ -5,7 +5,7 @@ import ssl
 import httpx
 import pytest
 
-from conftest import TOKEN, make_config
+from conftest import BASE, TOKEN
 from tlg_ipam_agent.client import AgentClient, Kind, make_http, tls_context
 
 
@@ -17,7 +17,7 @@ def test_tls_is_always_verified():
 
 
 async def test_the_http_client_verifies_and_does_not_follow_redirects():
-    async with make_http(make_config()) as http:
+    async with make_http(BASE, TOKEN) as http:
         assert http.follow_redirects is False
         assert http.headers["authorization"] == f"Bearer {TOKEN}"
         assert http.headers["user-agent"].startswith("tlg-ipam-agent/")
@@ -30,9 +30,9 @@ async def test_the_http_client_verifies_and_does_not_follow_redirects():
 def test_there_is_no_setting_that_turns_verification_off():
     import inspect
 
-    from tlg_ipam_agent import client, config
+    from tlg_ipam_agent import client, config, enrol, install
 
-    for module in (client, config):
+    for module in (client, config, enrol, install):
         source = inspect.getsource(module)
         assert "CERT_NONE" not in source
         assert "verify=False" not in source

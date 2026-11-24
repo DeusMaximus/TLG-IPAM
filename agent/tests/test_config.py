@@ -4,16 +4,18 @@ import ipaddress
 
 import pytest
 
-from conftest import TOKEN
+from conftest import ENROL_TOKEN, TOKEN
 from tlg_ipam_agent.config import DEFAULT_MAX_PPS, ConfigError, load
 
 GOOD = {"IPAM_URL": "https://ipam.home.arpa", "IPAM_AGENT_TOKEN": TOKEN}
 
 
 def test_defaults():
-    cfg = load(GOOD)
-    assert cfg.url == "https://ipam.home.arpa"
-    assert cfg.token == TOKEN
+    settings = load(GOOD)
+    assert settings.url == "https://ipam.home.arpa"
+    assert settings.agent_token == TOKEN and settings.enrol_token is None
+    cfg = settings.config(settings.agent_token)
+    assert cfg.token == TOKEN and cfg.url == settings.url
     assert cfg.max_pps == DEFAULT_MAX_PPS == 200
     assert [str(n) for n in cfg.allowed] == [
         "10.0.0.0/8",
@@ -26,6 +28,48 @@ def test_defaults():
 def test_repr_never_shows_the_token():
     assert TOKEN not in repr(load(GOOD))
     assert TOKEN not in str(load(GOOD))
+    assert TOKEN not in repr(load(GOOD).config(TOKEN))
+    enrolling = load({"IPAM_URL": "https://ipam.home.arpa", "IPAM_ENROL_TOKEN": ENROL_TOKEN})
+    assert ENROL_TOKEN not in repr(enrolling) and ENROL_TOKEN not in str(enrolling)
+
+
+@pytest.mark.parametrize("value", [None, ""])
+def test_neither_token_is_needed_to_load_the_settings(value):
+    """Where the token comes from when neither is set (a stored one) is `enrol`'s to
+    decide, after the settings are read; set but empty counts as unset."""
+    env = {"IPAM_URL": "https://ipam.home.arpa"}
+    if value is not None:
+        env |= {"IPAM_AGENT_TOKEN": value, "IPAM_ENROL_TOKEN": value}
+    settings = load(env)
+    assert settings.agent_token is None and settings.enrol_token is None
+
+
+def test_an_enrolment_token_is_read_from_its_own_variable():
+    settings = load({"IPAM_URL": "https://ipam.home.arpa", "IPAM_ENROL_TOKEN": ENROL_TOKEN})
+    assert settings.enrol_token == ENROL_TOKEN and settings.agent_token is None
+
+
+def test_both_tokens_set_is_refused():
+    with pytest.raises(ConfigError, match="IPAM_AGENT_TOKEN and IPAM_ENROL_TOKEN are both set") as err:
+        load({**GOOD, "IPAM_ENROL_TOKEN": ENROL_TOKEN})
+    assert TOKEN not in str(err.value) and ENROL_TOKEN not in str(err.value)
+
+
+@pytest.mark.parametrize(
+    "token",
+    [TOKEN, "not-a-token", f" {ENROL_TOKEN}", f"{ENROL_TOKEN}\n", "tlge_a b", "tlge_é", "tlge_" + "x" * 300],
+)
+def test_refused_enrolment_tokens_never_echo_the_value(token):
+    with pytest.raises(ConfigError, match="IPAM_ENROL_TOKEN") as err:
+        load({"IPAM_URL": "https://ipam.home.arpa", "IPAM_ENROL_TOKEN": token})
+    assert token.strip() not in str(err.value)
+
+
+def test_a_token_of_the_other_kind_is_named_as_such():
+    with pytest.raises(ConfigError, match="it is an enrolment token"):
+        load({**GOOD, "IPAM_AGENT_TOKEN": ENROL_TOKEN})
+    with pytest.raises(ConfigError, match="it is an agent token"):
+        load({"IPAM_URL": "https://ipam.home.arpa", "IPAM_ENROL_TOKEN": TOKEN})
 
 
 @pytest.mark.parametrize(
@@ -70,18 +114,12 @@ def test_refused_urls(url):
 
 @pytest.mark.parametrize(
     "token",
-    [None, "", "tlge_enrolment", "not-a-token", f" {TOKEN}", f"{TOKEN}\n", "tlga_a b", "tlga_é"],
+    ["tlge_enrolment", "not-a-token", f" {TOKEN}", f"{TOKEN}\n", "tlga_a b", "tlga_é", "tlga_" + "x" * 300],
 )
 def test_refused_tokens_never_echo_the_value(token):
-    env = dict(GOOD)
-    if token is None:
-        del env["IPAM_AGENT_TOKEN"]
-    else:
-        env["IPAM_AGENT_TOKEN"] = token
     with pytest.raises(ConfigError, match="IPAM_AGENT_TOKEN") as err:
-        load(env)
-    if token:
-        assert token.strip() not in str(err.value)
+        load({**GOOD, "IPAM_AGENT_TOKEN": token})
+    assert token.strip() not in str(err.value)
 
 
 def test_allowed_cidrs_parsed():

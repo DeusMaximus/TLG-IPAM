@@ -12,9 +12,9 @@ import time
 import httpx
 import pytest
 
-from conftest import TOKEN, FakeProber, FakeServer, accepted, job, make_agent, make_config, refused
+from conftest import ENROL_TOKEN, TOKEN, FakeProber, FakeServer, accepted, job, make_agent, refused
 from tlg_ipam_agent.client import RESPONSE_MAX, AgentClient, Kind, make_http
-from tlg_ipam_agent.loop import REDACTED, Redact, log
+from tlg_ipam_agent.loop import ENROL_REDACTED, REDACTED, Redact, log
 from tlg_ipam_agent.protocol import CHECKIN_RETRY_MIN_S, LEASE_S
 
 # --- a server that drips its answer, on loopback ---
@@ -48,7 +48,7 @@ async def dripping_server():
 async def test_a_dripping_answer_ends_at_the_request_deadline(route):
     server, port, arrived = await dripping_server()
     async with server:
-        async with make_http(make_config(url=f"http://127.0.0.1:{port}")) as http:
+        async with make_http(f"http://127.0.0.1:{port}", TOKEN) as http:
             client = AgentClient(http, request_timeout=0.5)
             started = time.monotonic()
             answer = await asyncio.wait_for(getattr(client, route)({}), timeout=10)
@@ -269,6 +269,28 @@ def test_the_cli_redacts_the_token_on_every_handler(monkeypatch):
     assert TOKEN not in stream.getvalue() and REDACTED in stream.getvalue()
 
 
+def test_the_cli_adds_a_token_learnt_later_to_the_same_filter(monkeypatch):
+    """The enrolment token is known at start, the agent token only once it is read or
+    exchanged (#22): both are redacted, by one filter per handler."""
+    from tlg_ipam_agent import cli
+
+    root = logging.getLogger()
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    monkeypatch.setattr(root, "handlers", [handler])
+    cli.configure_logging(None, ENROL_TOKEN)
+    cli.configure_logging(TOKEN)
+    assert sum(isinstance(f, Redact) for f in handler.filters) == 1
+    logging.getLogger("httpx").warning("both %s and %s", ENROL_TOKEN, TOKEN)
+    try:
+        raise RuntimeError(f"raised with {ENROL_TOKEN}")
+    except RuntimeError:
+        logging.getLogger("tlg_ipam_agent.test_redact_later").exception("failed")
+    out = stream.getvalue()
+    assert ENROL_TOKEN not in out and TOKEN not in out
+    assert out.count(ENROL_REDACTED) == 2 and out.count(REDACTED) == 1
+
+
 def test_every_request_has_a_thirty_second_deadline():
     from tlg_ipam_agent.client import REQUEST_TIMEOUT_S
 
@@ -328,7 +350,7 @@ async def test_a_compressed_answer_is_refused_undecoded():
     )
     server, port, seen = await _serving(head, lambda: [payload])
     async with server:
-        async with make_http(make_config(url=f"http://127.0.0.1:{port}")) as http:
+        async with make_http(f"http://127.0.0.1:{port}", TOKEN) as http:
             answer, peak = await _peak_during(AgentClient(http).checkin({}))
     assert peak < RESPONSE_MAX, f"held {peak} bytes"
     assert answer.kind is Kind.RETRY and "content encoding" in answer.message
@@ -342,7 +364,7 @@ async def test_a_plain_answer_far_over_the_cap_never_fills_memory():
     head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
     server, port, _ = await _serving(head, lambda: (chunk for _ in range(512)))
     async with server:
-        async with make_http(make_config(url=f"http://127.0.0.1:{port}")) as http:
+        async with make_http(f"http://127.0.0.1:{port}", TOKEN) as http:
             answer, peak = await _peak_during(AgentClient(http).checkin({}))
     assert peak < 2 * RESPONSE_MAX, f"held {peak} bytes"
     assert answer.kind is Kind.RETRY and str(RESPONSE_MAX) in answer.message
