@@ -33,7 +33,11 @@ first, then enrol again.
 `uninstall` stops and disables the unit and removes everything `install` created: the
 unit, both directories and the files in them, and the service user and its group when
 the record says `install` created them and their ids are still the recorded ones. An
-account the install found there is left. It leaves the virtual environment, which the
+account the install found there is left. The record goes last, once the account and
+group it stands for are gone, so an uninstall whose `userdel` failed (the account busy)
+can be run again. One window is not covered: an install stopped between `useradd` and
+writing the record leaves an account nothing records; remove it by hand (`userdel
+tlg-ipam-agent`) if `uninstall` reports it left in place. It leaves the virtual environment, which the
 operator made, and the agent's record on the server, which only the owner can remove.
 
 Neither command is reached until `cli` has had `trust.check` find that only root can
@@ -271,6 +275,31 @@ def _ca_file(value: str | None) -> str | None:
     return value
 
 
+# what OpenSSL reads from the environment to choose the CAs it trusts (the agent's TLS
+# context is `ssl.create_default_context`, which loads OpenSSL's default paths)
+TRUST_VARIABLES = ("SSL_CERT_FILE", "SSL_CERT_DIR")
+
+
+def service_trust(ca_file: str | None) -> dict[str, str]:
+    """The trust settings the unit's agent is given, through agent.env, and so the only
+    ones the exchange is made with (the round-2 review of #130: an exchange that trusted
+    what root's environment named, and a unit given nothing, spent the token on an agent
+    that could not verify its server). A unit inherits nothing of root's environment."""
+    return {"SSL_CERT_FILE": ca_file} if ca_file is not None else {}
+
+
+def inherited_trust(environ, ca_file: str | None) -> str | None:
+    """The first trust setting in the installer's environment that the unit would not
+    be given, or None: `SSL_CERT_DIR` always (there is no setting for a directory of
+    CAs), `SSL_CERT_FILE` unless it names the `--ca-file` itself."""
+    wanted = service_trust(ca_file)
+    for name in TRUST_VARIABLES:
+        value = environ.get(name)
+        if value and wanted.get(name) != value:
+            return name
+    return None
+
+
 def render_env(url: str, allowed, max_pps: int | None, ca_file: str | None, token_path: str) -> str:
     lines = [
         "# Written by `tlg-ipam-agent install`; `tlg-ipam-agent uninstall` removes it.",
@@ -281,8 +310,7 @@ def render_env(url: str, allowed, max_pps: int | None, ca_file: str | None, toke
         lines.append("ALLOWED_CIDRS=" + _plain(",".join(str(n) for n in allowed), "--allowed-cidrs"))
     if max_pps is not None:
         lines.append(f"MAX_PPS={max_pps}")
-    if ca_file is not None:
-        lines.append(f"SSL_CERT_FILE={ca_file}")
+    lines += [f"{name}={value}" for name, value in service_trust(ca_file).items()]
     return "\n".join(lines) + "\n"
 
 
@@ -316,9 +344,12 @@ WantedBy=multi-user.target
 
 
 def exchange(url: str, token: str, ca_file: str | None) -> Answer:
-    """The enrolment exchange, once. A private CA is the one the agent will use."""
-    if ca_file is not None:
-        os.environ["SSL_CERT_FILE"] = ca_file
+    """The enrolment exchange, once, trusting exactly what the unit's agent will:
+    every inherited trust setting is dropped and `service_trust` applied, before the
+    TLS context is made (`client.tls_context` reads them then)."""
+    for name in TRUST_VARIABLES:
+        os.environ.pop(name, None)
+    os.environ.update(service_trust(ca_file))
 
     async def once() -> Answer:
         async with make_http(url, token) as http:
@@ -363,6 +394,36 @@ def _delete_user(host: Host) -> None:
         _check(host, ("groupdel", SERVICE_USER), "removing the service user's group")
 
 
+def _remove_account(host: Host, recorded: tuple[int, int] | None, out, problems: list[str]) -> bool:
+    """Removes the service account and its group when `recorded` (the uid and gid
+    `install` wrote when it created them) still names them, and says whether nothing
+    the record stands for is left to remove. With no record, an account of the name is
+    someone else's and is left."""
+    user, group = host.service_user(), host.service_group()
+    if recorded is None:
+        if user is not None or group is not None:
+            out(f"left the {SERVICE_USER} account in place: install did not create it")
+        return True
+    gid = recorded[1]
+    if user is not None and tuple(user) != recorded:
+        out(f"left the {SERVICE_USER} account in place: it is not the one install created")
+        return True
+    if user is not None:
+        try:
+            _check(host, ("userdel", SERVICE_USER), "removing the service user")
+        except InstallError as exc:
+            problems.append(str(exc))
+            return False
+    group = host.service_group()
+    if group is not None and group == gid:
+        try:
+            _check(host, ("groupdel", SERVICE_USER), "removing the service user's group")
+        except InstallError as exc:
+            problems.append(str(exc))
+            return False
+    return True
+
+
 def _recorded_user(path: str) -> tuple[int, int] | None:
     """The uid and gid `install` recorded when it created the service user, or None
     when it recorded none (it found the account there) or the record is not one."""
@@ -388,17 +449,22 @@ def install(
     read_stdin: Callable[[], str] = read_token_line,
     interpreter: str = sys.executable,
     out: Callable[[str], None] = _say,
+    environ=os.environ,
+    secret: Callable[[str], None] = lambda token: None,
 ) -> int:
+    """`secret` is given each token as the install learns it (the enrolment token read
+    from standard input, the agent token from the answer), for `cli` to add to the
+    log redaction (`loop.Redact`)."""
     host = host or Host()
     try:
-        _install(options, host, paths, exchange, read_stdin, interpreter, out)
+        _install(options, host, paths, exchange, read_stdin, interpreter, out, environ, secret)
     except (InstallError, config.ConfigError, store.StoreError) as exc:
         out(f"install failed: {exc}")
         return 1
     return 0
 
 
-def _install(options, host, paths, exchange, read_stdin, interpreter, out) -> None:
+def _install(options, host, paths, exchange, read_stdin, interpreter, out, environ, secret) -> None:
     # that only root can change the code was checked by `cli`, before it imported this
     # module (`trust.check`)
     _preflight(host)
@@ -414,14 +480,22 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out) -> No
     allowed = None if options.allowed_cidrs is None else config.parse_allowed(options.allowed_cidrs, "--allowed-cidrs")
     max_pps = None if options.max_pps is None else config.parse_max_pps(options.max_pps, "--max-pps")
     ca_file = _ca_file(options.ca_file)
+    inherited = inherited_trust(environ, ca_file)
+    if inherited is not None:
+        raise InstallError(
+            f"{inherited} is set in this environment, and the unit would not have it: the "
+            "exchange would trust a CA the agent then could not. Unset it, and give a private "
+            "CA's bundle as --ca-file (a directory of CAs is not supported)"
+        )
     token = options.enrol_token
     if token is not None and token != "-":
         # the review of #130: any local user can read a command line from
         # /proc/<pid>/cmdline while the exchange waits on the server
         raise InstallError(
             "--enrol-token takes - alone, and reads the token from standard input: a token "
-            "on the command line can be read by any local user while install runs. Give it "
-            "on standard input instead"
+            "on the command line can be read by any local user while install runs, and sudo "
+            "logs it. It was not used, but treat it as exposed: re-enrol the agent on the "
+            "Agents page for a new one, and give that on standard input"
         )
     if token == "-":
         token = read_stdin().rstrip("\n")
@@ -429,6 +503,7 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out) -> No
             raise InstallError("--enrol-token -: nothing was read from standard input")
     if token is not None:
         token = config.parse_token(token, "--enrol-token", config.ENROL_TOKEN_PREFIX)
+        secret(token)
     env = render_env(url, allowed, max_pps, ca_file, paths.token)
     unit = render_unit(paths.env, interpreter)
 
@@ -484,6 +559,7 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out) -> No
                 answer = exchange(url, token, ca_file)
                 if answer.kind is not Kind.OK:
                     raise InstallError(_not_enrolled(answer))
+                secret(answer.data["agent_token"])
                 try:
                     pending.commit(answer.data["agent_token"].encode("ascii"))
                 except store.StoreError as exc:
@@ -536,23 +612,23 @@ def uninstall(*, host: Host | None = None, paths: Paths = Paths(), out: Callable
     for path in (
         paths.token + store.PENDING_SUFFIX, paths.token,
         paths.env + store.PENDING_SUFFIX, paths.env,
-        paths.user_record + store.PENDING_SUFFIX, paths.user_record,
+        paths.user_record + store.PENDING_SUFFIX,
     ):
         attempt(partial(store.remove_file, path))
-    for directory in (paths.state, paths.etc):
-        attempt(partial(store.remove_dir, directory))
+    attempt(partial(store.remove_dir, paths.state))
     # the account and its group go only if `install` created them: the uid and the
     # primary gid it recorded are both theirs still (Codex on #130: a uid alone would
     # let an account since repurposed with another group go). One it found there, or
-    # one since replaced, is left
-    user, group = host.service_user(), host.service_group()
-    if recorded is not None and user is not None and tuple(user) == recorded:
-        attempt(partial(_check, host, ("userdel", SERVICE_USER), "removing the service user"))
-        group = host.service_group()
-        if group is not None and group == recorded[1]:
-            attempt(partial(_check, host, ("groupdel", SERVICE_USER), "removing the service user's group"))
-    elif user is not None or group is not None:
-        out(f"left the {SERVICE_USER} account in place: install did not create it")
+    # one since replaced, is left. The record stays until what it stands for is gone
+    # (the round-2 review of #130: removed first, a `userdel` that failed, with the
+    # account busy, left the next uninstall unable to tell the account was the
+    # install's), so a retry finishes the job, a user already gone and its recorded
+    # group left included
+    if _remove_account(host, recorded, out, problems):
+        attempt(partial(store.remove_file, paths.user_record))
+        attempt(partial(store.remove_dir, paths.etc))
+    else:
+        out(f"kept {paths.user_record}, so that uninstall, run again, can still remove the account")
     for problem in problems:
         out(f"not removed: {problem}")
     out(

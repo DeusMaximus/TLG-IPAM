@@ -14,7 +14,7 @@ def trusted(monkeypatch):
 
 def test_install_takes_its_options_and_passes_them_on(monkeypatch):
     seen = {}
-    monkeypatch.setattr(install, "install", lambda options: seen.setdefault("options", options) and 0)
+    monkeypatch.setattr(install, "install", lambda options, **kw: seen.update(options=options, **kw) or 0)
     cli.main([
         "install", "--url", "https://ipam.home.arpa", "--enrol-token", "-",
         "--allowed-cidrs", "10.0.0.0/8", "--max-pps", "50", "--ca-file", "/etc/ca.pem",
@@ -26,6 +26,8 @@ def test_install_takes_its_options_and_passes_them_on(monkeypatch):
         max_pps="50",
         ca_file="/etc/ca.pem",
     )
+    # each token the install learns is handed to the log redaction
+    assert seen["secret"] is cli.configure_logging
 
 
 def test_install_needs_the_url(capsys):

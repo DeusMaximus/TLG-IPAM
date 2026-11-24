@@ -4,6 +4,7 @@
 Each layout is built in the test's own directory, whose owner stands in for root
 (`owner`), and `top` keeps the directories above it out of the judgement."""
 
+import json
 import os
 import subprocess
 import sys
@@ -237,3 +238,22 @@ def test_the_cli_takes_the_working_directory_off_before_it_checks(monkeypatch, t
     monkeypatch.setattr(install, "uninstall", lambda: 0)
     assert cli.main(["uninstall"]) == 0
     assert "" not in seen[0] and str(tmp_path) not in seen[0]
+
+
+def test_a_running_agent_never_imports_the_installer_or_the_check():
+    """What holds of the scanning process (round 2 of #130): it imports every module the
+    run path does (`cli._run`'s), and neither `install` nor `trust` is among them, so
+    the module that names `subprocess` and the fixed programs it runs are not loaded
+    there. That is not "`subprocess` is not loaded": the standard library's asyncio
+    imports it in every agent process. What keeps a launch out of the agent is that no
+    agent module but `install.py` names one (test_invariants.py) and that nothing the
+    server sends reaches `install`'s fixed argument lists."""
+    out = subprocess.run(
+        [sys.executable, "-c", f"import sys; sys.path.insert(0, {str(SRC)!r}); import tlg_ipam_agent.cli; "
+         "from tlg_ipam_agent import config, enrol, interfaces, client, loop, probe, scan; "
+         "import json; print(json.dumps(sorted(m for m in sys.modules if m.startswith('tlg_ipam_agent.'))))"],
+        capture_output=True, text=True, check=True,
+    )
+    loaded = json.loads(out.stdout)
+    assert "tlg_ipam_agent.install" not in loaded and "tlg_ipam_agent.trust" not in loaded
+    assert {"tlg_ipam_agent.loop", "tlg_ipam_agent.probe", "tlg_ipam_agent.enrol"} <= set(loaded)

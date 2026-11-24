@@ -104,8 +104,11 @@ def every_byte(root: Path) -> bytes:
     return b"".join(p.read_bytes() for p in root.rglob("*") if p.is_file())
 
 
-def run_install(root, host, options=None, *, exchange=None, stdin=ENROL_TOKEN + "\n", out=None):
+def run_install(root, host, options=None, *, exchange=None, stdin=ENROL_TOKEN + "\n", out=None, environ=None, secret=None):
     said = [] if out is None else out
+    extra = {"environ": {} if environ is None else environ}
+    if secret is not None:
+        extra["secret"] = secret
     code = install.install(
         options or Options(url=URL, enrol_token="-"),
         host=host,
@@ -114,6 +117,7 @@ def run_install(root, host, options=None, *, exchange=None, stdin=ENROL_TOKEN + 
         read_stdin=lambda: stdin,
         interpreter=PYTHON,
         out=said.append,
+        **extra,
     )
     return code, said
 
@@ -281,7 +285,79 @@ def test_a_token_on_the_command_line_is_refused_and_not_repeated(root):
         out=(said := []).append,
     ), said
     assert code == 1 and "--enrol-token takes - alone" in said[-1]
+    assert "treat it as exposed: re-enrol the agent" in said[-1]
     assert ENROL_TOKEN not in said[-1] and read == [] and host.commands == []
+
+
+@pytest.mark.parametrize(
+    "inherited, ca, refused",
+    [
+        ({"SSL_CERT_FILE": "/etc/root-ca.pem"}, False, "SSL_CERT_FILE"),  # the reviewer's case
+        ({"SSL_CERT_DIR": "/etc/root-cas"}, False, "SSL_CERT_DIR"),
+        ({"SSL_CERT_DIR": "/etc/root-cas"}, True, "SSL_CERT_DIR"),  # a directory beside --ca-file
+        ({"SSL_CERT_FILE": "/etc/root-ca.pem"}, True, "SSL_CERT_FILE"),  # another file than --ca-file
+        ({"SSL_CERT_FILE": "CA"}, True, None),  # the --ca-file itself
+        ({"SSL_CERT_FILE": ""}, False, None),  # set but empty names nothing
+        ({}, False, None),
+    ],
+)
+def test_trust_inherited_from_roots_environment_is_refused_before_anything_changes(root, inherited, ca, refused):
+    """Round 2 of the review of #130: the exchange trusted what root's environment
+    named, the unit was given nothing, and the token was spent on an agent that could
+    not verify its server. Only what the unit is given may be trusted."""
+    bundle = root / "ca.pem"
+    bundle.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
+    environ = {name: (str(bundle) if value == "CA" else value) for name, value in inherited.items()}
+    host = FakeHost()
+    before = tree(root)
+    asked = []
+    code, said = run_install(
+        root, host, Options(url=URL, enrol_token="-", ca_file=str(bundle) if ca else None),
+        exchange=lambda *a: asked.append(a) or ANSWER, environ=environ,
+    )
+    if refused:
+        assert code == 1 and f"{refused} is set in this environment" in said[-1] and "--ca-file" in said[-1]
+        assert asked == [] and host.commands == [] and tree(root) == before
+    else:
+        assert code == 0, said
+
+
+def test_the_exchange_is_made_with_exactly_the_trust_the_unit_is_given(root, monkeypatch):
+    """What `install.exchange` hands the TLS context (OpenSSL reads both variables when
+    it is made) is what agent.env gives the unit, whatever the installer's own
+    environment held."""
+    bundle = root / "ca.pem"
+    bundle.write_bytes(b"")
+    for name in install.TRUST_VARIABLES:
+        monkeypatch.setenv(name, "/inherited")
+    seen = []
+
+    class Http:
+        def __init__(self, url, token):
+            seen.append({name: os.environ.get(name) for name in install.TRUST_VARIABLES})
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def exchange(http):
+        return ANSWER
+
+    monkeypatch.setattr(install, "make_http", Http)
+    monkeypatch.setattr(install.enrol, "exchange", exchange)
+    for ca in (str(bundle), None):
+        install.exchange(URL, ENROL_TOKEN, ca)
+        env = install.render_env(URL, None, None, ca, "/var/lib/tlg-ipam-agent/token")
+        given = dict(line.split("=", 1) for line in env.splitlines() if line.startswith("SSL_"))
+        assert seen[-1] == {name: given.get(name) for name in install.TRUST_VARIABLES}
+
+
+def test_install_learns_each_token_for_the_log_redaction(root):
+    learnt = []
+    code, _ = run_install(root, FakeHost(), secret=learnt.append)
+    assert code == 0 and learnt == [ENROL_TOKEN, TOKEN]
 
 
 def test_a_ca_file_the_service_user_cannot_read_stops_the_install_before_the_exchange(root):
@@ -615,6 +691,44 @@ def test_an_account_with_the_recorded_uid_and_another_group_is_left(root):
     assert any("left the tlg-ipam-agent account in place" in line for line in said)
 
 
+def test_an_uninstall_whose_userdel_failed_can_be_run_again(root):
+    """Round 2 of the review of #130: the record went before `userdel`, which failed
+    (the account busy), and the next uninstall left the account as not the install's.
+    The record now stays until the account and group are gone."""
+    host = FakeHost()
+    run_install(root, host)
+    record = root / "etc/tlg-ipam-agent/created-user"
+    host.fail = {"userdel": 8}
+    said = []
+    assert install.uninstall(host=host, paths=paths_in(root), out=said.append) == 1
+    assert host.user is True and record.exists()
+    assert any("exited with 8" in line for line in said)
+    assert tree(root) == {
+        "etc", "etc/systemd", "etc/systemd/system", "var", "var/lib",
+        "etc/tlg-ipam-agent", "etc/tlg-ipam-agent/created-user",
+    }
+    host.fail = {}
+    host.commands.clear()
+    assert install.uninstall(host=host, paths=paths_in(root), out=lambda s: None) == 0
+    assert host.commands == [("userdel", "tlg-ipam-agent")]
+    assert host.user is False and host.group is None
+    assert tree(root) == {"etc", "etc/systemd", "etc/systemd/system", "var", "var/lib"}
+
+
+def test_a_retry_removes_the_recorded_group_the_user_left(root):
+    host = FakeHost(group_stays=True)
+    run_install(root, host)
+    host.fail = {"groupdel": 6}
+    assert install.uninstall(host=host, paths=paths_in(root), out=lambda s: None) == 1
+    assert host.user is False and host.group == os.getgid()
+    assert (root / "etc/tlg-ipam-agent/created-user").exists()
+    host.fail = {}
+    host.commands.clear()
+    assert install.uninstall(host=host, paths=paths_in(root), out=lambda s: None) == 0
+    assert host.commands == [("groupdel", "tlg-ipam-agent")] and host.group is None
+    assert tree(root) == {"etc", "etc/systemd", "etc/systemd/system", "var", "var/lib"}
+
+
 def test_uninstall_with_nothing_installed_does_nothing(root):
     host = FakeHost()
     before = tree(root)
@@ -759,3 +873,141 @@ def test_a_token_read_from_a_terminal_is_not_echoed(monkeypatch):
 def test_the_token_file_mode_is_the_store_s_and_owner_only():
     assert enrol.TOKEN_MODE == 0o600
     assert store.PENDING_SUFFIX == ".new"
+
+
+# --- live TLS: the exchange and the unit trust the same CA (round 2 of #130) ---
+
+from test_tls import pki  # noqa: E402,F401  (the private CA and a certificate for 127.0.0.1)
+
+
+class TlsServer:
+    """An HTTPS server on 127.0.0.1, in a thread of its own, serving the enrol and
+    check-in routes as the server answers them. `seen` is every request it read."""
+
+    def __init__(self, cert_and_key):
+        import json
+        import ssl
+        import threading
+
+        self.seen: list[tuple[str, str]] = []
+        ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ctx.load_cert_chain(*cert_and_key)
+        self.loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        async def handle(reader, writer):
+            try:
+                head = await reader.readuntil(b"\r\n\r\n")
+                lines = head.decode().split("\r\n")
+                length = next((int(l.split(":")[1]) for l in lines if l.lower().startswith("content-length")), 0)
+                await reader.readexactly(length)
+                path = lines[0].split()[1]
+                self.seen.append((path, next((l for l in lines if l.lower().startswith("authorization")), "")))
+                data = (
+                    {"agent_id": "0b6f3c1e-1111-4222-8333-444455556666", "agent_token": TOKEN}
+                    if path.endswith("/enrol")
+                    else {"checkin_interval_s": 60, "jobs": []}
+                )
+                body = json.dumps({"data": data}).encode()
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n"
+                    + f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+                )
+                await writer.drain()
+            except (ssl.SSLError, asyncio.IncompleteReadError, ConnectionError):
+                pass  # a client that did not trust the certificate
+            finally:
+                writer.close()
+
+        async def start():
+            self.server = await asyncio.start_server(handle, "127.0.0.1", 0, ssl=ctx)
+            self.port = self.server.sockets[0].getsockname()[1]
+            ready.set()
+
+        self.thread = threading.Thread(target=lambda: (self.loop.run_until_complete(start()), self.loop.run_forever()), daemon=True)
+        self.thread.start()
+        ready.wait(5)
+
+    def close(self):
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(5)
+
+
+@pytest.fixture
+def tls_server(pki):
+    server = TlsServer(pki["loopback"])
+    yield server
+    server.close()
+
+
+def _as_the_service(root: Path, monkeypatch) -> Kind:
+    """A check-in made the way the unit's agent makes it: with no trust setting but
+    what agent.env gives (a unit inherits nothing of root's environment), and the
+    token the install stored."""
+    from tlg_ipam_agent.client import AgentClient, make_http
+
+    env = dict(
+        line.split("=", 1)
+        for line in (root / "etc/tlg-ipam-agent/agent.env").read_text().splitlines()
+        if line and not line.startswith("#")
+    )
+    for name in install.TRUST_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    for name in install.TRUST_VARIABLES:
+        if name in env:
+            monkeypatch.setenv(name, env[name])
+    token = (root / "var/lib/tlg-ipam-agent/token").read_text()
+
+    async def checkin():
+        async with make_http(env["IPAM_URL"], token) as http:
+            return await AgentClient(http).checkin({})
+
+    return asyncio.run(checkin()).kind
+
+
+def _live(root, tls_server, monkeypatch, *, ca=None, inherited=None):
+    for name in install.TRUST_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in (inherited or {}).items():
+        monkeypatch.setenv(name, value)
+    said = []
+    code = install.install(
+        Options(url=f"https://127.0.0.1:{tls_server.port}", enrol_token="-", ca_file=ca),
+        host=FakeHost(),
+        paths=paths_in(root),
+        read_stdin=lambda: ENROL_TOKEN + "\n",
+        interpreter=PYTHON,
+        out=said.append,
+        environ=os.environ,
+    )
+    return code, said
+
+
+def test_live_tls_an_install_with_ca_file_gives_the_unit_the_trust_it_enrolled_with(root, tls_server, pki, monkeypatch):
+    code, said = _live(root, tls_server, monkeypatch, ca=str(pki["ca"]))
+    assert code == 0, said
+    assert [path for path, _ in tls_server.seen] == ["/api/v1/agent/enrol"]
+    assert tls_server.seen[0][1].lower() == f"authorization: bearer {ENROL_TOKEN}".lower()
+    assert _as_the_service(root, monkeypatch) is Kind.OK
+    assert [path for path, _ in tls_server.seen][-1] == "/api/v1/agent/checkin"
+
+
+@pytest.mark.parametrize("name", ["SSL_CERT_FILE", "SSL_CERT_DIR"])
+def test_live_tls_trust_only_root_inherited_spends_nothing(root, tls_server, pki, monkeypatch, name):
+    """The reviewer's reproduction: the CA named only in root's environment. Before the
+    fix the exchange trusted it, enrolled, and the unit could not verify the server.
+    Now nothing reaches the server and nothing is written."""
+    value = str(pki["ca"]) if name == "SSL_CERT_FILE" else str(pki["ca"].parent)
+    before = tree(root)
+    code, said = _live(root, tls_server, monkeypatch, inherited={name: value})
+    assert code == 1 and f"{name} is set in this environment" in said[-1], said
+    assert tls_server.seen == [] and tree(root) == before
+
+
+def test_live_tls_with_no_trust_for_the_server_the_exchange_fails_before_any_request(root, tls_server, monkeypatch):
+    """Neither the exchange nor the unit trusts the private CA: the TLS handshake fails,
+    no request is sent, the token is not spent and the install is taken back."""
+    before = tree(root)
+    code, said = _live(root, tls_server, monkeypatch)
+    assert code == 1 and "no answer" in said[-1], said
+    assert tls_server.seen == [] and tree(root) == before

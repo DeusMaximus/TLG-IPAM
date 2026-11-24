@@ -156,7 +156,9 @@ def main(argv: list[str] | None = None) -> int:
                 allowed_cidrs=args.allowed_cidrs,
                 max_pps=args.max_pps,
                 ca_file=args.ca_file,
-            )
+            ),
+            # each token, once known, is taken out of every log record (round 2 of #130)
+            secret=configure_logging,
         )
     return _main_run()
 
