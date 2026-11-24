@@ -27,6 +27,28 @@ Template:
 
 ---
 
+## 2026-11-24 — Claude Code (Opus 5.5), worker — #132: bound request heads, idle connections, pipelining and stalled readers below the app (PR #135)
+- **Done:** [PR #135](https://github.com/DeusMaximus/TLG-IPAM/pull/135) (`132-header-idle-bounds`, head `e9855bb`) closes #132. (The worker's own last entry covered round 4 only; the orchestrator has put the whole PR here.)
+  - The image's `CMD` is `python -m app.serve` (`api/app/serve.py`): uvicorn's own command line, so `UVICORN_*` settings still apply, with six pinned over it (`workers=1`, no reload, `http=header_limit.HeaderLimitProtocol`, no HTTP/2, `ws="none"`, 5 s keep-alive).
+  - `api/app/header_limit.py`, a subclass of uvicorn's httptools protocol:
+    - a head (request line and headers) of at most 64 KiB as received, `431 HEADERS_TOO_LARGE`, counted exactly by cutting reads where a head and a declared body end; a head after a chunked body in the same 4 KiB piece is the one stated exception;
+    - 10 s for a connection to deliver a head, closed without an answer;
+    - one pipelined request held ahead, with reading paused meanwhile;
+    - 60 s for a client that stops reading (a paused send buffer, or a closed connection that does not flush), then abort;
+    - a refusal by the parser follows one rule: uvicorn's `400` only when no earlier request is still unanswered; otherwise the refused request is dropped without running and the earlier answers go out in order, the connection closing after the last. Plain uvicorn, and `main` before this, wrote the `400` in front of them, which could hide a committed write;
+    - a stated bound on parser calls a sender can force.
+  - Docs: brief §2.2, §4.3 (the "below the app" paragraph and "Left to the reverse proxy or tunnel"), the `/mcp` refusal table and §9 row; spec §5.7 and §8 (the proxy checklist for nginx, Caddy and Cloudflare Tunnel, every line from documentation); `AGENTS.md` bullets "One uvicorn worker" and "One request-body cap"; README. Four decision comments on #132 record what the image bounds and what stays the proxy's.
+  - Merged: `83e392e`, squash, on the owner's go-ahead; the remote branch is deleted. CI green and Codex clean on `e9855bb`; Greptile last read `e2c2ff3`, and the briefed rounds were the outside read after it. The briefed review took six sessions:
+    - GPT-6.1 Sol at `e2c2ff3` was stopped by its provider's safety filter before a verdict (hand-over in `.dev/132/manual-handover.md`); its five leads went to the worker.
+    - GPT-6 Sol with Daybreak Blue, started from T3 Code, then gave NO-GO at `9ec525c` (two P2s in §8's proxy advice), NO-GO at `48148de` (P2: a committed write lost its answer behind a parser refusal), NO-GO at `4df1508` (P2: the same by another route), and GO at `e9855bb` with no finding. The owner kept the Opus 5.5 worker after the second and third NO-GO.
+    - Between the second and third, the orchestrator measured that a fix it had suggested (cutting chunked bodies at every CRLF CRLF) let a sender hold the worker 1.3 s per 1.9 MB body, and sent it back before the round; `.dev/132/crlf_cost.py` and `lost_answer.py` are the scripts.
+    - The orchestrator ran 1,321 server tests on `e9855bb`. No follow-ups filed.
+- **Decisions:** Deliberate calls in the PR body. A floor in the image plus the proxy in front; httptools kept, not h11; the limit is on bytes as received; 64 KiB although Cloudflare passes 128 KB; no concurrency limit in the image; the subclass relies on uvicorn 0.54 internals (`cycle`, `pipeline`, `flow`, the parser callbacks), held by the tests on both event loops.
+- **State:** merged. Server 1,321 on its head (192 of them this PR's). No schema change.
+- **Waiting on the owner:** the next server image build is the first real start of the new `CMD`: nobody could build the image here.
+- **Untested:** the Docker image; every proxy setting in spec §8 (no proxy ran); a multi-day MCP stream.
+- **Next:** #31 writes the deployment document from spec §8. #132 no longer blocks exposing `/mcp` (#26, which still waits on #25).
+
 ## 2026-11-24 — Claude Code (Sonnet 5.5), worker — #139: qualify the bulk_create_hosts size example and the brief's import figures (PR #148)
 - **Done:**
   - [PR #148](https://github.com/DeusMaximus/TLG-IPAM/pull/148) (`139-import-size-wording`, head `cc6267c`) closes #139. Documentation and tests only: no limit, route or tool result changed. Three files: `api/app/mcp_server.py` (docstring), `TLG-IPAM-Project-Brief.md` (§5.2 row, §4.3 import-size paragraph only), `api/tests/test_length_limits.py`.
@@ -123,32 +145,3 @@ Template:
   - #24 publishes the first image at protocol 2.
   - #20 and #93 untouched; #144 is in the same agent file.
   - `web/src/pages/Agents.test.jsx` keeps a static fixture message that mentions protocols 2 and 1, which is harmless.
-
-## 2026-11-24 — Claude Code (Opus 5.5), worker — #23: guided install, pending enrolments, version flags, scan offers (PR #141)
-- **Done:**
-  - [PR #141](https://github.com/DeusMaximus/TLG-IPAM/pull/141) (`23-ui-guided-install`, head `1718163`) closes #23.
-  - The Add agent dialog is now the guided install of spec §5.6: Container and systemd tabs, each with prerequisites and commands pinned to the server's `/health` version. The systemd install reads the enrolment token from standard input (`--enrol-token -`).
-  - Agents page: Re-enrol (with the commands that remove an old token from the host first), a pending-enrolments list, an "update available" flag, a protocol-mismatch line, the update commands, and "Scan *subnet* with this agent?" offers.
-  - Server, read-only:
-    - `agents.agent_out` adds `update_available` (PEP 440, `packaging`) and `protocol_mismatch` (read from the prefix of the stored `last_error`).
-    - `scans.suggestions` serves `GET /api/v1/scan-targets/suggestions` in two statements; REST only.
-  - `packaging` is now a direct dependency. All four locks were regenerated; only their `# via` comments changed.
-  - Spec §5.6 gains the update and re-enrol command table and a paragraph on where the artefact names come from. The brief, README and `AGENTS.md` (one new bullet) are updated.
-  - Review fixes:
-    - `78ef42e` (Codex P2, Greptile P1): a container from the first release's install (`IPAM_AGENT_TOKEN`, no volume) is told to re-enrol rather than update.
-    - `1718163` (Greptile P2): the modal overlay scrolls.
-  - Merged: `a36c153`, squash, on the owner's go-ahead; the remote branch is deleted. CI green and Codex clean on `1718163`. Greptile read only the first head, so one outside read by Sol (GPT-6.1 Sol) stood in for its re-run: GO at `1718163` with three P3s, none of the 13 Deliberate calls overruled. The orchestrator ran 1,112 server and 154 web tests, lint and build on that head. The three P3s are filed as #143 (a disabled agent's enrolment shown as open; the pending list following the browser's clock; release versions not in normal form accepted).
-- **Decisions:** Deliberate calls 1–13 in the PR body. The main ones:
-  - The flags are computed on the server.
-  - The mismatch is read from `last_error`, so `agent_protocol.py` is untouched.
-  - Accepting an offer is `POST /scan-targets` with the server defaults, then one `POST /subnets/{id}/scan`.
-  - Only subnets with no scan target are offered.
-  - "Not now" lasts only while the page is open.
-- **State:**
-  - merged. Tests: server 1,112, agent 1,193, web 154.
-  - No schema change; `PROTOCOL_VERSION` unchanged.
-- **Waiting on the owner:** nothing from this entry.
-- **Untested:** the commands against real artefacts (#24); the dialogs in a real browser.
-- **Next:**
-  - #24 must publish `ghcr.io/deusmaximus/tlg-ipam-agent:<version>` and `releases/download/v<version>/tlg_ipam_agent-<version>-py3-none-any.whl`, and give the server and agent one version. Today they differ: the server's `settings.version` is `0.1.0` and the agent's `__version__` is `0.2.0.dev0`.
-  - #92 (the plain-HTTP warning before a token is issued) and #143 are the dialog's open follow-ups.
