@@ -9,7 +9,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..errors import ApiError, conflict, not_found, validation_error
 from ..ipnet import ip_in_subnet, iter_free, parse_cidr
 from ..models import Host, Observation, Subnet
-from ..schemas import AllocateRequest, BulkHostItem, HostCreate, HostOut, HostUpdate
+from ..schemas import (
+    HOST_NOTES_MAX,
+    AllocateRequest,
+    BulkHostItem,
+    HostCreate,
+    HostOut,
+    HostUpdate,
+)
 from ..times import utc
 from . import changes, scans
 from . import device_types as device_types_svc
@@ -132,6 +139,19 @@ def _check_not_reserved(ip_int: int, subnet: Subnet) -> None:
         )
 
 
+def _check_notes(notes: str | None, stored: str | None = None) -> None:
+    """A host's notes are at most HOST_NOTES_MAX characters. An update that resends the
+    notes the host already holds is let through unchanged, so a host stored with longer
+    notes before the limit (#91) can still be edited (the UI's form resends every
+    field) and loses nothing; changing those notes means meeting the limit. The value
+    is not repeated: it can be as long as the request-body cap."""
+    if notes is None or len(notes) <= HOST_NOTES_MAX or notes == stored:
+        return
+    raise validation_error(
+        f"notes: a host's notes may be at most {HOST_NOTES_MAX} characters, not {len(notes)}"
+    )
+
+
 def _label(host: Host) -> str:
     return host.hostname or host.ip
 
@@ -159,6 +179,7 @@ async def create_host(
     (`services/findings.accept`): a finding type, never an observed value. The summary
     then names the address and the finding, not the hostname, which came from a device
     on the network (spec §7.2, invariant 8)."""
+    _check_notes(payload.notes)
     subnet = await get_subnet(session, payload.subnet_id)
     addr = ip_in_subnet(payload.ip, subnet.cidr)
     _check_not_reserved(int(addr), subnet)
@@ -199,6 +220,8 @@ async def update_host(
     data = payload.model_dump(exclude_unset=True)
     if not data:
         raise validation_error("At least one host field must be provided")
+    if "notes" in data:
+        _check_notes(data["notes"], host.notes)
     if data.get("device_type") is None:
         data.pop("device_type", None)
     else:
@@ -254,7 +277,9 @@ async def bulk_create(
 ) -> dict:
     """Import many hosts in one transaction. Each record succeeds or fails on its
     own — duplicates are skipped and invalid records error, without aborting the
-    batch. Returns per-record results plus counts, and writes ONE audit entry."""
+    batch. A record over a length limit (`HOST_NOTES_MAX` for notes, `ipnet.DOMAIN_MAX`
+    for a domain) is that record's error, never a refused import. Returns per-record
+    results plus counts, and writes ONE audit entry."""
     subnet = await get_subnet(session, subnet_id)
     taken = await _allocated_ints(session, subnet_id)
     valid_types = await device_types_svc._canonical_map(session)
@@ -269,6 +294,7 @@ async def bulk_create(
                 raise validation_error("record must be an object")
             item = BulkHostItem(**raw)
             result["ip"] = item.ip
+            _check_notes(item.notes)
             canonical_type = valid_types.get(item.device_type.strip().lower())
             if canonical_type is None:
                 raise validation_error(
@@ -361,6 +387,7 @@ _ALLOCATE_ATTEMPTS = 5
 async def allocate_next(
     session: AsyncSession, subnet_id: str, payload: AllocateRequest, source: str
 ) -> Host:
+    _check_notes(payload.notes)
     data = payload.model_dump()
     data["device_type"] = await device_types_svc.resolve(session, data["device_type"])
     # A concurrent writer can claim the chosen IP between the free-list read and
