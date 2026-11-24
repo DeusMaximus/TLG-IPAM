@@ -316,6 +316,39 @@ async def test_an_arp_job_on_an_interface_without_a_mac_marks_nothing_dead(owner
     assert seen["10.0.0.3"].alive is True  # not marked dead by an incomplete scan
 
 
+@pytest.mark.parametrize("failure", ["unopenable", "cut-off"])
+async def test_an_arp_sweep_that_fails_after_a_whole_icmp_sweep_marks_nothing_dead(owner, failure):
+    """#100, round 1 of the briefed review, finding 2, through the real routes: the
+    ICMP sweep finishes, the ARP sweep does not (its socket cannot be opened, or the
+    deadline cuts it off), so `liveness_complete` is false and an address stored by
+    an earlier scan, silent in this one, stays alive."""
+    from tlg_ipam_agent.probe import ProbeError
+
+    agent_row, subnet, target = await setup(owner, methods=("icmp", "arp"))
+    prober = FakeProber(alive=["10.0.0.2", "10.0.0.3"])
+    arp = FakeArp({"10.0.0.2": "02:00:00:00:00:02", "10.0.0.3": "02:00:00:00:00:03"})
+    agent = make_agent(agent_row["token"], prober=prober, arp=arp, max_pps=10)
+    await agent.checkin_once()
+    await run_queued(agent)
+    assert (await target_of(owner, target["id"]))["last_scan_complete"] is True
+    assert (await observations(subnet["id"]))["10.0.0.3"].alive is True
+
+    prober.alive = {ipaddress.ip_address("10.0.0.2")}
+    del arp.hosts[ipaddress.ip_address("10.0.0.3")]
+    if failure == "unopenable":
+        arp.fail_open = ProbeError("ARP socket unavailable (OSError)")
+    await _ok(await owner.post(f"/api/v1/subnets/{subnet['id']}/scan"), 202)
+    await past_the_checkin_gap(agent_row["id"])
+    await agent.checkin_once()
+    # at 10 a second the 14 echo requests take 1.4 s; a 2 s job cuts the ARP sweep
+    await run_queued(agent, timeout_s=None if failure == "unopenable" else 2)
+    shown = await target_of(owner, target["id"])
+    assert shown["last_scan_complete"] is False
+    assert ("ARP socket unavailable" if failure == "unopenable" else "during the ARP sweep") in shown["last_scan_error"]
+    seen = await observations(subnet["id"])
+    assert seen["10.0.0.2"].alive is True and seen["10.0.0.3"].alive is True
+
+
 async def test_a_complete_icmp_scan_marks_a_quiet_address_dead(owner):
     agent_row, subnet, _ = await setup(owner, methods=("icmp",))
     prober = FakeProber(alive=["10.0.0.2", "10.0.0.3"])
@@ -709,17 +742,22 @@ async def test_lookups_that_send_nothing_keep_the_stored_names_at_one_packet_a_s
         ("servfail", False),
         ("refused", False),
         ("malformed", False),
+        ("cname-referral", False),
+        ("cname-only", False),
         ("nxdomain", True),
         ("nodata", True),
         ("empty", True),
+        ("cname-nodata", True),
     ],
 )
 async def test_what_the_responder_answers_decides_the_names_and_never_the_dead(owner, action, cleared):
     """Acceptance for #100 (option 4) through the real routes, the real resolver and a
     DNS responder on loopback. A first scan stores the names of three live addresses.
     In the second, one of them has left, and the responder gives `action` to every
-    query: silence, SERVFAIL, REFUSED or malformed bytes leave the stored names in
-    place, NXDOMAIN or a NOERROR without a PTR record clear them. Either way the scan
+    query: silence, SERVFAIL, REFUSED, malformed bytes, a CNAME followed by a
+    delegation (RFC 2317; round 1 of the briefed review, finding 1) or a CNAME left
+    unresolved leave the stored names in place; NXDOMAIN, or a NOERROR whose authority
+    holds the SOA or that carries no record at all, clears them. Either way the scan
     is complete, its liveness sweep whole, and the departed address is marked dead."""
     from test_probe import ANSWERS, responder
 
@@ -795,3 +833,56 @@ async def test_a_scan_whose_lookups_had_no_server_still_marks_the_departed_dead(
     assert seen["10.0.0.1"].alive is True and seen["10.0.0.2"].alive is False
     shown = await target_of(owner, target["id"])
     assert shown["last_scan_complete"] is False and shown["last_scan_error"] == NO_DNS_SERVER
+
+
+async def test_a_delegated_reverse_zone_keeps_the_name_and_the_next_server_supplies_it(owner):
+    """Round 1 of the briefed review, finding 1, through the real routes. The subnet
+    lists its DNS server twice (the owner API takes IPv4 servers only, and loopback has
+    one IPv4 address everywhere; `test_probe.py` asks two distinct servers). A first
+    scan stores the name. In the second, the first query is answered with a CNAME and
+    a delegation, and the lookup goes on to the next server, whose PTR record
+    replaces the name; at `dfae349` it stopped there and cleared it. In a third, both
+    answer that way, and the name stays."""
+    from test_probe import ANSWERS, responder
+
+    from tlg_ipam_agent.probe import DnsResolver
+
+    key = "1.0.0.10.in-addr.arpa."
+    ANSWERS[key] = "first.home.arpa."
+    transport, dns_responder, port = await responder()
+    try:
+        agent_row, subnet, target = await setup(owner, cidr="10.0.0.0/29", dns_servers=["127.0.0.1", "127.0.0.1"])
+        agent = make_agent(
+            agent_row["token"],
+            prober=FakeProber(alive=["10.0.0.1"]),
+            resolver=DnsResolver(port=port),
+            interfaces=[{"name": "eth0", "cidr": "10.0.0.5/29", "mac": None}],
+        )
+
+        async def scan_once(number):
+            if number > 1:
+                await past_the_request_cooldown(target["id"])
+                await _ok(await owner.post(f"/api/v1/subnets/{subnet['id']}/scan"), 202)
+                await past_the_checkin_gap(agent_row["id"])
+            await agent.checkin_once()
+            await run_queued(agent)
+            return (await _names(subnet))["10.0.0.1"], await target_of(owner, target["id"])
+
+        name, _ = await scan_once(1)
+        assert name == "first.home.arpa" and len(dns_responder.arrivals) == 1
+
+        dns_responder.script = ["cname-referral", "answer"]
+        ANSWERS[key] = "second.home.arpa."
+        name, shown = await scan_once(2)
+        assert name == "second.home.arpa" and len(dns_responder.arrivals) == 3
+        assert shown["last_scan_complete"] is True and shown["last_scan_error"] is None
+
+        dns_responder.script = ["cname-referral"]
+        ANSWERS[key] = "third.home.arpa."
+        name, shown = await scan_once(3)
+        assert name == "second.home.arpa" and len(dns_responder.arrivals) == 5
+        assert shown["last_scan_complete"] is True
+        assert shown["last_scan_error"] == scan.no_answer(1, 1)
+    finally:
+        transport.close()
+        ANSWERS.pop(key, None)
