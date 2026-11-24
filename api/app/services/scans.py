@@ -19,7 +19,7 @@ through `services/subnets`, which imports it.
 from bisect import bisect_right
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete, false, or_, select, update
+from sqlalchemy import delete, exists, false, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
@@ -34,7 +34,7 @@ from ..ipnet import (
     usable_bounds,
 )
 from ..models import Agent, FindingDismissal, Observation, ReservedRange, ScanTarget, Subnet
-from ..schemas import ScanTargetCreate, ScanTargetOut, ScanTargetUpdate
+from ..schemas import ScanSuggestionOut, ScanTargetCreate, ScanTargetOut, ScanTargetUpdate
 from ..times import utc
 from . import changes
 
@@ -388,6 +388,58 @@ async def target_out(session: AsyncSession, target: ScanTarget) -> dict:
     """One target's answer, built as the list builds each (`targets_out`)."""
     [answer] = await targets_out(session, [target])
     return answer
+
+
+async def suggestions(session: AsyncSession) -> list[dict]:
+    """Subnets an agent could scan, for the Agents page's offer "Scan *subnet* with this
+    agent?" (spec §5.6, "Suggest, don't assume"): every pair of an `active` agent and a
+    subnet that has no scan target, is large enough to scan (`check_prefix`) and is on
+    the link of an interface the agent reported at its last accepted check-in, by the
+    rule `arp` is judged by (`jobs.l2_local`). An agent that has never checked in has
+    reported no interface, so it is offered nothing until its first check-in.
+
+    Read-only: nothing is stored and nothing is scanned. Accepting an offer is the
+    owner's `POST /scan-targets` with the subnet and the agent, and the defaults
+    (`schemas.ScanTargetCreate`). REST only, like the scan-target answer: no MCP tool
+    returns it.
+
+    Two statements whatever the number of agents and subnets, each reading only the
+    columns the answer uses (a subnet's notes have no length bound); ordered by agent
+    name, then subnet name, CIDR and id."""
+    # jobs imports this module, so it is imported here
+    from . import jobs
+
+    agents = (
+        await session.execute(
+            select(Agent.id, Agent.name, Agent.interfaces)
+            .where(Agent.state == "active")
+            .order_by(Agent.name, Agent.id)
+        )
+    ).all()
+    linked = [a for a in agents if a.interfaces]
+    if not linked:
+        return []
+    untargeted = ~exists().where(ScanTarget.subnet_id == Subnet.id)
+    subnets = (
+        await session.execute(
+            select(Subnet.id, Subnet.name, Subnet.cidr)
+            .where(untargeted)
+            .order_by(Subnet.name, Subnet.cidr, Subnet.id)
+        )
+    ).all()
+    scannable = [s for s in subnets if parse_cidr(s.cidr).prefixlen >= MIN_PREFIX]
+    return [
+        ScanSuggestionOut(
+            agent_id=agent.id,
+            agent_name=agent.name,
+            subnet_id=subnet.id,
+            subnet_name=subnet.name,
+            subnet_cidr=canonical_cidr(subnet.cidr),
+        ).model_dump()
+        for agent in linked
+        for subnet in scannable
+        if jobs.l2_local(subnet, agent.interfaces)
+    ]
 
 
 def _label(subnet: Subnet) -> str:

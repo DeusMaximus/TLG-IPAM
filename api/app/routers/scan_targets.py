@@ -15,6 +15,12 @@ async def list_scan_targets(session: AsyncSession = Depends(get_session)):
     return {"data": data, "total": len(data)}
 
 
+@router.get("/suggestions")
+async def list_scan_suggestions(session: AsyncSession = Depends(get_session)):
+    data = await svc.suggestions(session)
+    return {"data": data, "total": len(data)}
+
+
 @router.post("", status_code=201)
 async def create_scan_target(
     payload: ScanTargetCreate,

@@ -407,6 +407,11 @@ class AgentOut(BaseModel):
     job_issued_at: UtcDatetime | None
     created_at: UtcDatetime
     tokens: list[TokenOut]
+    # Computed on read by `services/agents.agent_out`; nothing stores them. Whether the
+    # agent's release is older than the server's (null: either is unknown or not a
+    # version), and whether its last check-in was refused for another protocol.
+    update_available: bool | None = None
+    protocol_mismatch: bool = False
 
 
 class AgentEnrolment(AgentOut):
@@ -454,6 +459,19 @@ class ScanTargetUpdate(BaseModel):
         if v is None:
             raise ValueError("must not be null")
         return v
+
+
+class ScanSuggestionOut(BaseModel):
+    """A subnet an agent could scan (`scans.suggestions`): the Agents page offers "Scan
+    *subnet* with this agent?" for it, and accepting creates the subnet's scan target
+    with the default methods and scope."""
+
+    agent_id: str
+    agent_name: str
+    subnet_id: str
+    subnet_name: str
+    # `ipnet.canonical_cidr`, whatever the row holds
+    subnet_cidr: str
 
 
 class ScopeRangeOut(ScanRange):

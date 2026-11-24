@@ -10,10 +10,6 @@ export const CHECKIN_INTERVAL_S = 60
 export const ONLINE_WITHIN_MS = 3 * CHECKIN_INTERVAL_S * 1000
 export const LATE_WITHIN_MS = 15 * 60 * 1000
 
-// The agent image, from the project's GitHub container registry (spec §5.6),
-// tagged with the server's version. The release pipeline that publishes it is #24.
-export const AGENT_IMAGE = 'ghcr.io/deusmaximus/tlg-ipam-agent'
-
 // A server time no more than this far ahead of the browser's clock is read as "now";
 // one further ahead is not read as an age at all (`serverAge`). One check-in interval:
 // ordinary drift between the browser's clock and the server's is seconds, and stays
@@ -88,44 +84,23 @@ export function openEnrolment(agent, now = Date.now()) {
   )
 }
 
-// Leave a value bare when it has no shell metacharacters; single-quote it otherwise
-export function shellQuote(value) {
-  const s = String(value)
-  return /^[A-Za-z0-9_./:=@%+-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`
+// Every enrolment token still open, by this browser's clock: one row per agent of the
+// "Pending enrolments" list (spec §5.8), listed until it is used or expires. An agent
+// holds at most one, since re-enrol revokes the one it replaces.
+export function pendingEnrolments(agents, now = Date.now()) {
+  return (agents || [])
+    .map((agent) => ({ agent, token: openEnrolment(agent, now) }))
+    .filter((p) => p.token)
 }
 
-// The M2a container command (spec §5.6): host networking and CAP_NET_RAW, the
-// server URL and the agent token, or a placeholder for it when the page does not hold
-// it. ALLOWED_CIDRS and MAX_PPS keep their defaults.
-export function containerCommand({ url, token, version }) {
-  return [
-    'docker run -d --name tlg-ipam-agent --restart unless-stopped \\',
-    '  --network host --cap-add NET_RAW \\',
-    `  -e IPAM_URL=${shellQuote(url)} \\`,
-    `  -e IPAM_AGENT_TOKEN=${token ? shellQuote(token) : '<agent token>'} \\`,
-    `  ${AGENT_IMAGE}:${version ? shellQuote(version) : '<version>'}`,
-  ].join('\n')
-}
-
-// The server URL an agent may be given (the agent's own `config.parse_url` rule):
-// `https`, or plain `http` only to a loopback host, where nothing crosses a network.
-// A page served over plain `http` from any other host gets null, so no command built
-// from it sends a token in clear.
-const LOOPBACK_HOST = /^(localhost|127(\.\d{1,3}){3}|\[::1\])$/i
-export const SERVER_URL_PLACEHOLDER = 'https://<server>'
-export function agentServerUrl({ protocol, hostname, origin }) {
-  if (protocol === 'https:') return origin
-  if (protocol === 'http:' && LOOPBACK_HOST.test(hostname)) return origin
-  return null
-}
-
-// The enrolment exchange by hand (spec §5.7, POST /api/v1/agent/enrol), until the
-// agent makes it itself on first start (#22). Its answer carries the agent token,
-// `{"data": {"agent_id": …, "agent_token": "tlga_…"}}`.
-export function enrolCommand({ url, token }) {
-  return [
-    `curl -fsS -X POST ${shellQuote(`${url}/api/v1/agent/enrol`)} \\`,
-    `  -H ${shellQuote(`Authorization: Bearer ${token}`)} \\`,
-    `  -H 'Content-Type: application/json' -d '{}'`,
-  ].join('\n')
+// How long an open enrolment token has left: "in 42m", "in 30s"; null once it is due
+export function timeLeft(value, now = Date.now()) {
+  const date = parseServerTime(value)
+  if (!date) return null
+  const s = Math.floor((date.getTime() - now) / 1000)
+  if (s <= 0) return null
+  if (s < 60) return `in ${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 120) return `in ${m}m`
+  return `in ${Math.floor(m / 60)}h`
 }

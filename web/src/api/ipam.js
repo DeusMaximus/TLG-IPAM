@@ -67,10 +67,14 @@ export const listAgents = () => api('/api/v1/agents')
 export const createAgent = (body) => api('/api/v1/agents', { method: 'POST', body })
 export const updateAgent = (id, body) => api(`/api/v1/agents/${id}`, { method: 'PUT', body })
 export const revokeAgentTokens = (id) => api(`/api/v1/agents/${id}/revoke`, { method: 'POST' })
+// a new enrolment token for an existing agent: the only other response that carries one
+export const reEnrolAgent = (id) => api(`/api/v1/agents/${id}/re-enrol`, { method: 'POST' })
 export const deleteAgent = (id) => api(`/api/v1/agents/${id}`, { method: 'DELETE' })
 
 // scan targets
 export const listScanTargets = () => api('/api/v1/scan-targets')
+// "Scan <subnet> with this agent?": subnets on an agent's link with no scan target yet
+export const listScanSuggestions = () => api('/api/v1/scan-targets/suggestions')
 export const createScanTarget = (body) => api('/api/v1/scan-targets', { method: 'POST', body })
 export const updateScanTarget = (id, body) =>
   api(`/api/v1/scan-targets/${id}`, { method: 'PUT', body })
