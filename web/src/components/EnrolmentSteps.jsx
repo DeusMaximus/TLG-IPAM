@@ -14,20 +14,65 @@ import InstallTabs, { Prerequisites } from './InstallTabs'
 
 // The page's server address as an agent may be given it, or a placeholder (and a
 // warning) when the page is on plain http across a network: no command it shows then
-// sends a token in clear. `location` is the page's own (`window.location`).
+// sends a token in clear. `location` is the page's own (`window.location`). `secure` is
+// the one test of which pages are warned, here and in the steps before a token is
+// issued: `agentServerUrl`'s, by the protocol and hostname the browser gives.
 export function serverUrlFor(location) {
   const secure = agentServerUrl(location)
   return { url: secure ?? SERVER_URL_PLACEHOLDER, secure: Boolean(secure) }
 }
 
-export function PlainHttpWarning() {
+const warningCls = 'mt-3 text-xs text-amber-200'
+
+// On such a page, before the request that issues an enrolment token (Add agent's
+// Create, re-enrol's Issue): the server's answer brings the token to this browser, so it
+// crosses the network in clear whatever the commands do afterwards. It warns; it does
+// not stop the owner.
+export function PlainHttpBeforeIssue() {
   return (
-    <p className="mt-3 text-xs text-amber-200" data-testid="agent-needs-https">
-      This page is served over plain HTTP, which would carry the enrolment token across the
-      network in clear. The commands below use <code>{SERVER_URL_PLACEHOLDER}</code>: put the
-      server&apos;s HTTPS address in its place. The agent refuses a plain-HTTP server address
-      anyway, unless it is on the agent&apos;s own host.
+    <p role="note" className={warningCls} data-testid="agent-plain-http-before">
+      This page is served over plain HTTP, so the enrolment token the next step shows reaches
+      this browser across the network in clear, where anyone who can watch the traffic can read
+      it and exchange it before the agent does. To keep it off the network, open this page over
+      HTTPS, or on the server&apos;s own host, first. The agent will need the server&apos;s HTTPS
+      address either way: the commands on the next step use{' '}
+      <code>{SERVER_URL_PLACEHOLDER}</code> in its place.
     </p>
+  )
+}
+
+// On such a page, the commands carry the placeholder. With `issued`, beside a token the
+// server has just sent: it has crossed in clear already, and the agent token, which the
+// exchange returns, crosses only if the exchange is made over plain http, which these
+// commands never make. Without it (the update commands) no token is on show.
+export function PlainHttpWarning({ issued }) {
+  return (
+    <div className={`${warningCls} space-y-1`} data-testid="agent-needs-https">
+      {issued ? (
+        <>
+          <p>
+            This page is served over plain HTTP, so the enrolment token above has already crossed
+            the network in clear. Until the agent exchanges it, anyone who read it on the way can
+            exchange it in the agent&apos;s place: run the agent soon. If its exchange is refused,
+            someone may have made it first: revoke this agent&apos;s token, then re-enrol it from
+            a page served over HTTPS or on the server&apos;s own host.
+          </p>
+          <p>
+            The agent token, which the exchange returns, crosses in clear only if the exchange is
+            made over plain HTTP, and the commands below do not make it so: they use{' '}
+            <code>{SERVER_URL_PLACEHOLDER}</code>. Put the server&apos;s HTTPS address in its
+            place. The agent refuses a plain-HTTP server address anyway, unless it is on the
+            agent&apos;s own host.
+          </p>
+        </>
+      ) : (
+        <p>
+          This page is served over plain HTTP, so the commands below use{' '}
+          <code>{SERVER_URL_PLACEHOLDER}</code>: put the server&apos;s HTTPS address in its place.
+          The agent refuses a plain-HTTP server address, unless it is on the agent&apos;s own host.
+        </p>
+      )}
+    </div>
   )
 }
 
@@ -75,7 +120,7 @@ export default function EnrolmentSteps({ token, expires, serverVersion, location
         </span>
       </div>
       <CopyBlock label="Enrolment token" text={token} testId="agent-token" />
-      {!secure && <PlainHttpWarning />}
+      {!secure && <PlainHttpWarning issued />}
       <VersionNote serverVersion={serverVersion} />
       <InstallTabs>
         {(tab) =>
