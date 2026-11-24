@@ -1,0 +1,64 @@
+# Releases
+
+What a release is, the owner's one-time setup before the first, and the checklist for each. The workflow is `.github/workflows/release.yml` (#24, spec §5.6). Releasing is the owner's: an agent prepares the version bump, the owner pushes the tag.
+
+## What a release is
+
+One version names the server and the scan agent: `VERSION` in `api/app/version.py` and `__version__` in `agent/src/tlg_ipam_agent/__init__.py`, the same string (`agent/tests/test_release.py` and `web/src/utils/install.test.js` fail otherwise). It is a PEP 440 public version in normal form, with no local `+…` part and no epoch. A server reports it at `GET /health`, its Agents page pins the install and update commands to it, and an agent that reports an older one is flagged "update available". Between releases, `main` carries the next release's `.dev0` (`0.3.0.dev0` after `0.2.0`).
+
+A release is the tag `v<version>` on a commit of `main` at that version. Pushing it runs the workflow, which publishes the two artefacts the install commands name (`web/src/utils/install.js`):
+
+| Artefact | Name | Where |
+|----------|------|-------|
+| Agent image, `linux/amd64` and `linux/arm64` | `ghcr.io/deusmaximus/tlg-ipam-agent:<version>` | GitHub container registry |
+| Agent wheel | `tlg_ipam_agent-<version>-py3-none-any.whl` | the GitHub release `v<version>`, so at `https://github.com/DeusMaximus/TLG-IPAM/releases/download/v<version>/…` |
+
+The server is not published as an image: it is built from the tag (`git checkout v<version> && docker compose up --build`), and then reports that version. A server built from `main` between releases reports a `.devN` version that names no artefact, so its install commands do not resolve. Use a release.
+
+### What the workflow does
+
+| Job | Runs on | Permission, and what for | Does |
+|-----|---------|--------------------------|------|
+| `build` | every trigger | `contents: read`, to check out the code | Checks that the tagged commit is on `main`, that the two versions are one release version and the tag is `v<version>` (`.github/scripts/release_check.py version`), and that the page's `install.releaseVersion` takes it. Builds the wheel with `python -m flit_core.wheel` from the hashed `agent/requirements-build.txt`, at the commit's time (`SOURCE_DATE_EPOCH`), so a rebuild is the same file. Checks its name, metadata and files (`release_check.py wheel`), then installs it with the agent's locked dependencies on Python 3.11 and 3.13 and runs `--version`. Builds the image for both platforms into one OCI archive, with no provenance or SBOM attestation. Then it takes each platform's image out of that archive and runs the start-up checks on it (`.github/scripts/check-agent-image.sh`, `--network none`, arm64 under QEMU). Records the wheel's SHA-256, the image index's digest and the archive's SHA-256, and uploads the wheel and the archive as the run's `release` artefact (kept 7 days). |
+| `publish-image` | a pushed tag | `packages: write`, to push to ghcr.io | Downloads the artefact and checks the archive's SHA-256. If `:<version>` already exists, it must already be this digest (a re-run), or the job fails. It pushes only when the registry answers that the tag is absent (`MANIFEST_UNKNOWN` or `NAME_UNKNOWN`). Any other failure to read the tag is tried three times, then stops the job with nothing pushed, so a registry error never lets a version be overwritten. Otherwise it pushes the archive as it is (`skopeo copy --all --preserve-digests`) and checks the registry now serves that digest. Checks out nothing. |
+| `publish-release` | a pushed tag, after `publish-image` | `contents: write`, to create the release and attach the wheel | Checks the wheel's SHA-256 and creates the release `v<version>` (`--verify-tag`), with the wheel attached and the digest and checksum in its notes. A pre-release version (`rc`, `.dev`) is marked as a pre-release. On a re-run, a release that already holds the wheel must hold this one, or the job fails; one without it gets it attached, and a draft an interrupted run left behind is then published. Checks out nothing. |
+| `verify` | a pushed tag, after `publish-release` | `contents: read`, to check out the image check script | Reads the image's index from the registry and pulls it with no credential, as an operator's host would, then runs the start-up checks. Downloads the wheel from the release URL and checks its SHA-256. Runs the systemd tab's `pip install <release wheel URL>` into a fresh venv on the runner's own Python. |
+
+Every other permission is none (`permissions: {}` at the top). Every action is pinned to a commit, and the BuildKit and binfmt images the build runs are pinned to digests. A pull request that changes what goes into the artefacts (`agent/`, `api/app/version.py`, `install.js`, the workflow or its scripts) runs `build` alone, and so does a run by hand (Actions → Release → Run workflow), which has no input that turns publishing on. No `latest` tag is pushed, nothing goes to PyPI, and nothing is signed: the install commands name an exact version, and the release notes carry the digest and checksum to compare against.
+
+## One-time setup, before the first tag
+
+1. **Workflow permissions.** The repository's default token permission (Settings → Actions → General → Workflow permissions) can stay read-only: each job asks for what it uses. Nothing changes here unless the account forbids workflows from asking for write permissions.
+2. **The container package.** If `ghcr.io/deusmaximus/tlg-ipam-agent` does not exist yet, the first `publish-image` creates it, connected to this repository by the image's `org.opencontainers.image.source`. If it exists already (pushed by hand earlier), open it (Profile → Packages → `tlg-ipam-agent` → Package settings → Manage Actions access) and give this repository the **Write** role. Without that, `publish-image` fails with `denied`.
+3. **Make the package public, after the first publish.** A new container package is private, so `docker pull` without a login fails and `verify` fails with "cannot be read without a credential". In Package settings → Danger Zone → Change visibility, choose **Public**, then re-run `verify` from the workflow run (Re-run failed jobs). This is needed once: later versions inherit the package's visibility.
+4. **Optional hardening:**
+   - A tag ruleset (Settings → Rules → Rulesets → New tag ruleset, target `v*`) that restricts creation, update and deletion to the owner. It stops a version tag being pushed or moved by anyone else with write access.
+   - Release immutability (Settings → General → Releases), so a published release's wheel and tag cannot be changed afterwards. `gh release create` attaches the wheel to a draft before publishing it, so the first run works with it. A re-run that had to attach the wheel to a release already published would be refused. Release the next version instead.
+
+## Checklist for each release
+
+1. **Pick the version**: `X.Y.Z`, or `X.Y.ZrcN` for a release candidate. It is a pre-release, and the install commands of a server at that version use it like any other.
+2. **Read what changed since the last tag** (`git log v<last>..main`). If `PROTOCOL_VERSION` (`api/app/agent_protocol.py`) changed, every agent must be updated together with the server: an older agent's check-ins are refused with a protocol mismatch, and it is given no scans until it runs the new release. Say so in the release notes (edit them after the run).
+3. **Bump PR.** A PR that sets `VERSION` in `api/app/version.py` and `__version__` in `agent/src/tlg_ipam_agent/__init__.py` to `X.Y.Z`, and nothing else. Its Release workflow run builds and checks both artefacts at `X.Y.Z` (the run on the PR publishes nothing). Merge it with CI green.
+4. **Tag the merge commit** on `main`, and push the tag:
+
+   ```sh
+   git fetch origin && git checkout --detach origin/main
+   git log -1 --oneline          # the bump's merge commit
+   git tag -a vX.Y.Z -m vX.Y.Z
+   git push origin vX.Y.Z
+   ```
+
+   A tag is pushed once. Never move or reuse one: an operator who installed `X.Y.Z` has those artefacts.
+5. **Watch the run** (Actions → Release): `build`, `publish-image`, `publish-release`, `verify`. On the first release, `verify` stops at the package's visibility (setup step 3).
+6. **See it from an operator's side.** The release page lists the wheel, and its notes give the image digest. Build the server from the tag and open Agents → Add agent: both tabs' commands name `X.Y.Z`, and the image and wheel URL they show are the published ones. An agent of the previous release is flagged "update available".
+7. **Open the next cycle.** A PR that sets both versions to the next `.dev0` (`X.Y.(Z+1).dev0`, or `X.(Y+1).0.dev0`).
+8. **Hand-off entry**: the version, the run, the image digest, anything that failed and how it was fixed.
+
+## When a step fails
+
+- **`build`:** nothing was published. Fix the cause on `main` with a PR. Then delete the tag (`git push --delete origin vX.Y.Z`, and `git tag -d vX.Y.Z` locally) and tag the fixed commit with the same version. This is the one case where a tag is reused, since nothing was published under it.
+- **`publish-image`:** `denied` means setup step 2. "Could not tell whether … exists, so nothing was pushed" means the registry failed to answer three times: re-run the failed jobs. Anything else: re-run the failed jobs of the same run. The build is not repeated, and the archive is pushed by its digest.
+- **`publish-release`:** the image is already published. Re-run the failed jobs: `publish-image` finds its digest already there and goes on, and `publish-release` finishes a release it had left as a draft (the wheel checked or attached, then published).
+- **`verify`:** on the first release, setup step 3. Otherwise compare what it fetched with the digests the build recorded (in the job's log and the release notes) before doing anything else.
+- **A release that is wrong once published:** do not replace its artefacts (the workflow refuses to) or move its tag. Release the next patch version, and say in the bad release's notes which version replaces it.

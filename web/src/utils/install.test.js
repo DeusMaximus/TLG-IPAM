@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import {
   AGENT_IMAGE,
+  RELEASE_DOWNLOADS,
   agentServerUrl,
   containerForget,
   containerRun,
@@ -150,6 +151,43 @@ describe('the version the commands are pinned to', () => {
     expect(systemdInstall({ url: URL_, version: undefined })).toContain(
       "'https://github.com/DeusMaximus/TLG-IPAM/releases/download/v<version>/tlg_ipam_agent-<version>-py3-none-any.whl'"
     )
+  })
+})
+
+// The release pipeline (#24) publishes what these commands name, at the one version the
+// server and the agent share: its workflow names the image and the downloads as this
+// module does, and both version literals are the same release version
+const REPO = new URL('../../../', import.meta.url)
+const read = (path) => readFileSync(new URL(path, REPO), 'utf8')
+
+describe('the release publishes what the commands name', () => {
+  const WORKFLOW = read('.github/workflows/release.yml')
+
+  it('names the image and the release downloads as the commands do', () => {
+    expect(WORKFLOW).toMatch(new RegExp(`^  IMAGE: ${escape(AGENT_IMAGE)}$`, 'm'))
+    expect(WORKFLOW).toMatch(new RegExp(`^  RELEASES: ${escape(RELEASE_DOWNLOADS)}$`, 'm'))
+  })
+
+  it('attaches the wheel under the name the URL ends with, to the release v<version>', () => {
+    const name = 'tlg_ipam_agent-$VERSION-py3-none-any.whl'
+    expect(wheelUrl('9.8.7').endsWith('/v9.8.7/' + name.replace('$VERSION', '9.8.7'))).toBe(true)
+    // the release job's name and tag, and the verify job's download
+    expect(WORKFLOW).toContain(`name="${name}"`)
+    expect(WORKFLOW).toContain('tag="v$VERSION"')
+    expect(WORKFLOW).toContain('url="$RELEASES/v$VERSION/$name"')
+    // the image under the bare version, which imageRef renders
+    expect(WORKFLOW).toContain('ref="docker://$IMAGE:$VERSION"')
+  })
+
+  it('is at the one version of the server and the agent, which the page pins to', () => {
+    const literal = (path, name) => {
+      const found = [...read(path).matchAll(new RegExp(`^${name} = "([^"]*)"$`, 'gm'))]
+      expect(found.length).toBe(1)
+      return found[0][1]
+    }
+    const server = literal('api/app/version.py', 'VERSION')
+    expect(literal('agent/src/tlg_ipam_agent/__init__.py', '__version__')).toBe(server)
+    expect(releaseVersion(server)).toBe(server)
   })
 })
 

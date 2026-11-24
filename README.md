@@ -92,7 +92,7 @@ On its first start the agent exchanges the enrolment token and stores the agent 
 
 Host networking puts the agent on the VLAN itself, and `NET_RAW` lets it send ICMP echo requests and ARP requests. `--cap-add NET_RAW` adds that capability to Docker's default set rather than leaving the container with it alone; add `--cap-drop ALL` before it if you want only that one. Rootless container runtimes cannot grant a usable `NET_RAW` on the host network and are not supported. `docker logs tlg-ipam-agent` shows the enrolment, each check-in refusal, each job and how it ended.
 
-The image is not published yet. Until it is, build it from this repository and tag it with the version in the command:
+Each release publishes the image under the server's version, for `linux/amd64` and `linux/arm64`, so the command pulls the one that matches your server. A server built from `main` between releases reports a development version (`0.3.0.dev0`, say) that no image carries; run a release, or build the image yourself and tag it with that version:
 
 ```sh
 docker build -f agent/Dockerfile -t ghcr.io/deusmaximus/tlg-ipam-agent:<version> agent
@@ -104,7 +104,7 @@ On an LXC or VM with systemd and Python 3.11 or later (with `venv`), as root:
 
 ```sh
 sudo python3 -m venv /opt/tlg-ipam-agent
-sudo /opt/tlg-ipam-agent/bin/pip install <the agent's wheel>
+sudo /opt/tlg-ipam-agent/bin/pip install https://github.com/DeusMaximus/TLG-IPAM/releases/download/v<version>/tlg_ipam_agent-<version>-py3-none-any.whl
 sudo /opt/tlg-ipam-agent/bin/tlg-ipam-agent install --url https://ipam.home.arpa --enrol-token -
 ```
 
@@ -114,7 +114,7 @@ sudo /opt/tlg-ipam-agent/bin/tlg-ipam-agent install --url https://ipam.home.arpa
 
 To update, install the new wheel into the same environment and run `install` again without `--enrol-token`: it keeps the stored token (and makes sure the service user owns it). `sudo /opt/tlg-ipam-agent/bin/tlg-ipam-agent uninstall` stops the unit and removes it, both directories, and the service user if `install` created it (an account it found there is left; if removing the account fails, say because a process still runs as it, the record of it is kept and `uninstall` can simply be run again); then remove `/opt/tlg-ipam-agent` yourself, and revoke or delete the agent on the Agents page. To enrol a host again, uninstall and install with the new token.
 
-The wheel is not published yet. Until it is, build it from this repository (`agent/README.md` says how) and give its path to `pip install`.
+Each release attaches the wheel to its GitHub release, and the Agents page fills in the server's version. For a server built from `main` between releases, build the wheel from this repository (`agent/README.md` says how) and give its path to `pip install`.
 
 ### Settings
 
