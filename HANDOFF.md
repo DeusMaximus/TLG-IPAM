@@ -27,6 +27,35 @@ Template:
 
 ---
 
+## 2026-11-25 — Claude Code (Opus 5.5), worker — #92: say before an enrolment token is issued that the page is on plain HTTP (PR #157)
+- **Merged:** 2026-11-25, squash `2abfcb4`, at head `884cda2`; branch deleted. Entry committed by the orchestrator, with the state lines brought up to date. The orchestrator ran lint, the 188 web tests and the build at the head before the merge.
+- **Done:** [PR #157](https://github.com/DeusMaximus/TLG-IPAM/pull/157) (`92-plain-http-warning`, head `884cda2`) closes #92.
+  - `web/src/components/EnrolmentSteps.jsx`: `PlainHttpBeforeIssue` (new, `agent-plain-http-before`) is shown before the request that issues a token. `PlainHttpWarning` (`agent-needs-https`) now has two wordings. With `issued`, beside the token: the token has already crossed in clear; run the agent soon; if its exchange is refused, revoke and re-enrol over HTTPS; the agent token crosses only over a plain-HTTP exchange, which the commands never make. Without it (update commands): no mention of a token.
+  - `AddAgentModal` form and `ReEnrolModal` confirmation show the notice when `!serverUrlFor(location).secure`; both still issue. The rule stays `install.agentServerUrl`'s; `web/` parses no address. No command changed (`install.js` and its test untouched).
+  - Docs: spec §5.6 has a new bullet, "A page served over plain HTTP"; brief §6.2 has a sentence on it; `AGENTS.md` guided-install bullet has one sentence.
+  - Tests: web 179 → 188 (`Agents.test.jsx`). The before-issue tests fail with the notice removed; the before-issue and update tests fail with the old wording restored. Server 1,340 and agent 1,388 pass (no code changes there).
+  - Review: Codex clean and Greptile 5/5 on `884cda2`; CI green (6 checks). No fix commits. It owed no briefed round.
+- **Decisions:** PR body Deliberate calls 1–4. Re-enrol warns before issuing too. The update dialog's warning drops the token wording. The remedy is revoke then re-enrol, not delete (keeps the scan targets) and not disable (enabling would revive the other party's token). The notice warns and does not block.
+- **State:** merged. No schema change; `PROTOCOL_VERSION` unchanged; no server or agent change.
+- **Waiting on the owner:** nothing from this PR.
+- **Untested:** a real browser on a real plain-HTTP origin (jsdom tests pass a `location` object).
+- **Next:** the owner key crossing in clear from such a page stays #31's (deployment guidance).
+
+## 2026-11-24 — Claude Code (Opus 5.5), worker — #138: the unit discards the CA trust settings the system manager supplies (PR #152)
+- **Merged:** 2026-11-25, squash `0537950`, at head `cbc4c9c`; branch deleted. Entry committed by the orchestrator, with the review and merge lines brought up to date.
+- **Done:** [PR #152](https://github.com/DeusMaximus/TLG-IPAM/pull/152) (`138-unit-manager-trust`, head `cbc4c9c`) closes #138.
+  - `install.discarded_trust(ca_file)` (new): `SSL_CERT_DIR` always, `SSL_CERT_FILE` unless `--ca-file` sets it. `render_unit(env_path, interpreter, ca_file)` writes `UnsetEnvironment=<those>` after `EnvironmentFile=`. Fixed names only; the `--ca-file` path stays in agent.env.
+  - Measured on systemd 257 (Debian 13, `--privileged --cgroupns=private --network none`): `UnsetEnvironment=` is applied after the manager's environment, `Environment=` and `EnvironmentFile=`, whatever the line order. `EnvironmentFile=` overrides the manager's value. The bare-name form is needed (`NAME=value` unsets only on a match). An empty `UnsetEnvironment=` in a drop-in clears the list. The same holds for `DefaultEnvironment=`.
+  - Real runs: `main`'s wheel reproduces the finding (install 0, token spent, `CERTIFICATE_VERIFY_FAILED`); this head checks in for the manager setting file, directory, both or neither, with and without `--ca-file`; `uninstall` leaves `/etc`, `/var/lib`, `/usr/lib/systemd` and the user database as before.
+  - Docs: spec §5.6 (install paragraph), `AGENTS.md` "Enrolment tokens" bullet, `README.md` private-CA paragraph.
+  - Tests: agent 1,362 → 1,374 on the branch, 1,379 merged with `main` (`unit_environment`, a stand-in for systemd's ordering built from the unit text; 8 manager × `--ca-file` cases; 3 live-TLS `--ca-file` cases; `_as_the_service` now builds its environment from the unit). 9 fail with the line removed. No server change.
+  - Review: Codex clean and Greptile 5/5 on `cbc4c9c`; CI green (10 checks). Briefed round by Codex (GPT-6.1 Sol) at `cbc4c9c`: GO, its round-3 finding on PR #130 closed, no new findings; it replayed the reproduction on a real systemd 257 and ran 30 probes of the ordering (review on the PR and in `.dev/138/review-1.md`).
+- **Decisions:** Deliberate calls 1–6 in the PR body: the unit discards rather than the installer reading `systemctl show-environment`; `SSL_CERT_FILE` is not unset with `--ca-file`; `SSL_CERT_DIR` is unset even with it; bare names; an owner's drop-in is the owner's; only the two OpenSSL variables. No new import or listed name, so `test_invariants.py` is unchanged.
+- **State:** merged. No schema change. A unit installed before this keeps its old text until `install` is run again.
+- **Waiting on the owner:** nothing from this PR.
+- **Untested:** an LXC, distributions other than Debian, systemd versions other than 257.
+- **Next:** #136 and #140 each edit `install.py`, one at a time. The image `ipam130-sol-systemd:review` on this machine runs systemd for installer checks; `docker exec` in it starts with umask 0000, so set `umask 022` first or `trust.check` refuses the venv.
+
 ## 2026-11-24 — Claude Code (Opus 5.5), worker — #143: open enrolments by the server's clock, none for a disabled agent; release versions in normal form (PR #150)
 - **Done:** [PR #150](https://github.com/DeusMaximus/TLG-IPAM/pull/150) (`143-agents-page-followups`, head `dabbfce`) closes #143. (Written by the orchestrator from the PR body: the worker's thread was still waiting on CI when the PR merged.)
   - Server, response only: `services/agents.expires_in_s` and `schemas.TokenOut.expires_in_s`, the whole seconds a live enrolment token has left by the server's clock (`agents.live`), rounded down, null for a token that is not live and for an agent token. Every owner answer for an agent carries it. No MCP tool reads it.
@@ -74,40 +103,3 @@ Template:
 - **Waiting on the owner:** the next server image build is the first real start of the new `CMD`: nobody could build the image here.
 - **Untested:** the Docker image; every proxy setting in spec §8 (no proxy ran); a multi-day MCP stream.
 - **Next:** #31 writes the deployment document from spec §8. #132 no longer blocks exposing `/mcp` (#26, which still waits on #25).
-
-## 2026-11-24 — Claude Code (Sonnet 5.5), worker — #139: qualify the bulk_create_hosts size example and the brief's import figures (PR #148)
-- **Done:**
-  - [PR #148](https://github.com/DeusMaximus/TLG-IPAM/pull/148) (`139-import-size-wording`, head `cc6267c`) closes #139. Documentation and tests only: no limit, route or tool result changed. Three files: `api/app/mcp_server.py` (docstring), `TLG-IPAM-Project-Brief.md` (§5.2 row, §4.3 import-size paragraph only), `api/tests/test_length_limits.py`.
-  - The `bulk_create_hosts` docstring and §5.2: the 400-record example holds only when every field is plain ASCII with no character JSON escapes (quote, backslash, a control character such as a line break or a tab) in any field. Non-BMP owner: 2,493,771 bytes as `json.dumps` writes it, `413` at the real `/mcp` route. A hostname and an owner of quotes, backslashes or tabs: 2,114,971.
-  - §4.3: the measured rows (`full_rows`) are named as measured examples, not a ceiling. They are at every character limit and ASCII (15-character address, 40-character device type). Figures re-measured: 1,000 rows without notes 1,151,011; at most 233 four-byte notes characters (1,295 ASCII with an ASCII owner); notes at the limit 17,546,011 (5,258,011 ASCII); at most 119 rows (398 ASCII notes, 428 with an ASCII owner too); 5-character device type 1,116,011. §4.3 also says a hostname and a device type accept non-ASCII (1,000 rows 2,973,011), that a MAC's punctuation, a domain's leading white space and trailing dots and a `last_seen`'s extra digits are accepted and dropped, and that a padded IPv4 address is refused.
-  - Tests: the example's largest call is posted to the real `/mcp` route and creates all 400 hosts; the non-ASCII-owner variant gets `413`; the escaped-ASCII case runs for quote, backslash and tab; the Unicode-row and no-largest-row cases; every §4.3 figure is asserted. The old in-process example test (`fastmcp.Client(mcp)`) skipped the body cap and is replaced.
-  - Review: Codex clean at `62977ac`, `d29492e` and `cc6267c`. Greptile P2 at `62977ac` (escapes outside notes) fixed in `d29492e`. An outside read (Codex, GPT-6.1 Sol) at `d29492e` was GO with two P3s (tabs; rows are examples, not a ceiling), both fixed in `cc6267c`, answered in one numbered PR comment. CI green on `cc6267c`.
-  - Merged: `1a48707`, squash, on the owner's go-ahead; the remote branch is deleted. Sol's GO was at `d29492e`; the orchestrator read `cc6267c`'s diff against its two remedies and ran 1,136 server tests on that head, and no further round was run for a wording-only change. No follow-ups.
-- **Decisions:** PR body Deliberate calls 1–5. The main ones: rebuilt the rows at every character limit instead of describing the old fixture, so all §4.3 figures changed; no row is "the largest" (limits count characters, padding is accepted on MAC, domain and `last_seen`, an IPv4 address is refused padded); the example is judged as `json.dumps` writes it; `test_body_limit.py` and `body_limit.py` untouched (its "about 1.15 MB" comment is accurate for the no-notes rows).
-- **State:** merged. Tests: server 1,136. No schema change; nothing in `web/` or the agent touched.
-- **Waiting on the owner:** nothing from this entry.
-- **Next:** nothing owed on #139. #132 (PR #135) owns the other §4.3 paragraphs and the `AGENTS.md` bullets "One uvicorn worker" and "One request-body cap".
-
-## 2026-11-24 — Claude Code (Opus 5.5), worker — #144: a PTR or a negative SOA is read only when it answers the question (PR #146)
-- **Done:**
-  - [PR #146](https://github.com/DeusMaximus/TLG-IPAM/pull/146) (`144-ptr-soa-owner-check`, head `22967e0`) closes #144.
-  - `probe.read_reply` reads one reply against its question:
-    - `answered_name` follows the reply's own CNAME chain from the question to its end; a loop is no usable answer.
-    - A PTR record counts only at that name; a PTR at any other owner makes the reply no usable answer.
-    - `says_no_name(reply, name)` counts an SOA only for a zone containing that name; an SOA only for other zones is no usable answer.
-    - No usable answer keeps the stored name and asks the next configured server, as for a referral.
-  - No new query, no new import, no wire change (`PROTOCOL_VERSION` 2); nothing under `api/` changed.
-  - Spec §5.2 gains "Which records of a reply are read". Agent README and brief §4.6 carry the operating note: a sole non-recursive server returning an unresolved alias warns on every scan; remedy is a recursive resolver or one serving the alias's target zone. `AGENTS.md`'s wire-contract bullet updated.
-  - Tests: agent 1,252 → 1,319 (38-row `read_reply` table, 8 new loopback responder actions, pacing and route tests extended); server 1,129. With `main`'s `probe.py` under the new tests, exactly the 31 new cases fail.
-  - Merged: `af8f49d`, squash, on the owner's go-ahead; the remote branch is deleted. CI green, Codex clean and Greptile 5/5 on `22967e0`, the only head. Briefed round (Codex, GPT-6.1 Sol): GO at `22967e0` with two P3s, no Deliberate call overruled; it measured 1,362 agent tests on the head merged with `main`. The orchestrator ran 1,319 agent and 1,129 server tests on the head. The two P3s are filed as #149 (a reply built from names whose hashes collide makes the CNAME walk quadratic; the spec does not state that a PTR at the chain's end wins over one elsewhere).
-- **Decisions:** Deliberate calls 1–9 in the PR body. The main ones:
-  - A PTR is read at the chain's end only.
-  - An unrelated PTR spoils the whole reply, even beside the right SOA.
-  - An unrelated SOA with an empty answer is no usable answer.
-  - `NXDOMAIN` is read as before.
-  - Two #100 table rows had a fixture SOA that did not contain the question; corrected, and the old fixture kept as `sibling-soa`.
-- **State:** merged. No schema change.
-- **Waiting on the owner:** nothing from this entry.
-- **Untested:** any real network or resolver; DNAME; an `NXDOMAIN` carrying an unrelated SOA; DNSSEC and malformed-message fuzzing.
-- **Next:**
-  - #149, #20 and #93 are all in `probe.py`, so they run one at a time.
