@@ -66,11 +66,14 @@ STUB_NAMES = ("gh", "skopeo", "sleep")
 # `/dev/tcp` or `/dev/udp`; under `set -e` the step then stops. The net splits words at
 # spaces (`x="a b" /bin/c` gets past it), so it is not what fails a test. The trap
 # function and the two names are read-only, and `trap - DEBUG`, `set +T` and the like
-# are themselves recorded, and refused, before they run.
+# are themselves recorded, and refused, before they run. `extdebug`, which makes a
+# failing trap skip its command, is set by the trap and not here: bash 5 reads it in a
+# startup file as a request to start its debugger, fails to, and turns it and
+# `functrace` off, so nothing in a `$( )` is seen (bash 3.2 does not).
 TRACE = r"""readonly PATH STEP_TRACE
-shopt -s extdebug
 set -o functrace
 __step_trace() {
+    shopt -q extdebug || shopt -s extdebug
     local line=$1 word first= run=run
     local -a words
     read -r -a words <<< "$BASH_COMMAND"
@@ -688,13 +691,6 @@ def test_every_line_of_each_publish_script_runs_in_some_test(tmp_path, workflow,
     runs = list(_scenarios(tmp_path, workflow, job))
     ran = {line for publish in runs for _, line, _ in publish.trace}
     script = runs[0].script
-    # The line a function is defined on is run when the function is called: bash 5
-    # gives the commands of its body other line numbers than bash 3.2 does.
-    called = {_command_word(command) for publish in runs for _, _, command in publish.trace}
-    for number, line in enumerate(script.splitlines(), 1):
-        defined = re.match(r"\s*([A-Za-z_]\w*)\s*\(\)", line)
-        if defined and defined.group(1) in called:
-            ran.add(number)
     missing = sorted(_command_lines(script) - ran)
     assert missing == [], [script.splitlines()[n - 1].strip() for n in missing]
 
@@ -710,14 +706,16 @@ def test_no_publish_script_names_a_network_redirection(workflow, job):
 # Changes a step could gain that its stderr and exit status would hide: each runs, or is
 # stopped, in the step's first line, its stderr discarded and its failure handled. The
 # first two are the review's of PR #154 (an unknown program, and one handed the token).
+# The ones the trap stops would leave a `ran-*` entry in the work directory if they ran.
 MUTATIONS = {
     "unknown-program": "curl https://example.invalid/ 2>/dev/null || true",
     "token-in-an-argument": 'curl -fsS -H "Authorization: Bearer ${TOKEN:-$GH_TOKEN}" https://example.invalid/ 2>/dev/null || true',
-    "a-path": "/usr/bin/true 2>/dev/null || true",
-    "command-builtin": "command -v curl >/dev/null 2>&1 || true",
-    "eval": "eval true 2>/dev/null || true",
+    "a-path": "/bin/mkdir ran-a-path 2>/dev/null || true",
+    "a-path-in-a-substitution": 'x=$(/bin/mkdir ran-in-a-substitution 2>/dev/null || true)',
+    "command-builtin": "command /bin/mkdir ran-command 2>/dev/null || true",
+    "eval": "eval /bin/mkdir ran-eval 2>/dev/null || true",
     "trap-removed": "trap - DEBUG 2>/dev/null || true",
-    "network-redirection": "echo probe 2>/dev/null > ./dev/tcp/example.invalid/80 || true",
+    "network-redirection": "echo probe 2>/dev/null > ./dev/tcp/ran-redirection || true",
 }
 
 
@@ -726,11 +724,15 @@ MUTATIONS = {
 def test_a_command_the_step_may_not_run_is_caught_whatever_it_does_with_its_failure(tmp_path, workflow, job, mutation):
     (step,) = [s for s in workflow["jobs"][job]["steps"] if "run" in s]
     publish = Publish(tmp_path, workflow, job, script=mutation + "\n" + step["run"])
+    (publish.work / "dev" / "tcp").mkdir(parents=True)
     result = publish.execute()
-    ran, line, command = publish.trace[0]
-    assert line == 1 and publish.unapproved()[:1] == [command]
-    # a path, `/dev/tcp` and the builtins that run another command are stopped first
-    assert ran is (_command_word(command) in ("curl", "trap"))
+    first_line = [command for ran, line, command in publish.trace if line == 1]
+    assert publish.unapproved() and publish.unapproved()[0] in first_line
+    # a path, `/dev/tcp` and the builtins that run another command are stopped before
+    # they run (and the shell they would run in with them: the step, or a `$( )`)
+    stopped = [command for ran, _, command in publish.trace if not ran]
+    assert bool(stopped) is ("ran-" in mutation)
+    assert list(publish.work.glob("ran-*")) == list(publish.work.glob("dev/tcp/*")) == []
     if mutation == MUTATIONS["unknown-program"]:
         # what the step's own answer shows: nothing, so only the record catches it
         assert result.returncode == 0
