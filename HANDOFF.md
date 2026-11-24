@@ -27,6 +27,46 @@ Template:
 
 ---
 
+## 2026-11-24 — Claude Code (Opus 5.5), worker — #24: release pipeline for the agent image and wheel (PR #145)
+- **Done:**
+  - [PR #145](https://github.com/DeusMaximus/TLG-IPAM/pull/145) (`24-release-pipeline`, head `5801a18`) closes #24. It includes `main` at `b2ba364` (merge `b8c9469`).
+  - One version: `api/app/version.py` `VERSION` = the agent's `__version__` = `0.2.0.dev0`.
+    - `settings.version` is a `ClassVar`, so `VERSION` in the environment is no longer read.
+    - `agent/tests/test_release.py` and `install.test.js` hold the two literals together.
+  - `.github/workflows/release.yml`. On a tag `v<version>` on `main`:
+    - `build` (`contents: read`): version and tag checks, the wheel (`flit_core` from the new hashed `agent/requirements-build.txt`, reproducible), the image (amd64 and arm64, one OCI archive), start-up checks per platform with `--network none`.
+    - `publish-image` (`packages: write`): `skopeo copy --all --preserve-digests`, only to a tag the registry says is absent.
+    - `publish-release` (`contents: write`): `gh release create`; a draft a re-run finds is published.
+    - `verify`: fetches both artefacts with no credential, as the install commands do.
+    - A PR or a run by hand builds and checks only. Actions are pinned to commits, the BuildKit and binfmt images to digests.
+  - `.github/scripts/release_check.py` and `check-agent-image.sh` (CI's `agent` job uses the script too).
+  - `.agents/releases.md` (the runbook); `AGENTS.md` bullet "One version, released from a tag" and the third agent lock command; brief §2.4 (new), §4.2, §7, §10; spec §5.6; both READMEs.
+  - Review fixes in `5801a18`: Codex P2 and Greptile P1 (draft release never published on a re-run), Greptile P1 (a failed registry read taken as an absent tag). All threads are answered and resolved.
+  - Merged: `50d785f`, squash, on the owner's go-ahead; the remote branch is deleted. Nothing was published: the workflow publishes only on a pushed `v*` tag. CI green and Codex clean on `5801a18`. Greptile read only `b8c9469`, so one outside read by Sol (GPT-6.1 Sol) stood in for its re-run: GO at `5801a18` with two P3s, no Deliberate call overruled; it started both platforms' images from the PR's own build artefact with no network, and ran the publish steps' shell against stub commands. The orchestrator ran 1,295 agent, 1,129 server and 157 web tests on that head. The two P3s are filed as #147 (no test runs the publish steps; the runbook does not cover a retry after the seven-day build artefact has expired).
+- **Decisions:** Deliberate calls 1–12 in the PR body. The main ones:
+  - two version literals and three checks that hold them equal;
+  - the environment no longer overrides the version;
+  - `main` stays at `.dev0` between releases;
+  - arm64 included (QEMU);
+  - build once and publish those files by digest;
+  - skopeo, not docker actions (skopeo 1.13's `docker-daemon:` transport is refused by current Docker, so images go through `docker-archive:`);
+  - no attestations, no `latest` tag, no `environment:` gate.
+- **State:**
+  - merged. Tests: server 1,129; agent 1,295; web 157.
+  - No schema change; `PROTOCOL_VERSION` 2, from #100.
+- **Waiting on the owner:**
+  - The one-time setup in `.agents/releases.md`: give the repository Write access if the ghcr package already exists, and make the package public after the first publish.
+  - Then the release checklist: a bump PR to `0.2.0`, tag `v0.2.0`, push it.
+- **Untested:**
+  - the real push to ghcr.io and the release creation;
+  - what ghcr.io tells the workflow token about a package never pushed (`DENIED` would stop the first release before pushing);
+  - `verify` against real artefacts;
+  - the publish jobs' re-run paths.
+- **Next:**
+  - The owner's first release per `.agents/releases.md`; #147 should land before it.
+  - #94 (pin the agent base image by digest) goes with it.
+  - #143 has a P3 on release versions not in normal form that `install.releaseVersion` accepts (`01.2`); the release check refuses them.
+
 ## 2026-11-24 — Claude Code (Opus 5.5), worker — #100: name lookups reported apart from liveness (PR #142)
 - **Done:**
   - [PR #142](https://github.com/DeusMaximus/TLG-IPAM/pull/142) (`100-name-lookup-state`, head `9b196e2`) closes #100 under option 4.
@@ -120,18 +160,3 @@ Template:
 - **State:** merged. 1,084 server and 924 agent tests pass. No schema change. Nothing in #132's or #22's areas touched.
 - **Waiting on the owner:** nothing from this entry.
 - **Next:** #135 and #130 both touch the "MCP tools are hand-curated" bullet's neighbours only; #137 changed one parenthesis in it, so a merge with either stays mechanical.
-
-## 2026-11-24 — Claude Code (Opus 5.5), worker — #91: a host's notes at most 4,096 characters; a row over a limit is that row's error (PR #134)
-- **Done:** [PR #134](https://github.com/DeusMaximus/TLG-IPAM/pull/134) (`91-notes-length-limit`, head `47e6544`) closes #91, per the owner's decision of 2026-11-24.
-  - `schemas.HOST_NOTES_MAX` (4,096), checked by `services/hosts._check_notes` on create, update, next-free and each bulk row: `422` "notes: a host's notes may be at most 4096 characters, not N", never repeating the value; in a bulk import, that row's `error`.
-  - Tests for UI, REST and MCP bulk paths for both `notes` and `domain` (the domain's UI and MCP cases were missing). 14 new server tests in `api/tests/test_length_limits.py`.
-  - `bulk_create_hosts` docstring and brief §5.2 row: a call is at most 2 MiB of encoded JSON, refused whole otherwise; split a batch yourself; 400 records of 4,096-character plain-ASCII notes (no quotes, backslashes, line breaks) fit.
-  - Brief §3.4, §3.7, §4.2, §4.3 (re-measured: 1,000 rows without notes are 1,110,573 bytes; they fit with at most 243 four-byte characters of notes each, 1,335 ASCII with an ASCII owner; at most 119 rows at every limit, 401 with ASCII notes), §5.1, §6.2; `AGENTS.md` "Bulk endpoints" bullet.
-  - Optional dialog item built: `utils/csv.importSize` measures the request; over the cap the dialog names the most rows a file can hold (every run of that many consecutive rows fits, at most 1,000) and does not send. 7 new web tests.
-  - Merged: `216bec1`, squash, on the owner's go-ahead; the remote branch is deleted. CI green, Codex clean and Greptile clean on `47e6544`. The orchestrator ran 1,083 server and 132 web tests on that head. #91 owed no briefed round; the owner asked for one read by Sol (GPT-6.1 Sol) in place of a Greptile re-run, and it was a GO at `47e6544` with two P3 documentation follow-ups, not yet filed (the review is on the PR thread):
-    - The docstring's and §5.2's 400-record example holds only when the other text fields are ASCII too. With the tests' 120-character non-BMP owner the same call is 2,477,553 bytes and is refused `413`.
-    - Brief §4.3 calls its measured rows "every bounded field at its maximum", but the fixture's `device_type` is 5 characters of a possible 40, so the figures are that fixture's. The 1,110,573-byte figure is not asserted by a test.
-- **Decisions:** PR body Deliberate calls 1–6. An update resending notes stored over the limit, unchanged, is let through (the `dns_servers` precedent, not #86's domain rule), because the UI resends every field. The check is in the service, not a schema `max_length`, so OpenAPI does not advertise it. The limit counts characters.
-- **State:** merged. Locally: 1,083 server tests, 132 web tests, lint and build pass. No schema change. Nothing in #132's or #22's areas, or in `services/findings.py`, was touched.
-- **Waiting on the owner:** whether to file the two P3 follow-ups.
-- **Next:** #133 can start (it owns `services/findings.py` and the findings tests). #135 and #130 merge `main` before their next review round; #134 and #135 both edit brief §4.3, in different paragraphs.
