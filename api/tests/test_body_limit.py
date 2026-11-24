@@ -44,6 +44,7 @@ from .test_startup import (
     _inherited,
     _read_stderr,
     _stop,
+    _image,
     _uvicorn,
     _wait_until_serving,
 )
@@ -1097,12 +1098,13 @@ async def test_a_full_result_set_is_served(client, agent_api, declare_length):
 # --- On a real uvicorn (#89) ---
 #
 # The tests above give the middleware header bytes directly. These send raw bytes to a
-# uvicorn started the way the image starts it, once with each of its HTTP parsers,
-# because which spellings of `Content-Length` reach the app is the parser's decision.
-# The image runs httptools: `uvicorn[standard]` installs it, and uvicorn's default
-# `--http auto` picks it over h11. httptools hands on a length with leading zeroes or
-# trailing whitespace as it came; h11 strips the whitespace and refuses the zeroes
-# with `400` before the app runs.
+# real uvicorn, once with each of its HTTP parsers, because which spellings of
+# `Content-Length` reach the app is the parser's decision. The image runs httptools
+# (`app.serve`, through `header_limit.HeaderLimitProtocol`), so the httptools server is
+# started as the image starts it; h11 is uvicorn's other parser, started from its
+# command line. httptools hands on a length with leading zeroes or trailing whitespace
+# as it came; h11 strips the whitespace and refuses the zeroes with `400` before the
+# app runs.
 
 
 @dataclass
@@ -1115,7 +1117,8 @@ class Served:
 @pytest.fixture(scope="module", params=["httptools", "h11"])
 def served(request, tmp_path_factory):
     key = secrets.token_hex(32)
-    proc = _uvicorn(tmp_path_factory.mktemp(request.param), key, "--http", request.param)
+    tmp_path = tmp_path_factory.mktemp(request.param)
+    proc = _image(tmp_path, key) if request.param == "httptools" else _uvicorn(tmp_path, key, "--http", "h11")
     lines, reader = _read_stderr(proc)
     try:
         port = _wait_until_serving(lines, time.monotonic() + START_DEADLINE)
@@ -1262,8 +1265,9 @@ CONNECTIONS = 32
 
 
 def _uvicorn_lowered(tmp_path, key, parser):
-    """uvicorn as `_uvicorn` starts it, in an interpreter that lowers the two limits
-    before the app is built."""
+    """The server as `served` starts it (the image's command for httptools, uvicorn's
+    command line for h11), in an interpreter that lowers the two limits before the app
+    is built."""
     env = {n: v for n, v in os.environ.items() if _inherited(n)}
     env.update(API_KEY=key, DB_PATH=str(tmp_path / "ipam.db"), STATIC_DIR=str(tmp_path / "no-static"))
     code = (
@@ -1271,10 +1275,15 @@ def _uvicorn_lowered(tmp_path, key, parser):
         "import app.body_limit as limits\n"
         f"limits.BODIES_MAX = {LOW_BUDGET}\n"
         f"limits.BODY_TIMEOUT_S = {LOW_TIMEOUT_S}\n"
-        "import uvicorn.main\n"
-        f"sys.argv = ['uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', '0', '--http', {parser!r}]\n"
-        "uvicorn.main.main()\n"
     )
+    if parser == "httptools":
+        code += "import app.serve\napp.serve.main(['--host', '127.0.0.1', '--port', '0'])\n"
+    else:
+        code += (
+            "import uvicorn.main\n"
+            f"sys.argv = ['uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', '0', '--http', {parser!r}]\n"
+            "uvicorn.main.main()\n"
+        )
     return subprocess.Popen(
         [sys.executable, "-c", code],
         cwd=API_DIR,

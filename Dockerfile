@@ -17,5 +17,6 @@ COPY --from=web /web/dist ./static
 ENV STATIC_DIR=/app/static \
     DB_PATH=/data/ipam.db
 EXPOSE 8080
-# One worker, stated here rather than left to the environment (brief §2.2).
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+# uvicorn with one worker, whatever the environment says (brief §2.2), and the limits
+# on request heads and idle connections that its command line cannot set (brief §4.3).
+CMD ["python", "-m", "app.serve"]
