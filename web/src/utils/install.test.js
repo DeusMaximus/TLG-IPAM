@@ -135,16 +135,97 @@ describe('the install commands match the spec', () => {
   })
 })
 
+// The release check's cases (`agent/tests/test_release.py`), read from that file so the
+// page and the release pipeline judge one list: what the check takes, and what it
+// refuses (#143). The read is strict: every line of the two parametrize blocks is a
+// shape it knows (a case, a comment, or the block's own syntax), so a case written in
+// any other way (single quotes, a tuple over several lines) fails here instead of
+// being left out of one side. A string is read only where its text is exactly what
+// Python reads: double quotes, no prefix, no backslash (so no escape, which this read
+// would take literally where Python decodes it), never two literals side by side.
+const STRING = String.raw`"([^"\\]*)"`
+const TAKEN_LIST = new RegExp(String.raw`^\[(${STRING}(?:, ${STRING})*)\],$`)
+const REFUSED_CASE = new RegExp(String.raw`^\(${STRING}, "[^"\\]*"\),$`)
+const unquote = (text) => [...text.matchAll(new RegExp(STRING, 'g'))].map((m) => m[1])
+
+function parseReleaseCases(source) {
+  const block = (before, header) => {
+    const end = source.indexOf(before)
+    if (end < 0) throw new Error(`no ${before} in test_release.py`)
+    const start = source.lastIndexOf('@pytest.mark.parametrize(', end)
+    const lines = source.slice(start, end).split('\n').map((l) => l.trim())
+    if (lines.shift() !== '@pytest.mark.parametrize(' || lines.shift() !== header) {
+      throw new Error(`${before}: the parametrize block does not start as expected`)
+    }
+    return lines.filter((l) => l && !l.startsWith('#') && l !== ')')
+  }
+  const taken = block('def test_a_release_version(', '"version",').flatMap((line) => {
+    const m = TAKEN_LIST.exec(line)
+    if (!m) throw new Error(`test_a_release_version: a line this read does not know: ${line}`)
+    return unquote(m[1])
+  })
+  const refusedLines = block('def test_not_a_release_version(', '"version, reason",')
+  if (refusedLines.shift() !== '[' || refusedLines.pop() !== '],') {
+    throw new Error('test_not_a_release_version: the case list is not one [ … ] block')
+  }
+  const refused = refusedLines.map((line) => {
+    const m = REFUSED_CASE.exec(line)
+    if (!m) throw new Error(`test_not_a_release_version: a line this read does not know: ${line}`)
+    return m[1]
+  })
+  return { taken, refused }
+}
+
+const releaseCases = () => parseReleaseCases(read('agent/tests/test_release.py'))
+
 describe('the version the commands are pinned to', () => {
+  it('reads the release check’s cases whole', () => {
+    const { taken, refused } = releaseCases()
+    expect(taken).toEqual(expect.arrayContaining(['0.2.0', '0.2.0rc1', '0.2.0.dev0', '0.2.0.post1']))
+    expect(refused).toEqual(
+      expect.arrayContaining(['', '0.2.0+local', '1!2.0', '0.2 ', '01.2', '00.02.00', '0.2.0rc01'])
+    )
+  })
+
+  it('refuses a case written in a shape it does not read, rather than skip it', () => {
+    const source = read('agent/tests/test_release.py')
+    const variants = [
+      // single quotes
+      source.replace('("00.02.00", "not in normal form"),', "('00.02.00', 'not in normal form'),"),
+      // a tuple over two lines
+      source.replace('("00.02.00", "not in normal form"),', '(\n        "00.02.00",\n        "not in normal form",\n    ),'),
+      // a second list line, or one with a single-quoted case
+      source.replace('"0.2.0.post1"],', "'0.2.0.post1'],"),
+      source.replace('["0.2.0", "1.0",', '["0.2.0",\n     "1.0",'),
+      // an escape Python decodes: it tests `0.2.0rc001`, a literal read would not
+      source.replace('("00.02.00", "not in normal form"),', '("\\x30.2.0rc001", "not in normal form"),'),
+      source.replace('["0.2.0", "1.0",', '["\\x30.2.0", "1.0",'),
+      // a string prefix, and two literals Python joins into one
+      source.replace('("00.02.00", "not in normal form"),', '(r"00.02.00", "not in normal form"),'),
+      source.replace('("00.02.00", "not in normal form"),', '("00.02" ".00", "not in normal form"),'),
+      source.replace('["0.2.0", "1.0",', '["0.2" ".0", "1.0",'),
+    ]
+    for (const variant of variants) {
+      expect(variant).not.toBe(source)
+      expect(() => parseReleaseCases(variant)).toThrow()
+    }
+  })
+
   it('is the server version when it is a release version in normal form', () => {
-    for (const v of ['0.2.0', '1.0', '0.2.0rc1', '0.2.0.dev0', '0.2.0.post1']) {
+    for (const v of releaseCases().taken) {
       expect(releaseVersion(v)).toBe(v)
     }
   })
 
   it('is a placeholder otherwise, never a guessed artefact name', () => {
-    for (const v of [undefined, null, '', 'v0.2.0', '0.2.0+local', '0.2.0-rc1', '1!2.0', '0.2 ']) {
+    // a spelling PEP 440 normalises to another, `00.02.00` (`0.2.0`) or `0.2.0rc01`
+    // (`0.2.0rc1`), names no published artefact either
+    for (const v of [undefined, null, ...releaseCases().refused]) {
       expect(releaseVersion(v)).toBeNull()
+    }
+    for (const v of ['00.02.00', '0.2.0rc01']) {
+      expect(containerRun({ url: URL_, enrolToken: ENROL, version: v }).endsWith(`${AGENT_IMAGE}:<version>`)).toBe(true)
+      expect(wheelUrl(v)).toBe(wheelUrl('<version>'))
     }
     const run = containerRun({ url: URL_, enrolToken: ENROL, version: '0.2.0+local' })
     expect(run.endsWith(`${AGENT_IMAGE}:<version>`)).toBe(true)

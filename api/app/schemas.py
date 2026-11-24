@@ -388,6 +388,10 @@ class TokenOut(BaseModel):
     expires_at: UtcDatetime | None
     used_at: UtcDatetime | None
     revoked_at: UtcDatetime | None
+    # Computed on read by `services/agents.agent_out` (`agents.expires_in_s`); nothing
+    # stores it. The whole seconds a live enrolment token has left by the server's
+    # clock when the answer was built; null when it is not live, and for an agent token.
+    expires_in_s: int | None = None
 
 
 class AgentOut(BaseModel):

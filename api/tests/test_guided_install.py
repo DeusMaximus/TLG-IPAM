@@ -3,12 +3,16 @@
 - `update_available` and `protocol_mismatch` on every agent answer: computed on read by
   `agents.agent_out` from the version the agent last reported and the `last_error`
   check-in stored, never stored themselves.
+- `expires_in_s` on each token of every agent answer: the seconds a live enrolment
+  token has left by the server's clock, computed on read by `agents.agent_out` (#143),
+  so the page does not judge an expiry by the browser's clock.
 - `GET /scan-targets/suggestions`: the subnets an agent could scan, for "Scan *subnet*
   with this agent?". Read-only, REST only, and two statements whatever the data holds.
 """
 
 import inspect
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import event, func, select, update
@@ -17,7 +21,7 @@ from app import mcp_server
 from app.agent_protocol import PROTOCOL_VERSION
 from app.config import Settings
 from app.database import SessionLocal, engine
-from app.models import Agent, Change
+from app.models import Agent, Change, Token
 from app.services import agents as agents_svc
 from app.services import jobs
 
@@ -112,6 +116,100 @@ async def test_a_protocol_refusal_is_flagged_until_an_accepted_check_in(client, 
     assert (await agent_answer(client, agent["id"]))["protocol_mismatch"] is True
     await jobs_for(agent_api, token)
     assert (await agent_answer(client, agent["id"]))["protocol_mismatch"] is False
+
+
+# --- Time left on an enrolment token (#143) ---
+
+T0 = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc)
+
+
+def _token(kind="enrol", **columns) -> Token:
+    values = {"expires_at": T0 + agents_svc.ENROL_TOKEN_LIFETIME, "used_at": None, "revoked_at": None}
+    return Token(kind=kind, **{**values, **columns})
+
+
+@pytest.mark.parametrize(
+    "token, now, expected",
+    [
+        (_token(), T0, 3600),
+        (_token(), T0 + timedelta(minutes=30, milliseconds=400), 1799),  # rounded down
+        (_token(), T0 + timedelta(minutes=59, seconds=59, milliseconds=999), 0),  # live, not 1 s
+        (_token(), T0 + agents_svc.ENROL_TOKEN_LIFETIME, None),  # refused from expires_at on
+        (_token(), T0 + timedelta(hours=2), None),
+        # stored as SQLite gives it back, without its zone
+        (_token(expires_at=(T0 + timedelta(minutes=5)).replace(tzinfo=None)), T0, 300),
+        (_token(used_at=T0), T0, None),
+        (_token(revoked_at=T0), T0, None),
+        (_token(kind="agent", expires_at=None), T0, None),
+        (_token(kind="agent", expires_at=None, revoked_at=T0), T0, None),
+    ],
+)
+def test_expires_in_s_is_the_time_a_live_enrolment_token_has_left(token, now, expected):
+    assert agents_svc.expires_in_s(token, now) == expected
+    # it is null exactly when the token is not a live enrolment token
+    assert (expected is None) == (token.kind != "enrol" or not agents_svc.live(token, now))
+
+
+class _Clock:
+    """The services' clock, set by the test, so two answers read one instant."""
+
+    def __init__(self, now):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+def _left(answer) -> dict[str, int | None]:
+    return {t["kind"] + ("-revoked" if t["revoked_at"] else ""): t["expires_in_s"] for t in answer["tokens"]}
+
+
+async def test_every_agent_answer_says_how_long_its_enrolment_token_has_left(
+    client, agent_api, monkeypatch
+):
+    clock = _Clock(T0)
+    monkeypatch.setattr(agents_svc, "_now", clock)
+    res = await client.post("/api/v1/agents", json={"name": "fresh"})
+    assert res.status_code == 201, res.text
+    created = res.json()["data"]
+    # the create answer: the token it issued, a whole lifetime from the server's clock
+    assert _left(created) == {"enrol": 3600}
+
+    clock.now = T0 + timedelta(minutes=42, seconds=30)
+    answer = await agent_answer(client, created["id"])
+    assert _left(answer) == {"enrol": 1050}
+
+    # a disabled agent's token is still live by the token's own rule; the page shows it
+    # as blocked from the agent's state
+    res = await client.put(f"/api/v1/agents/{created['id']}", json={"enabled": False})
+    assert res.status_code == 200, res.text
+    assert _left(res.json()["data"]) == {"enrol": 1050}
+    res = await client.put(f"/api/v1/agents/{created['id']}", json={"enabled": True})
+    assert res.status_code == 200, res.text
+
+    # re-enrol revokes the open token and issues one with a whole lifetime
+    res = await client.post(f"/api/v1/agents/{created['id']}/re-enrol")
+    assert res.status_code == 201, res.text
+    re_enrolled = res.json()["data"]
+    assert {t["expires_in_s"] for t in re_enrolled["tokens"] if t["revoked_at"]} == {None}
+    assert [t["expires_in_s"] for t in re_enrolled["tokens"] if not t["revoked_at"]] == [3600]
+
+    # by the server's clock, once it expires it has no time left: null, never 0 or less
+    clock.now = T0 + timedelta(minutes=42, seconds=30) + agents_svc.ENROL_TOKEN_LIFETIME
+    answer = await agent_answer(client, created["id"])
+    assert all(t["expires_in_s"] is None for t in answer["tokens"])
+
+
+async def test_an_exchanged_or_revoked_enrolment_token_has_no_time_left(client, agent_api):
+    agent, _ = await make_agent(client)
+    answer = await agent_answer(client, agent["id"])
+    # the spent enrolment token and the agent token: neither expires as an open enrolment
+    assert {t["kind"]: t["expires_in_s"] for t in answer["tokens"]} == {"enrol": None, "agent": None}
+
+    res = await client.post("/api/v1/agents", json={"name": "unsent"})
+    fresh = res.json()["data"]
+    assert (await client.post(f"/api/v1/agents/{fresh['id']}/revoke")).status_code == 200
+    assert _left(await agent_answer(client, fresh["id"])) == {"enrol-revoked": None}
 
 
 def test_every_protocol_refusal_starts_with_the_prefix_the_flag_reads():
@@ -279,3 +377,4 @@ def test_no_mcp_tool_serves_suggestions_or_the_flags():
     source = inspect.getsource(mcp_server)
     assert "suggestions" not in source
     assert "agent_out" not in source and "update_available" not in source
+    assert "expires_in_s" not in source

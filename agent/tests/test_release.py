@@ -56,8 +56,12 @@ def test_the_environment_cannot_change_the_servers_version(monkeypatch):
 
 
 # The cases `install.test.js` gives `install.releaseVersion`, with the same verdict:
-# what the release check takes, the page pins its commands to
-@pytest.mark.parametrize("version", ["0.2.0", "1.0", "0.2.0rc1", "0.2.0.dev0", "0.2.0.post1"])
+# what the release check takes, the page pins its commands to. `install.test.js` reads
+# both lists from this file, so they are one list; keep each a one-line string per case.
+@pytest.mark.parametrize(
+    "version",
+    ["0.2.0", "1.0", "10.0", "0", "0.2.0rc1", "0.2.0rc0", "0.2.0.dev0", "0.2.0.post1"],
+)
 def test_a_release_version(version):
     assert release_check.release_problem(version) is None
 
@@ -73,6 +77,13 @@ def test_a_release_version(version):
         ("0.2 ", "not in normal form"),
         ("0.2.0RC1", "not in normal form"),
         ("01.2", "not in normal form"),
+        # a number with a leading zero, which PEP 440 normalises away (#143)
+        ("00.02.00", "not in normal form"),
+        ("1.02", "not in normal form"),
+        ("0.2.0rc01", "not in normal form"),
+        ("0.2.0a00", "not in normal form"),
+        ("0.2.0.post01", "not in normal form"),
+        ("0.2.0.dev01", "not in normal form"),
         ("custom-build", "not a PEP 440 version"),
     ],
 )

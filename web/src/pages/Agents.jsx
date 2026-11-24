@@ -21,10 +21,16 @@ import { useToast, useTree } from '../context'
 import { useFetch } from '../hooks/useFetch'
 import {
   activeToken,
-  openEnrolment,
   agentStatus,
+  blockedEnrolment,
+  liveEnrolment,
+  monotonicNow,
+  nextEnrolmentChange,
+  openEnrolment,
   pendingEnrolments,
+  received,
   relativeTime,
+  sinceAsked,
   STATUS_LABELS,
   timeLeft,
 } from '../utils/agents'
@@ -33,6 +39,13 @@ import { parseServerTime } from '../utils/time'
 
 // How often the list and the status dots refresh while the page is open
 const REFRESH_MS = 30 * 1000
+
+// The agents list with the monotonic time it was asked for, which an enrolment
+// token's time left counts from (`agents.enrolmentLeft`, `agents.received`)
+const loadAgents = () => {
+  const askedAt = monotonicNow()
+  return listAgents().then((answer) => received(answer, askedAt))
+}
 
 const DOT = {
   online: 'bg-emerald-500',
@@ -123,9 +136,10 @@ function Version({ agent, onUpdate }) {
   )
 }
 
-function TokenCell({ agent, now }) {
+function TokenCell({ agent, elapsed }) {
   const token = activeToken(agent)
-  const enrolment = openEnrolment(agent, now)
+  const enrolment = openEnrolment(agent, elapsed)
+  const blocked = blockedEnrolment(agent, elapsed)
   const enrolled = (agent.tokens || []).some((t) => t.kind === 'agent')
   return (
     <div>
@@ -140,7 +154,15 @@ function TokenCell({ agent, now }) {
       )}
       {enrolment && (
         <div className="mt-0.5 whitespace-nowrap text-slate-500">
-          enrolment open, expires {timeLeft(enrolment.expires_at, now) ?? 'soon'}
+          enrolment open, expires {timeLeft(enrolment, elapsed) ?? 'soon'}
+        </div>
+      )}
+      {blocked && (
+        <div
+          className="mt-0.5 max-w-56 text-slate-500"
+          title="The server refuses a disabled agent's enrolment token until the agent is enabled"
+        >
+          enrolment blocked until it is enabled, expires {timeLeft(blocked, elapsed) ?? 'soon'}
         </div>
       )}
     </div>
@@ -152,6 +174,7 @@ function AgentRow({
   targets,
   subnets,
   now,
+  elapsed,
   onToggle,
   onRevoke,
   onReEnrol,
@@ -159,7 +182,8 @@ function AgentRow({
   onDelete,
 }) {
   const token = activeToken(agent)
-  const enrolment = token ? null : openEnrolment(agent, now)
+  // a disabled agent's live enrolment token can still be revoked
+  const enrolment = token ? null : liveEnrolment(agent, elapsed)
   const revocable = token || enrolment
   const disabled = agent.state === 'disabled'
   return (
@@ -202,7 +226,7 @@ function AgentRow({
         <Covered targets={targets} subnets={subnets} />
       </td>
       <td className="px-3 py-2.5">
-        <TokenCell agent={agent} now={now} />
+        <TokenCell agent={agent} elapsed={elapsed} />
       </td>
       <td className="px-3 py-2.5">
         <div className="flex justify-end gap-1">
@@ -253,9 +277,10 @@ function AgentRow({
 }
 
 // Every enrolment token still open (spec §5.8), listed until it is used or expires by
-// this browser's clock; the list and the clock refresh with the page
-function PendingEnrolments({ agents, now }) {
-  const pending = pendingEnrolments(agents, now)
+// the server's clock (`expires_in_s`), never the browser's; a disabled agent's is not
+// open. The list and the time left refresh with the page.
+function PendingEnrolments({ agents, elapsed }) {
+  const pending = pendingEnrolments(agents, elapsed)
   if (!pending.length) return null
   return (
     <section className="mb-4" aria-label="Pending enrolments">
@@ -267,7 +292,7 @@ function PendingEnrolments({ agents, now }) {
             <code className="text-slate-400">{token.token_prefix}…</code>
             <span className="text-slate-400">
               {agent.state === 'pending' ? 'waiting for its first enrolment' : 'being re-enrolled'},
-              expires {timeLeft(token.expires_at, now) ?? 'soon'}
+              expires {timeLeft(token, elapsed) ?? 'soon'}
             </span>
           </li>
         ))}
@@ -367,11 +392,14 @@ function deleteCoverage(covered) {
 export default function Agents() {
   const toast = useToast()
   const { subnets } = useTree()
-  const agents = useFetch(listAgents, [])
+  const agents = useFetch(loadAgents, [])
   const targets = useFetch(listScanTargets, [])
   const suggested = useFetch(listScanSuggestions, [])
   const health = useFetch(getHealth, [])
   const [now, setNow] = useState(() => Date.now())
+  // the monotonic clock the enrolment countdown reads; `now` stays the wall clock the
+  // status dots and check-in ages read
+  const [mono, setMono] = useState(() => monotonicNow())
   const [adding, setAdding] = useState(false)
   const [confirming, setConfirming] = useState(null)
   // offers set aside with "Not now", for as long as the page is open
@@ -385,6 +413,7 @@ export default function Agents() {
   useEffect(() => {
     const id = setInterval(() => {
       setNow(Date.now())
+      setMono(monotonicNow())
       refreshAgents()
       refreshTargets()
       refreshSuggested()
@@ -394,6 +423,7 @@ export default function Agents() {
 
   const reload = () => {
     setNow(Date.now())
+    setMono(monotonicNow())
     refreshAgents()
     refreshTargets()
     refreshSuggested()
@@ -459,6 +489,24 @@ export default function Agents() {
   }
 
   const list = agents.data?.data
+  // the countdown's reading of the monotonic clock: the page's, or the answer's arrival
+  // if that is later; elapsed runs from the request to it
+  const readAt = Math.max(mono, agents.data?.arrivedAt ?? -Infinity)
+  const elapsed = sinceAsked(agents.data, readAt)
+
+  // An enrolment token's label and its running out are scheduled on their own, apart
+  // from the list refresh: the page updates when what it shows of one next changes,
+  // and a token leaves it when its time runs out, whether or not a refresh succeeds.
+  // The delay is less the time since `readAt`, so a late render does not push it later,
+  // rounded up to a whole millisecond and at least 1: a fraction would round down to 0,
+  // and fire before a coarse monotonic clock has moved, leaving nothing to schedule again.
+  const nextChange = nextEnrolmentChange(list, elapsed)
+  useEffect(() => {
+    if (nextChange === null) return undefined
+    const delay = Math.max(1, Math.ceil(nextChange - (monotonicNow() - readAt)))
+    const id = setTimeout(() => setMono(monotonicNow()), delay)
+    return () => clearTimeout(id)
+  }, [nextChange, readAt])
 
   return (
     <div>
@@ -481,7 +529,7 @@ export default function Agents() {
           onAccept={accept}
           onDismiss={(s) => setDismissed((d) => new Set(d).add(`${s.agent_id}:${s.subnet_id}`))}
         />
-        {list && <PendingEnrolments agents={list} now={now} />}
+        {list && <PendingEnrolments agents={list} elapsed={elapsed} />}
         {agents.error && !list && (
           <p className="text-sm text-red-400">Could not load agents: {agents.error.message}</p>
         )}
@@ -521,6 +569,7 @@ export default function Agents() {
                     targets={coveredBy(agent.id)}
                     subnets={subnets}
                     now={now}
+                    elapsed={elapsed}
                     onToggle={toggle}
                     onRevoke={(a) => setConfirming({ kind: 'revoke', agent: a })}
                     onReEnrol={(a) => setConfirming({ kind: 're-enrol', agent: a })}
