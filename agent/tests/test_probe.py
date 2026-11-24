@@ -16,6 +16,7 @@ import dns.asyncquery
 import dns.exception
 import dns.flags
 import dns.message
+import dns.name
 import dns.rcode
 import dns.rdatatype
 import dns.resolver
@@ -59,6 +60,15 @@ ANSWERS = {
 }
 
 
+# #144: the Responder's replies whose records the agent must read against the question
+FOREIGN = {
+    "foreign-soa", "cname-foreign-soa", "cname-origin-soa", "cname-out-nodata",
+    "foreign-ptr", "foreign-ptr-soa", "cname-chain-ptr", "cname-chain-nodata",
+}
+# of those, the ones that give no usable answer, so the next configured server is asked
+NOT_ANSWERING = ["foreign-soa", "cname-foreign-soa", "cname-origin-soa", "foreign-ptr", "foreign-ptr-soa"]
+
+
 class Responder(asyncio.DatagramProtocol):
     """Answers PTR queries from ANSWERS. `script` gives the rcode (or "silent", or
     "truncated") for each query in turn; the last entry repeats. #100 adds "refused",
@@ -69,7 +79,15 @@ class Responder(asyncio.DatagramProtocol):
     classless delegation, `1.0-7.0.0.10.in-addr.arpa.` for 10.0.0.1, in the answer:
     with name servers for `0-7.0.0.10.in-addr.arpa.` and no SOA ("cname-referral"),
     with the target zone's SOA ("cname-nodata"), with nothing else ("cname-only"), and
-    with the target's PTR record after it ("cname-ptr")."""
+    with the target's PTR record after it ("cname-ptr"). #144 adds replies whose
+    records do not answer the question: an unrelated zone's SOA, with no answer
+    ("foreign-soa") or after the CNAME ("cname-foreign-soa"); a CNAME to a target
+    outside the reverse tree, `<label>.rev.example.com.`, with the question's own
+    zone's SOA ("cname-origin-soa") or the target zone's ("cname-out-nodata"); a PTR
+    record at another address's owner, alone ("foreign-ptr") or with the question's
+    zone's SOA ("foreign-ptr-soa"); and a chain of two CNAMEs, from the question to
+    `1.0-7.…` and on to `<label>.rev.example.com.`, with the PTR record at its end
+    ("cname-chain-ptr") or the end's zone's SOA ("cname-chain-nodata")."""
 
     def __init__(self, script=("answer",)):
         self.script = list(script)
@@ -107,6 +125,33 @@ class Responder(asyncio.DatagramProtocol):
             pass
         elif action == "referral":
             reply.authority.append(dns.rrset.from_text("10.in-addr.arpa.", 60, "IN", "NS", "ns.home.arpa."))
+        elif action in FOREIGN:
+            asked = question.name.to_text()
+            label, zone = asked.split(".", 1)
+            classless = "1.0-7." + zone
+            outside = f"{label}.rev.example.com."
+            if action in ("cname-foreign-soa", "cname-origin-soa", "cname-out-nodata"):
+                target = classless if action == "cname-foreign-soa" else outside
+                reply.answer.append(dns.rrset.from_text(question.name, 60, "IN", "CNAME", target))
+            if action in ("cname-chain-ptr", "cname-chain-nodata"):
+                reply.answer.append(dns.rrset.from_text(question.name, 60, "IN", "CNAME", classless))
+                reply.answer.append(dns.rrset.from_text(classless, 60, "IN", "CNAME", outside))
+            if action in ("foreign-ptr", "foreign-ptr-soa"):
+                reply.answer.append(dns.rrset.from_text("99." + zone, 60, "IN", "PTR", "foreign.home.arpa."))
+            if action == "cname-chain-ptr":
+                reply.answer.append(dns.rrset.from_text(outside, 60, "IN", "PTR", "nas.home.arpa."))
+            soa = {
+                "foreign-soa": "example.com.",
+                "cname-foreign-soa": "example.com.",
+                "cname-origin-soa": zone,
+                "foreign-ptr-soa": zone,
+                "cname-out-nodata": "rev.example.com.",
+                "cname-chain-nodata": "rev.example.com.",
+            }.get(action)
+            if soa is not None:
+                reply.authority.append(dns.rrset.from_text(
+                    soa, 60, "IN", "SOA", "ns.example.com. admin.example.com. 1 60 60 60 60"
+                ))
         elif action.startswith("cname-"):
             target = "1.0-7." + ".".join(question.name.to_text().split(".")[1:])
             reply.answer.append(dns.rrset.from_text(question.name, 60, "IN", "CNAME", target))
@@ -245,11 +290,13 @@ def _ipv6_loopback() -> bool:
         return False
 
 
+@pytest.mark.parametrize("first_reply", ["servfail", "cname-foreign-soa", "foreign-ptr"])
 @pytest.mark.parametrize("late", [0.0, 0.1], ids=["on-time", "first-query-late"])
 @pytest.mark.parametrize("second", ["127.0.0.1", "::1"])
-async def test_failover_to_the_next_server_is_paced_with_the_icmp_sweep(second, late, monkeypatch):
+async def test_failover_to_the_next_server_is_paced_with_the_icmp_sweep(second, late, first_reply, monkeypatch):
     """At MAX_PPS=4 the echo request and both queries (the first server answers
-    SERVFAIL, the second the name) take three slots of one budget, on the real clock.
+    SERVFAIL, or with records that do not answer the question, #144, the second the
+    name) take three slots of one budget, on the real clock.
 
     What is held (#87): each slot is granted at least 0.25 s after the one before, by
     the clock the pacer reads, and each packet is handed over at its grant and before
@@ -291,10 +338,10 @@ async def test_failover_to_the_next_server_is_paced_with_the_icmp_sweep(second, 
         await asyncio.sleep(seconds + (late if len(sleeps) == 1 else 0.0))
 
     if second == "127.0.0.1":
-        first_t, first, port = await responder(script=("servfail", "answer"))
+        first_t, first, port = await responder(script=(first_reply, "answer"))
         second_t, second_p = first_t, first
     else:
-        (first_t, first), (second_t, second_p), port = await responders_on_one_port(script=("servfail", "answer"))
+        (first_t, first), (second_t, second_p), port = await responders_on_one_port(script=(first_reply, "answer"))
     try:
         raw = job(
             ranges=[{"start": "10.0.0.9", "end": "10.0.0.9"}],
@@ -348,11 +395,12 @@ async def test_a_silent_server_gets_one_query_and_at_most_three_servers_are_trie
         transport.close()
 
 
-@pytest.mark.parametrize("action", ["nxdomain", "nodata", "empty", "cname-nodata"])
+@pytest.mark.parametrize("action", ["nxdomain", "nodata", "empty", "cname-nodata", "cname-out-nodata", "cname-chain-nodata"])
 async def test_an_answer_that_there_is_no_name_is_no_name_and_ends_the_lookup(action):
     """#100: NXDOMAIN, or NOERROR without a PTR record that says so (`says_no_name`:
-    the zone's SOA, after a CNAME or not, or an empty answer and no authority), is the
-    one answer that lets the server clear a stored name; no further server is asked."""
+    the SOA of the zone that holds the name the answer is about, after a CNAME chain
+    or not, #144, or an empty answer and no authority), is the one answer that lets
+    the server clear a stored name; no further server is asked."""
     transport, proto, port = await responder(script=(action,))
     try:
         answer = await DnsResolver(port=port).ptr(ipaddress.ip_address("10.0.0.9"), ("127.0.0.1",) * 3, unpaced())
@@ -364,12 +412,15 @@ async def test_an_answer_that_there_is_no_name_is_no_name_and_ends_the_lookup(ac
 
 @pytest.mark.parametrize(
     "action",
-    ["silent", "servfail", "refused", "referral", "cname-referral", "cname-only", "malformed", "truncated"],
+    ["silent", "servfail", "refused", "referral", "cname-referral", "cname-only", "malformed", "truncated",
+     *NOT_ANSWERING],
 )
 async def test_a_lookup_no_server_answered_usably_is_no_answer_not_no_name(action):
     """#100: silence, SERVFAIL, REFUSED, a referral (after a CNAME too: round 1 of the
     briefed review, finding 1), a CNAME the reply leaves unresolved, malformed bytes
-    and a truncated reply say nothing about the name. Every server is asked in turn, once each, and
+    and a truncated reply say nothing about the name; nor (#144) does an SOA for a
+    zone that does not hold the name the answer is about, or a PTR record at an owner
+    the question does not reach. Every server is asked in turn, once each, and
     the lookup is None, which leaves a stored name as it is."""
     transport, proto, port = await responder(script=(action,))
     try:
@@ -381,7 +432,8 @@ async def test_a_lookup_no_server_answered_usably_is_no_answer_not_no_name(actio
         transport.close()
 
 
-UNUSABLE_FIRST = ["silent", "servfail", "refused", "referral", "cname-referral", "cname-only", "malformed"]
+UNUSABLE_FIRST = ["silent", "servfail", "refused", "referral", "cname-referral", "cname-only", "malformed",
+                  *NOT_ANSWERING]
 
 
 @pytest.mark.parametrize("first", UNUSABLE_FIRST)
@@ -398,10 +450,14 @@ async def test_a_later_servers_answer_decides_after_one_without_a_usable_one(fir
         transport.close()
 
 
-async def test_a_cname_with_its_ptr_record_is_the_name():
-    transport, proto, port = await responder(script=("cname-ptr",))
+@pytest.mark.parametrize("action", ["cname-ptr", "cname-chain-ptr"])
+async def test_a_cname_with_its_ptr_record_is_the_name(action):
+    """The PTR record at the end of the question's CNAME chain in the reply is the
+    name, one link (RFC 2317) or two, the second outside the reverse tree (#144)."""
+    transport, proto, port = await responder(script=(action,))
     try:
         assert await DnsResolver(port=port).ptr(ipaddress.ip_address("10.0.0.1"), ("127.0.0.1",), unpaced()) == "nas.home.arpa."
+        assert len(proto.arrivals) == 1
     finally:
         transport.close()
 
@@ -420,39 +476,99 @@ async def test_a_delegation_after_a_cname_goes_on_to_a_different_server():
         v6_t.close()
 
 
-def _reply(answer=(), authority=()):
-    query = dns.message.make_query("1.0.0.10.in-addr.arpa.", dns.rdatatype.PTR)
+def _reply(answer=(), authority=(), rcode=dns.rcode.NOERROR):
+    query = dns.message.make_query(_Q, dns.rdatatype.PTR)
     reply = dns.message.make_response(query)
-    for owner, kind, data in answer:
-        reply.answer.append(dns.rrset.from_text(owner, 60, "IN", kind, data))
-    for owner, kind, data in authority:
-        reply.authority.append(dns.rrset.from_text(owner, 60, "IN", kind, data))
+    reply.set_rcode(rcode)
+    for section, records in ((reply.answer, answer), (reply.authority, authority)):
+        for owner, kind, data in records:
+            section.append(dns.rrset.from_text(owner, 60, "IN", kind, data))
     return reply
 
 
-_CNAME = ("1.0.0.10.in-addr.arpa.", "CNAME", "1.0-7.0.0.10.in-addr.arpa.")
-_NS = ("0-7.0.0.10.in-addr.arpa.", "NS", "ns.example.com.")
-_SOA = ("0-7.0.0.10.in-addr.arpa.", "SOA", "ns.example.com. admin.example.com. 1 60 60 60 60")
+def _soa(zone):
+    return (zone, "SOA", "ns.example.com. admin.example.com. 1 60 60 60 60")
 
 
-@pytest.mark.parametrize(
-    "answer, authority, no_name",
-    [
-        ((), (), True),  # NOERROR, nothing at all: the name has no PTR record
-        ((), (_SOA,), True),  # NODATA
-        ((), (_NS, _SOA), True),  # NODATA from the zone's own server, its NS beside
-        ((), (_NS,), False),  # a referral
-        ((_CNAME,), (_SOA,), True),  # the alias's target has no PTR record
-        ((_CNAME,), (_NS, _SOA), True),
-        ((_CNAME,), (_NS,), False),  # a referral after the alias (RFC 2317)
-        ((_CNAME,), (), False),  # an alias the reply does not resolve
-        ((("1.0.0.10.in-addr.arpa.", "TXT", '"x"'),), (), False),  # an answer about something else
-    ],
-    ids=["empty", "soa", "ns-and-soa", "referral", "cname-soa", "cname-ns-and-soa",
-         "cname-referral", "cname-only", "other-type"],
-)
-def test_which_replies_say_there_is_no_name(answer, authority, no_name):
-    assert probe.says_no_name(_reply(answer, authority)) is no_name
+# the question, for 10.0.0.1; its zone; an RFC 2317 target inside the reverse tree and
+# one outside it (RFC 2317 §5.2), with their zones
+_Q = "1.0.0.10.in-addr.arpa."
+_Q_ZONE = "0.0.10.in-addr.arpa."
+_IN = "1.0-7.0.0.10.in-addr.arpa."
+_IN_ZONE = "0-7.0.0.10.in-addr.arpa."
+_OUT = "1.rev.example.com."
+_OUT_ZONE = "rev.example.com."
+_CNAME = (_Q, "CNAME", _IN)
+_CNAME_OUT = (_Q, "CNAME", _OUT)
+_CHAIN = (_CNAME, (_IN, "CNAME", _OUT))
+_NS = (_IN_ZONE, "NS", "ns.example.com.")
+_SOA = _soa(_IN_ZONE)
+_NAME = "nas.home.arpa."
+
+
+def _ptr(owner, target=_NAME):
+    return (owner, "PTR", target)
+
+
+# (answer, authority, rcode, what the reply says): a name, NO_NAME, or None (no usable
+# answer: the stored name is kept and the next server asked)
+READINGS = {
+    # a PTR record is read at the name the answer is about, and only there (#144)
+    "ptr": ((_ptr(_Q),), (), None, _NAME),
+    "ptr-any-case": ((_ptr(_Q.upper()),), (), None, _NAME),
+    "ptr-with-another-beside": ((_ptr(_Q), _ptr("99.0.0.10.in-addr.arpa.", "other.home.arpa.")), (), None, _NAME),
+    "cname-ptr": ((_CNAME, _ptr(_IN)), (), None, _NAME),  # RFC 2317
+    "cname-out-ptr": ((_CNAME_OUT, _ptr(_OUT)), (), None, _NAME),
+    "chain-ptr": ((*_CHAIN, _ptr(_OUT)), (), None, _NAME),
+    "chain-ptr-and-soa": ((*_CHAIN, _ptr(_OUT)), (_soa(_OUT_ZONE),), None, _NAME),
+    "foreign-ptr": ((_ptr("99.0.0.10.in-addr.arpa.", "foreign.home.arpa."),), (), None, None),
+    "foreign-ptr-soa": ((_ptr("99.0.0.10.in-addr.arpa.", "foreign.home.arpa."),), (_soa(_Q_ZONE),), None, None),
+    "ptr-at-the-alias": ((_CNAME, _ptr(_Q)), (), None, None),  # the chain goes on past it
+    "ptr-mid-chain": ((*_CHAIN, _ptr(_IN)), (), None, None),
+    "ptr-off-the-chain": ((_CNAME, _ptr(_OUT)), (), None, None),
+    "cname-loop": ((_CNAME, (_IN, "CNAME", _Q)), (_soa(_Q_ZONE),), None, None),
+    # NXDOMAIN, as before #144
+    "nxdomain": ((), (), dns.rcode.NXDOMAIN, probe.NO_NAME),
+    "nxdomain-cname": ((_CNAME,), (_SOA,), dns.rcode.NXDOMAIN, probe.NO_NAME),
+    "servfail": ((), (), dns.rcode.SERVFAIL, None),
+    # no PTR record: an SOA counts only for a zone that holds the name (#144)
+    "empty": ((), (), None, probe.NO_NAME),  # nothing at all: the name has no PTR record
+    "soa": ((), (_soa(_Q_ZONE),), None, probe.NO_NAME),  # NODATA
+    "ancestor-soa": ((), (_soa("10.in-addr.arpa."),), None, probe.NO_NAME),
+    "soa-at-the-name": ((), (_soa(_Q),), None, probe.NO_NAME),
+    "ns-and-soa": ((), ((_Q_ZONE, "NS", "ns.example.com."), _soa(_Q_ZONE)), None, probe.NO_NAME),
+    "foreign-soa": ((), (_soa("example.com."),), None, None),
+    "sibling-soa": ((), (_SOA,), None, None),  # 0-7.0.0.10.in-addr.arpa. does not hold 1.0.0.10
+    "foreign-and-own-soa": ((), (_soa("example.com."), _soa(_Q_ZONE)), None, probe.NO_NAME),
+    "referral": ((), (_NS,), None, None),
+    "foreign-soa-and-ns": ((), (_soa("example.com."), _NS), None, None),
+    "cname-soa": ((_CNAME,), (_SOA,), None, probe.NO_NAME),  # the alias's target has no PTR record
+    "cname-ns-and-soa": ((_CNAME,), (_NS, _SOA), None, probe.NO_NAME),
+    "cname-origin-soa-in-tree": ((_CNAME,), (_soa(_Q_ZONE),), None, probe.NO_NAME),  # that zone holds the target
+    "cname-out-target-soa": ((_CNAME_OUT,), (_soa(_OUT_ZONE),), None, probe.NO_NAME),
+    "cname-out-origin-soa": ((_CNAME_OUT,), (_soa(_Q_ZONE),), None, None),  # says nothing of the target
+    "cname-foreign-soa": ((_CNAME,), (_soa("example.com."),), None, None),
+    "chain-soa": (_CHAIN, (_soa(_OUT_ZONE),), None, probe.NO_NAME),
+    "chain-first-link-soa": (_CHAIN, (_SOA,), None, None),
+    "cname-referral": ((_CNAME,), (_NS,), None, None),  # a referral after the alias (RFC 2317)
+    "cname-only": ((_CNAME,), (), None, None),  # an alias the reply does not resolve
+    "other-type": (((_Q, "TXT", '"x"'),), (), None, None),  # an answer about something else
+    "other-type-soa": (((_Q, "TXT", '"x"'),), (_soa(_Q_ZONE),), None, probe.NO_NAME),
+}
+
+
+@pytest.mark.parametrize("case", list(READINGS))
+def test_what_a_reply_says(case):
+    """#144: what one reply says, read against the question. A PTR record is the name
+    only at the question's name or the end of its CNAME chain in the reply; an SOA is
+    a negative answer only for a zone that holds that name. Anything else that
+    does not answer the question is no usable answer. The rows for NXDOMAIN, a PTR at
+    the question or the chain's end, and the right zone's SOA (with a CNAME before it
+    or not) are #100's, and read as they did."""
+    answer, authority, rcode, says = READINGS[case]
+    reply = _reply(answer, authority, rcode if rcode is not None else dns.rcode.NOERROR)
+    got = probe.read_reply(reply, dns.name.from_text(_Q))
+    assert got == says if isinstance(says, str) else got is says
 
 
 async def test_a_truncated_answer_does_not_fall_back_to_tcp():
