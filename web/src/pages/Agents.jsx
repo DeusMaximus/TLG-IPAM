@@ -1,26 +1,34 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Ban, Plus, Power, PowerOff, Trash2 } from 'lucide-react'
+import { ArrowUpCircle, Ban, KeyRound, Plus, Power, PowerOff, Radar, Trash2 } from 'lucide-react'
 import {
+  createScanTarget,
   deleteAgent,
   getHealth,
   listAgents,
+  listScanSuggestions,
   listScanTargets,
+  requestScan,
   revokeAgentTokens,
   updateAgent,
 } from '../api/ipam'
 import AddAgentModal from '../components/AddAgentModal'
 import EmptyState from '../components/EmptyState'
 import Modal, { dangerBtn, primaryBtn, secondaryBtn } from '../components/Modal'
+import ReEnrolModal from '../components/ReEnrolModal'
+import UpdateModal from '../components/UpdateModal'
 import { useToast, useTree } from '../context'
 import { useFetch } from '../hooks/useFetch'
 import {
   activeToken,
   openEnrolment,
   agentStatus,
+  pendingEnrolments,
   relativeTime,
   STATUS_LABELS,
+  timeLeft,
 } from '../utils/agents'
+import { NEW_TARGET, SCAN_METHODS } from '../utils/scans'
 import { parseServerTime } from '../utils/time'
 
 // How often the list and the status dots refresh while the page is open
@@ -87,7 +95,69 @@ function Covered({ targets, subnets }) {
   )
 }
 
-function AgentRow({ agent, targets, subnets, now, onToggle, onRevoke, onDelete }) {
+// The version the agent last reported, and the server's two flags (`update_available`,
+// `protocol_mismatch`, computed on read by `agents.agent_out`): either offers the
+// update command
+function Version({ agent, onUpdate }) {
+  const flagged = agent.update_available || agent.protocol_mismatch
+  return (
+    <div>
+      <span className="font-mono text-slate-300">{agent.version || '—'}</span>
+      {agent.update_available && (
+        <span
+          className="ml-1.5 rounded bg-amber-900/60 px-1.5 py-0.5 text-[11px] text-amber-200"
+          data-testid="update-available"
+        >
+          update available
+        </span>
+      )}
+      {flagged && (
+        <button
+          onClick={() => onUpdate(agent)}
+          className="mt-1 flex items-center gap-1 text-blue-400 hover:text-blue-300"
+        >
+          <ArrowUpCircle size={12} /> Update command
+        </button>
+      )}
+    </div>
+  )
+}
+
+function TokenCell({ agent, now }) {
+  const token = activeToken(agent)
+  const enrolment = openEnrolment(agent, now)
+  const enrolled = (agent.tokens || []).some((t) => t.kind === 'agent')
+  return (
+    <div>
+      {token ? (
+        <code className="text-slate-400">{token.token_prefix}…</code>
+      ) : !enrolled ? (
+        <span className="text-slate-400" title="It has never exchanged an enrolment token">
+          not enrolled
+        </span>
+      ) : (
+        <span className="text-amber-400">revoked</span>
+      )}
+      {enrolment && (
+        <div className="mt-0.5 whitespace-nowrap text-slate-500">
+          enrolment open, expires {timeLeft(enrolment.expires_at, now) ?? 'soon'}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function AgentRow({
+  agent,
+  targets,
+  subnets,
+  now,
+  onToggle,
+  onRevoke,
+  onReEnrol,
+  onUpdate,
+  onDelete,
+}) {
   const token = activeToken(agent)
   const enrolment = token ? null : openEnrolment(agent, now)
   const revocable = token || enrolment
@@ -112,11 +182,19 @@ function AgentRow({ agent, targets, subnets, now, onToggle, onRevoke, onDelete }
             {agent.platform}
           </div>
         )}
+        {agent.protocol_mismatch && (
+          <div className="mt-1 max-w-64 font-medium text-red-400" data-testid="protocol-mismatch">
+            Protocol mismatch: it is given no scans until it runs the release that matches the
+            server.
+          </div>
+        )}
         {agent.last_error && (
           <div className="mt-1 max-w-64 text-red-400">Last check-in refused: {agent.last_error}</div>
         )}
       </td>
-      <td className="whitespace-nowrap px-3 py-2.5 font-mono text-slate-300">{agent.version || '—'}</td>
+      <td className="whitespace-nowrap px-3 py-2.5">
+        <Version agent={agent} onUpdate={onUpdate} />
+      </td>
       <td className="px-3 py-2.5">
         <Interfaces interfaces={agent.interfaces} />
       </td>
@@ -124,15 +202,7 @@ function AgentRow({ agent, targets, subnets, now, onToggle, onRevoke, onDelete }
         <Covered targets={targets} subnets={subnets} />
       </td>
       <td className="px-3 py-2.5">
-        {token ? (
-          <code className="text-slate-400">{token.token_prefix}…</code>
-        ) : !(agent.tokens || []).some((t) => t.kind === 'agent') ? (
-          <span className="text-slate-400" title="It has never exchanged an enrolment token">
-            not enrolled
-          </span>
-        ) : (
-          <span className="text-amber-400">revoked</span>
-        )}
+        <TokenCell agent={agent} now={now} />
       </td>
       <td className="px-3 py-2.5">
         <div className="flex justify-end gap-1">
@@ -159,6 +229,18 @@ function AgentRow({ agent, targets, subnets, now, onToggle, onRevoke, onDelete }
             <Ban size={12} /> Revoke
           </button>
           <button
+            onClick={() => onReEnrol(agent)}
+            disabled={disabled}
+            className="flex items-center gap-1 rounded px-2 py-1 text-slate-300 hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
+            title={
+              disabled
+                ? 'Enable it first: a disabled agent cannot be re-enrolled'
+                : 'Issue a new enrolment token for it'
+            }
+          >
+            <KeyRound size={12} /> Re-enrol
+          </button>
+          <button
             onClick={() => onDelete(agent)}
             className="flex items-center gap-1 rounded px-2 py-1 text-red-400 hover:bg-slate-700"
           >
@@ -167,6 +249,85 @@ function AgentRow({ agent, targets, subnets, now, onToggle, onRevoke, onDelete }
         </div>
       </td>
     </tr>
+  )
+}
+
+// Every enrolment token still open (spec §5.8), listed until it is used or expires by
+// this browser's clock; the list and the clock refresh with the page
+function PendingEnrolments({ agents, now }) {
+  const pending = pendingEnrolments(agents, now)
+  if (!pending.length) return null
+  return (
+    <section className="mb-4" aria-label="Pending enrolments">
+      <h2 className="text-sm font-medium text-slate-200">Pending enrolments</h2>
+      <ul className="mt-2 space-y-1 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs">
+        {pending.map(({ agent, token }) => (
+          <li key={token.id} className="flex flex-wrap items-baseline gap-x-2" data-testid={`pending-${agent.id}`}>
+            <span className="font-medium text-slate-100">{agent.name}</span>
+            <code className="text-slate-400">{token.token_prefix}…</code>
+            <span className="text-slate-400">
+              {agent.state === 'pending' ? 'waiting for its first enrolment' : 'being re-enrolled'},
+              expires {timeLeft(token.expires_at, now) ?? 'soon'}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </section>
+  )
+}
+
+const methodLabels = (ids) =>
+  SCAN_METHODS.filter((m) => ids.includes(m.id))
+    .map((m) => m.label)
+    .join(', ')
+
+// "Scan <subnet> with this agent?" (spec §5.6, "Suggest, don't assume"): the subnets on
+// an agent's link that have no scan target, as the server matches them
+// (`scans.suggestions`). Nothing is scanned until the owner accepts one.
+function Suggestions({ suggestions, busy, onAccept, onDismiss }) {
+  if (!suggestions.length) return null
+  return (
+    <section className="mb-4" aria-label="Suggested scans">
+      <h2 className="text-sm font-medium text-slate-200">Suggested scans</h2>
+      <p className="mt-0.5 text-xs text-slate-400">
+        Subnets on the link of an agent&apos;s interface that nothing scans yet. Scanning one sets
+        it up with the default methods ({methodLabels(NEW_TARGET.methods)}), its DHCP pool left out
+        and on request only, then asks for one scan; its subnet page changes the settings.
+      </p>
+      <ul className="mt-2 space-y-1.5">
+        {suggestions.map((s) => {
+          const key = `${s.agent_id}:${s.subnet_id}`
+          return (
+            <li
+              key={key}
+              data-testid={`suggestion-${key}`}
+              className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs"
+            >
+              <span className="text-slate-300">
+                Scan <span className="font-medium text-slate-100">{s.subnet_name}</span>{' '}
+                <span className="font-mono text-slate-500">{s.subnet_cidr}</span> with{' '}
+                <span className="font-medium text-slate-100">{s.agent_name}</span>?
+              </span>
+              <span className="flex gap-1">
+                <button
+                  onClick={() => onAccept(s)}
+                  disabled={busy === key}
+                  className="flex items-center gap-1 rounded bg-blue-600 px-2 py-1 font-medium text-white hover:bg-blue-500 disabled:opacity-50"
+                >
+                  <Radar size={12} /> {busy === key ? 'Setting up…' : 'Scan'}
+                </button>
+                <button
+                  onClick={() => onDismiss(s)}
+                  className="rounded px-2 py-1 text-slate-400 hover:bg-slate-700"
+                >
+                  Not now
+                </button>
+              </span>
+            </li>
+          )
+        })}
+      </ul>
+    </section>
   )
 }
 
@@ -208,27 +369,62 @@ export default function Agents() {
   const { subnets } = useTree()
   const agents = useFetch(listAgents, [])
   const targets = useFetch(listScanTargets, [])
+  const suggested = useFetch(listScanSuggestions, [])
   const health = useFetch(getHealth, [])
   const [now, setNow] = useState(() => Date.now())
   const [adding, setAdding] = useState(false)
   const [confirming, setConfirming] = useState(null)
+  // offers set aside with "Not now", for as long as the page is open
+  const [dismissed, setDismissed] = useState(() => new Set())
+  const [accepting, setAccepting] = useState(null)
 
   const { refresh: refreshAgents } = agents
   const { refresh: refreshTargets } = targets
+  const { refresh: refreshSuggested } = suggested
 
   useEffect(() => {
     const id = setInterval(() => {
       setNow(Date.now())
       refreshAgents()
       refreshTargets()
+      refreshSuggested()
     }, REFRESH_MS)
     return () => clearInterval(id)
-  }, [refreshAgents, refreshTargets])
+  }, [refreshAgents, refreshTargets, refreshSuggested])
 
   const reload = () => {
     setNow(Date.now())
     refreshAgents()
     refreshTargets()
+    refreshSuggested()
+  }
+
+  const offers = (suggested.data?.data || []).filter(
+    (s) => !dismissed.has(`${s.agent_id}:${s.subnet_id}`)
+  )
+
+  // One click: the scan target with the defaults, then one scan of it. Each is the
+  // ordinary owner write, audit-logged by its own service.
+  const accept = async (s) => {
+    const key = `${s.agent_id}:${s.subnet_id}`
+    setAccepting(key)
+    try {
+      await createScanTarget({ subnet_id: s.subnet_id, agent_id: s.agent_id })
+    } catch (err) {
+      toast.error(err.message)
+      setAccepting(null)
+      reload()
+      return
+    }
+    try {
+      await requestScan(s.subnet_id)
+      toast.success(`${s.agent_name} will scan ${s.subnet_name} at its next check-in`)
+    } catch (err) {
+      toast.error(`Scanning of ${s.subnet_name} is set up, but the scan was not requested: ${err.message}`)
+    } finally {
+      setAccepting(null)
+      reload()
+    }
   }
 
   // Only a successful load says which subnets each agent covers. Until then, or
@@ -279,6 +475,13 @@ export default function Agents() {
       </p>
 
       <div className="mt-5">
+        <Suggestions
+          suggestions={offers}
+          busy={accepting}
+          onAccept={accept}
+          onDismiss={(s) => setDismissed((d) => new Set(d).add(`${s.agent_id}:${s.subnet_id}`))}
+        />
+        {list && <PendingEnrolments agents={list} now={now} />}
         {agents.error && !list && (
           <p className="text-sm text-red-400">Could not load agents: {agents.error.message}</p>
         )}
@@ -290,8 +493,8 @@ export default function Agents() {
         )}
         {list && list.length === 0 && (
           <EmptyState>
-            No agents yet. Add one, then run the container command it gives you on a host in the
-            VLAN to be scanned.
+            No agents yet. Add one, then run the command it gives you, in a container or as a
+            systemd service, on a host in the VLAN to be scanned.
           </EmptyState>
         )}
         {list && list.length > 0 && (
@@ -320,6 +523,8 @@ export default function Agents() {
                     now={now}
                     onToggle={toggle}
                     onRevoke={(a) => setConfirming({ kind: 'revoke', agent: a })}
+                    onReEnrol={(a) => setConfirming({ kind: 're-enrol', agent: a })}
+                    onUpdate={(a) => setConfirming({ kind: 'update', agent: a })}
                     onDelete={(a) => setConfirming({ kind: 'delete', agent: a })}
                   />
                 ))}
@@ -337,6 +542,23 @@ export default function Agents() {
         />
       )}
 
+      {confirming?.kind === 're-enrol' && (
+        <ReEnrolModal
+          agent={confirming.agent}
+          serverVersion={health.data?.version}
+          onClose={() => setConfirming(null)}
+          onIssued={reload}
+        />
+      )}
+
+      {confirming?.kind === 'update' && (
+        <UpdateModal
+          agent={confirming.agent}
+          serverVersion={health.data?.version}
+          onClose={() => setConfirming(null)}
+        />
+      )}
+
       {confirming?.kind === 'revoke' && (
         <Confirm
           title={`Revoke the token of ${confirming.agent.name}?`}
@@ -350,8 +572,8 @@ export default function Agents() {
           }
         >
           <p>
-            The agent can no longer check in. It keeps its name and the subnets it covers, but a
-            revoked token cannot be reissued: to run it again, delete it and add a new agent.
+            The agent can no longer check in. It keeps its name and the subnets it covers. A
+            revoked token cannot be reissued: to run it again, re-enrol it for a new one.
           </p>
         </Confirm>
       )}

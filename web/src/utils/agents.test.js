@@ -1,14 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import {
   activeToken,
-  agentServerUrl,
   AHEAD_WITHIN_MS,
   agentStatus,
-  containerCommand,
-  enrolCommand,
   openEnrolment,
+  pendingEnrolments,
   relativeTime,
-  shellQuote,
+  timeLeft,
 } from './agents'
 
 const NOW = Date.parse('2026-11-16T12:00:00Z')
@@ -80,47 +78,6 @@ describe('activeToken', () => {
   })
 })
 
-describe('containerCommand', () => {
-  it('runs the agent with host networking, NET_RAW, the URL and the token', () => {
-    const cmd = containerCommand({
-      url: 'https://ipam.home.arpa',
-      token: 'tlga_abc-DEF_123',
-      version: '0.2.0',
-    })
-    expect(cmd).toContain('--network host')
-    expect(cmd).toContain('--cap-add NET_RAW')
-    expect(cmd).toContain('-e IPAM_URL=https://ipam.home.arpa')
-    expect(cmd).toContain('-e IPAM_AGENT_TOKEN=tlga_abc-DEF_123')
-    expect(cmd).toMatch(/tlg-ipam-agent:0\.2\.0$/)
-  })
-
-  it('leaves a placeholder for a token the page does not hold', () => {
-    const cmd = containerCommand({ url: 'https://ipam.home.arpa', version: '0.2.0' })
-    expect(cmd).toContain('-e IPAM_AGENT_TOKEN=<agent token> \\')
-  })
-
-  it('leaves a placeholder when the server version is unknown', () => {
-    expect(containerCommand({ url: 'http://x', token: 't', version: undefined })).toMatch(
-      /:<version>$/
-    )
-  })
-
-  it('quotes anything with shell metacharacters', () => {
-    expect(shellQuote('plain-1.2')).toBe('plain-1.2')
-    expect(shellQuote("a b'c")).toBe(`'a b'\\''c'`)
-    expect(shellQuote('$(id)')).toBe(`'$(id)'`)
-  })
-})
-
-describe('enrolCommand', () => {
-  it('posts the enrolment token as the bearer to the enrol route', () => {
-    const cmd = enrolCommand({ url: 'https://ipam.home.arpa', token: 'tlge_abc-DEF_123' })
-    expect(cmd).toContain('curl -fsS -X POST https://ipam.home.arpa/api/v1/agent/enrol \\')
-    expect(cmd).toContain("-H 'Authorization: Bearer tlge_abc-DEF_123'")
-    expect(cmd).toContain("-H 'Content-Type: application/json' -d '{}'")
-  })
-})
-
 describe('openEnrolment', () => {
   const now = Date.parse('2026-11-16T06:30:00Z')
   const enrol = (over) => ({
@@ -141,23 +98,38 @@ describe('openEnrolment', () => {
   })
 })
 
-describe('agentServerUrl', () => {
-  const at = (url) => {
-    const u = new URL(url)
-    return agentServerUrl({ protocol: u.protocol, hostname: u.hostname, origin: u.origin })
-  }
-
-  it('gives an https origin, or a plain-http one only on a loopback host', () => {
-    expect(at('https://ipam.home.arpa')).toBe('https://ipam.home.arpa')
-    expect(at('https://10.0.0.2:8443')).toBe('https://10.0.0.2:8443')
-    expect(at('http://localhost:8080')).toBe('http://localhost:8080')
-    expect(at('http://127.0.0.1:8080')).toBe('http://127.0.0.1:8080')
-    expect(at('http://[::1]:8080')).toBe('http://[::1]:8080')
+describe('pendingEnrolments', () => {
+  const now = Date.parse('2026-11-16T06:30:00Z')
+  const enrol = (over) => ({
+    kind: 'enrol',
+    token_prefix: 'tlge_abcdefgh',
+    expires_at: '2026-11-16T07:00:00',
+    used_at: null,
+    revoked_at: null,
+    ...over,
   })
 
-  it('gives nothing for plain http across a network', () => {
-    expect(at('http://ipam.home.arpa')).toBeNull()
-    expect(at('http://10.0.0.2:8080')).toBeNull()
-    expect(at('http://127.0.0.1.example.com')).toBeNull()
+  it('lists each agent with an open enrolment token until it is used or expires', () => {
+    const open = { id: 'a', tokens: [enrol()] }
+    const used = { id: 'b', tokens: [enrol({ used_at: '2026-11-16T06:10:00' })] }
+    const expired = { id: 'c', tokens: [enrol({ expires_at: '2026-11-16T06:29:59' })] }
+    const revoked = { id: 'd', tokens: [enrol({ revoked_at: '2026-11-16T06:10:00' })] }
+    // an active agent being re-enrolled holds its agent token and the new one
+    const reEnrolling = { id: 'e', tokens: [{ kind: 'agent', revoked_at: null }, enrol()] }
+    const found = pendingEnrolments([open, used, expired, revoked, reEnrolling], now)
+    expect(found.map((p) => p.agent.id)).toEqual(['a', 'e'])
+    expect(found[0].token.token_prefix).toBe('tlge_abcdefgh')
+    expect(pendingEnrolments(null, now)).toEqual([])
+  })
+})
+
+describe('timeLeft', () => {
+  const now = Date.parse('2026-11-16T06:30:00Z')
+  it('says how long an open token has left, and nothing once it is due', () => {
+    expect(timeLeft('2026-11-16T07:00:00', now)).toBe('in 30m')
+    expect(timeLeft('2026-11-16T06:30:45', now)).toBe('in 45s')
+    expect(timeLeft('2026-11-16T09:30:00+00:00', now)).toBe('in 3h')
+    expect(timeLeft('2026-11-16T06:30:00', now)).toBeNull()
+    expect(timeLeft(null, now)).toBeNull()
   })
 })

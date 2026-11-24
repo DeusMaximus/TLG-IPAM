@@ -15,6 +15,10 @@ vi.mock('../api/ipam', () => ({
   revokeAgentTokens: vi.fn(),
   deleteAgent: vi.fn(),
   listScanTargets: vi.fn(),
+  listScanSuggestions: vi.fn(),
+  createScanTarget: vi.fn(),
+  requestScan: vi.fn(),
+  reEnrolAgent: vi.fn(),
   getHealth: vi.fn(),
 }))
 
@@ -45,6 +49,8 @@ const agentRow = (over = {}) => ({
   current_job_id: null,
   job_issued_at: null,
   created_at: '2026-11-16T06:00:00',
+  update_available: false,
+  protocol_mismatch: false,
   tokens: [
     {
       id: 'tok-1',
@@ -96,6 +102,7 @@ beforeEach(() => {
   ipam.getHealth.mockResolvedValue({ status: 'ok', version: '0.2.0' })
   ipam.listScanTargets.mockResolvedValue({ data: [target], total: 1 })
   ipam.listAgents.mockResolvedValue({ data: [agentRow()], total: 1 })
+  ipam.listScanSuggestions.mockResolvedValue({ data: [], total: 0 })
 })
 
 afterEach(() => {
@@ -227,20 +234,38 @@ describe('Agents page', () => {
 
     expect(ipam.createAgent).toHaveBeenCalledWith({ name: 'lab-vlan20' })
     expect(await screen.findByTestId('agent-token')).toHaveTextContent(ENROL_TOKEN)
-    // step 1, the exchange by hand, until the agent makes it itself (#22)
     // served from loopback here (jsdom), so the page's own origin is used
     expect(screen.queryByTestId('agent-needs-https')).toBeNull()
-    const exchange = screen.getByTestId('agent-enrol-command').textContent
-    expect(exchange).toContain(`POST ${window.location.origin}/api/v1/agent/enrol`)
-    expect(exchange).toContain(`'Authorization: Bearer ${ENROL_TOKEN}'`)
-    // step 2: the container command holds no token, only a placeholder for the agent's
+    expect(screen.queryByTestId('agent-version-unknown')).toBeNull()
+
+    // the Container tab first: the enrolment token as IPAM_ENROL_TOKEN, a volume for the
+    // agent's own token, pinned to the server's version
+    expect(screen.getByRole('tab', { name: 'Container' })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByTestId('prerequisites')).toHaveTextContent('Docker or Podman running as root')
     const command = screen.getByTestId('agent-command').textContent
-    expect(command).toContain('-e IPAM_AGENT_TOKEN=<agent token>')
-    expect(command).not.toContain('tlg' + 'e_')
+    expect(command).toContain(`-e IPAM_ENROL_TOKEN=${ENROL_TOKEN}`)
+    expect(command).toContain('-v tlg-ipam-agent:/var/lib/tlg-ipam-agent')
     expect(command).toContain(`-e IPAM_URL=${window.location.origin}`)
     expect(command).toContain('--network host')
     expect(command).toContain('--cap-add NET_RAW')
-    expect(command).toMatch(/tlg-ipam-agent:0\.2\.0$/)
+    expect(command).toMatch(/ghcr\.io\/deusmaximus\/tlg-ipam-agent:0\.2\.0$/)
+    expect(command).not.toContain('tlga_')
+    expect(screen.queryByTestId('agent-forget-command')).toBeNull()
+
+    // the systemd tab: three commands, the token read from standard input, never an argument
+    await user.click(screen.getByRole('tab', { name: 'systemd' }))
+    expect(screen.getByTestId('prerequisites')).toHaveTextContent('Python 3.11 or later')
+    const systemd = screen.getByTestId('agent-systemd-commands').textContent
+    expect(systemd.split('\n')).toEqual([
+      'sudo python3 -m venv /opt/tlg-ipam-agent',
+      'sudo /opt/tlg-ipam-agent/bin/pip install https://github.com/DeusMaximus/TLG-IPAM/releases/download/v0.2.0/tlg_ipam_agent-0.2.0-py3-none-any.whl',
+      `sudo /opt/tlg-ipam-agent/bin/tlg-ipam-agent install --url ${window.location.origin} --enrol-token -`,
+    ])
+    expect(systemd).not.toContain('tlg' + 'e_')
+    expect(systemd).not.toContain('tlga_')
+    expect(screen.queryByTestId('agent-command')).toBeNull()
+    // the token itself stays on show, to paste when install asks
+    expect(screen.getByTestId('agent-token')).toHaveTextContent(ENROL_TOKEN)
 
     // a stray click on the backdrop does not throw the token away
     await user.click(screen.getByRole('dialog').parentElement)
@@ -274,11 +299,22 @@ describe('Agents page', () => {
     await user.type(screen.getByLabelText('Name'), 'lab-vlan20')
     await user.click(screen.getByRole('button', { name: 'Create agent' }))
     expect(await screen.findByTestId('agent-needs-https')).toBeInTheDocument()
-    const exchange = screen.getByTestId('agent-enrol-command').textContent
     const command = screen.getByTestId('agent-command').textContent
-    expect(exchange).toContain("'https://<server>/api/v1/agent/enrol'")
     expect(command).toContain("-e IPAM_URL='https://<server>'")
-    for (const text of [exchange, command]) expect(text).not.toContain('http://10.0.0.2')
+    await user.click(screen.getByRole('tab', { name: 'systemd' }))
+    const systemd = screen.getByTestId('agent-systemd-commands').textContent
+    expect(systemd).toContain("--url 'https://<server>' --enrol-token -")
+    for (const text of [command, systemd]) expect(text).not.toContain('http://10.0.0.2')
+  })
+
+  it('pins nothing to a guess when the server version is unknown', async () => {
+    const user = userEvent.setup()
+    ipam.createAgent.mockResolvedValue(created())
+    render(<AddAgentModal serverVersion={undefined} onClose={vi.fn()} onCreated={vi.fn()} />)
+    await user.type(screen.getByLabelText('Name'), 'lab-vlan20')
+    await user.click(screen.getByRole('button', { name: 'Create agent' }))
+    expect(await screen.findByTestId('agent-version-unknown')).toBeInTheDocument()
+    expect(screen.getByTestId('agent-command').textContent).toMatch(/tlg-ipam-agent:<version>$/)
   })
 
   it('drops the token when the dialog is closed with its close button too', async () => {
@@ -414,5 +450,267 @@ describe('Agents page', () => {
 
     const row = await screen.findByTestId('agent-agent-1')
     expect(within(row).getByText('unknown')).toBeInTheDocument()
+  })
+
+  // --- Re-enrol ---
+
+  it('re-enrols an agent after a confirmation, and shows its new token once', async () => {
+    const user = userEvent.setup()
+    ipam.reEnrolAgent.mockResolvedValue({
+      data: {
+        ...agentRow({ tokens: [...agentRow().tokens, enrolToken()] }),
+        enrol_token: ENROL_TOKEN,
+        enrol_token_expires_at: EXPIRES,
+      },
+    })
+    renderPage()
+
+    const row = await screen.findByTestId('agent-agent-1')
+    await user.click(within(row).getByRole('button', { name: /Re-enrol/ }))
+    expect(screen.getByRole('dialog')).toHaveTextContent('keeps its name and the subnets it covers')
+    expect(ipam.reEnrolAgent).not.toHaveBeenCalled()
+
+    await user.click(screen.getByRole('button', { name: 'Issue a new enrolment token' }))
+    expect(ipam.reEnrolAgent).toHaveBeenCalledWith('agent-1')
+    expect(await screen.findByTestId('agent-token')).toHaveTextContent(ENROL_TOKEN)
+    // the host may still hold the old token, which would win: how to remove it first
+    expect(screen.getByTestId('agent-forget-command').textContent).toBe(
+      'docker rm -f tlg-ipam-agent\ndocker volume rm tlg-ipam-agent'
+    )
+    expect(screen.getByTestId('agent-command')).toHaveTextContent(`IPAM_ENROL_TOKEN=${ENROL_TOKEN}`)
+    await user.click(screen.getByRole('tab', { name: 'systemd' }))
+    expect(screen.getByTestId('agent-forget-command').textContent).toBe(
+      'sudo /opt/tlg-ipam-agent/bin/tlg-ipam-agent uninstall'
+    )
+    await waitFor(() => expect(ipam.listAgents).toHaveBeenCalledTimes(2))
+
+    // a stray backdrop click keeps it; Done drops it for good
+    await user.click(screen.getByRole('dialog').parentElement)
+    expect(screen.getByTestId('agent-token')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /Done, I have saved the token/ }))
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(document.body.innerHTML).not.toContain(ENROL_TOKEN)
+  })
+
+  it('cannot close the re-enrol dialog while its request is in flight', async () => {
+    const user = userEvent.setup()
+    let respond
+    ipam.reEnrolAgent.mockReturnValue(new Promise((resolve) => (respond = resolve)))
+    renderPage()
+
+    const row = await screen.findByTestId('agent-agent-1')
+    await user.click(within(row).getByRole('button', { name: /Re-enrol/ }))
+    await user.click(screen.getByRole('button', { name: 'Issue a new enrolment token' }))
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: 'Close' }))
+    await user.click(screen.getByRole('dialog').parentElement)
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+
+    respond({ data: { ...agentRow(), enrol_token: ENROL_TOKEN, enrol_token_expires_at: EXPIRES } })
+    expect(await screen.findByTestId('agent-token')).toHaveTextContent(ENROL_TOKEN)
+  })
+
+  it('keeps the re-enrol dialog open with the server error, and offers no re-enrol to a disabled agent', async () => {
+    const user = userEvent.setup()
+    ipam.listAgents.mockResolvedValue({
+      data: [agentRow(), agentRow({ id: 'a-off', name: 'off', state: 'disabled' })],
+      total: 2,
+    })
+    ipam.reEnrolAgent.mockRejectedValue(new ApiError('CONFLICT', 'Agent lab-vlan20 is disabled', 409))
+    renderPage()
+
+    const off = await screen.findByTestId('agent-a-off')
+    expect(within(off).getByRole('button', { name: /Re-enrol/ })).toBeDisabled()
+    const row = screen.getByTestId('agent-agent-1')
+    await user.click(within(row).getByRole('button', { name: /Re-enrol/ }))
+    await user.click(screen.getByRole('button', { name: 'Issue a new enrolment token' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('is disabled')
+    expect(screen.queryByTestId('agent-token')).toBeNull()
+  })
+
+  // --- Version flags ---
+
+  it('flags an agent older than the server, with the update command', async () => {
+    const user = userEvent.setup()
+    ipam.listAgents.mockResolvedValue({
+      data: [agentRow({ version: '0.1.0', update_available: true })],
+      total: 1,
+    })
+    renderPage()
+
+    const row = await screen.findByTestId('agent-agent-1')
+    expect(within(row).getByTestId('update-available')).toHaveTextContent('update available')
+    expect(within(row).queryByTestId('protocol-mismatch')).toBeNull()
+    await user.click(within(row).getByRole('button', { name: /Update command/ }))
+    const dialog = screen.getByRole('dialog')
+    expect(dialog).toHaveTextContent('runs 0.1.0, older than this server (0.2.0)')
+    const container = screen.getByTestId('agent-update-command').textContent.split('\n')
+    expect(container.slice(0, 2)).toEqual([
+      'docker pull ghcr.io/deusmaximus/tlg-ipam-agent:0.2.0',
+      'docker rm -f tlg-ipam-agent',
+    ])
+    expect(container.join('\n')).toContain('-v tlg-ipam-agent:/var/lib/tlg-ipam-agent')
+    expect(container.join('\n')).not.toMatch(/tlg[ae]_|IPAM_ENROL_TOKEN|IPAM_AGENT_TOKEN/)
+
+    await user.click(screen.getByRole('tab', { name: 'systemd' }))
+    expect(screen.getByTestId('agent-update-command').textContent.split('\n')).toEqual([
+      'sudo /opt/tlg-ipam-agent/bin/pip install https://github.com/DeusMaximus/TLG-IPAM/releases/download/v0.2.0/tlg_ipam_agent-0.2.0-py3-none-any.whl',
+      `sudo /opt/tlg-ipam-agent/bin/tlg-ipam-agent install --url ${window.location.origin}`,
+    ])
+  })
+
+  it('does not flag an agent the server does not flag', async () => {
+    ipam.listAgents.mockResolvedValue({
+      data: [agentRow({ version: '0.9.0', update_available: null })],
+      total: 1,
+    })
+    renderPage()
+    const row = await screen.findByTestId('agent-agent-1')
+    expect(within(row).queryByTestId('update-available')).toBeNull()
+    expect(within(row).queryByRole('button', { name: /Update command/ })).toBeNull()
+  })
+
+  it('says clearly that an agent on another protocol gets no scans, and how to update it', async () => {
+    const user = userEvent.setup()
+    const error =
+      'Protocol mismatch: the agent speaks protocol 2, the server speaks protocol 1. Install the agent release that matches the server.'
+    ipam.listAgents.mockResolvedValue({
+      data: [agentRow({ protocol_mismatch: true, last_error: error })],
+      total: 1,
+    })
+    renderPage()
+
+    const row = await screen.findByTestId('agent-agent-1')
+    expect(within(row).getByTestId('protocol-mismatch')).toHaveTextContent('given no scans')
+    expect(within(row).getByText(`Last check-in refused: ${error}`)).toBeInTheDocument()
+    await user.click(within(row).getByRole('button', { name: /Update command/ }))
+    expect(screen.getByRole('dialog')).toHaveTextContent('speaks another protocol than this server')
+  })
+
+  // --- Pending enrolments ---
+
+  it('lists pending enrolments until they are used or expire', async () => {
+    const soon = new Date(Date.now() + 42.5 * 60 * 1000).toISOString().replace('Z', '+00:00')
+    const pending = (id, token) =>
+      agentRow({ id, name: id, state: 'pending', last_checkin_at: null, tokens: [token] })
+    ipam.listAgents.mockResolvedValue({
+      data: [
+        pending('open', enrolToken({ id: 'e-open', expires_at: soon })),
+        pending('expired', enrolToken({ id: 'e-old', expires_at: '2000-01-01T00:00:00' })),
+        pending('used', enrolToken({ id: 'e-used', expires_at: soon, used_at: '2026-11-16T06:10:00' })),
+        // an active agent being re-enrolled
+        agentRow({ id: 'again', name: 'again', tokens: [...agentRow().tokens, enrolToken({ id: 'e-again', expires_at: soon })] }),
+      ],
+      total: 4,
+    })
+    renderPage()
+
+    const list = await screen.findByRole('region', { name: 'Pending enrolments' })
+    const open = within(list).getByTestId('pending-open')
+    expect(open).toHaveTextContent('waiting for its first enrolment')
+    expect(open).toHaveTextContent('expires in 42m')
+    expect(open).toHaveTextContent(`${ENROL_TOKEN.slice(0, 13)}…`)
+    expect(within(list).getByTestId('pending-again')).toHaveTextContent('being re-enrolled')
+    expect(within(list).queryByTestId('pending-expired')).toBeNull()
+    expect(within(list).queryByTestId('pending-used')).toBeNull()
+    // the row says so as well
+    expect(within(screen.getByTestId('agent-open')).getByText(/enrolment open, expires in 42m/)).toBeInTheDocument()
+  })
+
+  it('lists no pending enrolments when there are none', async () => {
+    renderPage()
+    await screen.findByTestId('agent-agent-1')
+    expect(screen.queryByRole('region', { name: 'Pending enrolments' })).toBeNull()
+  })
+
+  // --- Suggested scans ---
+
+  const suggestion = (over = {}) => ({
+    agent_id: 'agent-1',
+    agent_name: 'lab-vlan20',
+    subnet_id: 'sub-2',
+    subnet_name: 'IoT',
+    subnet_cidr: '10.30.0.0/24',
+    ...over,
+  })
+
+  it('offers to scan a subnet on the agent’s link, and one click sets it up and asks for a scan', async () => {
+    const user = userEvent.setup()
+    ipam.listScanSuggestions.mockResolvedValueOnce({ data: [suggestion()], total: 1 })
+    ipam.createScanTarget.mockResolvedValue({ data: { id: 'tgt-2' } })
+    ipam.requestScan.mockResolvedValue({ data: { id: 'tgt-2' } })
+    renderPage()
+
+    const offer = await screen.findByTestId('suggestion-agent-1:sub-2')
+    expect(offer).toHaveTextContent('Scan IoT 10.30.0.0/24 with lab-vlan20?')
+    expect(screen.getByRole('region', { name: 'Suggested scans' })).toHaveTextContent(
+      'ICMP, ARP, Reverse DNS'
+    )
+    // nothing is set up or scanned until the owner accepts
+    expect(ipam.createScanTarget).not.toHaveBeenCalled()
+    expect(ipam.requestScan).not.toHaveBeenCalled()
+
+    await user.click(within(offer).getByRole('button', { name: /Scan/ }))
+    // the server's defaults: methods, scope and interval are left to it
+    expect(ipam.createScanTarget).toHaveBeenCalledWith({ subnet_id: 'sub-2', agent_id: 'agent-1' })
+    await waitFor(() => expect(ipam.requestScan).toHaveBeenCalledWith('sub-2'))
+    expect(await screen.findByText('lab-vlan20 will scan IoT at its next check-in')).toBeInTheDocument()
+    // reloaded: the server no longer offers it
+    await waitFor(() => expect(ipam.listScanSuggestions).toHaveBeenCalledTimes(2))
+    expect(screen.queryByTestId('suggestion-agent-1:sub-2')).toBeNull()
+  })
+
+  it('asks for no scan when the target could not be set up', async () => {
+    const user = userEvent.setup()
+    ipam.listScanSuggestions.mockResolvedValue({ data: [suggestion()], total: 1 })
+    ipam.createScanTarget.mockRejectedValue(
+      new ApiError('CONFLICT', 'Subnet IoT already has a scan target', 409)
+    )
+    renderPage()
+
+    const offer = await screen.findByTestId('suggestion-agent-1:sub-2')
+    await user.click(within(offer).getByRole('button', { name: /Scan/ }))
+    expect(await screen.findByText('Subnet IoT already has a scan target')).toBeInTheDocument()
+    expect(ipam.requestScan).not.toHaveBeenCalled()
+  })
+
+  it('says when the target is set up but the scan request failed', async () => {
+    const user = userEvent.setup()
+    ipam.listScanSuggestions.mockResolvedValueOnce({ data: [suggestion()], total: 1 })
+    ipam.createScanTarget.mockResolvedValue({ data: { id: 'tgt-2' } })
+    ipam.requestScan.mockRejectedValue(new ApiError('UNAVAILABLE', 'busy', 503))
+    renderPage()
+
+    const offer = await screen.findByTestId('suggestion-agent-1:sub-2')
+    await user.click(within(offer).getByRole('button', { name: /Scan/ }))
+    expect(
+      await screen.findByText('Scanning of IoT is set up, but the scan was not requested: busy')
+    ).toBeInTheDocument()
+  })
+
+  it('sets an offer aside with Not now', async () => {
+    const user = userEvent.setup()
+    ipam.listScanSuggestions.mockResolvedValue({
+      data: [suggestion(), suggestion({ subnet_id: 'sub-3', subnet_name: 'Guest' })],
+      total: 2,
+    })
+    renderPage()
+
+    const offer = await screen.findByTestId('suggestion-agent-1:sub-2')
+    await user.click(within(offer).getByRole('button', { name: 'Not now' }))
+    expect(screen.queryByTestId('suggestion-agent-1:sub-2')).toBeNull()
+    expect(screen.getByTestId('suggestion-agent-1:sub-3')).toBeInTheDocument()
+    expect(ipam.createScanTarget).not.toHaveBeenCalled()
+  })
+
+  it('renders an offer’s names as text, never as markup', async () => {
+    ipam.listScanSuggestions.mockResolvedValue({
+      data: [suggestion({ agent_name: '<img src=x onerror=alert(1)>' })],
+      total: 1,
+    })
+    renderPage()
+    const offer = await screen.findByTestId('suggestion-agent-1:sub-2')
+    expect(offer).toHaveTextContent('<img src=x onerror=alert(1)>')
+    expect(offer.querySelector('img')).toBeNull()
   })
 })
