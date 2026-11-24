@@ -40,11 +40,11 @@ from datetime import datetime, timedelta, timezone
 from typing import get_args
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..errors import ApiError, validation_error
-from ..ipnet import canonical_cidr, parse_ip
+from ..ipnet import DOMAIN_MAX, canonical_cidr, parse_ip
 from ..models import FindingDismissal, Host, Observation, ScanTarget, Subnet
 from ..schemas import FindingKey, FindingOut, FindingType, HostCreate, HostUpdate
 from . import changes, scans
@@ -298,30 +298,66 @@ NETWORK_REPORTED_NOTE = (
 # ordinary finding (short names, a PTR name under the subnet's domain) is about 400
 # characters, so an ordinary page is about 10,000.
 #
-# Size: the findings on a page come to at most `PAGE_BUDGET` bytes of compact UTF-8 JSON,
-# counted in bytes because a byte count is never below a count of characters or UTF-16
-# units. With the rest of the result (the note, about 330; a cursor, at most 1,156; the
-# keys) a page stays under 50,000 characters and, even at 2 characters a token, under
-# 25,000 tokens. The count alone does not bound it: a domain suffix has no length limit
-# but the request-body cap, and a host's FQDN carries it into every finding. A finding
-# with the other fields at their ASCII maximum (a 120-character subnet name, 253-character
-# PTR name, hostname and domain) is 1,738 bytes, so 25 of them fit the budget and longer
-# ones make shorter pages. A finding over the budget on its own comes alone, so paging
-# always moves on; such a page can still pass a client's limit, and the result puts
-# `next_cursor` before the findings so that a client that cuts the text keeps it.
-# `test_mcp.test_a_page_at_every_field_maximum_fits_a_client` and
-# `test_pages_of_long_domains_stay_inside_the_budget` hold both bounds. (The review that
-# asked for paging measured 5,000 findings, 3,003,133 bytes, in one result.)
-# `body_limit.BODY_MAX` bounds what a client sends, not this.
+# Size: the `findings` array, as compact UTF-8 JSON brackets and commas included, is at
+# most `PAGE_BUDGET` bytes, counted in bytes because a byte count is never below a count
+# of characters or UTF-16 units. With the rest of the result (the note, about 330; a
+# cursor, at most 1,156; the keys) a page stays under 50,000 characters and, even at 2
+# characters a token, under 25,000 tokens. The result carries the page twice, as a JSON
+# text block and as structured content, so the whole MCP result is about twice this;
+# what a client counts against its limits was not measured.
+#
+# One finding: at most `FINDING_MAX` bytes, well inside the budget, so a page always fits
+# it. Every value a finding carries has a length bound: a subnet name 120 characters, a
+# hostname 253 (both since v0.1.0), a PTR name 253 (`agent_protocol.rdns_name`), a domain
+# suffix `ipnet.DOMAIN_MAX` (since #86). A host whose effective domain was stored longer
+# before #86 is listed with `host_fqdn` null, not with a cut FQDN; its record keeps the
+# domain. `test_mcp.test_the_largest_finding_fits_its_bound` builds the largest finding
+# those bounds allow, 4,880 bytes (control characters, which JSON writes in 6 bytes
+# each, in the names; the address at IPv4's widest)
+# and `test_a_host_with_a_domain_stored_before_the_limit_is_listed_without_its_fqdn` the
+# legacy case.
 PAGE_SIZE = 25
 PAGE_BUDGET = 45_000
+FINDING_MAX = 5_000
+# The work one call does is bounded too (#86), whatever the data: at most
+# `CALL_STATEMENTS` SQL statements, each of which reads at most `SCAN_CHUNK` hosts and
+# `SCAN_CHUNK` observations (and the dismissals at those addresses) along their
+# `(subnet_id, ip_int)` indexes, passing over no row it does not return (`_read_chunk`),
+# but the one that lists the subnets. That one reads the order key (id, name, CIDR) of
+# each subnet that can hold a finding at all: one with an observation, or with a scan
+# target and a host (`stale` needs no observation). A subnet with neither costs no
+# statement. The scope each visit reads (`scans.scan_scope`) takes only the subnet's
+# excluded reserved ranges, along their own index, and a subnet holds at most
+# `schemas.SUBNET_RESERVED_RANGES_MAX`; one stored with more before that limit is read
+# whole, the other exception (`test_mcp.test_every_read_of_a_call_does_bounded_work`,
+# which counts SQLite instructions over every statement of a call). A call that
+# reaches the bound stops where it is and returns what it found, possibly nothing, with
+# a cursor at the last address it examined; the next call goes on from there. Each call
+# reads at least one chunk, so paging always moves on. Measured on the issue's case (500
+# empty subnets between two that hold findings): 4,521 statements before, 17 after, as
+# many as without them; and a call never passes the bound however many subnets it
+# visits that hold nothing (`test_mcp.test_one_call_costs_at_most_the_statement_bound`).
+CALL_STATEMENTS = 100
+# 2 x SCAN_CHUNK addresses is the most the dismissal statement binds: inside the 999
+# parameters of the oldest SQLite builds, as `scans._IN_BATCH` is
+SCAN_CHUNK = 250
+# what `_context` runs (the subnet, its target, its scope's three) and what one chunk
+# runs (hosts, observations, dismissals)
+_VISIT_STATEMENTS = 5
+_CHUNK_STATEMENTS = 3
+# A position after every finding of a subnet: the cursor of a call that stopped after
+# reading the whole of one, so the next call skips it without a statement.
+_ADDRESS_END = 2**128 - 1
+# the largest `ip_int` a row can hold: a SQLite INTEGER is 64-bit, signed
+_ROW_INT_MAX = 2**63 - 1
+_LAST_TYPE = len(FINDING_TYPES) - 1
 # A cursor is base64url of UTF-8 JSON (`ensure_ascii=False`): a subnet's name, at most
 # 120 characters of at most 6 bytes each as JSON (a control character's `\u0000`; a
 # 4-byte character stays 4), so 720; a CIDR (43 at most, because the listing uses its
 # canonical spelling, `ipnet.canonical_cidr`, whatever a subnet stored before #97
-# holds), an id (36), an address (39 digits for IPv6), a type (13) and 14 of JSON
-# punctuation. 865 bytes is 1,156 base64 characters; the cap leaves room above that,
-# and every cursor the encoder can make fits
+# holds), an id (36), an address (39 digits, as `_ADDRESS_END` and an IPv6 address
+# have), a type (13) and 14 of JSON punctuation. 865 bytes is 1,156 base64 characters;
+# the cap leaves room above that, and every cursor the encoder can make fits
 # (`test_mcp.test_a_cursor_at_its_largest_round_trips`).
 CURSOR_MAX = 2048
 _TYPE_ORDER = {name: index for index, name in enumerate(FINDING_TYPES)}
@@ -375,6 +411,102 @@ def _encoded_size(value) -> int:
     )
 
 
+def _listed_fqdn(host, subnet_domain: str | None) -> str | None:
+    """The host's FQDN as the listing gives it: null when its effective domain is longer
+    than `ipnet.DOMAIN_MAX`, which only a row stored before that limit can be, so that
+    no finding carries an unbounded value."""
+    effective = host.domain or subnet_domain
+    if effective is not None and len(effective) > DOMAIN_MAX:
+        return None
+    return hosts_svc.fqdn_of(host.hostname, host.domain, subnet_domain)
+
+
+def _region_end(ctx: _Context, start: int) -> int | None:
+    """The last address of the stretch `start` is in: before the DHCP pool, the pool, or
+    after it (None, the end of the subnet). A chunk stays inside one, because the pool's
+    observations are read differently (`_read_chunk`)."""
+    if ctx.pool is None:
+        return None
+    low, high = ctx.pool
+    if start < low:
+        return low - 1
+    if start <= high:
+        return high
+    return None
+
+
+async def _read_chunk(session: AsyncSession, ctx: _Context, start: int):
+    """The next addresses of the subnet, from `start` up, with their host and observation
+    rows and their dismissals: at most `SCAN_CHUNK` rows of each table, in three
+    statements. Returns the addresses in order, their rows, and the last address read
+    in full, or None when the subnet has nothing after them.
+
+    Each read follows the table's `(subnet_id, ip_int)` index in address order and
+    passes over no row it does not return, so no statement's work grows with the
+    subnet (Codex on #129). A chunk stays in one stretch of the subnet
+    (`_region_end`). Hosts are read up to `SCAN_CHUNK` rows. Outside the DHCP pool,
+    observations are read the same way, no further than a full host chunk's last
+    address. Inside it, only the observations at the chunk's hosts are read: an
+    observation in the pool at an address with no host can only be a `dynamic`
+    `unknown_host`, which this listing leaves out, so it is never read, and no cursor
+    names its address. A table that fills its chunk may have more after it, so only
+    the addresses up to the lower of the full chunks' last ones are taken; the rest is
+    read again by the next chunk. A chunk that ends at its stretch's end returns that
+    end, the pool's own bound, as the last address read."""
+    end = _region_end(ctx, start)
+    in_pool = ctx.pool is not None and ctx.pool[0] <= start <= ctx.pool[1]
+    hosts_query = select(*_HOST_COLUMNS).where(Host.subnet_id == ctx.id, Host.ip_int >= start)
+    if end is not None:
+        hosts_query = hosts_query.where(Host.ip_int <= end)
+    hosts = (
+        await session.execute(hosts_query.order_by(Host.ip_int).limit(SCAN_CHUNK))
+    ).all()
+    full = [hosts[-1].ip_int] if len(hosts) == SCAN_CHUNK else []
+    if in_pool:
+        seen = []
+        if hosts:
+            seen = (
+                await session.execute(
+                    select(*_OBSERVATION_COLUMNS).where(
+                        Observation.subnet_id == ctx.id,
+                        Observation.ip_int.in_([h.ip_int for h in hosts]),
+                    )
+                )
+            ).all()
+    else:
+        observations = select(*_OBSERVATION_COLUMNS).where(
+            Observation.subnet_id == ctx.id, Observation.ip_int >= start
+        )
+        upper = full[0] if full else end
+        if upper is not None:
+            observations = observations.where(Observation.ip_int <= upper)
+        seen = (
+            await session.execute(observations.order_by(Observation.ip_int).limit(SCAN_CHUNK))
+        ).all()
+        if len(seen) == SCAN_CHUNK:
+            full.append(seen[-1].ip_int)
+    bound = min(full) if full else end
+    by_host = {r.ip_int: r for r in hosts if bound is None or r.ip_int <= bound}
+    by_observation = {r.ip_int: r for r in seen if bound is None or r.ip_int <= bound}
+    addresses = sorted(by_host.keys() | by_observation.keys())
+    dismissed = {}
+    if addresses:
+        dismissed = {
+            (ip_int, type_name): observed
+            for ip_int, type_name, observed in (
+                await session.execute(
+                    select(
+                        FindingDismissal.ip_int, FindingDismissal.type, FindingDismissal.observed
+                    ).where(
+                        FindingDismissal.subnet_id == ctx.id,
+                        FindingDismissal.ip_int.in_(addresses),
+                    )
+                )
+            ).all()
+        }
+    return addresses, by_host, by_observation, dismissed, bound
+
+
 async def list_named(
     session: AsyncSession,
     subnet_id: str | None = None,
@@ -386,80 +518,128 @@ async def list_named(
     `list_findings`'s finding, unchanged, plus the subnet's `subnet_name` and
     `subnet_cidr` (its canonical spelling, `ipnet.canonical_cidr`) and the recorded
     `host_name` and `host_fqdn` of the host at the address (null for an
-    `unknown_host`). `dynamic` findings are left out, as
-    `list_findings` leaves them out by default: a scanned DHCP pool is where personal
-    devices answer (spec §7.1).
+    `unknown_host`, and `host_fqdn` null for a domain stored before `ipnet.DOMAIN_MAX`;
+    `_listed_fqdn`). `dynamic` findings are left out, as `list_findings` leaves them out
+    by default: a scanned DHCP pool is where personal devices answer (spec §7.1).
 
-    Returns `{"findings": [...], "next_cursor": ...}`: at most `PAGE_SIZE` findings and,
-    unless the first alone is larger, at most `PAGE_BUDGET` bytes of them, and a cursor
-    when at least one more follows, null otherwise. The order is total, by
-    subnet (name, CIDR, id), then address, then type, and the cursor is the position of
-    the page's last finding, so a client that passes it back gets what comes after it.
-    A finding resolved between calls therefore moves nothing later in the order.
-    Subnets before the cursor's are skipped without a query. Only reads; a fixed number
-    of statements per subnet visited.
+    Returns `{"findings": [...], "next_cursor": ...}`: at most `PAGE_SIZE` findings, of
+    at most `FINDING_MAX` bytes each and `PAGE_BUDGET` bytes as an array. The order is
+    total, by subnet (name, CIDR, id), then address, then type. The cursor is null once
+    the listing has reached its end, and otherwise a position in that order: the page's
+    last finding when the page is full, or, when the call reached `CALL_STATEMENTS`,
+    the last address it examined, so a page can be short, or empty, and still have a
+    cursor. A client that passes it back gets what comes after it, so a finding
+    resolved between calls moves nothing later in the order. Only reads. Every read is
+    bounded (the comment on `CALL_STATEMENTS`) but two: the statement listing the
+    subnets, and the excluded reserved ranges of a subnet stored with more than
+    `schemas.SUBNET_RESERVED_RANGES_MAX` before that limit, which its scope reads whole.
 
     Each call reads the data as it is then; there is no snapshot. Following the cursor
     sees every finding exactly once while the data and the filters stay as they were. A
     finding that appears before the cursor after paging began is not seen until a
     fresh listing (no cursor), and a subnet renamed meanwhile can move its findings
     across the cursor, so they are missed or seen twice. The tool's docstring tells the
-    assistant to start again without a cursor when it needs the current state."""
+    assistant to start again without a cursor when it needs the current state.
+
+    A cursor from a call that stopped at the bound names a host's address, an
+    observation's outside the DHCP pool, or a bound of the pool, possibly with nothing
+    listed there; an unhosted address in the pool is never read (`_read_chunk`)."""
     _check_type(type_)
     after = _decode_cursor(cursor) if cursor is not None else None
-    query = select(Subnet.id, Subnet.name, Subnet.cidr, Subnet.domain)
+    budget = CALL_STATEMENTS - 1  # the subnets' statement below
+    # Every finding is at an address with an observation, but `stale`, which needs a
+    # scan target and a host (`_stale`): a subnet with neither cannot hold one.
+    candidate = or_(
+        exists().where(Observation.subnet_id == Subnet.id),
+        and_(
+            exists().where(ScanTarget.subnet_id == Subnet.id),
+            exists().where(Host.subnet_id == Subnet.id),
+        ),
+    )
+    query = select(Subnet.id, Subnet.name, Subnet.cidr).where(candidate)
     if subnet_id is not None:
         await get_subnet(session, subnet_id)
+        budget -= 1
         query = query.where(Subnet.id == subnet_id)
     # each subnet's place in the order, by its CIDR's canonical spelling: a subnet
     # stored before #97 may hold a spelling of any length, which the cursor carries
     rows = (await session.execute(query)).all()
-    subnets = sorted(
-        (((s.name, canonical_cidr(s.cidr), s.id), s) for s in rows), key=lambda pair: pair[0]
-    )
+    subnets = sorted(((s.name, canonical_cidr(s.cidr), s.id) for s in rows))
+    now = datetime.now(timezone.utc)
     page: list[dict] = []
-    used = 0
+    used = 2  # the array's brackets
+    # the position the next call starts after: the last finding listed or, once a chunk
+    # is read in full, the last address read
     last: tuple | None = None
-    for place, subnet in subnets:
+
+    def stopped() -> dict:
+        return {"findings": page, "next_cursor": _encode_cursor(last)}
+
+    for place in subnets:
+        resume = after is not None and place == after[:3]
         if after is not None and place < after[:3]:
             continue
-        found = await list_findings(session, subnet.id, type_)
-        if not found:
+        # Where the subnet's reading resumes: at the cursor's address, unless the cursor
+        # is after every finding there (its last type), and then at the next one, so a
+        # chunk always ends past the cursor and paging moves on.
+        start = 0
+        if resume:
+            start = after[3] + (1 if after[4] == _LAST_TYPE else 0)
+        if start > _ROW_INT_MAX:
+            # Nothing is stored there: `_ADDRESS_END`, the cursor of a call that read
+            # the subnet in full, or an address a client made up past what SQLite's
+            # integer column holds, which must not reach a statement.
             continue
-        hosts = {
-            row.id: row
-            for row in (
-                await session.execute(
-                    select(Host.id, Host.hostname, Host.domain).where(
-                        Host.subnet_id == subnet.id
-                    )
-                )
-            ).all()
-        }
-        for f in sorted(found, key=lambda f: (f["ip_int"], _TYPE_ORDER[f["type"]])):
-            position = (*place, f["ip_int"], _TYPE_ORDER[f["type"]])
-            if after is not None and position <= after:
-                continue
-            if len(page) == PAGE_SIZE:
-                return {"findings": page, "next_cursor": _encode_cursor(last)}
-            host = hosts.get(f["host_id"])
-            named = {
-                **f,
-                "subnet_name": subnet.name,
-                "subnet_cidr": place[1],
-                "host_name": host.hostname if host is not None else None,
-                "host_fqdn": (
-                    hosts_svc.fqdn_of(host.hostname, host.domain, subnet.domain)
-                    if host is not None
-                    else None
-                ),
-            }
-            size = _encoded_size(named) + 1  # and its comma
-            if page and used + size > PAGE_BUDGET:
-                return {"findings": page, "next_cursor": _encode_cursor(last)}
-            page.append(named)
-            used += size
-            last = position
+        if last is not None and budget < _VISIT_STATEMENTS + _CHUNK_STATEMENTS:
+            return stopped()
+        budget -= _VISIT_STATEMENTS
+        ctx = await _context(session, place[2])
+        end_of_subnet = (*place, _ADDRESS_END, _LAST_TYPE)
+        if ctx is None:  # deleted since the list was read
+            last = end_of_subnet
+            continue
+        while True:
+            if last is not None and budget < _CHUNK_STATEMENTS:
+                return stopped()
+            budget -= _CHUNK_STATEMENTS
+            addresses, hosts, observations, dismissed, bound = await _read_chunk(
+                session, ctx, start
+            )
+            for ip_int in addresses:
+                host = hosts.get(ip_int)
+                found = _evaluate(ctx, host, observations.get(ip_int), now)
+                for f in sorted(found, key=lambda f: _TYPE_ORDER[f.type]):
+                    if type_ is not None and f.type != type_:
+                        continue
+                    if f.dynamic or dismissed.get((ip_int, f.type)) == f.observed:
+                        continue
+                    position = (*place, ip_int, _TYPE_ORDER[f.type])
+                    if after is not None and position <= after:
+                        continue
+                    if len(page) == PAGE_SIZE:
+                        return stopped()
+                    named = {
+                        **f.model_dump(),
+                        "subnet_name": place[0],
+                        "subnet_cidr": place[1],
+                        "host_name": None,
+                        "host_fqdn": None,
+                    }
+                    if host is not None:
+                        named["host_name"] = host.hostname
+                        named["host_fqdn"] = _listed_fqdn(host, ctx.domain)
+                    size = _encoded_size(named) + (1 if page else 0)  # and its comma
+                    # never true of the first: a finding is at most FINDING_MAX bytes
+                    if page and used + size > PAGE_BUDGET:
+                        return stopped()
+                    page.append(named)
+                    used += size
+                    last = position
+            if bound is None:
+                last = end_of_subnet
+                break
+            last = (*place, bound, _LAST_TYPE)
+            start = bound + 1
     return {"findings": page, "next_cursor": None}
 
 

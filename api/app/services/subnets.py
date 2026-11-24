@@ -15,6 +15,7 @@ from ..ipnet import (
 from ..models import Host, ReservedRange, Subnet
 from ..schemas import (
     SUBNET_DNS_SERVERS_MAX,
+    SUBNET_RESERVED_RANGES_MAX,
     ReservedRangeCreate,
     ReservedRangeOut,
     ReservedRangeUpdate,
@@ -333,6 +334,17 @@ async def create_reserved_range(
         )
     if int(start) > int(end):
         raise validation_error("start_ip must not be greater than end_ip")
+    # Counted under the write lock, so two adds at once cannot both pass the limit.
+    await scans.take_write_lock(session)
+    held = await session.scalar(
+        select(func.count(ReservedRange.id)).where(ReservedRange.subnet_id == subnet_id)
+    )
+    if held >= SUBNET_RESERVED_RANGES_MAX:
+        await session.rollback()
+        raise validation_error(
+            f"reserved_ranges: a subnet holds at most {SUBNET_RESERVED_RANGES_MAX} "
+            "reserved ranges; delete one before adding another"
+        )
     block = ReservedRange(
         subnet_id=subnet_id,
         start_ip=payload.start_ip,
