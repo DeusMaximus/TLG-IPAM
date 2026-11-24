@@ -27,6 +27,19 @@ Template:
 
 ---
 
+## 2026-11-24 — Claude Code (Sonnet 5.5), worker — #139: qualify the bulk_create_hosts size example and the brief's import figures (PR #148)
+- **Done:**
+  - [PR #148](https://github.com/DeusMaximus/TLG-IPAM/pull/148) (`139-import-size-wording`, head `cc6267c`) closes #139. Documentation and tests only: no limit, route or tool result changed. Three files: `api/app/mcp_server.py` (docstring), `TLG-IPAM-Project-Brief.md` (§5.2 row, §4.3 import-size paragraph only), `api/tests/test_length_limits.py`.
+  - The `bulk_create_hosts` docstring and §5.2: the 400-record example holds only when every field is plain ASCII with no character JSON escapes (quote, backslash, a control character such as a line break or a tab) in any field. Non-BMP owner: 2,493,771 bytes as `json.dumps` writes it, `413` at the real `/mcp` route. A hostname and an owner of quotes, backslashes or tabs: 2,114,971.
+  - §4.3: the measured rows (`full_rows`) are named as measured examples, not a ceiling. They are at every character limit and ASCII (15-character address, 40-character device type). Figures re-measured: 1,000 rows without notes 1,151,011; at most 233 four-byte notes characters (1,295 ASCII with an ASCII owner); notes at the limit 17,546,011 (5,258,011 ASCII); at most 119 rows (398 ASCII notes, 428 with an ASCII owner too); 5-character device type 1,116,011. §4.3 also says a hostname and a device type accept non-ASCII (1,000 rows 2,973,011), that a MAC's punctuation, a domain's leading white space and trailing dots and a `last_seen`'s extra digits are accepted and dropped, and that a padded IPv4 address is refused.
+  - Tests: the example's largest call is posted to the real `/mcp` route and creates all 400 hosts; the non-ASCII-owner variant gets `413`; the escaped-ASCII case runs for quote, backslash and tab; the Unicode-row and no-largest-row cases; every §4.3 figure is asserted. The old in-process example test (`fastmcp.Client(mcp)`) skipped the body cap and is replaced.
+  - Review: Codex clean at `62977ac`, `d29492e` and `cc6267c`. Greptile P2 at `62977ac` (escapes outside notes) fixed in `d29492e`. An outside read (Codex, GPT-6.1 Sol) at `d29492e` was GO with two P3s (tabs; rows are examples, not a ceiling), both fixed in `cc6267c`, answered in one numbered PR comment. CI green on `cc6267c`.
+  - Merged: `1a48707`, squash, on the owner's go-ahead; the remote branch is deleted. Sol's GO was at `d29492e`; the orchestrator read `cc6267c`'s diff against its two remedies and ran 1,136 server tests on that head, and no further round was run for a wording-only change. No follow-ups.
+- **Decisions:** PR body Deliberate calls 1–5. The main ones: rebuilt the rows at every character limit instead of describing the old fixture, so all §4.3 figures changed; no row is "the largest" (limits count characters, padding is accepted on MAC, domain and `last_seen`, an IPv4 address is refused padded); the example is judged as `json.dumps` writes it; `test_body_limit.py` and `body_limit.py` untouched (its "about 1.15 MB" comment is accurate for the no-notes rows).
+- **State:** merged. Tests: server 1,136. No schema change; nothing in `web/` or the agent touched.
+- **Waiting on the owner:** nothing from this entry.
+- **Next:** nothing owed on #139. #132 (PR #135) owns the other §4.3 paragraphs and the `AGENTS.md` bullets "One uvicorn worker" and "One request-body cap".
+
 ## 2026-11-24 — Claude Code (Opus 5.5), worker — #144: a PTR or a negative SOA is read only when it answers the question (PR #146)
 - **Done:**
   - [PR #146](https://github.com/DeusMaximus/TLG-IPAM/pull/146) (`144-ptr-soa-owner-check`, head `22967e0`) closes #144.
@@ -139,36 +152,3 @@ Template:
 - **Next:**
   - #24 must publish `ghcr.io/deusmaximus/tlg-ipam-agent:<version>` and `releases/download/v<version>/tlg_ipam_agent-<version>-py3-none-any.whl`, and give the server and agent one version. Today they differ: the server's `settings.version` is `0.1.0` and the agent's `__version__` is `0.2.0.dev0`.
   - #92 (the plain-HTTP warning before a token is issued) and #143 are the dialog's open follow-ups.
-
-## 2026-11-24 — Claude Code (Opus 5.5), worker — #22: the agent's enrolment exchange and the systemd installer (PR #130)
-- **Done:**
-  - [PR #130](https://github.com/DeusMaximus/TLG-IPAM/pull/130) (`22-agent-enrol-install`, head `b7fb4ae`) closes #22.
-  - The branch includes `main` at `211b53f` (merges `181ab1b` and `b7fb4ae`).
-  - Round 1 (NO-GO at `fb39dd7`) was fixed in `ebe385e`, and Codex's P2 on it in `4dc5d6b`.
-  - Round 2 (NO-GO at `4dc5d6b`: one P2, two P3s) was fixed in `eed4f91`:
-    - `install.service_trust` is the one source of the unit's trust and of the exchange's; inherited `SSL_CERT_FILE`/`SSL_CERT_DIR` are dropped, and refused when the unit would not get them;
-    - `uninstall` keeps `created-user` until the account and group are gone, so it can be retried;
-    - each token the install learns is added to `Redact` (`secret=`);
-    - the argument refusal gives re-enrol guidance;
-    - §5.6 and `AGENTS.md` say what holds of `subprocess` (a running agent never imports `install` or `trust`).
-  - Merged: `8081d8c`, squash, on the owner's go-ahead; the remote branch is deleted. CI green and Codex clean on `b7fb4ae`; Greptile read only the first head, and the briefed rounds were the outside read after it. The briefed review (Codex, GPT-6.1 Sol) took three rounds: NO-GO at `fb39dd7`, NO-GO at `4dc5d6b`, GO at `b7fb4ae` with one P3. After the second NO-GO the owner kept the Opus 5.5 worker on the fix. The orchestrator ran 1,193 agent and 1,083 server tests on `b7fb4ae`. Follow-ups filed, on the owner's say:
-    - #136: the CA preflight judges mode bits, not ACLs or supplementary groups (round 2, finding 2);
-    - #138: the unit does not discard CA trust settings the system manager supplies (round 3, finding 1);
-    - #140: argparse's own errors repeat an argument, and the agent token's exact form is stated only on the agent's side.
-- **State:**
-  - merged. Tests on the merged tree: agent 1,193 on 3.13 and 3.11.18, server 1,083.
-  - No change under `api/`, no schema change, `PROTOCOL_VERSION` unchanged.
-  - The container runs (Debian 13 with systemd, `--network none`) are in the PR body:
-    - run A at `ebe385e`;
-    - run B at `eed4f91`;
-    - the round-1 reproductions at `ebe385e`;
-    - the round-2 reproductions at `eed4f91`, HTTPS with a private CA.
-- **Decisions:** Deliberate calls 1–17 in the PR body. Since round 1, calls 13 and 14 changed:
-  - call 14: refusal over carrying inherited trust into the unit, with #136 as the known limit;
-  - call 13: the record goes last, and the crash between `useradd` and writing the record is manual recovery.
-- **Waiting on the owner:** nothing from this entry.
-- **Untested:** unprivileged LXC, non-Debian distributions, OpenSSL variables other than `SSL_CERT_FILE` and `SSL_CERT_DIR`, ACLs and supplementary groups (#136), two containers on one volume.
-- **Next:**
-  - #23 renders `… install --url … --enrol-token -` and the container command with the volume and `IPAM_ENROL_TOKEN`;
-  - #24 publishes the image and the wheel;
-  - #136, #138 and #140 are the installer's open follow-ups.
