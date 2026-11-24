@@ -673,6 +673,8 @@ describe('Agents page', () => {
       vi.setSystemTime(new Date('2026-11-16T12:00:00Z'))
     })
     afterEach(() => {
+      // the coarse-clock test's spy on `performance.now`, then the timers
+      vi.restoreAllMocks()
       vi.useRealTimers()
     })
 
@@ -719,6 +721,24 @@ describe('Agents page', () => {
       expect(cell().getByText(/expires in 1s/)).toBeInTheDocument()
       // gone at 45 s (allowing the test's steps 100 ms), not at the next refresh (60 s)
       await advance(1100)
+      expect(listed()).toBeNull()
+      expect(cell().queryByText(/enrolment open/)).toBeNull()
+    })
+
+    it('drops a token on time when it arrives with a fraction of a millisecond left on a coarse clock', async () => {
+      // a monotonic clock quantised to 0.1 ms, as browsers coarsen `performance.now()`
+      const fakeNow = performance.now.bind(performance)
+      vi.spyOn(performance, 'now').mockImplementation(() => Math.floor((fakeNow() + 100.2) * 10) / 10)
+      // asked at 100.2 ms; the answer, with 1 s left, arrives 999.8 ms later: 0.2 ms left
+      ipam.listAgents.mockImplementationOnce(
+        () => new Promise((resolve) => setTimeout(() => resolve({ data: [fresh(1)], total: 1 }), 999.8))
+      )
+      ipam.listAgents.mockRejectedValue(new Error('server unreachable'))
+      renderPage()
+      await act(() => vi.advanceTimersByTimeAsync(999.8))
+      expect(cell().getByText(/enrolment open, expires soon/)).toBeInTheDocument()
+      // gone within milliseconds, not at the 30 s refresh
+      await advance(10)
       expect(listed()).toBeNull()
       expect(cell().queryByText(/enrolment open/)).toBeNull()
     })

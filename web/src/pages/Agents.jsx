@@ -497,11 +497,13 @@ export default function Agents() {
   // An enrolment token's label and its running out are scheduled on their own, apart
   // from the list refresh: the page updates when what it shows of one next changes,
   // and a token leaves it when its time runs out, whether or not a refresh succeeds.
-  // The delay is less the time since `readAt`, so a late render does not push it later.
+  // The delay is less the time since `readAt`, so a late render does not push it later,
+  // rounded up to a whole millisecond and at least 1: a fraction would round down to 0,
+  // and fire before a coarse monotonic clock has moved, leaving nothing to schedule again.
   const nextChange = nextEnrolmentChange(list, elapsed)
   useEffect(() => {
     if (nextChange === null) return undefined
-    const delay = Math.max(0, nextChange - (monotonicNow() - readAt))
+    const delay = Math.max(1, Math.ceil(nextChange - (monotonicNow() - readAt)))
     const id = setTimeout(() => setMono(monotonicNow()), delay)
     return () => clearTimeout(id)
   }, [nextChange, readAt])
