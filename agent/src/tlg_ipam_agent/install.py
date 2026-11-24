@@ -541,10 +541,12 @@ def uninstall(*, host: Host | None = None, paths: Paths = Paths(), out: Callable
         attempt(partial(store.remove_file, path))
     for directory in (paths.state, paths.etc):
         attempt(partial(store.remove_dir, directory))
-    # the account and its group go only if `install` created them: the uid and gid it
-    # recorded are theirs still. One it found there, or one since replaced, is left
+    # the account and its group go only if `install` created them: the uid and the
+    # primary gid it recorded are both theirs still (Codex on #130: a uid alone would
+    # let an account since repurposed with another group go). One it found there, or
+    # one since replaced, is left
     user, group = host.service_user(), host.service_group()
-    if recorded is not None and user is not None and user[0] == recorded[0]:
+    if recorded is not None and user is not None and tuple(user) == recorded:
         attempt(partial(_check, host, ("userdel", SERVICE_USER), "removing the service user"))
         group = host.service_group()
         if group is not None and group == recorded[1]:

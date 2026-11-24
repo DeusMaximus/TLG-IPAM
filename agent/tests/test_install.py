@@ -602,6 +602,19 @@ def test_an_account_replaced_since_the_install_is_left(root):
     assert not any(c[0] == "userdel" for c in host.commands) and host.user is True
 
 
+def test_an_account_with_the_recorded_uid_and_another_group_is_left(root):
+    """Codex on #130: the record is the uid and the primary gid together."""
+    host = FakeHost()
+    run_install(root, host)
+    record = root / "etc/tlg-ipam-agent/created-user"
+    record.write_text(f"{os.getuid()}:{os.getgid() + 1}\n")
+    host.commands.clear()
+    said = []
+    assert install.uninstall(host=host, paths=paths_in(root), out=said.append) == 0
+    assert not any(c[0] in ("userdel", "groupdel") for c in host.commands) and host.user is True
+    assert any("left the tlg-ipam-agent account in place" in line for line in said)
+
+
 def test_uninstall_with_nothing_installed_does_nothing(root):
     host = FakeHost()
     before = tree(root)
