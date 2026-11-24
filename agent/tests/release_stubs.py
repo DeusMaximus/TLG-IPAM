@@ -8,15 +8,24 @@ Standard library only: each stub runs as `python -I -S` with this directory on i
 What they answer is taken from `gh` (2.105, `pkg/cmd/release`) and skopeo, as far as
 the publish steps use them:
 
-- `gh release view <tag>` finds a published release by its tag, else a draft that has
-  it as its pending tag, and fails with `release not found` when there is neither.
+- `gh release view`, `download`, `upload` and `edit` find the release by its tag as
+  gh's `FetchRelease` does (`pkg/cmd/release/shared/fetch.go`): it asks for the
+  published release with the tag and for a draft with it as its pending tag at once,
+  and takes whichever answers first. With neither it fails with `release not found`.
+  When both exist, either can win, call by call: the state's `lookup_wins` lists the
+  winner of each such lookup in turn (`published` or `draft`), so a test runs every
+  order, and a lookup it did not plan for is refused.
 - `gh release create <tag> <asset>` with an asset refuses a tag that a *published*
   release already has (`a release with the same tag name already exists`). A draft
   with the tag does not stop it: it makes a new draft, uploads, then publishes it.
-- `gh release download --pattern <name>` fails with `no assets match the file pattern`
-  when the release has no such asset.
+- `gh release download --pattern <name>` fails with `no assets to download` when the
+  release has no asset, and `no assets match the file pattern` when it has others.
 - `gh release upload` without `--clobber` refuses a name the release already has
   (`asset under the same name already exists`), so an asset is never replaced.
+- Assumed, not taken from gh or checked against GitHub: publishing a draft
+  (`gh release edit --draft=false`) whose tag a published release already has is
+  refused (`422`, `tag_name already_exists`). The tests that reach it assert only what
+  holds either way: the published release is not changed.
 - `skopeo inspect --raw` prints the manifest a tag names, byte for byte, and fails with
   the registry's `manifest unknown` (`name unknown` before a repository's first push)
   for a tag that is absent. `skopeo copy --all --preserve-digests` from an OCI archive
@@ -81,13 +90,24 @@ def take_flags(argv: list[str], valued: set[str], plain: set[str]) -> tuple[list
 # --- gh ---
 
 
-def _find(releases: list[dict], tag: str) -> dict | None:
-    """As `gh`'s FetchRelease: the published release with the tag, else a draft."""
-    for draft in (False, True):
-        for release in releases:
-            if release["tag"] == tag and release["draft"] is draft:
-                return release
-    return None
+class Unplanned(Exception):
+    """A lookup with both a published release and a draft that `lookup_wins` has no
+    winner left for."""
+
+
+def _find(stub: Stub, state: dict, tag: str) -> dict | None:
+    """As `gh`'s FetchRelease: the published release with the tag or a draft with it,
+    whichever answers first; `lookup_wins` says which when both exist."""
+    published = [r for r in state["releases"] if r["tag"] == tag and not r["draft"]]
+    drafts = [r for r in state["releases"] if r["tag"] == tag and r["draft"]]
+    if published and drafts:
+        if not state["lookup_wins"]:
+            raise Unplanned
+        winner = state["lookup_wins"].pop(0)
+        state["lookups_raced"] += 1
+        stub.save("github", state)
+        return published[0] if winner == "published" else drafts[0]
+    return (published or drafts or [None])[0]
 
 
 def gh(stub: Stub, argv: list[str]) -> int:
@@ -110,7 +130,11 @@ def gh(stub: Stub, argv: list[str]) -> int:
         return fail(state["fail"][verb])
     releases = state["releases"]
     tag = args[0]
-    release = _find(releases, tag)
+    if verb in ("view", "download", "upload", "edit"):
+        try:
+            release = _find(stub, state, tag)
+        except Unplanned:
+            return refuse("gh", argv)
 
     def notes() -> str:
         return Path(flags["--notes-file"]).read_text()
@@ -140,6 +164,8 @@ def gh(stub: Stub, argv: list[str]) -> int:
     elif verb == "download" and args == [tag] and flags.keys() == {"--repo", "--pattern", "--dir"}:
         if release is None:
             return fail("release not found")
+        if not release["assets"]:
+            return fail("no assets to download")
         if flags["--pattern"] not in release["assets"]:
             return fail("no assets match the file pattern")
         out = Path(flags["--dir"])
@@ -157,6 +183,10 @@ def gh(stub: Stub, argv: list[str]) -> int:
     }:
         if release is None:
             return fail("release not found")
+        if "--draft=false" in flags and release["draft"] and any(
+            r["tag"] == tag and not r["draft"] for r in releases
+        ):
+            return fail("HTTP 422: Validation Failed [{\"resource\":\"Release\",\"code\":\"already_exists\",\"field\":\"tag_name\"}]")
         release.update(title=flags["--title"], notes=notes(), prerelease="--prerelease" in flags)
         if "--draft=false" in flags:
             release["draft"] = False
