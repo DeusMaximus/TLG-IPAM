@@ -27,6 +27,21 @@ Template:
 
 ---
 
+## 2026-11-24 — Claude Code (Opus 5.5), worker — #91: a host's notes at most 4,096 characters; a row over a limit is that row's error (PR #134)
+- **Done:** [PR #134](https://github.com/DeusMaximus/TLG-IPAM/pull/134) (`91-notes-length-limit`, head `47e6544`) closes #91, per the owner's decision of 2026-11-24.
+  - `schemas.HOST_NOTES_MAX` (4,096), checked by `services/hosts._check_notes` on create, update, next-free and each bulk row: `422` "notes: a host's notes may be at most 4096 characters, not N", never repeating the value; in a bulk import, that row's `error`.
+  - Tests for UI, REST and MCP bulk paths for both `notes` and `domain` (the domain's UI and MCP cases were missing). 14 new server tests in `api/tests/test_length_limits.py`.
+  - `bulk_create_hosts` docstring and brief §5.2 row: a call is at most 2 MiB of encoded JSON, refused whole otherwise; split a batch yourself; 400 records of 4,096-character plain-ASCII notes (no quotes, backslashes, line breaks) fit.
+  - Brief §3.4, §3.7, §4.2, §4.3 (re-measured: 1,000 rows without notes are 1,110,573 bytes; they fit with at most 243 four-byte characters of notes each, 1,335 ASCII with an ASCII owner; at most 119 rows at every limit, 401 with ASCII notes), §5.1, §6.2; `AGENTS.md` "Bulk endpoints" bullet.
+  - Optional dialog item built: `utils/csv.importSize` measures the request; over the cap the dialog names the most rows a file can hold (every run of that many consecutive rows fits, at most 1,000) and does not send. 7 new web tests.
+  - Merged: `216bec1`, squash, on the owner's go-ahead; the remote branch is deleted. CI green, Codex clean and Greptile clean on `47e6544`. The orchestrator ran 1,083 server and 132 web tests on that head. #91 owed no briefed round; the owner asked for one read by Sol (GPT-6.1 Sol) in place of a Greptile re-run, and it was a GO at `47e6544` with two P3 documentation follow-ups, not yet filed (the review is on the PR thread):
+    - The docstring's and §5.2's 400-record example holds only when the other text fields are ASCII too. With the tests' 120-character non-BMP owner the same call is 2,477,553 bytes and is refused `413`.
+    - Brief §4.3 calls its measured rows "every bounded field at its maximum", but the fixture's `device_type` is 5 characters of a possible 40, so the figures are that fixture's. The 1,110,573-byte figure is not asserted by a test.
+- **Decisions:** PR body Deliberate calls 1–6. An update resending notes stored over the limit, unchanged, is let through (the `dns_servers` precedent, not #86's domain rule), because the UI resends every field. The check is in the service, not a schema `max_length`, so OpenAPI does not advertise it. The limit counts characters.
+- **State:** merged. Locally: 1,083 server tests, 132 web tests, lint and build pass. No schema change. Nothing in #132's or #22's areas, or in `services/findings.py`, was touched.
+- **Waiting on the owner:** whether to file the two P3 follow-ups.
+- **Next:** #133 can start (it owns `services/findings.py` and the findings tests). #135 and #130 merge `main` before their next review round; #134 and #135 both edit brief §4.3, in different paragraphs.
+
 ## 2026-11-24 — Claude Code (Fable 5.2), orchestrator — seven PRs merged; PR #130 (#22) held at a NO-GO; session ended on an unstable network
 - **Done:** seven PRs squash-merged on the owner's go-ahead, remote branches deleted. The newest worker entries are below; older ones are in the archive.
   - First wave: #122 (#120) `ed4a7d6`; #123 (#121) `d067821`, a packet slot ends with the event-loop step it was granted in; #124 (#21) `0226262`, enrolment tokens, `POST /api/v1/agent/enrol`, re-enrol.
@@ -117,16 +132,3 @@ Template:
 - **State:** green. Measured on this head: 1020 server and 922 agent tests pass (Python 3.13). The mutation (deleting `await scans.take_write_lock(session)` from `results._release`, in a throwaway worktree, never committed) fails only the new test, on the lock assertion; the four existing cases pass on it. The edit and the output are in the PR body. No schema or web change.
 - **Waiting on the owner:** merge of #128.
 - **Next:** #125 (agent tests) is the other open test-gap issue in this wave. #22, #90 and #86 as in the previous entry.
-
-## 2026-11-24 — Claude Code (Sonnet 5.5), worker — #125: DNS hand-off guard test (PR #127)
-- **Done:** [PR #127](https://github.com/DeusMaximus/TLG-IPAM/pull/127) (`125-dns-handoff-guard-test`, head `6559de8`) closes #125. Tests only, plus a comment.
-  - `agent/tests/test_dns_send.py`: the DNS counterpart of `test_icmplib_send.py`. It runs the real `DnsResolver.ptr`, the installed dnspython and `QuerySocket` on the real `scan.Pacer`, with 12 concurrent lookups and an always-overdue clock. Only `create_datagram_endpoint` on the running loop is replaced. The stand-in transport records whether the slot of the lookup that sent the datagram is still open (`pacer.ended < granted[address]`), and answers through `datagram_received`. It sends no packet.
-  - The control puts an `await` ahead of `dns.asyncquery.udp` and expects every query to reach the transport after its slot has ended.
-  - `scan.py`: three comment lines in `Pacer`'s docstring (a `Pacer` belongs to one event loop). No other file changed.
-  - Merged: `45712d5`, squash, on the owner's go-ahead; the remote branch is deleted. CI green, Codex clean and Greptile clean on `6559de8`, the only head. The orchestrator ran 924 agent tests on that head (Python 3.13) and repeated the mutation: the new test fails on the open-slot assertion and the control passes. The Python 3.11 count and the blind-check control are the worker's alone. No follow-up filed. Nothing from this entry is waiting on the owner any more.
-- **Decisions:**
-  - The open slot is judged per lookup, not by a pacer-wide count. A global count reported late sends as open when another lookup's slot was open.
-  - The ARP request needs no counterpart: no library sits between its slot and `PacketLink.sendto`. Said in the PR.
-- **State:** green. Agent suite: 924 passed on Python 3.13.12 and on 3.11.18 (922 on `main` at `a8534eb`, plus 2). CI is green on `6559de8`. Codex and Greptile both reviewed the head with no findings, and none are open. Mutation (a `sleep(0)` before `dns.asyncquery.udp`): the new test fails on the open-slot assertion and the control passes. Control with a blind check: the control fails. The mutation worktree was removed and never committed. No schema change.
-- **Waiting on the owner:** the merge.
-- **Next:** nothing from this entry. #22 owns the rest of `agent/`; the one new file in `agent/tests/` and the `Pacer` docstring edit should not conflict with it.

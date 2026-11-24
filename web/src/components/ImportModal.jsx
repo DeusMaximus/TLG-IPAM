@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import { Download } from 'lucide-react'
 import { bulkCreateHosts } from '../api/ipam'
 import { useToast, useTree } from '../context'
-import { csvToHosts } from '../utils/csv'
+import { csvToHosts, importSize } from '../utils/csv'
 import Modal, { inputCls, primaryBtn, secondaryBtn } from './Modal'
 
 // Only ip is required; blank cells and omitted columns are simply left unset.
@@ -30,6 +30,13 @@ export default function ImportModal({ subnet, onClose, onSaved }) {
       return { error: err.message }
     }
   }, [text])
+
+  // the server refuses a request over its body cap whole (#91): measure it before sending
+  const size = useMemo(
+    () => (parsed && !parsed.error ? importSize(parsed.hosts) : null),
+    [parsed],
+  )
+  const tooLarge = size?.splitAt != null
 
   const pickFile = (e) => {
     const file = e.target.files?.[0]
@@ -100,6 +107,16 @@ export default function ImportModal({ subnet, onClose, onSaved }) {
               )}
             </p>
           )}
+          {tooLarge && (
+            <p className="mt-2 text-xs text-red-400" role="alert">
+              As one request this import is {(size.bytes / 1024 / 1024).toFixed(1)} MiB, over the
+              server&apos;s 2 MiB limit, and would be refused whole.{' '}
+              {size.splitAt > 0
+                ? `Split the file into files of at most ${size.splitAt} rows, each with the ` +
+                  'header row, and import them one at a time.'
+                : 'One row is over the limit by itself: shorten it.'}
+            </p>
+          )}
           <div className="mt-5 flex justify-end gap-2">
             <button type="button" onClick={onClose} className={secondaryBtn}>
               Cancel
@@ -107,7 +124,7 @@ export default function ImportModal({ subnet, onClose, onSaved }) {
             <button
               type="button"
               onClick={runImport}
-              disabled={busy || !parsed || parsed.error || parsed.hosts.length === 0}
+              disabled={busy || !parsed || parsed.error || parsed.hosts.length === 0 || tooLarge}
               className={primaryBtn}
             >
               Import {parsed && !parsed.error ? parsed.hosts.length : ''} host(s)
