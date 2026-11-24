@@ -13,15 +13,17 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 
+from packaging.version import InvalidVersion, Version
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from ..agent_protocol import AGENT_TOKEN_PREFIX, ENROL_TOKEN_PREFIX
+from ..config import settings
 from ..errors import ApiError, conflict, not_found
 from ..models import Agent, Token
-from ..schemas import AgentCreate, AgentUpdate
+from ..schemas import AgentCreate, AgentOut, AgentUpdate
 from ..times import utc
 from . import changes, scans
 
@@ -52,6 +54,51 @@ def actor_for(agent: Agent) -> str:
 def display(token: Token) -> str:
     """A token as the change log names it: its display prefix, never the token."""
     return f"{token.token_prefix}…"
+
+
+# How check-in's refusal of another protocol starts (`jobs._protocol_error`): the one
+# `last_error` the Agents page names a protocol mismatch
+PROTOCOL_MISMATCH_PREFIX = "Protocol mismatch:"
+
+
+def _release(value: str | None) -> Version | None:
+    try:
+        return Version(value) if value else None
+    except InvalidVersion:
+        return None
+
+
+def update_available(agent_version: str | None, server_version: str | None = None) -> bool | None:
+    """Whether the agent runs an older release than the server expects (spec §5.6,
+    "Version reporting"). Server and agent share one version (#24), so the server
+    expects its own (`settings.version`), compared as PEP 440 versions: `0.2.0.dev0` is
+    older than `0.2.0`. None when either is unknown or not a version, as an agent that
+    has never checked in, or one reporting text that is not one, is. A newer agent is
+    not flagged: it is not older than the server expects."""
+    agent = _release(agent_version)
+    server = _release(settings.version if server_version is None else server_version)
+    if agent is None or server is None:
+        return None
+    return agent < server
+
+
+def protocol_mismatch(agent: Agent) -> bool:
+    """Whether the agent's last check-in was refused for speaking another protocol (it
+    then gets no job, spec §5.6). Read from the `last_error` check-in stored, which an
+    accepted check-in clears."""
+    return (agent.last_error or "").startswith(PROTOCOL_MISMATCH_PREFIX)
+
+
+def agent_out(agent: Agent) -> dict:
+    """An agent as the owner routes answer with it: its columns and tokens
+    (`schemas.AgentOut`), and the two flags the Agents page shows, computed on read
+    (`update_available`, `protocol_mismatch`)."""
+    out = AgentOut.model_validate(agent)
+    flags = {
+        "update_available": update_available(agent.version),
+        "protocol_mismatch": protocol_mismatch(agent),
+    }
+    return out.model_copy(update=flags).model_dump()
 
 
 async def list_agents(session: AsyncSession) -> list[Agent]:

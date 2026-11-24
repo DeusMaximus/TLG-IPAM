@@ -67,20 +67,13 @@ This release does ICMP, ARP and reverse DNS. Reverse DNS asks the subnet's DNS s
 
 ### Run one
 
-1. In the UI, open **Agents → Add agent** and name it. The dialog shows the agent's enrolment token (`tlge_…`) once; it can be exchanged once, within an hour.
-2. On a Linux host on the target VLAN, run the agent in a container or as a systemd unit, as below, with that enrolment token. The agent exchanges it for its long-lived agent token (`tlga_…`) itself and keeps that.
-3. Assign the subnet to the agent in the subnet's **Scanning** section, and save.
+1. In the UI, open **Agents → Add agent** and name it. The dialog shows the agent's enrolment token (`tlge_…`) once, which can be exchanged once, within an hour, and two tabs, **Container** and **systemd**, each with its prerequisites and the commands below, ready to paste, with the server's address and version filled in.
+2. On a Linux host on the target VLAN, run them. The agent exchanges the enrolment token for its long-lived agent token (`tlga_…`) itself and keeps that; the page never sees it.
+3. Once the agent has checked in, the Agents page offers to scan each subnet one of its interfaces is on that nothing scans yet: **Scan** sets it up with the default methods and asks for a scan. Or assign the subnet to the agent in the subnet's **Scanning** section, and save.
 
-The dialog still shows the interim install from before the agent could enrol itself: a `curl` command that makes the exchange by hand and prints the agent token, and a container command that takes it as `IPAM_AGENT_TOKEN`. That works too, and needs no volume; a later release of the dialog shows the commands below.
+A used, expired or revoked enrolment token is refused (`403`); so, for a minute, is every attempt after ten that failed (`429`). If the answer to the exchange is lost, or the token runs out before it is used, **Re-enrol** on the agent's row issues a new enrolment token for the same agent, which keeps its scan targets, and shows the commands again, with those that remove an old token from the host first. Exchanging it also revokes the agent token the agent held before, which is the way to replace a lost or leaked one. Pending enrolments are listed on the page until they are used or expire.
 
-A used, expired or revoked enrolment token is refused (`403`); so, for a minute, is every attempt after ten that failed (`429`). If the answer to the exchange is lost, or the token runs out before it is used, issue a new enrolment token for the same agent. Its id is in `GET /api/v1/agents`, and it keeps its scan targets:
-
-```sh
-curl -fsS -X POST https://ipam.home.arpa/api/v1/agents/<agent id>/re-enrol \
-  -H 'X-API-Key: <owner key>'
-```
-
-The answer's `enrol_token` is the new one. Exchanging it also revokes the agent token the agent held before, which is the way to replace a lost or leaked one. (Deleting the agent and adding it again works too, but leaves its subnets unassigned.) The Agents page gains a Re-enrol button in a later release.
+An agent older than the server is flagged "update available", and one refused for speaking another protocol says so; either offers the update command for both ways of running it.
 
 #### In a container
 
@@ -129,7 +122,7 @@ The wheel is not published yet. Until it is, build it from this repository (`age
 |----------|---------|---|
 | `IPAM_URL` | (required) | The server's URL. Must be `https://`: the token is a credential, and the server's certificate is always verified, with no setting to turn that off. Plain `http://` is accepted only for a server on the agent host's own loopback address (`http://127.0.0.1:8080`). |
 | `IPAM_ENROL_TOKEN` | | The `tlge_…` enrolment token, for the container's first start. Ignored once an agent token is stored in `/var/lib/tlg-ipam-agent`. |
-| `IPAM_AGENT_TOKEN` | | An agent token you hold (the interim install's `curl` printed it). Used as it is: nothing is read from or stored in `/var/lib/tlg-ipam-agent`. Set this or `IPAM_ENROL_TOKEN`, not both. |
+| `IPAM_AGENT_TOKEN` | | An agent token you hold (made by an exchange by hand at `POST /api/v1/agent/enrol`, as the agents of the first release were). Used as it is: nothing is read from or stored in `/var/lib/tlg-ipam-agent`. Set this or `IPAM_ENROL_TOKEN`, not both. |
 | `ALLOWED_CIDRS` | `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10` | The agent's own limit on what it will scan, whatever the server asks. A job for a subnet outside it is refused without a packet being sent, and the subnet's Scanning section shows why. Set it to your own networks if they use other ranges. |
 | `MAX_PPS` | `200` | The most packets a second the agent sends (1–1000): echo requests, ARP requests and DNS queries together, each ARP retry and each failover to another DNS server counted, from one scan into the next. The agent hands each to the kernel at least a slot (`1/MAX_PPS`) after it handed over the one before, and a slot that comes late is not made up for. What the kernel and the network card do after that hand-off is outside the agent's control and can put two packets closer together on the wire. The host's kernel also sends ARP of its own to reach an address it pings on the agent's subnet (up to 3 requests for an address that does not answer); that is not counted. |
 

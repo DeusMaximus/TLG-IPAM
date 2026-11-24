@@ -704,6 +704,7 @@ packaging==26.3 \
     --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
     # via
     #   -c ../api/requirements-dev.txt
+    #   -r ../api/requirements.in
     #   fastmcp-slim
     #   pytest
 pathable==0.6.0 \

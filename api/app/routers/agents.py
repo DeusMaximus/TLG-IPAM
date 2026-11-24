@@ -3,14 +3,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..auth import request_source
 from ..database import get_session
-from ..schemas import AgentCreate, AgentEnrolment, AgentOut, AgentUpdate
+from ..schemas import AgentCreate, AgentEnrolment, AgentUpdate
 from ..services import agents as svc
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 
 
 def _out(agent) -> dict:
-    return AgentOut.model_validate(agent).model_dump()
+    return svc.agent_out(agent)
 
 
 @router.get("")
