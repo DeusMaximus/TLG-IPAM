@@ -11,19 +11,25 @@ of the real programs they copy) and the four text tools the scripts use, and not
 else. Each test then reads what the step wrote and what it left: the registry's tags,
 the releases and their wheels, and every call made.
 
-A `PATH` is not a sandbox: a command named by a path, and bash's `/dev/tcp`, pass it.
-So every command the step runs is also recorded as bash is about to run it, by a
-DEBUG trap (`TRACE`, through `BASH_ENV`), into a file the step cannot redirect, and
-`Publish.run` refuses any command whose word is not one of `SHELL_WORDS`, the stubs,
-the tools or a function the script defines (`Publish.unapproved`), whatever the step
-does with the command's stderr or its exit status. The trap stops, before it runs, a
-command named by a path, one of the builtins that run another command, and one that
-names `/dev/tcp` or `/dev/udp`. With `test_every_line_of_each_publish_script_runs_in_some_test`,
-a command added on any line of either script is checked. What this does not see: a
-command word or a redirection built at run time from variables is judged by its text,
-not its value (`$cmd args` is refused as unknown; `> "$file"` is not looked at), and a
-command on a line some test runs, in a part of that line no test reaches
-(`a || b` where `a` always succeeds in the tests), is not run.
+A DEBUG trap (`TRACE`, through `BASH_ENV`) records the commands bash runs in the step,
+as it is about to run each, and `Publish.run` fails on a recorded command whose word is
+not one of `SHELL_WORDS`, the stubs, the tools or a function the script defines
+(`Publish.unapproved`), whatever the step did with that command's stderr or exit
+status. `test_every_line_of_each_publish_script_runs_in_some_test` makes each line of
+either script that holds a command run in some test, so a command added on any line is
+run by one.
+
+This is a tripwire for changes made in good faith (a new command, a changed argument,
+a branch no test takes): it makes one fail a test until someone looks. It is not a
+sandbox, and it does not hold against a script written to get past it, which is what
+review of the workflow's diff is for. It stops nothing: a command is judged by its
+text after the step has run (a quoted or variable-built word, `"/bin/c"` or `$cmd`, is
+refused as unknown), and a changed script is run as it is, so the tests' own runs of
+one run what it names. It does not see: a step that writes to the trace file
+(truncating it erases what came before); any redirection's target
+(`> /dev/"tcp"/host/port` opens a socket); what an `EXIT` trap's handler runs; and a
+command in a part of a line no test reaches (`a || b` where `a` always succeeds in
+the tests).
 """
 
 import copy
@@ -57,39 +63,14 @@ TOOLS = ("cut", "grep", "head", "sha256sum")
 SHELL_WORDS = {"echo", "printf", "test", "[", "[[", "((", "exit", "break", "continue", "true", "false", ":",
                "for", "case", "while", "until"}
 STUB_NAMES = ("gh", "skopeo", "sleep")
-# Sourced by bash before the script (`BASH_ENV`). It records each command as bash is
-# about to run it, NUL-separated, with whether it ran. `Publish.unapproved` is the
-# check: it reads each recorded command's word as bash does. Before that, the trap is a
-# net that keeps a changed script from reaching anything in the tests' own runs: it
-# skips a command whose first word names a path or runs another command (`exec`,
-# `command`, `eval`, `source`, `.`, `builtin`, `coproc`, `time`), and one that names
-# `/dev/tcp` or `/dev/udp`; under `set -e` the step then stops. The net splits words at
-# spaces (`x="a b" /bin/c` gets past it), so it is not what fails a test. The trap
-# function and the two names are read-only, and `trap - DEBUG`, `set +T` and the like
-# are themselves recorded, and refused, before they run. `extdebug`, which makes a
-# failing trap skip its command, is set by the trap and not here: bash 5 reads it in a
-# startup file as a request to start its debugger, fails to, and turns it and
-# `functrace` off, so nothing in a `$( )` is seen (bash 3.2 does not).
+# Sourced by bash before the script (`BASH_ENV`): records each command as bash is about
+# to run it, with its line, NUL-separated, into the file `STEP_TRACE` names. The trap
+# function and the two names are read-only, and `trap - DEBUG` and `set +T` are
+# themselves recorded, and refused, before they take effect. The file is not protected:
+# the step can write to it. `functrace` carries the trap into functions and `$( )`.
 TRACE = r"""readonly PATH STEP_TRACE
 set -o functrace
-__step_trace() {
-    shopt -q extdebug || shopt -s extdebug
-    local line=$1 word first= run=run
-    local -a words
-    read -r -a words <<< "$BASH_COMMAND"
-    for word in "${words[@]}"; do
-        case $word in */dev/tcp/* | */dev/udp/*) run=skip ;; esac
-        if [ -z "$first" ]; then
-            case $word in
-                [A-Za-z_]*=*) case ${word%%=*} in *[!A-Za-z0-9_]*) first=$word ;; esac ;;
-                *) first=$word ;;
-            esac
-        fi
-    done
-    case $first in /* | exec | command | eval | source | . | builtin | coproc | time) run=skip ;; esac
-    printf '%s\t%s\t%s\0' "$run" "$line" "$BASH_COMMAND" >> "$STEP_TRACE"
-    [ "$run" = run ]
-}
+__step_trace() { printf '%s\t%s\0' "$1" "$BASH_COMMAND" >> "$STEP_TRACE"; }
 readonly -f __step_trace
 trap '__step_trace "$LINENO"' DEBUG
 """
@@ -172,7 +153,7 @@ class Publish:
         }
 
         # what GitHub and the registry hold before the step runs
-        self.github = {"tags": [self.tag], "releases": [], "fail": {}, "lookup_wins": [], "lookups_raced": 0}
+        self.github = {"tags": [self.tag], "releases": [], "fail": {}, "lookup_wins": [], "looked_up": []}
         self.registry = {
             "tags": {},
             "repository_exists": True,
@@ -182,8 +163,8 @@ class Publish:
             "logouts": 0,
         }
         self.calls: list[dict] = []
-        # (ran, line, command) for every command the step was about to run
-        self.trace: list[tuple[bool, int, str]] = []
+        # (line, command) for each command the trap recorded the step about to run
+        self.trace: list[tuple[int, str]] = []
 
         for program in STUB_NAMES:
             stub = self.bin / program
@@ -250,16 +231,14 @@ class Publish:
         self.calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
         trace = self.state / "trace"
         records = trace.read_text().split("\0")[:-1] if trace.exists() else []
-        self.trace = [(ran == "run", int(line), command) for ran, line, command in (r.split("\t", 2) for r in records)]
+        self.trace = [(int(line), command) for line, command in (r.split("\t", 1) for r in records)]
         return result
 
     def unapproved(self) -> list[str]:
-        """Each command the step ran, or was stopped from running, that it may not run."""
+        """Each recorded command whose word is not one the step may run. It is found
+        after the step has run: nothing here stops a command."""
         allowed = SHELL_WORDS | set(STUB_NAMES) | set(TOOLS) | _functions(self.script)
-        return [
-            command for ran, _, command in self.trace
-            if not ran or (_command_word(command) or ":") not in allowed
-        ]
+        return [command for _, command in self.trace if (_command_word(command) or ":") not in allowed]
 
     def refused(self) -> list[dict]:
         """Each call a stub refused, even one whose stderr the step discarded."""
@@ -267,6 +246,8 @@ class Publish:
         return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
 
     def run(self) -> subprocess.CompletedProcess:
+        """Runs the step and fails on a recorded command it may not run, a call a stub
+        refused, or a program it could not find: the tripwire (module docstring)."""
         result = self.execute()
         assert self.trace, "the trap recorded nothing"
         assert self.unapproved() == [], self.unapproved()
@@ -666,9 +647,16 @@ def _command_lines(script: str) -> set[int]:
     """The lines of `script` that hold a command: not blank, a comment, a keyword or
     brace that closes or opens a block, a `case` pattern, or the arguments of a
     command continued from the line before (a continued line that starts with `|`,
-    `||` or `&&` holds a command)."""
+    `||` or `&&` holds a command).
+
+    It reads only the constructs the two publish scripts use: one command per line or
+    per `\\` continuation, `if`, `for` and `case` blocks, brace groups and one-line
+    functions. A here-document is refused, naming its line; a quoted string that spans
+    lines is not seen, and its lines are read as commands."""
     lines, continued = set(), False
     for number, line in enumerate(script.splitlines(), 1):
+        if re.search(r"(?<!<)<<(?!<)", line):
+            raise ValueError(f"line {number} opens a here-document, which _command_lines does not read: {line.strip()}")
         text = line.strip()
         after_continuation, continued = continued, text.endswith("\\")
         if not text or text.startswith("#") or _STRUCTURE.fullmatch(text):
@@ -682,6 +670,9 @@ def _command_lines(script: str) -> set[int]:
 def test_reading_which_lines_hold_a_command():
     script = 'if false; then\n  curl x \\\n    --flag\n  # a note\nfi\ncase $a in\n  b)\n    echo "$a" \\\n      || exit 1\n    ;;\nesac\n'
     assert _command_lines(script) == {1, 2, 6, 8, 9}
+    with pytest.raises(ValueError, match="line 2 opens a here-document"):
+        _command_lines("echo a\ncat <<'END'\njust text\nEND\n")
+    assert _command_lines("grep x <<< \"$a\"\n") == {1}
 
 
 @pytest.mark.parametrize("job", ["publish-image", "publish-release"])
@@ -689,33 +680,25 @@ def test_every_line_of_each_publish_script_runs_in_some_test(tmp_path, workflow,
     """So a command added anywhere in either script is run, and checked, by a test:
     a line no test reaches fails here until one does."""
     runs = list(_scenarios(tmp_path, workflow, job))
-    ran = {line for publish in runs for _, line, _ in publish.trace}
+    ran = {line for publish in runs for line, _ in publish.trace}
     script = runs[0].script
     missing = sorted(_command_lines(script) - ran)
     assert missing == [], [script.splitlines()[n - 1].strip() for n in missing]
 
 
-@pytest.mark.parametrize("job", ["publish-image", "publish-release"])
-def test_no_publish_script_names_a_network_redirection(workflow, job):
-    """Bash opens `/dev/tcp/<host>/<port>` and `/dev/udp/…` as sockets, with no program
-    to see on the `PATH`; a spelling built at run time is not seen by this."""
-    (step,) = [s for s in workflow["jobs"][job]["steps"] if "run" in s]
-    assert not re.search(r"/dev/(tcp|udp)\b", step["run"])
-
-
-# Changes a step could gain that its stderr and exit status would hide: each runs, or is
-# stopped, in the step's first line, its stderr discarded and its failure handled. The
-# first two are the review's of PR #154 (an unknown program, and one handed the token).
-# The ones the trap stops would leave a `ran-*` entry in the work directory if they ran.
+# Changes made in good faith that a step's stderr and exit status would hide: each is
+# the step's first line, its stderr discarded and its failure handled. The first two are
+# the review's of PR #154 (an unknown program, and one handed the token). Each runs as
+# written (`curl` is not on the `PATH`; `/bin/mkdir` makes a directory in the test's own
+# work directory), and is found in the record afterwards.
 MUTATIONS = {
     "unknown-program": "curl https://example.invalid/ 2>/dev/null || true",
     "token-in-an-argument": 'curl -fsS -H "Authorization: Bearer ${TOKEN:-$GH_TOKEN}" https://example.invalid/ 2>/dev/null || true',
-    "a-path": "/bin/mkdir ran-a-path 2>/dev/null || true",
-    "a-path-in-a-substitution": 'x=$(/bin/mkdir ran-in-a-substitution 2>/dev/null || true)',
-    "command-builtin": "command /bin/mkdir ran-command 2>/dev/null || true",
-    "eval": "eval /bin/mkdir ran-eval 2>/dev/null || true",
+    "a-path": "/bin/mkdir made-by-a-path 2>/dev/null || true",
+    "a-path-in-a-substitution": 'x=$(/bin/mkdir made-in-a-substitution 2>/dev/null || true)',
+    "command-builtin": "command -v curl >/dev/null 2>&1 || true",
+    "eval": "eval true 2>/dev/null || true",
     "trap-removed": "trap - DEBUG 2>/dev/null || true",
-    "network-redirection": "echo probe 2>/dev/null > ./dev/tcp/ran-redirection || true",
 }
 
 
@@ -724,15 +707,9 @@ MUTATIONS = {
 def test_a_command_the_step_may_not_run_is_caught_whatever_it_does_with_its_failure(tmp_path, workflow, job, mutation):
     (step,) = [s for s in workflow["jobs"][job]["steps"] if "run" in s]
     publish = Publish(tmp_path, workflow, job, script=mutation + "\n" + step["run"])
-    (publish.work / "dev" / "tcp").mkdir(parents=True)
     result = publish.execute()
-    first_line = [command for ran, line, command in publish.trace if line == 1]
+    first_line = [command for line, command in publish.trace if line == 1]
     assert publish.unapproved() and publish.unapproved()[0] in first_line
-    # a path, `/dev/tcp` and the builtins that run another command are stopped before
-    # they run (and the shell they would run in with them: the step, or a `$( )`)
-    stopped = [command for ran, _, command in publish.trace if not ran]
-    assert bool(stopped) is ("ran-" in mutation)
-    assert list(publish.work.glob("ran-*")) == list(publish.work.glob("dev/tcp/*")) == []
     if mutation == MUTATIONS["unknown-program"]:
         # what the step's own answer shows: nothing, so only the record catches it
         assert result.returncode == 0
@@ -746,9 +723,12 @@ def test_a_command_the_step_may_not_run_is_caught_whatever_it_does_with_its_fail
 @pytest.mark.parametrize("leftover", ["none", "same", "other"])
 def test_a_rerun_over_a_published_release_and_a_leftover_draft(tmp_path, workflow, leftover):
     """A failed lookup can leave a draft beside the published release (above). gh's
-    lookup then answers with either, call by call: every order of winners is run, and
-    in each the published release keeps its wheel and stays published, and no wheel
-    is replaced anywhere."""
+    lookup then answers with either, call by call: every order of winners is run, each
+    lookup is checked to have returned the release its order names, and in each run the
+    published release keeps its wheel and stays published, and no wheel is replaced
+    anywhere. When `view` returns the published release the step edits nothing; when
+    every lookup returns the draft, the step goes on to publish it unless it holds
+    another wheel."""
     wheels = {"none": None, "same": "this", "other": b"a wheel some other build made"}
     explored: list[tuple[str, ...]] = []
     for order in itertools.product(("published", "draft"), repeat=4):
@@ -757,11 +737,21 @@ def test_a_rerun_over_a_published_release_and_a_leftover_draft(tmp_path, workflo
         publish = Publish(tmp_path / "-".join(order), workflow, "publish-release")
         wheel = publish.wheel if wheels[leftover] == "this" else wheels[leftover]
         published = publish.release(draft=False, wheel=publish.wheel)
-        publish.release(draft=True, wheel=wheel)
+        draft = publish.release(draft=True, wheel=wheel)
         before = copy.deepcopy(publish.github["releases"])
         publish.github["lookup_wins"] = list(order)
         publish.run()
-        explored.append(order[: publish.github["lookups_raced"]])
+        returned = [
+            "draft" if lookup["id"] == draft["id"] else "published"
+            for lookup in publish.github["looked_up"] if lookup["both"]
+        ]
+        assert returned == list(order[: len(returned)])
+        explored.append(order[: len(returned)])
+        edits = publish.argvs("gh", "edit")
+        if returned[0] == "published":
+            assert edits == []
+        if set(returned) == {"draft"}:
+            assert bool(edits) is (leftover != "other")
         after = {r["id"]: r for r in publish.github["releases"]}
         assert after[published["id"]]["draft"] is False
         assert after[published["id"]]["assets"] == published["assets"]
@@ -769,5 +759,5 @@ def test_a_rerun_over_a_published_release_and_a_leftover_draft(tmp_path, workflo
             for name, data in release["assets"].items():
                 assert after[release["id"]]["assets"][name] == data
         assert len(after) == 2
-    # the draft won at least one lookup, and the published release at least one
-    assert any("draft" in done for done in explored) and any("published" in done for done in explored)
+    # every lookup of one run returned the draft, and every lookup of another the published release
+    assert {"draft"} in [set(done) for done in explored] and {"published"} in [set(done) for done in explored]

@@ -14,7 +14,8 @@ the publish steps use them:
   and takes whichever answers first. With neither it fails with `release not found`.
   When both exist, either can win, call by call: the state's `lookup_wins` lists the
   winner of each such lookup in turn (`published` or `draft`), so a test runs every
-  order, and a lookup it did not plan for is refused.
+  order, and a lookup it did not plan for is refused. `looked_up` records each lookup:
+  the verb, the id of the release it returned, and whether both existed.
 - `gh release create <tag> <asset>` with an asset refuses a tag that a *published*
   release already has (`a release with the same tag name already exists`). A draft
   with the tag does not stop it: it makes a new draft, uploads, then publishes it.
@@ -104,8 +105,6 @@ def _find(stub: Stub, state: dict, tag: str) -> dict | None:
         if not state["lookup_wins"]:
             raise Unplanned
         winner = state["lookup_wins"].pop(0)
-        state["lookups_raced"] += 1
-        stub.save("github", state)
         return published[0] if winner == "published" else drafts[0]
     return (published or drafts or [None])[0]
 
@@ -135,6 +134,9 @@ def gh(stub: Stub, argv: list[str]) -> int:
             release = _find(stub, state, tag)
         except Unplanned:
             return refuse("gh", argv)
+        both = {r["draft"] for r in releases if r["tag"] == tag} == {False, True}
+        state["looked_up"].append({"verb": verb, "id": release and release["id"], "both": both})
+        stub.save("github", state)
 
     def notes() -> str:
         return Path(flags["--notes-file"]).read_text()
