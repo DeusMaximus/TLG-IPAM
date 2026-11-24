@@ -27,15 +27,27 @@ or the agent be restarted. A subnet that lists its own DNS servers is not affect
 setting them is the other way out.
 
 **What clears a stored name.** Only a DNS server's answer that an address has no name
-(`NXDOMAIN`, or a `NOERROR` without a PTR record that carries the zone's SOA, or no
-record at all) clears the name the server holds for it. A lookup no server answered
+(`NXDOMAIN`, or a `NOERROR` without a PTR record that carries the SOA of a zone holding
+the name, or no record at all) clears the name the server holds for it. A reply is read
+against the question: a PTR record counts only at the address's own reverse name or at
+the end of the CNAME chain the reply gives for it, and an SOA only for a zone that
+contains that name. A lookup no server answered
 usably (silence, `SERVFAIL`, `REFUSED`, a malformed or truncated reply, a referral, also
-after a CNAME as in a classless reverse delegation, or a CNAME left unresolved; each
+after a CNAME as in a classless reverse delegation, a CNAME left unresolved, a PTR
+record for some other name, or an SOA for a zone that does not hold the name; each
 sends the lookup on to the next configured server) leaves the stored name as it is,
 and the scan reports
 "rdns: no DNS server gave a usable answer for N of M addresses". So a resolver outage
 keeps stale names until a server answers again, and never stops the scan from marking
 a host that has left the network as gone.
+
+**A warning on every scan from a non-recursive server.** The agent follows neither a
+CNAME nor a referral itself. If a subnet's only DNS server does not recurse and answers
+its reverse names with an alias it does not resolve (classless reverse delegation,
+RFC 2317, served by another server), every scan of that subnet reports "no DNS server
+gave a usable answer", and a stale name there is never cleared. That is by design, not
+a fault. To fix it, point the subnet at a recursive resolver, or at a server that also
+serves the zone the alias points into.
 
 **The packet budget (`MAX_PPS`).** Every echo request, ARP request and DNS query the
 agent sends takes a slot of one budget, which it keeps from one scan to the next. Each

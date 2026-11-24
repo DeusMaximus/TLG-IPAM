@@ -53,7 +53,8 @@ Slot = Callable[[], Awaitable[float]]
 
 class NoName:
     """What `ptr` returns when a server answered that the address has no name: NXDOMAIN,
-    or NOERROR without a PTR record that says so (`says_no_name`). Unlike None, which is a lookup no server gave a
+    or NOERROR without a PTR record that says so (`says_no_name`, for the name the
+    answer is about). Unlike None, which is a lookup no server gave a
     usable answer to, it is the one answer that lets the server clear a stored name
     (spec §5.7). `NO_NAME` is its one instance."""
 
@@ -299,12 +300,39 @@ class QuerySocket(asyncio.DatagramProtocol):
             self._transport.abort()
 
 
-def says_no_name(reply: dns.message.Message) -> bool:
-    """Whether a NOERROR reply that carries no PTR record says the address has no name
-    (spec §5.2, RFC 2308 §2.2), rather than nothing about it.
+def answered_name(reply: dns.message.Message, question: "dns.name.Name") -> "dns.name.Name | None":
+    """The name a reply's answer is about (spec §5.2): the question's name, followed
+    along the CNAME records the answer section holds, each at the name the chain has
+    reached so far, to the last target (RFC 1034 §3.6.2; RFC 2317's classless
+    delegation is such a chain). Records at any other owner are not part of it. None
+    when the chain loops. dnspython keeps one CNAME per owner (the last a reply
+    carries), so a link has one target. The agent follows the chain only within the
+    reply; it sends no query for a target."""
+    cnames = {
+        rrset.name: rrset for rrset in reply.answer if rrset.rdtype == dns.rdatatype.CNAME and len(rrset)
+    }
+    name = question
+    seen = {name}
+    while name in cnames:
+        name = cnames[name][0].target
+        if name in seen:
+            return None
+        seen.add(name)
+    return name
 
-    - The zone's SOA in the authority section is a negative answer (NODATA), whether
-      or not the answer section holds the CNAMEs that led to it: no name.
+
+def says_no_name(reply: dns.message.Message, name: "dns.name.Name") -> bool:
+    """Whether a NOERROR reply that carries no PTR record for `name`, the name its
+    answer is about (`answered_name`), says that name has no PTR record (spec §5.2,
+    RFC 2308 §2.2), rather than nothing about it.
+
+    - An SOA in the authority section for a zone that contains `name` (its owner is
+      `name` or an ancestor of it) is a negative answer (NODATA), whether or not the
+      answer section holds the CNAMEs that led to `name`, and whether or not name
+      servers stand beside it: no name.
+    - An SOA there for any other zone (one unrelated to the question, or the
+      question's own zone beside a CNAME whose target lies outside it) says nothing
+      about `name`.
     - Name servers there and no SOA is a referral, from a server that does not
       recurse, pointing at the ones that know: nothing about the name, even after a
       CNAME (RFC 2317's classless reverse delegation is exactly that). The agent does
@@ -315,12 +343,43 @@ def says_no_name(reply: dns.message.Message) -> bool:
       resolve, or records of another type): the name is an alias, or the reply is
       about something else, and the target's own answer is missing: nothing about
       the name."""
-    kinds = {rrset.rdtype for rrset in reply.authority}
-    if dns.rdatatype.SOA in kinds:
+    soas = [rrset.name for rrset in reply.authority if rrset.rdtype == dns.rdatatype.SOA]
+    if any(name.is_subdomain(zone) for zone in soas):
         return True
-    if dns.rdatatype.NS in kinds:
+    if soas:
+        return False
+    if any(rrset.rdtype == dns.rdatatype.NS for rrset in reply.authority):
         return False
     return not reply.answer
+
+
+def read_reply(reply: dns.message.Message, question: "dns.name.Name") -> str | NoName | None:
+    """What a reply to the PTR query for `question` says (spec §5.2): the name, NO_NAME
+    when it says there is none, or None when it gives no usable answer and the next
+    configured server is asked.
+
+    - NXDOMAIN: NO_NAME. Any rcode but NOERROR: None.
+    - A PTR record is read only at the name the answer is about (`answered_name`: the
+      question's name, or the last target of its CNAME chain in this reply). A PTR
+      record at any other owner, the chain's earlier links included (a name with a
+      CNAME holds no other record), answers some other question, and the reply is
+      None whatever else it holds.
+    - No PTR record at all: NO_NAME if `says_no_name` for that name, else None."""
+    rcode = reply.rcode()
+    if rcode == dns.rcode.NXDOMAIN:
+        return NO_NAME
+    if rcode != dns.rcode.NOERROR:
+        return None  # SERVFAIL, REFUSED: no answer about the name
+    name = answered_name(reply, question)
+    if name is None:
+        return None  # a CNAME chain that loops
+    ptrs = [rrset for rrset in reply.answer if rrset.rdtype == dns.rdatatype.PTR and len(rrset)]
+    for rrset in ptrs:
+        if rrset.name == name:
+            return rrset[0].target.to_text()
+    if ptrs:
+        return None  # a PTR record at an owner the question does not reach
+    return NO_NAME if says_no_name(reply, name) else None
 
 
 def no_query_sent(cause: str) -> str:
@@ -458,10 +517,12 @@ class DnsResolver:
 
     async def ptr(self, address: Address, servers: tuple[str, ...], slot: Slot) -> str | NoName | None:
         """The PTR name of `address`, or NO_NAME when a server says there is none
-        (NXDOMAIN, or NOERROR without a PTR record that `says_no_name`), or None when
+        (NXDOMAIN, or NOERROR without a PTR record that `says_no_name`), as one reply
+        is read by `read_reply`, or None when
         no server asked gave a usable answer (silence, SERVFAIL, REFUSED, another rcode,
-        a referral, a CNAME the reply leaves unresolved, a truncated, malformed or
-        mismatched reply), or when the lookup's
+        a referral, a CNAME the reply leaves unresolved, a PTR record at an owner the
+        question does not reach, an SOA for a zone that does not hold the name, a
+        truncated, malformed or mismatched reply), or when the lookup's
         time ran out after a query was sent (or before its first attempt, which only
         the job's deadline does). Raises ProbeError when there is no server to ask, or
         when no query was sent before the servers or the lookup's time ran out."""
@@ -537,17 +598,12 @@ class DnsResolver:
             finally:
                 sock.close()
             asked = True
-            rcode = reply.rcode()
-            if rcode == dns.rcode.NXDOMAIN:
-                return NO_NAME
-            if rcode != dns.rcode.NOERROR:
-                continue  # SERVFAIL, REFUSED: no answer about the name, the next server
-            for rrset in reply.answer:
-                if rrset.rdtype == dns.rdatatype.PTR and len(rrset):
-                    return rrset[0].target.to_text()
-            if not says_no_name(reply):
-                continue  # a referral, or an alias left unresolved: the next server
-            return NO_NAME
+            answer = read_reply(reply, name)
+            if answer is None:
+                # SERVFAIL, REFUSED, a referral, an alias left unresolved, or records
+                # that do not answer the question: the next server
+                continue
+            return answer
         if not asked:
             # every server was tried, and none could be sent the query
             raise ProbeError(no_query_sent(unsent or "unknown"))
