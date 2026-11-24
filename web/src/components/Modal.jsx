@@ -10,7 +10,9 @@ export default function Modal({
 }) {
   return (
     <div
-      className="fixed inset-0 z-40 flex items-start justify-center bg-black/60 pt-24"
+      // the overlay scrolls, so a dialog taller than the window (the guided install's
+      // commands) can be read to its last button
+      className="fixed inset-0 z-40 flex items-start justify-center overflow-y-auto bg-black/60 px-4 pb-8 pt-24"
       onMouseDown={(e) => closeOnBackdrop && e.target === e.currentTarget && onClose()}
     >
       <div

@@ -248,8 +248,8 @@ def _protocol_error(body: dict) -> str | None:
     else:
         spoken = "no protocol this server knows"
     return (
-        f"Protocol mismatch: the agent speaks {spoken}, the server speaks protocol "
-        f"{PROTOCOL_VERSION}. Install the agent release that matches the server."
+        f"{agents.PROTOCOL_MISMATCH_PREFIX} the agent speaks {spoken}, the server speaks "
+        f"protocol {PROTOCOL_VERSION}. Install the agent release that matches the server."
     )
 
 

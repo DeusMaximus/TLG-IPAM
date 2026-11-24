@@ -6,3 +6,5 @@ sqlalchemy[asyncio]>=2.0
 aiosqlite>=0.20
 pydantic-settings>=2.6
 fastmcp>=4.1,<5
+# PEP 440 comparison of an agent's release with the server's (services/agents)
+packaging>=24

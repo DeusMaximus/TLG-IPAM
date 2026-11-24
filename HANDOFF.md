@@ -27,6 +27,35 @@ Template:
 
 ---
 
+## 2026-11-24 — Claude Code (Opus 5.5), worker — #23: guided install, pending enrolments, version flags, scan offers (PR #141)
+- **Done:**
+  - [PR #141](https://github.com/DeusMaximus/TLG-IPAM/pull/141) (`23-ui-guided-install`, head `1718163`) closes #23.
+  - The Add agent dialog is now the guided install of spec §5.6: Container and systemd tabs, each with prerequisites and commands pinned to the server's `/health` version. The systemd install reads the enrolment token from standard input (`--enrol-token -`).
+  - Agents page: Re-enrol (with the commands that remove an old token from the host first), a pending-enrolments list, an "update available" flag, a protocol-mismatch line, the update commands, and "Scan *subnet* with this agent?" offers.
+  - Server, read-only:
+    - `agents.agent_out` adds `update_available` (PEP 440, `packaging`) and `protocol_mismatch` (read from the prefix of the stored `last_error`).
+    - `scans.suggestions` serves `GET /api/v1/scan-targets/suggestions` in two statements; REST only.
+  - `packaging` is now a direct dependency. All four locks were regenerated; only their `# via` comments changed.
+  - Spec §5.6 gains the update and re-enrol command table and a paragraph on where the artefact names come from. The brief, README and `AGENTS.md` (one new bullet) are updated.
+  - Review fixes:
+    - `78ef42e` (Codex P2, Greptile P1): a container from the first release's install (`IPAM_AGENT_TOKEN`, no volume) is told to re-enrol rather than update.
+    - `1718163` (Greptile P2): the modal overlay scrolls.
+  - Merged: `a36c153`, squash, on the owner's go-ahead; the remote branch is deleted. CI green and Codex clean on `1718163`. Greptile read only the first head, so one outside read by Sol (GPT-6.1 Sol) stood in for its re-run: GO at `1718163` with three P3s, none of the 13 Deliberate calls overruled. The orchestrator ran 1,112 server and 154 web tests, lint and build on that head. The three P3s are filed as #143 (a disabled agent's enrolment shown as open; the pending list following the browser's clock; release versions not in normal form accepted).
+- **Decisions:** Deliberate calls 1–13 in the PR body. The main ones:
+  - The flags are computed on the server.
+  - The mismatch is read from `last_error`, so `agent_protocol.py` is untouched.
+  - Accepting an offer is `POST /scan-targets` with the server defaults, then one `POST /subnets/{id}/scan`.
+  - Only subnets with no scan target are offered.
+  - "Not now" lasts only while the page is open.
+- **State:**
+  - merged. Tests: server 1,112, agent 1,193, web 154.
+  - No schema change; `PROTOCOL_VERSION` unchanged.
+- **Waiting on the owner:** nothing from this entry.
+- **Untested:** the commands against real artefacts (#24); the dialogs in a real browser.
+- **Next:**
+  - #24 must publish `ghcr.io/deusmaximus/tlg-ipam-agent:<version>` and `releases/download/v<version>/tlg_ipam_agent-<version>-py3-none-any.whl`, and give the server and agent one version. Today they differ: the server's `settings.version` is `0.1.0` and the agent's `__version__` is `0.2.0.dev0`.
+  - #92 (the plain-HTTP warning before a token is issued) and #143 are the dialog's open follow-ups.
+
 ## 2026-11-24 — Claude Code (Opus 5.5), worker — #22: the agent's enrolment exchange and the systemd installer (PR #130)
 - **Done:**
   - [PR #130](https://github.com/DeusMaximus/TLG-IPAM/pull/130) (`22-agent-enrol-install`, head `b7fb4ae`) closes #22.
@@ -121,36 +150,3 @@ Template:
   - After #22 merges: #100 (same agent files; Opus 5.5, briefed), then #23, whose systemd tab shows the stdin form of the command and whose container tab shows a volume and `IPAM_ENROL_TOKEN`, then #92 on the same dialog. #24 waits on #22; #94 goes with #24. #93 and #20 are stretches.
   - Then M3 (#26 to #32) after #25. #26 also waits on #132. No OAuth grant may be issued before #28's write-scope checks are in force.
   - No real-network test is planned. The owner's permission to send packets on the test host covered 2026-11-23 only: ask again first.
-
-## 2026-11-24 — Claude Code (Opus 5.5), worker — #86: bound list_scan_findings' work per call and the size of one finding (PR #129)
-- **Done:** [PR #129](https://github.com/DeusMaximus/TLG-IPAM/pull/129) (`86-bound-findings-call`, head `f77e53f`) closes #86.
-  - `findings.list_named` reads each subnet in chunks (`_read_chunk`) along `(subnet_id, ip_int)` indexes on hosts, observations and dismissals.
-    - At most `CALL_STATEMENTS` (100) statements per call, each returning at most `SCAN_CHUNK` (250) rows per table.
-    - Inside a scanned DHCP pool, observations are read only at the chunk's hosts' addresses.
-    - Subnets that cannot hold a finding cost no statement. A call that hits the limit returns a short or empty page with a cursor.
-  - The scope read uses a covering index on reserved ranges `(subnet_id, scan_excluded, start_int, end_int)`. A subnet holds at most `schemas.SUBNET_RESERVED_RANGES_MAX` (100) reserved ranges on every add path, counted under the write lock.
-  - A domain is at most 253 characters (`ipnet.DOMAIN_MAX`), so a finding is at most `FINDING_MAX` (5,000) bytes; the largest built is 4,880. A host whose domain was stored longer is listed with `host_fqdn` null.
-  - The page budget counts brackets and commas. A cursor address above 64 bits never reaches SQL.
-  - Startup creates declared indexes missing from existing tables (`database._add_missing_indexes`).
-  - Docs:
-    - brief: tool row, §3 domain and range rules, the `add_reserved_range` row;
-    - spec: §5.8 and new §7.2 invariant 9;
-    - `AGENTS.md`: the MCP bullet and the schema bullet;
-    - the tool docstrings.
-  - Merged: `e8cfe1e`, squash, on the owner's go-ahead, which accepted the 100-range limit; the remote branch is deleted. CI green and Codex clean on `f77e53f`. Greptile reviewed only the first head (`6870cae`, nothing raised) and was not retriggered. Briefed rounds (Codex, GPT-6.1 Sol): NO-GO at `591b8bf` (one P2, two P3s), GO at `f77e53f` with two P3s. The first is filed as #133; the second, contradictory figures in the PR body, the orchestrator corrected in the body without a commit. The orchestrator ran 1,069 server tests on the head merged with `main` at `c5d7139`, disabled the limit (its one test went red), and on the earlier head removed the observations index (the plan and work tests went red). Nothing from this entry is waiting on the owner any more.
-- **Decisions:** PR body Deliberate calls 1–9.
-  - The bound is on statements, each with a row bound and an index.
-  - It has two exceptions: the subnet list, and the excluded ranges of a subnet stored with more than 100 before the limit, which its scope reads whole.
-  - Cursors from a stop never name an unhosted pool address.
-  - A stored over-long domain is refused when a write resends it.
-  - An over-long stored domain gives null `host_fqdn`, not a cut value.
-  - Schema: four new indexes, no column or table change.
-- **State:** CI green on `f77e53f`; Codex clean on it.
-  - Earlier Codex P1s on `6870cae` and `6e3e6f1` are fixed and answered on their threads.
-  - Greptile reviewed only `6870cae` (no findings).
-  - Briefed round 1 at `591b8bf` was NO-GO (P2 scope read, P3 walk fixture, P3 figures); all three are fixed at `f77e53f`.
-  - Locally: 1,029 server and 922 agent tests pass. The head merges cleanly with `main` at `b391e84`.
-- **Waiting on the owner:**
-  - The 100-range limit and its legacy exception (Deliberate call 9): accept or overrule.
-  - The Greptile retrigger, the briefed round 2 (the orchestrator runs it on `f77e53f`), and the merge.
-- **Next:** #91 adds only the `notes` limit, since `domain` is at 253 here. #26 can expose `/mcp` once #129 and #90 are in.
