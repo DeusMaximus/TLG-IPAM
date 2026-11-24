@@ -56,8 +56,9 @@ starting a process, outside the one module each is allowed in, and allows each l
 read only in the module listed for it. It sees names, so code that reaches a file
 without one it lists passes it, and review holds the rule (spec §7.2, invariant 1).
 
-**Building the wheel** (for the systemd install, until releases publish one):
-`.venv/bin/pip wheel --no-deps . -w dist` from this directory. Then, on the host,
+**Building the wheel** (for the systemd install of a build of `main`; each release
+publishes one, `.agents/releases.md`): `.venv/bin/pip wheel --no-deps . -w dist` from
+this directory. Then, on the host,
 `sudo python3 -m venv /opt/tlg-ipam-agent`, `sudo /opt/tlg-ipam-agent/bin/pip install
 tlg_ipam_agent-<version>-py3-none-any.whl`, and `tlg-ipam-agent install` as the
 [project README](../README.md#run-it-as-a-systemd-unit) shows.

@@ -1,4 +1,8 @@
+from typing import ClassVar
+
 from pydantic_settings import BaseSettings
+
+from .version import VERSION
 
 # The value `.env.example` ships. Anyone who has read the repository knows it.
 PLACEHOLDER_API_KEY = "change-me"
@@ -15,7 +19,9 @@ class Settings(BaseSettings):
     api_key: str = ""
     db_path: str = "./ipam.db"
     static_dir: str = "./static"
-    version: str = "0.1.0"
+    # The release this code is (`app/version.py`, #24): a class attribute, not a field,
+    # so no environment variable can make a server report another release than it runs
+    version: ClassVar[str] = VERSION
 
 
 def api_key_problem(value: str) -> str | None:

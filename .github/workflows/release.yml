@@ -1,0 +1,302 @@
+# The scan agent's release (#24, v0.2 spec §5.6). A tag v<version>, on a commit of main
+# whose server and agent are both at <version>, publishes the two artefacts the Agents
+# page's install commands name (web/src/utils/install.js):
+#
+#   - the image ghcr.io/deusmaximus/tlg-ipam-agent:<version>, for linux/amd64 and
+#     linux/arm64;
+#   - the wheel tlg_ipam_agent-<version>-py3-none-any.whl, attached to the GitHub
+#     release v<version>;
+#
+# and then fetches both as an operator would, with no credential. A pull request that
+# changes what goes into them, and a run by hand, build and check both and publish
+# nothing. .agents/releases.md is the checklist.
+#
+# Only the two publish jobs hold a credential that can write, each the one permission
+# it uses, and they run only for a pushed tag. They check out nothing: they publish the
+# files the build job made and checked, by the digests it recorded. Every action is
+# pinned to a commit, and every image the build runs to a digest.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - 'agent/**'
+      - 'api/app/version.py'
+      - 'web/src/utils/install.js'
+      - '.github/workflows/release.yml'
+      - '.github/scripts/**'
+  workflow_dispatch:
+
+# Nothing unless a job asks for it.
+permissions: {}
+
+# bash with pipefail, so a check piped into tee still fails its step
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # The names install.js renders; web/src/utils/install.test.js holds these two lines
+  # to its AGENT_IMAGE and RELEASE_DOWNLOADS.
+  IMAGE: ghcr.io/deusmaximus/tlg-ipam-agent
+  RELEASES: https://github.com/DeusMaximus/TLG-IPAM/releases/download
+  SOURCE: https://github.com/DeusMaximus/TLG-IPAM
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  build:
+    name: Build and check
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read # check out the code
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      wheel_sha256: ${{ steps.wheel.outputs.sha256 }}
+      image_digest: ${{ steps.image.outputs.digest }}
+      archive_sha256: ${{ steps.image.outputs.archive_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # main's history, to check that a tag is on it
+          persist-credentials: false
+      # No dependency cache: nothing another ref wrote reaches a release.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: |
+            3.11
+            3.13
+      - name: Build tools, from the hashed lock
+        run: |
+          python3.13 -m venv "$RUNNER_TEMP/build"
+          "$RUNNER_TEMP/build/bin/pip" install --require-hashes -r agent/requirements-build.txt
+      - name: One version, and the tag names it
+        id: version
+        run: |
+          args=()
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            # what is released is what main holds
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "::error::$GITHUB_REF_NAME tags $GITHUB_SHA, which is not on main; tag a commit of main"
+              exit 1
+            fi
+            args=(--tag "$GITHUB_REF_NAME")
+          fi
+          "$RUNNER_TEMP/build/bin/python" .github/scripts/release_check.py version "${args[@]}" | tee -a "$GITHUB_OUTPUT"
+      - name: The Agents page pins its commands to it
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # shellcheck disable=SC2016 # the ${v} is JavaScript's, in a template literal
+          node --input-type=module -e '
+            import { releaseVersion } from "./web/src/utils/install.js"
+            const v = process.env.VERSION
+            if (releaseVersion(v) !== v) {
+              console.error(`::error::install.releaseVersion does not take ${v}: the page would show <version>`)
+              process.exit(1)
+            }'
+      - name: Wheel
+        id: wheel
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          wheel="dist/tlg_ipam_agent-$VERSION-py3-none-any.whl"
+          # the commit's time in the archive, so a rebuild of the tag gives the same file
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
+            "$RUNNER_TEMP/build/bin/python" -m flit_core.wheel --outdir dist agent
+          test "$(ls dist)" = "$(basename "$wheel")"
+          "$RUNNER_TEMP/build/bin/python" .github/scripts/release_check.py wheel "$wheel" --version "$VERSION"
+          # installed with the agent's locked dependencies, on the oldest Python the
+          # wheel takes and the newest CI runs, it reports the version
+          for py in python3.11 python3.13; do
+            venv="$RUNNER_TEMP/wheel-$py"
+            "$py" -m venv "$venv"
+            "$venv/bin/pip" install --require-hashes -r agent/requirements.txt
+            "$venv/bin/pip" install --no-deps --no-index "$wheel"
+            "$venv/bin/pip" check
+            test "$("$venv/bin/tlg-ipam-agent" --version)" = "$VERSION"
+          done
+          echo "sha256=$(sha256sum "$wheel" | cut -d' ' -f1)" | tee -a "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=docker.io/moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
+      - name: Image, for both platforms, as one OCI archive
+        id: image
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          archive=dist-image/agent-image.tar
+          mkdir dist-image
+          # No provenance or SBOM attestation: the index holds the two images alone.
+          docker buildx build \
+            --platform "$PLATFORMS" \
+            --pull \
+            --provenance=false --sbom=false \
+            --label "org.opencontainers.image.source=$SOURCE" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label org.opencontainers.image.licenses=MIT \
+            --annotation "index:org.opencontainers.image.source=$SOURCE" \
+            --annotation "index:org.opencontainers.image.version=$VERSION" \
+            --annotation "index:org.opencontainers.image.description=TLG-IPAM scan agent" \
+            --output "type=oci,dest=$archive" \
+            -f agent/Dockerfile agent
+          # the index the archive holds, and its two platforms
+          digest=$(tar -xOf "$archive" index.json | jq -r '.manifests | if length == 1 then .[0].digest else error("not one index") end')
+          held=$(tar -xOf "$archive" "blobs/sha256/${digest#sha256:}" \
+            | jq -r '[.manifests[].platform | "\(.os)/\(.architecture)"] | sort | join(",")')
+          test "$held" = "$PLATFORMS"
+          echo "digest=$digest" | tee -a "$GITHUB_OUTPUT"
+          echo "archive_sha256=$(sha256sum "$archive" | cut -d' ' -f1)" | tee -a "$GITHUB_OUTPUT"
+      - name: Each platform of that archive starts, with no network
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          for platform in ${PLATFORMS//,/ }; do
+            arch=${platform#linux/}
+            # The image of that platform from the archive itself, not a second build.
+            # Through a docker-archive file: the runner's skopeo (1.13) speaks an API
+            # version to the Docker daemon that current engines refuse.
+            one="$RUNNER_TEMP/agent-$arch.tar"
+            skopeo copy --override-os linux --override-arch "$arch" \
+              oci-archive:dist-image/agent-image.tar "docker-archive:$one:tlg-ipam-agent:release-$arch"
+            docker load -i "$one"
+            test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "tlg-ipam-agent:release-$arch")" = "$platform"
+            bash .github/scripts/check-agent-image.sh "tlg-ipam-agent:release-$arch" "$VERSION" "$platform"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: |
+            dist/*.whl
+            dist-image/agent-image.tar
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-image:
+    name: Publish the image
+    needs: build
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write # push the image to ghcr.io
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+      - name: Push it, once, by its digest
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          DIGEST: ${{ needs.build.outputs.image_digest }}
+          ARCHIVE_SHA256: ${{ needs.build.outputs.archive_sha256 }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          archive=dist-image/agent-image.tar
+          echo "$ARCHIVE_SHA256  $archive" | sha256sum -c -
+          ref="docker://$IMAGE:$VERSION"
+          printf '%s' "$TOKEN" | skopeo login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          digest_of() { skopeo inspect --raw "$1" > manifest.json && echo "sha256:$(sha256sum manifest.json | cut -d' ' -f1)"; }
+          if have=$(digest_of "$ref" 2>/dev/null); then
+            # a re-run of this workflow: the tag must already be this build
+            if [ "$have" != "$DIGEST" ]; then
+              echo "::error::$IMAGE:$VERSION is already published as $have, not this build's $DIGEST; a version is published once, so release a new one"
+              exit 1
+            fi
+            echo "$IMAGE:$VERSION is already this build ($DIGEST)"
+          else
+            skopeo copy --all --preserve-digests "oci-archive:$archive" "$ref"
+          fi
+          test "$(digest_of "$ref")" = "$DIGEST"
+          skopeo logout ghcr.io
+          echo "pushed $IMAGE:$VERSION@$DIGEST"
+
+  publish-release:
+    name: Publish the release and its wheel
+    needs: [build, publish-image]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the release v<version> and attach the wheel to it
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+      - name: Release v<version> with the wheel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.build.outputs.version }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+          WHEEL_SHA256: ${{ needs.build.outputs.wheel_sha256 }}
+          DIGEST: ${{ needs.build.outputs.image_digest }}
+        run: |
+          tag="v$VERSION"
+          name="tlg_ipam_agent-$VERSION-py3-none-any.whl"
+          echo "$WHEEL_SHA256  dist/$name" | sha256sum -c -
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            # a re-run of this workflow: the wheel attached must be this build's
+            if gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir attached; then
+              echo "$WHEEL_SHA256  attached/$name" | sha256sum -c - \
+                || { echo "::error::$tag already holds another $name; a version is published once, so release a new one"; exit 1; }
+            else
+              gh release upload "$tag" "dist/$name" --repo "$GITHUB_REPOSITORY"
+            fi
+            exit 0
+          fi
+          {
+            echo "The TLG-IPAM scan agent at $VERSION, built from $GITHUB_SHA by the release workflow. A server at this tag reports the same version (\`GET /health\`), and its Agents page shows the install and update commands for both artefacts."
+            echo
+            echo "- Image: \`$IMAGE:$VERSION\` (${PLATFORMS//,/, }), digest \`$DIGEST\`"
+            echo "- Wheel: \`$name\`, SHA-256 \`$WHEEL_SHA256\`"
+          } > notes.md
+          flags=()
+          if [ "$PRERELEASE" = true ]; then flags=(--prerelease); fi
+          gh release create "$tag" "dist/$name" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$tag" --notes-file notes.md "${flags[@]}"
+
+  verify:
+    name: The install commands resolve
+    needs: [build, publish-release]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read # check out the image check script
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The image, pulled with no credential
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          DIGEST: ${{ needs.build.outputs.image_digest }}
+        run: |
+          hint="if this is the first release, make the package public (.agents/releases.md) and re-run this job"
+          skopeo inspect --raw "docker://$IMAGE:$VERSION" > manifest.json \
+            || { echo "::error::$IMAGE:$VERSION cannot be read without a credential; $hint"; exit 1; }
+          test "sha256:$(sha256sum manifest.json | cut -d' ' -f1)" = "$DIGEST"
+          docker pull --platform linux/amd64 "$IMAGE:$VERSION"
+          bash .github/scripts/check-agent-image.sh "$IMAGE:$VERSION" "$VERSION" linux/amd64
+      - name: The wheel, installed by the systemd tab's command
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          WHEEL_SHA256: ${{ needs.build.outputs.wheel_sha256 }}
+        run: |
+          name="tlg_ipam_agent-$VERSION-py3-none-any.whl"
+          url="$RELEASES/v$VERSION/$name"
+          curl -fsSL --retry 5 --retry-all-errors -o "$name" "$url"
+          echo "$WHEEL_SHA256  $name" | sha256sum -c -
+          # the guided install's `pip install <release wheel URL>`, into a fresh venv,
+          # with the runner's own Python as an operator's host would have it
+          /usr/bin/python3 -m venv venv
+          venv/bin/pip install "$url"
+          test "$(venv/bin/tlg-ipam-agent --version)" = "$VERSION"
+          echo "$url installs $VERSION"

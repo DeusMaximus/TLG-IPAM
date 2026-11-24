@@ -62,6 +62,10 @@ volumes:
 | `/mcp` | Streamable HTTP MCP endpoint |
 | `/api/v1/docs` | OpenAPI / Swagger (FastAPI auto-generated) |
 
+### 2.4 Releases
+
+The server and the agent are one version (#24, spec §5.6): `VERSION` in `api/app/version.py` and the agent's `__version__`, the same string, a PEP 440 public version in normal form (`0.2.0` at a release, the next release's `.dev0` on `main` between releases). `GET /health` reports it, the Agents page pins its install commands to it, and an agent older than it is flagged. A tag `v<version>` on a commit of `main` runs `.github/workflows/release.yml`, which builds the agent's wheel and its image (`linux/amd64` and `linux/arm64`), checks both (the versions and the tag, the wheel's name, metadata and files, the image's start-up on each platform with no network), and publishes them under exactly the names the commands use: `ghcr.io/deusmaximus/tlg-ipam-agent:<version>` and `tlg_ipam_agent-<version>-py3-none-any.whl` on the GitHub release `v<version>`. It then fetches both with no credential, as the commands do. A pull request or a run by hand builds and checks and publishes nothing. The server itself is built from the tag, not published as an image. The checklist is `.agents/releases.md`.
+
 ---
 
 ## 3. Data model
@@ -291,7 +295,7 @@ Agent-facing routes, `/api/v1/agent/*` but `enrol`, take an agent token instead 
 
 | Route | Notes |
 |---|---|
-| `GET  /health` | No auth. Returns `{status: "ok", version}`. |
+| `GET  /health` | No auth. Returns `{status: "ok", version}`: the release version (`app/version.py`), which the scan agent shares (§2.4), read from the code and never from the environment. |
 | `GET  /api/v1/sections` | List all sections with subnet count. |
 | `POST /api/v1/sections` | Create section. |
 | `PUT  /api/v1/sections/{id}` | Update. |
@@ -640,6 +644,10 @@ When no API key is stored in the browser, the SPA shows an in-app API-key connec
 
 ```
 tlg-ipam/
+├── .github/
+│   ├── workflows/ci.yml     # tests, lint, build, the locks, the agent image's start-up checks
+│   ├── workflows/release.yml # a tag v<version>: build, check and publish the agent's image and wheel (#24)
+│   └── scripts/             # release_check.py (versions, tag, wheel), check-agent-image.sh (start-up, no network)
 ├── docker-compose.yml
 ├── Dockerfile               # multi-stage: node builds web/dist, python runs API + serves it
 ├── api/
@@ -649,6 +657,7 @@ tlg-ipam/
 │   └── app/
 │       ├── main.py           # FastAPI app + static SPA serving + MCP mount
 │       ├── config.py         # env vars (pydantic-settings)
+│       ├── version.py        # the release version, which the agent's __version__ matches (#24)
 │       ├── database.py       # SQLAlchemy async engine + session
 │       ├── models.py         # ORM models (Section, Subnet, ReservedRange, Host, DeviceType, Change, Agent, Token, ScanTarget, Observation, FindingDismissal)
 │       ├── schemas.py        # Pydantic request/response schemas
@@ -684,6 +693,7 @@ tlg-ipam/
 │   ├── Dockerfile           # the agent image: host networking, CAP_NET_RAW
 │   ├── requirements.in / requirements-dev.in    # httpx, icmplib, dnspython; tests add the server's set
 │   ├── requirements.txt / requirements-dev.txt  # generated locks, constrained to api/requirements-dev.txt
+│   ├── requirements-build.in / .txt             # flit_core and packaging, for the release's wheel build and checks
 │   ├── tests/               # fake server and prober; end-to-end against the real routes; contract checks against agent_protocol
 │   └── src/tlg_ipam_agent/
 │       ├── cli.py           # entry point: configuration, signals, the loop; the install and uninstall commands
@@ -806,6 +816,7 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 - The container runs one uvicorn worker, pinned by `--workers 1` in the image's `CMD` (§2.2).
 - A request body over 2 MiB is `413 PAYLOAD_TOO_LARGE` on every route, `/mcp` included, before authentication or parsing, with a declared `Content-Length` and without one (§4.3).
 - The bodies of the requests in progress hold at most 16 MiB together (`503` past it), a body not received whole within 60 s is `408`, and both close the connection, on every route (§4.3).
+- The server and the agent are one version, and a tag `v<version>` publishes the agent image and wheel under the names the Agents page's install commands use, then fetches both with no credential (§2.4, `.agents/releases.md`).
 
 ### UI quality
 - Dark mode correct — no hardcoded colours bleeding through.

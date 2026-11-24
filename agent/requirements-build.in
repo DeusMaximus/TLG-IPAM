@@ -1,0 +1,8 @@
+# What the release pipeline (.github/workflows/release.yml) builds and checks the
+# agent's wheel with (#24): the build backend pyproject.toml's [build-system] names,
+# run as `python -m flit_core.wheel`, and packaging for the version rule
+# (.github/scripts/release_check.py). `requirements-build.txt` is the lock compiled from
+# this file: edit here, then regenerate (AGENTS.md, "Dependency lock"). packaging is
+# pinned to the server's test environment, as every package the two share is.
+flit_core>=3.12,<4
+packaging

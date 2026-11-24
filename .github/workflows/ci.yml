@@ -41,15 +41,8 @@ jobs:
       - name: Image builds and starts
         run: |
           docker build -f Dockerfile -t tlg-ipam-agent:ci .
-          docker run --rm --network none tlg-ipam-agent:ci --version
-          # with no configuration it refuses to start, naming the variable
-          out=$(docker run --rm --network none tlg-ipam-agent:ci 2>&1) && exit 1 || true
-          echo "$out" | grep -q "IPAM_URL is not set"
-          # with a URL and neither token, nor one stored, it names what it needs (#22)
-          out=$(docker run --rm --network none -e IPAM_URL=http://127.0.0.1:8080 tlg-ipam-agent:ci 2>&1) && exit 1 || true
-          echo "$out" | grep -q "no agent token: set IPAM_ENROL_TOKEN"
-          # the directory a volume mounts over for the stored token: root's, 0700
-          test "$(docker run --rm --network none --entrypoint stat tlg-ipam-agent:ci -c '%U %a' /var/lib/tlg-ipam-agent)" = "root 700"
+          # the start-up checks the release workflow runs on each platform it publishes
+          bash ../.github/scripts/check-agent-image.sh tlg-ipam-agent:ci
 
   # The locks are generated from the .in files (AGENTS.md → "Dependency lock").
   # Recompiling in place keeps every pin, and its hashes, that still satisfies
@@ -96,11 +89,12 @@ jobs:
         working-directory: agent
         run: |
           # The agent's regenerate commands, verbatim from AGENTS.md → "Dependency lock".
-          # Both are constrained to the server's test lock, so a change there that
+          # All three are constrained to the server's test lock, so a change there that
           # moves a shared package shows up here until the agent's locks follow.
           cmds=(
             "uv pip compile requirements.in --universal --python-version 3.11 --generate-hashes --no-header -c ../api/requirements-dev.txt -o requirements.txt"
             "uv pip compile requirements-dev.in --universal --python-version 3.12 --generate-hashes --no-header -c requirements.txt -c ../api/requirements-dev.txt -o requirements-dev.txt"
+            "uv pip compile requirements-build.in --universal --python-version 3.12 --generate-hashes --no-header -c ../api/requirements-dev.txt -o requirements-build.txt"
           )
           for c in "${cmds[@]}"; do
             if ! grep -qxF -- "$c" ../AGENTS.md; then
@@ -109,16 +103,16 @@ jobs:
             fi
           done
           fail() {
-            echo "::error::$1 Regenerate both agent locks from agent/ with uv 0.13.6, after the server locks, and commit them:%0A  ${cmds[0]}%0A  ${cmds[1]}"
-            printf '\n%s\nRegenerate both agent locks from agent/ with uv 0.13.6, after the server locks, and commit them:\n' "$1"
+            echo "::error::$1 Regenerate the agent locks from agent/ with uv 0.13.6, after the server locks, and commit them:%0A  ${cmds[0]}%0A  ${cmds[1]}%0A  ${cmds[2]}"
+            printf '\n%s\nRegenerate the agent locks from agent/ with uv 0.13.6, after the server locks, and commit them:\n' "$1"
             printf '  %s\n' "${cmds[@]}"
             exit 1
           }
           for c in "${cmds[@]}"; do
             $c >/dev/null || fail "uv could not compile the agent locks from the .in files."
           done
-          git diff --exit-code -- requirements.txt requirements-dev.txt \
-            || fail "agent/requirements.txt or agent/requirements-dev.txt does not match its .in file or the server's lock (diff above)."
+          git diff --exit-code -- requirements.txt requirements-dev.txt requirements-build.txt \
+            || fail "agent/requirements.txt, requirements-dev.txt or requirements-build.txt does not match its .in file or the server's lock (diff above)."
 
   frontend:
     runs-on: ubuntu-latest
