@@ -22,8 +22,9 @@ the publish steps use them:
   for a tag that is absent. `skopeo copy --all --preserve-digests` from an OCI archive
   makes the tag name the archive's index, so the registry serves its digest.
 
-Any other argument list is refused (exit 2), so a step that changes how it calls them
-fails its tests until the stubs, and these notes, follow.
+Any other argument list is refused (exit 2) and recorded in `refused.jsonl`, which every
+run of a step checks is absent, so a step that changes how it calls them fails its tests
+until the stubs, and these notes, follow, whatever the step does with the stub's stderr.
 """
 
 import io
@@ -228,10 +229,17 @@ def main(program: str, state_dir: str) -> int:
         sys.stdin = io.StringIO(stdin)
     stub.record(program, argv, stdin)
     if program == "gh":
-        return gh(stub, argv)
-    if program == "skopeo":
-        return skopeo(stub, argv)
-    if program == "sleep" and len(argv) == 1 and argv[0].isdigit():
-        return 0
-    return refuse(program, argv)
+        code = gh(stub, argv)
+    elif program == "skopeo":
+        code = skopeo(stub, argv)
+    elif program == "sleep" and len(argv) == 1 and argv[0].isdigit():
+        code = 0
+    else:
+        code = refuse(program, argv)
+    # A refusal is also recorded here, since a step can send the stub's stderr to a
+    # file or to /dev/null and take the failure as an answer it expects.
+    if code == 2:
+        with open(stub.dir / "refused.jsonl", "a") as log:
+            log.write(json.dumps({"program": program, "argv": argv}) + "\n")
+    return code
 

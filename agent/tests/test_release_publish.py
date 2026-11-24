@@ -182,7 +182,9 @@ class Publish:
             timeout=60,
         )
         assert "command not found" not in result.stderr, result.stderr
-        assert "stub " not in result.stderr, result.stderr  # a call the stubs do not know
+        # a call the stubs do not know, even one whose stderr the step discarded
+        refused = self.state / "refused.jsonl"
+        assert not refused.exists(), refused.read_text()
         self.github = json.loads((self.state / "github.json").read_text())
         self.registry = json.loads((self.state / "registry.json").read_text())
         log = self.state / "calls.jsonl"
