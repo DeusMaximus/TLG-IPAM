@@ -89,14 +89,30 @@ def protocol_mismatch(agent: Agent) -> bool:
     return (agent.last_error or "").startswith(PROTOCOL_MISMATCH_PREFIX)
 
 
-def agent_out(agent: Agent) -> dict:
+def expires_in_s(token: Token, now: datetime) -> int | None:
+    """Whole seconds an enrolment token has left by the server's clock at `now`, rounded
+    down, while it is live (`live`: unrevoked, unused, unexpired); None for one that is
+    not, and for an agent token, which does not expire. The Agents page counts down from
+    it, so what it shows as open does not depend on the browser's clock (#143)."""
+    if token.kind != "enrol" or not live(token, now):
+        return None
+    return int((utc(token.expires_at) - now).total_seconds())
+
+
+def agent_out(agent: Agent, now: datetime | None = None) -> dict:
     """An agent as the owner routes answer with it: its columns and tokens
-    (`schemas.AgentOut`), and the two flags the Agents page shows, computed on read
-    (`update_available`, `protocol_mismatch`)."""
+    (`schemas.AgentOut`), the two flags the Agents page shows (`update_available`,
+    `protocol_mismatch`) and each token's `expires_in_s` at `now`, all computed on
+    read."""
+    now = _now() if now is None else now
     out = AgentOut.model_validate(agent)
     flags = {
         "update_available": update_available(agent.version),
         "protocol_mismatch": protocol_mismatch(agent),
+        "tokens": [
+            out_token.model_copy(update={"expires_in_s": expires_in_s(token, now)})
+            for out_token, token in zip(out.tokens, agent.tokens, strict=True)
+        ],
     }
     return out.model_copy(update=flags).model_dump()
 

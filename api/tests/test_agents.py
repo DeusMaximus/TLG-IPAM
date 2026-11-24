@@ -130,8 +130,10 @@ async def test_create_returns_a_pending_agent_and_its_enrolment_token(client):
     assert datetime.fromisoformat(agent["enrol_token_expires_at"]) == expires
     assert set(listed) == {
         "id", "kind", "token_prefix", "created_at", "last_used_at",
-        "expires_at", "used_at", "revoked_at",
+        "expires_at", "used_at", "revoked_at", "expires_in_s",
     }
+    # what it has left by the server's clock as the answer was built, rounded down (#143)
+    assert 3590 <= listed["expires_in_s"] <= 3600
 
 
 async def test_an_enrolled_agent_holds_its_agent_token(client):

@@ -37,9 +37,17 @@ export function agentServerUrl({ protocol, hostname, origin }) {
 
 // A version the artefacts can be pinned to: a PEP 440 public version in its normal
 // form (`0.2.0`, `0.2.0rc1`, `0.2.0.dev0`), which is the wheel's file name as built and
-// a valid image tag. Anything else (no version yet, a local `+…` build) gets null, and
-// the commands carry VERSION_PLACEHOLDER instead of guessing an artefact name.
-const RELEASE_VERSION = /^\d+(\.\d+)*((a|b|rc)\d+)?(\.post\d+)?(\.dev\d+)?$/
+// a valid image tag. Anything else (no version yet, a local `+…` build, a spelling PEP
+// 440 normalises to another, such as `00.02.00` for `0.2.0` or `0.2.0rc01` for
+// `0.2.0rc1`) gets null, and the commands carry VERSION_PLACEHOLDER instead of guessing
+// an artefact name. Each number is written without leading zeroes, as normalising
+// writes it. The release check (`.github/scripts/release_check.py`) refuses the same
+// versions: `agent/tests/test_release.py` gives it the cases `install.test.js` gives
+// this, which reads them from there.
+const N = '(0|[1-9]\\d*)'
+const RELEASE_VERSION = new RegExp(
+  `^${N}(\\.${N})*((a|b|rc)${N})?(\\.post${N})?(\\.dev${N})?$`
+)
 export const releaseVersion = (version) =>
   typeof version === 'string' && RELEASE_VERSION.test(version) ? version : null
 

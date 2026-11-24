@@ -72,32 +72,57 @@ export const STATUS_LABELS = {
 export const activeToken = (agent) =>
   (agent.tokens || []).find((t) => t.kind === 'agent' && !t.revoked_at) || null
 
-// An enrolment token the agent can still exchange: unrevoked, unused and, by this
-// browser's clock, unexpired (the server decides; this only guides the page)
-export function openEnrolment(agent, now = Date.now()) {
-  return (
-    (agent.tokens || []).find((t) => {
-      if (t.kind !== 'enrol' || t.revoked_at || t.used_at) return false
-      const expires = parseServerTime(t.expires_at)
-      return !expires || expires.getTime() > now
-    }) || null
-  )
+// The list answer with the browser's time it arrived at. An enrolment token's time left
+// is the server's `expires_in_s`, less the time since then by this browser: a difference
+// of two readings of one clock, which a browser clock set wrong does not move (#143).
+export const received = (answer, at = Date.now()) => ({ ...answer, receivedAt: at })
+
+// How long it has been since the list arrived, by this browser; never negative (the
+// page reads its clock just before it asks for the list, so `now` can be the earlier)
+export const sinceReceived = (receivedAt, now = Date.now()) =>
+  typeof receivedAt === 'number' ? Math.max(0, now - receivedAt) : 0
+
+// The milliseconds an enrolment token has left: what the server said it had when it
+// answered (`expires_in_s`, by the server's own clock, which is the one the exchange
+// checks), less `elapsed`. Null for any token the server did not call live (used,
+// revoked, expired, an agent token), and once that time has run out. The token's
+// `expires_at` is never compared with the browser's clock.
+export function enrolmentLeft(token, elapsed = 0) {
+  if (!token || token.kind !== 'enrol' || token.revoked_at || token.used_at) return null
+  if (typeof token.expires_in_s !== 'number') return null
+  const left = token.expires_in_s * 1000 - Math.max(0, elapsed)
+  return left > 0 ? left : null
 }
 
-// Every enrolment token still open, by this browser's clock: one row per agent of the
-// "Pending enrolments" list (spec §5.8), listed until it is used or expires. An agent
-// holds at most one, since re-enrol revokes the one it replaces.
-export function pendingEnrolments(agents, now = Date.now()) {
+// The enrolment token the server still calls live, whatever the agent's state: the
+// one Revoke revokes. An agent holds at most one, since re-enrol revokes the one it
+// replaces.
+export const liveEnrolment = (agent, elapsed = 0) =>
+  (agent.tokens || []).find((t) => enrolmentLeft(t, elapsed) !== null) || null
+
+// An enrolment token the agent can exchange now: live, and its agent not disabled,
+// since the exchange refuses a disabled agent's (`services/enrolment`). A disabled
+// agent's live token is blocked until the agent is enabled (`blockedEnrolment`).
+export const openEnrolment = (agent, elapsed = 0) =>
+  agent.state === 'disabled' ? null : liveEnrolment(agent, elapsed)
+
+export const blockedEnrolment = (agent, elapsed = 0) =>
+  agent.state === 'disabled' ? liveEnrolment(agent, elapsed) : null
+
+// Every enrolment token open now: one row per agent of the "Pending enrolments" list
+// (spec §5.8), listed until it is used or expires by the server's clock. A disabled
+// agent's is left out: its exchange would be refused.
+export function pendingEnrolments(agents, elapsed = 0) {
   return (agents || [])
-    .map((agent) => ({ agent, token: openEnrolment(agent, now) }))
+    .map((agent) => ({ agent, token: openEnrolment(agent, elapsed) }))
     .filter((p) => p.token)
 }
 
 // How long an open enrolment token has left: "in 42m", "in 30s"; null once it is due
-export function timeLeft(value, now = Date.now()) {
-  const date = parseServerTime(value)
-  if (!date) return null
-  const s = Math.floor((date.getTime() - now) / 1000)
+export function timeLeft(token, elapsed = 0) {
+  const left = enrolmentLeft(token, elapsed)
+  if (left === null) return null
+  const s = Math.floor(left / 1000)
   if (s <= 0) return null
   if (s < 60) return `in ${s}s`
   const m = Math.floor(s / 60)

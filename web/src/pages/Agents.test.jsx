@@ -76,6 +76,8 @@ const enrolToken = (over = {}) => ({
   created_at: '2026-11-16T06:00:00',
   last_used_at: null,
   expires_at: EXPIRES,
+  // the server's count of what it has left (`agents.expires_in_s`), null once not live
+  expires_in_s: 3600,
   used_at: null,
   revoked_at: null,
   ...over,
@@ -207,7 +209,7 @@ describe('Agents page', () => {
     ipam.listAgents.mockResolvedValue({
       data: [
         pending('open', enrolToken({ expires_at: '2999-01-01T00:00:00' })),
-        pending('expired', enrolToken({ expires_at: '2000-01-01T00:00:00' })),
+        pending('expired', enrolToken({ expires_at: '2000-01-01T00:00:00', expires_in_s: null })),
       ],
       total: 2,
     })
@@ -599,11 +601,11 @@ describe('Agents page', () => {
       agentRow({ id, name: id, state: 'pending', last_checkin_at: null, tokens: [token] })
     ipam.listAgents.mockResolvedValue({
       data: [
-        pending('open', enrolToken({ id: 'e-open', expires_at: soon })),
-        pending('expired', enrolToken({ id: 'e-old', expires_at: '2000-01-01T00:00:00' })),
-        pending('used', enrolToken({ id: 'e-used', expires_at: soon, used_at: '2026-11-16T06:10:00' })),
+        pending('open', enrolToken({ id: 'e-open', expires_at: soon, expires_in_s: 42.5 * 60 })),
+        pending('expired', enrolToken({ id: 'e-old', expires_at: '2000-01-01T00:00:00', expires_in_s: null })),
+        pending('used', enrolToken({ id: 'e-used', expires_at: soon, expires_in_s: null, used_at: '2026-11-16T06:10:00' })),
         // an active agent being re-enrolled
-        agentRow({ id: 'again', name: 'again', tokens: [...agentRow().tokens, enrolToken({ id: 'e-again', expires_at: soon })] }),
+        agentRow({ id: 'again', name: 'again', tokens: [...agentRow().tokens, enrolToken({ id: 'e-again', expires_at: soon, expires_in_s: 42.5 * 60 })] }),
       ],
       total: 4,
     })
@@ -619,6 +621,74 @@ describe('Agents page', () => {
     expect(within(list).queryByTestId('pending-used')).toBeNull()
     // the row says so as well
     expect(within(screen.getByTestId('agent-open')).getByText(/enrolment open, expires in 42m/)).toBeInTheDocument()
+  })
+
+  it('does not list a disabled agent’s enrolment as open, and calls it blocked (#143)', async () => {
+    // created, then disabled before it enrolled: the exchange refuses its token (403)
+    ipam.listAgents.mockResolvedValue({
+      data: [agentRow({ id: 'off', name: 'off', state: 'disabled', last_checkin_at: null, tokens: [enrolToken({ id: 'e-off' })] })],
+      total: 1,
+    })
+    renderPage()
+    const row = await screen.findByTestId('agent-off')
+    expect(screen.queryByRole('region', { name: 'Pending enrolments' })).toBeNull()
+    expect(screen.queryByText(/being re-enrolled/)).toBeNull()
+    expect(screen.queryByText(/enrolment open/)).toBeNull()
+    expect(within(row).getByText('not enrolled')).toBeInTheDocument()
+    expect(within(row).getByText(/enrolment blocked until it is enabled, expires in 60m/)).toBeInTheDocument()
+    // the token is still live, so it can still be revoked
+    expect(within(row).getByRole('button', { name: /Revoke/ })).toBeEnabled()
+    expect(within(row).getByRole('button', { name: /Re-enrol/ })).toBeDisabled()
+  })
+
+  describe('with the browser’s clock off the server’s (#143)', () => {
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    // The server answered at 12:00 by its own clock; the browser's says otherwise
+    it('keeps a live token listed when the browser’s clock is ahead', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] })
+      vi.setSystemTime(new Date('2026-11-16T12:31:00Z'))
+      ipam.listAgents.mockResolvedValue({
+        data: [
+          agentRow({
+            id: 'fresh',
+            name: 'fresh',
+            state: 'pending',
+            last_checkin_at: null,
+            tokens: [enrolToken({ expires_at: '2026-11-16T12:30:00+00:00', expires_in_s: 1800 })],
+          }),
+        ],
+        total: 1,
+      })
+      renderPage()
+      const list = await screen.findByRole('region', { name: 'Pending enrolments' })
+      expect(within(list).getByTestId('pending-fresh')).toHaveTextContent('expires in 30m')
+      expect(within(screen.getByTestId('agent-fresh')).getByText(/enrolment open, expires in 30m/)).toBeInTheDocument()
+    })
+
+    it('does not show an expired token as open when the browser’s clock is behind', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] })
+      vi.setSystemTime(new Date('2026-11-16T11:58:00Z'))
+      ipam.listAgents.mockResolvedValue({
+        data: [
+          agentRow({
+            id: 'stale',
+            name: 'stale',
+            state: 'pending',
+            last_checkin_at: null,
+            tokens: [enrolToken({ expires_at: '2026-11-16T11:59:00+00:00', expires_in_s: null })],
+          }),
+        ],
+        total: 1,
+      })
+      renderPage()
+      const row = await screen.findByTestId('agent-stale')
+      expect(screen.queryByRole('region', { name: 'Pending enrolments' })).toBeNull()
+      expect(within(row).queryByText(/enrolment open/)).toBeNull()
+      expect(within(row).getByRole('button', { name: /Revoke/ })).toBeDisabled()
+    })
   })
 
   it('lists no pending enrolments when there are none', async () => {

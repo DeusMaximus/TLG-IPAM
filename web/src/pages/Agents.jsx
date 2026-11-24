@@ -21,10 +21,14 @@ import { useToast, useTree } from '../context'
 import { useFetch } from '../hooks/useFetch'
 import {
   activeToken,
-  openEnrolment,
   agentStatus,
+  blockedEnrolment,
+  liveEnrolment,
+  openEnrolment,
   pendingEnrolments,
+  received,
   relativeTime,
+  sinceReceived,
   STATUS_LABELS,
   timeLeft,
 } from '../utils/agents'
@@ -33,6 +37,10 @@ import { parseServerTime } from '../utils/time'
 
 // How often the list and the status dots refresh while the page is open
 const REFRESH_MS = 30 * 1000
+
+// The agents list with the browser's time it arrived at, which an enrolment token's
+// time left counts from (`agents.enrolmentLeft`)
+const loadAgents = () => listAgents().then((answer) => received(answer))
 
 const DOT = {
   online: 'bg-emerald-500',
@@ -123,9 +131,10 @@ function Version({ agent, onUpdate }) {
   )
 }
 
-function TokenCell({ agent, now }) {
+function TokenCell({ agent, elapsed }) {
   const token = activeToken(agent)
-  const enrolment = openEnrolment(agent, now)
+  const enrolment = openEnrolment(agent, elapsed)
+  const blocked = blockedEnrolment(agent, elapsed)
   const enrolled = (agent.tokens || []).some((t) => t.kind === 'agent')
   return (
     <div>
@@ -140,7 +149,15 @@ function TokenCell({ agent, now }) {
       )}
       {enrolment && (
         <div className="mt-0.5 whitespace-nowrap text-slate-500">
-          enrolment open, expires {timeLeft(enrolment.expires_at, now) ?? 'soon'}
+          enrolment open, expires {timeLeft(enrolment, elapsed) ?? 'soon'}
+        </div>
+      )}
+      {blocked && (
+        <div
+          className="mt-0.5 max-w-56 text-slate-500"
+          title="The server refuses a disabled agent's enrolment token until the agent is enabled"
+        >
+          enrolment blocked until it is enabled, expires {timeLeft(blocked, elapsed) ?? 'soon'}
         </div>
       )}
     </div>
@@ -152,6 +169,7 @@ function AgentRow({
   targets,
   subnets,
   now,
+  elapsed,
   onToggle,
   onRevoke,
   onReEnrol,
@@ -159,7 +177,8 @@ function AgentRow({
   onDelete,
 }) {
   const token = activeToken(agent)
-  const enrolment = token ? null : openEnrolment(agent, now)
+  // a disabled agent's live enrolment token can still be revoked
+  const enrolment = token ? null : liveEnrolment(agent, elapsed)
   const revocable = token || enrolment
   const disabled = agent.state === 'disabled'
   return (
@@ -202,7 +221,7 @@ function AgentRow({
         <Covered targets={targets} subnets={subnets} />
       </td>
       <td className="px-3 py-2.5">
-        <TokenCell agent={agent} now={now} />
+        <TokenCell agent={agent} elapsed={elapsed} />
       </td>
       <td className="px-3 py-2.5">
         <div className="flex justify-end gap-1">
@@ -253,9 +272,10 @@ function AgentRow({
 }
 
 // Every enrolment token still open (spec §5.8), listed until it is used or expires by
-// this browser's clock; the list and the clock refresh with the page
-function PendingEnrolments({ agents, now }) {
-  const pending = pendingEnrolments(agents, now)
+// the server's clock (`expires_in_s`), never the browser's; a disabled agent's is not
+// open. The list and the time left refresh with the page.
+function PendingEnrolments({ agents, elapsed }) {
+  const pending = pendingEnrolments(agents, elapsed)
   if (!pending.length) return null
   return (
     <section className="mb-4" aria-label="Pending enrolments">
@@ -267,7 +287,7 @@ function PendingEnrolments({ agents, now }) {
             <code className="text-slate-400">{token.token_prefix}…</code>
             <span className="text-slate-400">
               {agent.state === 'pending' ? 'waiting for its first enrolment' : 'being re-enrolled'},
-              expires {timeLeft(token.expires_at, now) ?? 'soon'}
+              expires {timeLeft(token, elapsed) ?? 'soon'}
             </span>
           </li>
         ))}
@@ -367,7 +387,7 @@ function deleteCoverage(covered) {
 export default function Agents() {
   const toast = useToast()
   const { subnets } = useTree()
-  const agents = useFetch(listAgents, [])
+  const agents = useFetch(loadAgents, [])
   const targets = useFetch(listScanTargets, [])
   const suggested = useFetch(listScanSuggestions, [])
   const health = useFetch(getHealth, [])
@@ -459,6 +479,7 @@ export default function Agents() {
   }
 
   const list = agents.data?.data
+  const elapsed = sinceReceived(agents.data?.receivedAt, now)
 
   return (
     <div>
@@ -481,7 +502,7 @@ export default function Agents() {
           onAccept={accept}
           onDismiss={(s) => setDismissed((d) => new Set(d).add(`${s.agent_id}:${s.subnet_id}`))}
         />
-        {list && <PendingEnrolments agents={list} now={now} />}
+        {list && <PendingEnrolments agents={list} elapsed={elapsed} />}
         {agents.error && !list && (
           <p className="text-sm text-red-400">Could not load agents: {agents.error.message}</p>
         )}
@@ -521,6 +542,7 @@ export default function Agents() {
                     targets={coveredBy(agent.id)}
                     subnets={subnets}
                     now={now}
+                    elapsed={elapsed}
                     onToggle={toggle}
                     onRevoke={(a) => setConfirming({ kind: 'revoke', agent: a })}
                     onReEnrol={(a) => setConfirming({ kind: 're-enrol', agent: a })}
