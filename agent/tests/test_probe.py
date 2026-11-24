@@ -974,34 +974,16 @@ def test_the_largest_ordinary_ptr_answer_fits_the_advertised_payload():
     assert probe.read_reply(dns.message.from_wire(wire), question) == ptr
 
 
-def test_the_parse_of_a_reply_the_agent_reads_is_bounded_by_its_size():
-    """The bound #153 buys. dnspython 2.9.2 indexes a reply's records by keys that hold
-    the owner name, hashed as h = 9*h + byte over its labels' bytes from 0, so distinct
-    names can hash alike, and each record is compared with every one before it of the
-    same hash. A question entry takes at least 6 bytes (a 2-byte pointer, its type and
-    class), so a message of DNS_PAYLOAD bytes holds at most (DNS_PAYLOAD - 12) // 6
-    records and costs at most that many squared, halved, name comparisons, whatever
-    the names. Built to the limit from a name of zero-byte labels and its suffixes
-    (leading zero bytes leave h at 0, so all hash alike), every entry after the first a
-    pointer, the parse stays under that ceiling. Counted with the profiler, never
-    timed; the PR gives the times."""
-    labels = 126
-    header = struct.pack("!HHHHHH", 0, 0x8180, 0, 0, 0, 0)
-    body = bytearray(b"\x01\x00" * labels + b"\x00" + struct.pack("!HH", 65280, 1))
-    offsets = [12 + 2 * i for i in range(labels + 1)]
-    entries = 1
-    for offset in [*offsets[1:][::-1], *[12] * 1000]:  # the shortest first; then the longest again
-        if 12 + len(body) + 6 > probe.DNS_PAYLOAD:
-            break
-        body += struct.pack("!HHH", 0xC000 | offset, 65280, 1)
-        entries += 1
-    wire = bytearray(header + body)
-    wire[4:6] = struct.pack("!H", entries)
-    wire = bytes(wire)
-    assert len(wire) <= probe.DNS_PAYLOAD
-    names = {dns.name.Name((b"\x00",) * i + (b"",)) for i in range(labels + 1)}
-    assert len({hash(name) for name in names}) == 1  # the premise: they hash alike
+def _question_entries(wire_names: list[bytes]) -> bytes:
+    """A reply whose question section holds one entry per name given on the wire, each
+    with the same type and class, so that the entries' keys differ only by their names."""
+    body = b"".join(name + struct.pack("!HH", 65280, 1) for name in wire_names)
+    return struct.pack("!HHHHHH", 0, 0x8180, len(wire_names), 0, 0, 0) + body
 
+
+def _comparisons(wire: bytes) -> tuple[dns.message.Message, int]:
+    """The message `from_wire` reads from `wire`, and the `Name.fullcompare` calls it
+    made, counted with the profiler; the hook found is put back."""
     fullcompare = dns.name.Name.fullcompare.__code__
     compared = 0
 
@@ -1016,11 +998,48 @@ def test_the_parse_of_a_reply_the_agent_reads_is_bounded_by_its_size():
         message = dns.message.from_wire(wire)
     finally:
         sys.setprofile(previous)
-    most = (probe.DNS_PAYLOAD - 12) // 6
-    assert len(message.question) == entries <= most
-    assert len({rrset.name for rrset in message.question}) == labels + 1  # distinct names
-    assert entries * (entries - 1) // 2 >= compared > 5000  # quadratic, and under the ceiling
-    assert compared <= most * (most - 1) // 2
+    return message, compared
+
+
+def test_the_parse_of_a_reply_the_agent_reads_is_bounded_by_its_size():
+    """The bound #153 buys. dnspython 2.9.2 indexes a reply's records by keys that hold
+    the owner name, hashed as h = 9*h + byte over its labels' bytes from 0, so distinct
+    names can hash alike, and each record is compared with at most every one before it
+    of the same hash. The smallest entry a reply can carry is a question at the root:
+    its 1-byte name, its type and class, 5 bytes (a record of any other section adds a
+    TTL and RDLENGTH, 11 bytes at the least). So a message of DNS_PAYLOAD bytes holds
+    at most (DNS_PAYLOAD - 12) // 5 = 244 entries, and costs at most 244 * 243 / 2 =
+    29,646 name comparisons, whatever the names.
+
+    Two replies are built to the limit. Of root entries alone, it holds exactly that
+    many. Of a name of 126 zero-byte labels, its suffixes by pointer, the root (leading
+    zero bytes leave h at 0, so all 127 hash alike) and then repeats of the root, it
+    makes more comparisons than any reply the PR measured, and stays under the ceiling.
+    Counted, never timed; the PR gives the times."""
+    most = (probe.DNS_PAYLOAD - 12) // 5
+    ceiling = most * (most - 1) // 2
+    assert (most, ceiling) == (244, 29_646)
+
+    roots = _question_entries([b"\x00"] * most)
+    assert len(roots) == probe.DNS_PAYLOAD  # the entry count is reached exactly
+    message, compared = _comparisons(roots)
+    assert len(message.question) == most
+    assert compared == most - 1  # each repeat meets the one equal key
+
+    labels = 126
+    names = [b"\x01\x00" * labels + b"\x00"]  # spelled once, at offset 12
+    names += [struct.pack("!H", 0xC000 | (12 + 2 * i)) for i in range(labels - 1, 0, -1)]  # its suffixes
+    names += [b"\x00"]  # the root, last of the distinct names
+    while len(_question_entries(names + [b"\x00"])) <= probe.DNS_PAYLOAD:
+        names.append(b"\x00")
+    wire = _question_entries(names)
+    assert probe.DNS_PAYLOAD - 5 < len(wire) <= probe.DNS_PAYLOAD
+    assert len({hash(dns.name.Name((b"\x00",) * i + (b"",))) for i in range(labels + 1)}) == 1  # the premise
+    message, compared = _comparisons(wire)
+    entries = len(message.question)
+    assert entries == len(names) and len({rrset.name for rrset in message.question}) == labels + 1
+    assert compared > 13_000  # quadratic in the entries
+    assert compared <= entries * (entries - 1) // 2 <= ceiling
 
 
 # --- no server to ask is not a completed lookup (#78) ---
