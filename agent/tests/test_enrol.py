@@ -241,6 +241,12 @@ async def test_a_throttled_or_unavailable_exchange_retries_on_the_back_off(tmp_p
     "data",
     [
         {"agent_id": AGENT_ID, "agent_token": "tlge_" + "x" * 43},
+        # the review of #130: printable and prefixed, but not what the server issues
+        {"agent_id": AGENT_ID, "agent_token": "tlga_!"},
+        {"agent_id": AGENT_ID, "agent_token": "tlga_x"},
+        {"agent_id": AGENT_ID, "agent_token": "tlga_" + "x" * 42},
+        {"agent_id": AGENT_ID, "agent_token": "tlga_" + "x" * 44},
+        {"agent_id": AGENT_ID, "agent_token": "tlga_" + "x" * 42 + "."},
         {"agent_id": AGENT_ID, "agent_token": TOKEN + "\n"},
         {"agent_id": AGENT_ID, "agent_token": "tlga_" + "x" * 300},
         {"agent_id": AGENT_ID, "agent_token": "tlga_../../etc/x y"},

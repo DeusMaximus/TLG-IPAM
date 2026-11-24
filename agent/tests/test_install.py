@@ -34,15 +34,17 @@ ANSWER = Answer(Kind.OK, 200, None, "HTTP 200", {"agent_id": "0b6f3c1e-1111-4222
 
 class FakeHost(install.Host):
     def __init__(
-        self, *, root=True, systemd=True, user=False, group_stays=False, fail=None, unsafe=None, failed_unit=False
+        self, *, root=True, systemd=True, user=False, group_stays=False, fail=None, failed_unit=False, ids=None
     ):
         self.root, self.systemd = root, systemd
+        # the service user's uid and gid: the test's own unless given (a token file can
+        # be given only to the test's own user without root)
+        self.ids = ids or (os.getuid(), os.getgid())
         self.failed_unit = failed_unit
         self.user = user
-        self.group = user
+        self.group = os.getgid() if user else None
         self.group_stays = group_stays
         self.fail = fail or {}
-        self.unsafe = unsafe
         self.hidden = None
         self.commands: list[tuple[str, ...]] = []
 
@@ -53,14 +55,10 @@ class FakeHost(install.Host):
         return self.systemd
 
     def service_user(self):
-        return (os.getuid(), os.getgid()) if self.user else None
+        return self.ids if self.user else None
 
     def service_group(self):
         return self.group
-
-    def code_not_root_only(self, interpreter):
-        assert interpreter == PYTHON
-        return self.unsafe
 
     def code_unreachable(self, interpreter):
         assert interpreter == PYTHON
@@ -74,12 +72,12 @@ class FakeHost(install.Host):
         if code:
             return code
         if argv[0] == "useradd":
-            self.user = self.group = True
+            self.user, self.group = True, os.getgid()
         elif argv[0] == "userdel":
             self.user = False
-            self.group = self.group_stays
+            self.group = os.getgid() if self.group_stays else None
         elif argv[0] == "groupdel":
-            self.group = False
+            self.group = None
         return 0
 
 
@@ -106,10 +104,10 @@ def every_byte(root: Path) -> bytes:
     return b"".join(p.read_bytes() for p in root.rglob("*") if p.is_file())
 
 
-def run_install(root, host, options=None, *, exchange=None, stdin="", out=None):
+def run_install(root, host, options=None, *, exchange=None, stdin=ENROL_TOKEN + "\n", out=None):
     said = [] if out is None else out
     code = install.install(
-        options or Options(url=URL, enrol_token=ENROL_TOKEN),
+        options or Options(url=URL, enrol_token="-"),
         host=host,
         paths=paths_in(root),
         exchange=exchange or (lambda url, token, ca: ANSWER),
@@ -149,7 +147,7 @@ def test_install_writes_the_token_for_the_service_user_alone_and_starts_the_unit
         assert stat.S_IMODE(os.stat(root / written).st_mode) == 0o644
     assert tree(root) == {
         "etc", "etc/systemd", "etc/systemd/system", "etc/systemd/system/tlg-ipam-agent.service",
-        "etc/tlg-ipam-agent", "etc/tlg-ipam-agent/agent.env",
+        "etc/tlg-ipam-agent", "etc/tlg-ipam-agent/agent.env", "etc/tlg-ipam-agent/created-user",
         "var", "var/lib", "var/lib/tlg-ipam-agent", "var/lib/tlg-ipam-agent/token",
     }
     # acceptance 3: the enrolment token is in no file; the agent token only in its own
@@ -164,7 +162,7 @@ def test_the_settings_file_holds_the_settings_and_no_secret(root):
     ca.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
     options = Options(
         url="https://ipam.home.arpa:8443/",
-        enrol_token=ENROL_TOKEN,
+        enrol_token="-",
         allowed_cidrs="10.20.0.0/16 192.168.1.0/24",
         max_pps="50",
         ca_file=str(ca),
@@ -217,7 +215,6 @@ def test_the_enrolment_token_can_come_from_standard_input(root):
     [
         (FakeHost(root=False), "run it as root"),
         (FakeHost(systemd=False), "systemd is not running"),
-        (FakeHost(unsafe="/home/someone/venv"), "/home/someone/venv can be changed by a user other than root"),
     ],
 )
 def test_install_refuses_before_it_changes_anything(root, host, message):
@@ -230,18 +227,17 @@ def test_install_refuses_before_it_changes_anything(root, host, message):
 @pytest.mark.parametrize(
     "options, message",
     [
-        (Options(url="http://ipam.home.arpa", enrol_token=ENROL_TOKEN), "--url must use https"),
-        (Options(url=None, enrol_token=ENROL_TOKEN), "--url is not set"),
-        (Options(url=URL, enrol_token=TOKEN), "--enrol-token is not an enrolment token"),
-        (Options(url=URL, enrol_token="tlge_a b"), "--enrol-token contains characters"),
-        (Options(url=URL, enrol_token="-"), "nothing was read from standard input"),
+        (Options(url="http://ipam.home.arpa", enrol_token="-"), "--url must use https"),
+        (Options(url=None, enrol_token="-"), "--url is not set"),
+        (Options(url=URL, enrol_token=ENROL_TOKEN), "--enrol-token takes - alone"),
+        (Options(url=URL, enrol_token=TOKEN), "--enrol-token takes - alone"),
         (Options(url=URL), "--enrol-token is needed"),
-        (Options(url=URL, enrol_token=ENROL_TOKEN, allowed_cidrs="10.0.0.1/8"), "--allowed-cidrs"),
-        (Options(url=URL, enrol_token=ENROL_TOKEN, max_pps="0"), "--max-pps"),
-        (Options(url=URL, enrol_token=ENROL_TOKEN, ca_file="relative.pem"), "--ca-file must be an absolute path"),
-        (Options(url=URL, enrol_token=ENROL_TOKEN, ca_file="/no/such/ca.pem"), "cannot be found"),
-        (Options(url=URL, enrol_token=ENROL_TOKEN, ca_file="/a b.pem"), "--ca-file has a character"),
-        (Options(url="https://ipam.home.arpa/%61", enrol_token=ENROL_TOKEN), "--url has a character"),
+        (Options(url=URL, enrol_token="-", allowed_cidrs="10.0.0.1/8"), "--allowed-cidrs"),
+        (Options(url=URL, enrol_token="-", max_pps="0"), "--max-pps"),
+        (Options(url=URL, enrol_token="-", ca_file="relative.pem"), "--ca-file must be an absolute path"),
+        (Options(url=URL, enrol_token="-", ca_file="/no/such/ca.pem"), "cannot be found"),
+        (Options(url=URL, enrol_token="-", ca_file="/a b.pem"), "--ca-file has a character"),
+        (Options(url="https://ipam.home.arpa/%61", enrol_token="-"), "--url has a character"),
     ],
 )
 def test_bad_options_are_refused_before_anything_changes(root, options, message):
@@ -251,6 +247,100 @@ def test_bad_options_are_refused_before_anything_changes(root, options, message)
     assert code == 1 and message in said[-1], said
     assert ENROL_TOKEN not in said[-1]
     assert host.commands == [] and tree(root) == before
+
+
+@pytest.mark.parametrize(
+    "line, message",
+    [
+        ("", "nothing was read from standard input"),
+        (TOKEN + "\n", "--enrol-token is not an enrolment token"),
+        ("tlge_a b\n", "--enrol-token contains characters"),
+    ],
+)
+def test_a_bad_token_on_standard_input_is_refused_before_anything_changes(root, line, message):
+    host = FakeHost()
+    before = tree(root)
+    code, said = run_install(root, host, stdin=line, exchange=lambda *a: pytest.fail("no exchange"))
+    assert code == 1 and message in said[-1], said
+    assert host.commands == [] and tree(root) == before
+
+
+def test_a_token_on_the_command_line_is_refused_and_not_repeated(root):
+    """The review of #130: another local user can read an argument from
+    /proc/<pid>/cmdline while the exchange waits, so `--enrol-token` takes `-` alone.
+    The refusal comes before standard input is read and does not repeat the value."""
+    host = FakeHost()
+    read = []
+    code, said = install.install(
+        Options(url=URL, enrol_token=ENROL_TOKEN),
+        host=host,
+        paths=paths_in(root),
+        exchange=lambda *a: pytest.fail("no exchange"),
+        read_stdin=lambda: read.append(1) or "",
+        interpreter=PYTHON,
+        out=(said := []).append,
+    ), said
+    assert code == 1 and "--enrol-token takes - alone" in said[-1]
+    assert ENROL_TOKEN not in said[-1] and read == [] and host.commands == []
+
+
+def test_a_ca_file_the_service_user_cannot_read_stops_the_install_before_the_exchange(root):
+    """The review of #130: root could read the bundle and the service user could not,
+    and the install spent the token on a unit that could not verify the server. The
+    file is checked as the service user, after the account exists, before the
+    exchange, and the install is taken back."""
+    ca = root / "ca.pem"
+    ca.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
+    ca.chmod(0o600)  # root's (here, the test's) alone
+    host = FakeHost(ids=(os.getuid() + 1000, os.getgid() + 1000))
+    before = tree(root)
+    code, said = run_install(
+        root, host, Options(url=URL, enrol_token="-", ca_file=str(ca)), exchange=lambda *a: pytest.fail("no exchange")
+    )
+    assert code == 1 and "could not read" in said[-1] and str(ca) in said[-1], said
+    assert tree(root) == before and host.commands == [USERADD, ("userdel", "tlg-ipam-agent")]
+
+
+def test_a_ca_file_behind_a_directory_the_service_user_cannot_enter_is_refused(tmp_path):
+    """Every directory on the way is judged, and a link's directories too."""
+    tmp_path.chmod(0o755)
+    hidden = tmp_path / "private"
+    hidden.mkdir()
+    ca = hidden / "ca.pem"
+    ca.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
+    ca.chmod(0o644)
+    hidden.chmod(0o700)  # the installer's alone: others cannot enter it
+    other = (os.getuid() + 1000, os.getgid() + 1000)
+    top = str(tmp_path)
+    assert install.blocked_for(str(ca), *other, top=top) == str(hidden)
+    # a link from a readable place into it is followed, and refused at the same place
+    (tmp_path / "ca-link.pem").symlink_to(ca)
+    assert install.blocked_for(str(tmp_path / "ca-link.pem"), *other, top=top) == str(hidden)
+    hidden.chmod(0o711)
+    assert install.blocked_for(str(ca), *other, top=top) is None
+    assert install.blocked_for(str(tmp_path / "missing.pem"), *other, top=top) == str(tmp_path / "missing.pem")
+
+
+@pytest.mark.parametrize(
+    "mode, uid, gid, readable",
+    [
+        (0o600, "me", "other", True),  # the owner's bits
+        (0o060, "other", "mine", True),  # the group's, for a file of the user's group
+        (0o604, "other", "other", True),  # others' bits
+        (0o640, "other", "other", False),  # group bits of a group it is not in
+        (0o600, "other", "mine", False),
+    ],
+)
+def test_a_file_is_judged_by_the_bits_that_apply_to_the_service_user(tmp_path, mode, uid, gid, readable):
+    path = tmp_path / "ca.pem"
+    path.write_bytes(b"")
+    path.chmod(mode)
+    me, mine = os.getuid(), os.getgid()
+    as_uid = me if uid == "me" else me + 1000
+    as_gid = mine if gid == "mine" else mine + 1000
+    # the directories above are the test's own: judged from the test's user
+    blocked = install.blocked_for(str(path), as_uid, as_gid, top=str(path))
+    assert (blocked is None) is readable
 
 
 @pytest.mark.parametrize(
@@ -389,35 +479,6 @@ def _venv(root: Path) -> dict:
     return dict(interpreter=str(venv / "bin/python3"), prefix=str(venv), package=str(package))
 
 
-def _changeable_paths(root, layout):
-    return install.not_root_only(layout["interpreter"], prefix=layout["prefix"], package=layout["package"],
-                                 owner=os.getuid(), top=str(root))
-
-
-def test_code_only_its_owner_can_change_passes(tmp_path):
-    assert _changeable_paths(tmp_path, _venv(tmp_path)) is None
-
-
-@pytest.mark.parametrize(
-    "path",
-    [
-        "opt/tlg-ipam-agent/bin",  # the directory the unit names, behind a link to the real file
-        "usr/bin",  # where the link leads
-        "usr/bin/python3.13",
-        "opt/tlg-ipam-agent",
-        "opt",
-        "opt/tlg-ipam-agent/lib/python3.13/site-packages/tlg_ipam_agent",
-        "opt/tlg-ipam-agent/lib/python3.13/site-packages/tlg_ipam_agent/cli.py",
-    ],
-)
-def test_code_others_could_change_is_refused(tmp_path, path):
-    """Greptile on #130: a writable `bin` passed, since only the link's target was
-    looked at. Every path the unit runs, or a directory above one, is checked."""
-    layout = _venv(tmp_path)
-    (tmp_path / path).chmod(0o775 if (tmp_path / path).is_dir() else 0o664)
-    assert _changeable_paths(tmp_path, layout) == str(tmp_path / path)
-
-
 def _unreachable(root, layout):
     return install.unreachable(layout["interpreter"], prefix=layout["prefix"], package=layout["package"], top=str(root))
 
@@ -475,7 +536,7 @@ def test_install_then_uninstall_leaves_nothing_behind(root):
     said = []
     assert install.uninstall(host=host, paths=paths_in(root), out=said.append) == 0, said
     assert tree(root) == before
-    assert host.user is False and host.group is False
+    assert host.user is False and host.group is None
     assert host.commands == [
         ("systemctl", "disable", "--now", "tlg-ipam-agent.service"),
         ("systemctl", "is-failed", "--quiet", "tlg-ipam-agent.service"),
@@ -503,7 +564,42 @@ def test_uninstall_removes_a_group_userdel_left(root):
     host.commands.clear()
     assert install.uninstall(host=host, paths=paths_in(root), out=lambda s: None) == 0
     assert host.commands[-2:] == [("userdel", "tlg-ipam-agent"), ("groupdel", "tlg-ipam-agent")]
-    assert host.group is False
+    assert host.group is None
+
+
+def test_an_account_the_install_found_is_used_and_left_by_uninstall(root):
+    """The review of #130: `uninstall` removed an account of the same name that the
+    install had not created. Now only an account it recorded creating is removed."""
+    host = FakeHost(user=True)
+    code, said = run_install(root, host)
+    assert code == 0, said
+    assert USERADD not in host.commands
+    assert not (root / "etc/tlg-ipam-agent/created-user").exists()
+    host.commands.clear()
+    said = []
+    assert install.uninstall(host=host, paths=paths_in(root), out=said.append) == 0
+    assert not any(c[0] in ("userdel", "groupdel") for c in host.commands)
+    assert host.user is True and host.group == os.getgid()
+    assert any("left the tlg-ipam-agent account in place" in line for line in said)
+    assert tree(root) == {"etc", "etc/systemd", "etc/systemd/system", "var", "var/lib"}
+
+
+def test_uninstall_with_only_a_same_name_account_leaves_it(root):
+    """The reviewer's reproduction: no unit, no files, an account of that name."""
+    host = FakeHost(user=True)
+    assert install.uninstall(host=host, paths=paths_in(root), out=lambda s: None) == 0
+    assert host.commands == [] and host.user is True
+
+
+def test_an_account_replaced_since_the_install_is_left(root):
+    host = FakeHost()
+    run_install(root, host)
+    record = root / "etc/tlg-ipam-agent/created-user"
+    assert record.read_text() == f"{os.getuid()}:{os.getgid()}\n"
+    record.write_text(f"{os.getuid() + 1}:{os.getgid()}\n")  # the uid it created is gone
+    host.commands.clear()
+    assert install.uninstall(host=host, paths=paths_in(root), out=lambda s: None) == 0
+    assert not any(c[0] == "userdel" for c in host.commands) and host.user is True
 
 
 def test_uninstall_with_nothing_installed_does_nothing(root):
@@ -580,8 +676,9 @@ async def test_install_enrols_against_the_real_route(owner, root):
     created = (await owner.post("/api/v1/agents", json={"name": "lxc-agent"})).json()["data"]
     host = FakeHost()
     exchange = real_exchange(asyncio.get_running_loop())
-    options = Options(url=URL, enrol_token=created["enrol_token"])
-    code, said = await asyncio.to_thread(run_install, root, host, options, exchange=exchange)
+    options = Options(url=URL, enrol_token="-")
+    stdin = created["enrol_token"] + "\n"
+    code, said = await asyncio.to_thread(run_install, root, host, options, exchange=exchange, stdin=stdin)
     assert code == 0, said
     stored = (root / "var/lib/tlg-ipam-agent/token").read_text()
     assert stored.startswith("tlga_")
@@ -596,7 +693,7 @@ async def test_install_enrols_against_the_real_route(owner, root):
     for directory in ("etc/systemd/system", "var/lib"):
         (other / directory).mkdir(parents=True)
     host = FakeHost()
-    code, said = await asyncio.to_thread(run_install, other, host, options, exchange=exchange)
+    code, said = await asyncio.to_thread(run_install, other, host, options, exchange=exchange, stdin=stdin)
     assert code == 1 and "HTTP 403 FORBIDDEN" in said[-1]
     assert tree(other) == {"etc", "etc/systemd", "etc/systemd/system", "var", "var/lib"}
 

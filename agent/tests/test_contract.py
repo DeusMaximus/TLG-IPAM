@@ -77,6 +77,15 @@ def test_every_token_the_server_issues_has_the_shape_the_agent_takes(kind, prefi
         assert len(plain) <= config.TOKEN_MAX
 
 
+def test_every_agent_token_the_server_issues_is_the_form_the_enrol_answer_must_carry():
+    """`client.ISSUED_AGENT_TOKEN` is the agent's copy of what `agents.issue_token`
+    makes (finding 4 of the review of #130): an answer carrying anything else is not
+    stored. A change to the server's form fails here before it fails an enrolment."""
+    for _ in range(500):
+        assert client.ISSUED_AGENT_TOKEN.fullmatch(_issued("agent"))
+    assert not client.ISSUED_AGENT_TOKEN.fullmatch(_issued("enrol"))
+
+
 def test_the_enrol_body_is_what_the_server_accepts_and_stores_unchanged():
     body = loop.reported()
     parsed = server.EnrolRequest.model_validate(body)

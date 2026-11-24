@@ -22,7 +22,6 @@ from typing import Any
 import httpx
 
 from . import __version__
-from .config import ConfigError, parse_token
 
 ENROL_PATH = "/api/v1/agent/enrol"
 CHECKIN_PATH = "/api/v1/agent/checkin"
@@ -37,6 +36,10 @@ _CODE = re.compile(r"[A-Z][A-Z0-9_]{0,39}")
 _COUNT_MAX = 4096
 # the server's ids are UUIDs (models._uuid)
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# the agent token the current protocol issues: the prefix and secrets.token_urlsafe(32),
+# 43 characters of the URL-safe base64 alphabet (services/agents.issue_token;
+# tests/test_contract.py holds this to what the server really issues)
+ISSUED_AGENT_TOKEN = re.compile(r"tlga_[A-Za-z0-9_-]{43}")
 
 
 class Kind(enum.Enum):
@@ -133,16 +136,15 @@ def checkin_data(data: dict) -> dict | None:
 
 def enrol_data(data: dict) -> dict | None:
     """The enrol answer, when it has the shape agent_protocol.EnrolResponse gives it: an
-    agent id that is a UUID and an agent token that has a token's shape
-    (`config.parse_token`). The token is checked before the agent writes it anywhere."""
+    agent id that is a UUID and an agent token of exactly the form the server issues
+    (ISSUED_AGENT_TOKEN), checked before the agent writes it anywhere. Anything else is
+    a 200 not in the route's shape (spec §5.7), retried, and never stored: the review of
+    #130 found `tlga_!` passing the looser `config.parse_token`, which the agent still
+    uses for a token the operator gives it."""
     agent_id, token = data.get("agent_id"), data.get("agent_token")
     if not isinstance(agent_id, str) or not _UUID.fullmatch(agent_id):
         return None
-    if not isinstance(token, str):
-        return None
-    try:
-        parse_token(token, "agent_token")
-    except ConfigError:
+    if not isinstance(token, str) or not ISSUED_AGENT_TOKEN.fullmatch(token):
         return None
     return {"agent_id": agent_id, "agent_token": token}
 

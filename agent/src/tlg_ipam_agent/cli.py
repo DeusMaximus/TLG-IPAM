@@ -1,27 +1,41 @@
 """`tlg-ipam-agent`: run the agent with its configuration from the environment, or
-install it as a systemd unit (`install`, `uninstall`; spec §5.6)."""
+install it as a systemd unit (`install`, `uninstall`; spec §5.6).
+
+This module imports only `argparse` and `sys` at its top, and nothing else of the
+agent's but the package itself. `install` and `uninstall` run as root, so before they
+import `install` (and through it the agent's other modules and their dependencies),
+`trust.check` must find that only root can change the code Python could load (#22,
+the review of #130). Running the agent imports the rest only once it has been asked to
+run.
+"""
 
 import argparse
-import asyncio
-import logging
-import os
-import signal
 import sys
 
-from . import __version__, config, enrol, install, interfaces
-from .client import AgentClient, make_http
-from .loop import Agent, Redact, log
-from .probe import DnsResolver, IcmpProber, PacketLink
+from . import __version__
+
+# the install's own paths, written out here so that the parser is built without
+# importing `install` (its tests hold them to install.ETC_DIR and install.ENV_NAME)
+ETC_ENV = "/etc/tlg-ipam-agent/agent.env"
 
 
-async def _run(settings: config.Settings) -> int:
+async def _run(settings) -> int:
+    import asyncio
+    import signal
+
+    from . import enrol, interfaces
+    from .client import AgentClient, make_http
+    from .config import ConfigError
+    from .loop import Agent, log
+    from .probe import DnsResolver, IcmpProber, PacketLink
+
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
     try:
         token = await enrol.agent_token(settings, stop=stop)
-    except config.ConfigError as exc:
+    except ConfigError as exc:
         log.error("%s", exc)
         return 2
     if token is None:  # stopped while waiting to enrol
@@ -45,6 +59,10 @@ def configure_logging(*tokens: str | None) -> None:
     """Log to stderr; every handler redacts each token the agent holds, so the agent's
     own records and every library's are covered. Called again as a token becomes
     known, it adds it to the same filter."""
+    import logging
+
+    from .loop import Redact
+
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     known = [t for t in tokens if t]
     if not known:
@@ -70,16 +88,17 @@ def _parser() -> argparse.ArgumentParser:
         "install",
         help="install the agent as a systemd unit and enrol it (as root)",
         description="Creates the service user, enrols the agent, writes "
-        f"{install.ETC_DIR}/{install.ENV_NAME} and the agent token, and installs, "
-        "enables and starts the unit. Run from the virtual environment the agent was "
-        "installed into, as root.",
+        f"{ETC_ENV} and the agent token, and installs, enables and starts the unit. Run "
+        "from the virtual environment the agent was installed into, as root.",
     )
     setup.add_argument("--url", required=True, help="the server's URL (https)")
     setup.add_argument(
         "--enrol-token",
-        metavar="TOKEN",
-        help="the tlge_ token the Agents page shows, or - to read it from standard input; "
-        "leave it out to keep the agent token already stored (an update)",
+        metavar="-",
+        help="- to read the tlge_ token the Agents page shows from standard input (asked "
+        "for, not echoed, on a terminal); never the token itself, which any local user "
+        "could read from the command line. Leave it out to keep the agent token already "
+        "stored (an update)",
     )
     setup.add_argument("--allowed-cidrs", metavar="CIDRS", help="ALLOWED_CIDRS for the agent")
     setup.add_argument("--max-pps", metavar="N", help="MAX_PPS for the agent")
@@ -92,25 +111,63 @@ def _parser() -> argparse.ArgumentParser:
         "uninstall",
         help="stop the unit and remove everything install created (as root)",
         description="Stops and disables the unit and removes it, the settings, the agent "
-        "token and the service user. The virtual environment is left in place.",
+        "token and the service user if install created it. The virtual environment is "
+        "left in place.",
     )
     return parser
 
 
+def _root_only(command: str) -> bool:
+    """`trust.check`, before anything else of the agent's is imported."""
+    from . import trust
+
+    # no later import may come from the working directory, which `python -m` puts on
+    # the path and which may be anyone's (or `/`, which the check would walk whole)
+    sys.path[:] = trust.without_working_directory(sys.path)
+    try:
+        trust.check()
+    except trust.Untrusted as exc:
+        print(
+            f"{command} refused: {exc} can be changed by a user other than root, and "
+            "this command runs the code Python loads from there as root (the unit, with "
+            "CAP_NET_RAW). Install the agent into a virtual environment only root can "
+            "write, such as /opt/tlg-ipam-agent, and run it from there",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.command == "install":
-        options = install.Options(
-            url=args.url,
-            enrol_token=args.enrol_token,
-            allowed_cidrs=args.allowed_cidrs,
-            max_pps=args.max_pps,
-            ca_file=args.ca_file,
+    if args.command in ("install", "uninstall"):
+        if not _root_only(args.command):
+            return 1
+        from . import install
+
+        if args.command == "uninstall":
+            return install.uninstall()
+        configure_logging(None)
+        return install.install(
+            install.Options(
+                url=args.url,
+                enrol_token=args.enrol_token,
+                allowed_cidrs=args.allowed_cidrs,
+                max_pps=args.max_pps,
+                ca_file=args.ca_file,
+            )
         )
-        configure_logging(None if options.enrol_token == "-" else options.enrol_token)
-        return install.install(options)
-    if args.command == "uninstall":
-        return install.uninstall()
+    return _main_run()
+
+
+def _main_run() -> int:
+    import asyncio
+    import os
+
+    from . import config
+    from .loop import log
+
     configure_logging(None)
     if sys.platform != "linux":
         log.error("the agent runs on Linux only (spec §5.6)")

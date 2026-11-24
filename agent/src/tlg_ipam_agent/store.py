@@ -7,9 +7,11 @@ this one is held to opening no file at all (`tests/test_invariants.py`, `WRITES_
 
 Nothing here takes a path or content from the server: the paths are the agent's own
 constants (or a test's directory), and the one thing the server supplies, the agent
-token, is checked for the token's shape (`config.parse_token`) before it is written.
+token, is checked for the form the server issues (`client.enrol_data`) before it is
+written.
 
-A file is read without following a link at its path (`O_NOFOLLOW`) and without waiting
+A file is read without following a link at the last component of its path
+(`O_NOFOLLOW`; a link in a directory above it is followed) and without waiting
 on a FIFO or device (`O_NONBLOCK`, then `fstat`), and only up to READ_MAX bytes. A file
 is written beside its final path, created exclusively with its mode and owner set
 before any byte goes in, flushed to disk, and renamed into place, so a reader sees the

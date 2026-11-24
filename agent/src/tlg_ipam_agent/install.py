@@ -3,7 +3,8 @@
 `install`, run as root from the virtual environment the agent was installed into:
 
 1. creates the service user `tlg-ipam-agent` (a system user with no home and no login
-   shell, and a group of its own), unless it is there;
+   shell, and a group of its own), unless it is there, and records the uid and gid of
+   one it creates in `/etc/tlg-ipam-agent/created-user`;
 2. creates `/etc/tlg-ipam-agent` and `/var/lib/tlg-ipam-agent`, root's, mode 0755;
 3. writes `/etc/tlg-ipam-agent/agent.env` (the server's URL and the settings given; no
    secret) and the unit `/etc/systemd/system/tlg-ipam-agent.service`, both mode 0644;
@@ -12,12 +13,14 @@
 5. reloads systemd, enables the unit and (re)starts it.
 
 The enrolment token comes from the operator and goes nowhere but the request: it is in
-no file this writes, and the unit's agent never sees it. `--enrol-token -` reads it
-from standard input (with a prompt, and without echoing it, on a terminal), which is
-the form to use under `sudo`: sudo logs the whole command line, and on a host with a
-persistent journal that puts a token given as `--enrol-token tlge_…` on disk (#22
-measured it on Debian 13; journald also keeps sudo's command line beside the entry). The token file exists, empty, with its
-owner and mode, before the exchange, so nothing that could fail locally is left until
+no file this writes, and the unit's agent never sees it. It is read from standard
+input alone (`--enrol-token -`; with a prompt, and without echoing it, on a
+terminal), never taken as an argument: any local user can read a command line from
+`/proc/<pid>/cmdline` while the exchange waits, and sudo logs it, which on a host with
+a persistent journal puts it on disk (#22 measured both). A `--ca-file` must be
+readable by the service user (`blocked_for`), judged once the account exists and
+before the exchange. The token file exists, empty, with its owner and mode, before the
+exchange, so nothing that could fail locally is left until
 the token is spent; if the install fails before the exchange, or the exchange is
 refused, what this run created is taken away again. Once the token is stored nothing
 is taken back.
@@ -28,9 +31,13 @@ then run it). With a token already stored, `--enrol-token` is refused: `uninstal
 first, then enrol again.
 
 `uninstall` stops and disables the unit and removes everything `install` created: the
-unit, both directories and the files in them, and the service user and its group. It
-leaves the virtual environment, which the operator made, and the agent's record on the
-server, which only the owner can remove.
+unit, both directories and the files in them, and the service user and its group when
+the record says `install` created them and their ids are still the recorded ones. An
+account the install found there is left. It leaves the virtual environment, which the
+operator made, and the agent's record on the server, which only the owner can remove.
+
+Neither command is reached until `cli` has had `trust.check` find that only root can
+change the code Python could load: this module is imported after that check.
 
 The programs this runs are fixed (`useradd`, `userdel`, `groupdel`, `systemctl`), with
 fixed arguments, a fixed PATH and no shell; nothing the server sends reaches them.
@@ -52,7 +59,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
-from . import config, enrol, store
+from . import config, enrol, store, trust
 from .client import Answer, Kind, make_http
 
 SERVICE_USER = "tlg-ipam-agent"
@@ -60,6 +67,10 @@ UNIT_NAME = "tlg-ipam-agent.service"
 ETC_DIR = "/etc/tlg-ipam-agent"
 UNIT_PATH = "/etc/systemd/system/" + UNIT_NAME
 ENV_NAME = "agent.env"
+# written when `install` creates the service user, holding its uid and gid: `uninstall`
+# removes only an account this records (the review of #130: one the install found
+# there is someone else's)
+USER_RECORD_NAME = "created-user"
 DIR_MODE = 0o755
 FILE_MODE = 0o644
 # the programs `install` runs see this environment and nothing else of the caller's
@@ -93,11 +104,15 @@ class Paths:
     def token(self) -> str:
         return enrol.token_path(self.state)
 
+    @property
+    def user_record(self) -> str:
+        return os.path.join(self.etc, USER_RECORD_NAME)
+
 
 @dataclass(frozen=True)
 class Options:
     url: str | None
-    # as given: a token, "-" for standard input, or None
+    # as given: "-" for standard input, or None; any other value is refused
     enrol_token: str | None = None
     allowed_cidrs: str | None = None
     max_pps: str | None = None
@@ -122,27 +137,18 @@ class Host:
             return None
         return entry.pw_uid, entry.pw_gid
 
-    def service_group(self) -> bool:
+    def service_group(self) -> int | None:
         try:
-            grp.getgrnam(SERVICE_USER)
+            return grp.getgrnam(SERVICE_USER).gr_gid
         except KeyError:
-            return False
-        return True
+            return None
 
     def run(self, *argv: str) -> int:
         print("+ " + " ".join(argv), flush=True)
         return subprocess.run(list(argv), env=COMMAND_ENV, stdin=subprocess.DEVNULL, check=False).returncode
 
-    def code_not_root_only(self, interpreter: str) -> str | None:
-        return not_root_only(interpreter)
-
     def code_unreachable(self, interpreter: str) -> str | None:
         return unreachable(interpreter)
-
-
-def _changeable(path: Path, owner: int) -> bool:
-    info = os.stat(path)
-    return info.st_uid != owner or bool(info.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
 
 
 def unreachable(
@@ -182,37 +188,6 @@ def unreachable(
     return None
 
 
-def not_root_only(
-    interpreter: str,
-    *,
-    prefix: str = sys.prefix,
-    package: str = str(Path(__file__).resolve().parent),
-    owner: int = 0,
-    top: str = "/",
-) -> str | None:
-    """The first path a user other than `owner` (root) owns or could write to, among
-    what the unit runs with CAP_NET_RAW, or None: the interpreter it names (followed
-    to its file) and the agent's modules, and every directory from each of these up
-    to `top`: the interpreter's own directory as the unit names it (a venv's `bin`,
-    which a link to the system Python would otherwise skip) and as resolved, the
-    virtual environment, and the package. Whoever can change one of them can run
-    their own code with the capability. `owner` and `top` are for a test."""
-    package_dir = Path(package)
-    files = [Path(interpreter).resolve(), *sorted(package_dir.glob("*.py"))]
-    for path in files:
-        if _changeable(path, owner):
-            return str(path)
-    starts = (Path(interpreter).parent, Path(interpreter).resolve().parent, Path(prefix), package_dir)
-    stop = Path(top)
-    for start in starts:
-        for directory in (start, *start.parents):
-            if _changeable(directory, owner):
-                return str(directory)
-            if directory == stop:
-                break
-    return None
-
-
 def read_token_line() -> str:
     """One line of standard input. On a terminal it prompts on stderr and turns echo
     off while the line is read, so the token is not left on the screen."""
@@ -246,6 +221,39 @@ def _plain(value: str, name: str) -> str:
     if not _PLAIN.fullmatch(value):
         raise InstallError(f"{name} has a character the unit's environment file cannot hold as it is")
     return value
+
+
+def _allowed(info: os.stat_result, uid: int, gid: int, bits: tuple[int, int, int]) -> bool:
+    """Whether a user `uid` whose only group is `gid` gets one of `bits` (user, group,
+    others) on the file `info` describes, as the kernel decides it."""
+    mine, group, others = bits
+    if info.st_uid == uid:
+        return bool(info.st_mode & mine)
+    if info.st_gid == gid:
+        return bool(info.st_mode & group)
+    return bool(info.st_mode & others)
+
+
+def blocked_for(path: str, uid: int, gid: int, top: str = "/") -> str | None:
+    """The first path on the way to `path` that the user `uid` (in group `gid` alone, as
+    the service user is) could not pass through, or `path` itself if it could not read
+    it; None when it can read it. Every directory from `/` and every directory a link
+    passes through is looked at, as `trust.resolve` walks them (the review of #130: a
+    CA bundle root could read and the service user could not passed, and the install
+    spent the token on a unit that could not verify the server)."""
+    searchable = (stat.S_IXUSR, stat.S_IXGRP, stat.S_IXOTH)
+    readable = (stat.S_IRUSR, stat.S_IRGRP, stat.S_IROTH)
+
+    def refuse(candidate: str, info: os.stat_result, last: bool) -> bool:
+        return not _allowed(info, uid, gid, readable if last else searchable)
+
+    try:
+        trust.resolve(path, refuse, top)
+    except trust.Untrusted as exc:
+        return str(exc)
+    except FileNotFoundError:
+        return path
+    return None
 
 
 def _ca_file(value: str | None) -> str | None:
@@ -351,8 +359,24 @@ def _rollback(undo: list[Callable[[], object]], out: Callable[[str], None]) -> N
 
 def _delete_user(host: Host) -> None:
     _check(host, ("userdel", SERVICE_USER), "removing the service user")
-    if host.service_group():
+    if host.service_group() is not None:
         _check(host, ("groupdel", SERVICE_USER), "removing the service user's group")
+
+
+def _recorded_user(path: str) -> tuple[int, int] | None:
+    """The uid and gid `install` recorded when it created the service user, or None
+    when it recorded none (it found the account there) or the record is not one."""
+    try:
+        data = store.read_small(path)
+    except store.StoreError:
+        return None
+    if data is None:
+        return None
+    try:
+        uid, gid = data.decode("ascii").strip().split(":")
+        return int(uid), int(gid)
+    except ValueError:
+        return None
 
 
 def install(
@@ -375,14 +399,9 @@ def install(
 
 
 def _install(options, host, paths, exchange, read_stdin, interpreter, out) -> None:
+    # that only root can change the code was checked by `cli`, before it imported this
+    # module (`trust.check`)
     _preflight(host)
-    unsafe = host.code_not_root_only(interpreter)
-    if unsafe is not None:
-        raise InstallError(
-            f"{unsafe} can be changed by a user other than root, and the unit would run the "
-            "code under it with CAP_NET_RAW. Install the agent into a virtual environment "
-            "only root can write, such as /opt/tlg-ipam-agent"
-        )
     hidden = host.code_unreachable(interpreter)
     if hidden is not None:
         raise InstallError(
@@ -396,6 +415,14 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out) -> No
     max_pps = None if options.max_pps is None else config.parse_max_pps(options.max_pps, "--max-pps")
     ca_file = _ca_file(options.ca_file)
     token = options.enrol_token
+    if token is not None and token != "-":
+        # the review of #130: any local user can read a command line from
+        # /proc/<pid>/cmdline while the exchange waits on the server
+        raise InstallError(
+            "--enrol-token takes - alone, and reads the token from standard input: a token "
+            "on the command line can be read by any local user while install runs. Give it "
+            "on standard input instead"
+        )
     if token == "-":
         token = read_stdin().rstrip("\n")
         if not token:
@@ -421,15 +448,27 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out) -> No
     undo: list[Callable[[], object]] = []
     try:
         user = host.service_user()
-        if user is None:
+        created_user = user is None
+        if created_user:
             _check(host, USERADD, "creating the service user")
             undo.append(partial(_delete_user, host))
             user = host.service_user()
             if user is None:
                 raise InstallError(f"useradd ran but there is no user {SERVICE_USER}")
+        if ca_file is not None:
+            blocked = blocked_for(ca_file, *user)
+            if blocked is not None:
+                raise InstallError(
+                    f"--ca-file: {SERVICE_USER}, which the unit runs as, could not read "
+                    f"{ca_file} (stopped at {blocked}), so the agent could not verify the "
+                    "server. Make the file and the directories above it readable by that user"
+                )
         for directory in (paths.etc, paths.state):
             if store.make_dir(directory, DIR_MODE):
                 undo.append(partial(store.remove_dir, directory))
+        if created_user:
+            store.write_file(paths.user_record, f"{user[0]}:{user[1]}\n".encode("ascii"), FILE_MODE)
+            undo.append(partial(store.remove_file, paths.user_record))
         for path, content in ((paths.env, env), (paths.unit, unit)):
             existed = os.path.lexists(path)
             store.write_file(path, content.encode("ascii"), FILE_MODE)
@@ -478,6 +517,8 @@ def uninstall(*, host: Host | None = None, paths: Paths = Paths(), out: Callable
         except (InstallError, store.StoreError) as exc:
             problems.append(str(exc))
 
+    # read before the directory that holds it goes
+    recorded = _recorded_user(paths.user_record)
     systemd = host.has_systemd()
     if systemd and os.path.lexists(paths.unit):
         attempt(partial(_check, host, ("systemctl", "disable", "--now", UNIT_NAME), "stopping the unit"))
@@ -495,15 +536,21 @@ def uninstall(*, host: Host | None = None, paths: Paths = Paths(), out: Callable
     for path in (
         paths.token + store.PENDING_SUFFIX, paths.token,
         paths.env + store.PENDING_SUFFIX, paths.env,
+        paths.user_record + store.PENDING_SUFFIX, paths.user_record,
     ):
         attempt(partial(store.remove_file, path))
     for directory in (paths.state, paths.etc):
         attempt(partial(store.remove_dir, directory))
-    if host.service_user() is not None or host.service_group():
-        if host.service_user() is not None:
-            attempt(partial(_check, host, ("userdel", SERVICE_USER), "removing the service user"))
-        if host.service_group():
+    # the account and its group go only if `install` created them: the uid and gid it
+    # recorded are theirs still. One it found there, or one since replaced, is left
+    user, group = host.service_user(), host.service_group()
+    if recorded is not None and user is not None and user[0] == recorded[0]:
+        attempt(partial(_check, host, ("userdel", SERVICE_USER), "removing the service user"))
+        group = host.service_group()
+        if group is not None and group == recorded[1]:
             attempt(partial(_check, host, ("groupdel", SERVICE_USER), "removing the service user's group"))
+    elif user is not None or group is not None:
+        out(f"left the {SERVICE_USER} account in place: install did not create it")
     for problem in problems:
         out(f"not removed: {problem}")
     out(

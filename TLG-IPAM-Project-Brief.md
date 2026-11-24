@@ -687,6 +687,7 @@ tlg-ipam/
 │       ├── enrol.py         # where the agent token comes from; the container's enrolment exchange
 │       ├── store.py         # the only code that opens or writes files: the stored token, the install's files
 │       ├── install.py       # `tlg-ipam-agent install` / `uninstall`: service user, token, settings, systemd unit
+│       ├── trust.py         # before install/uninstall import the rest: only root can change the code they run
 │       ├── protocol.py      # the agent's copy of the wire contract; parse_job
 │       ├── client.py        # HTTP to /api/v1/agent/*, TLS always verified; answers sorted OK / RETRY / REFUSED
 │       ├── backoff.py       # the refusal rule of spec §5.7
