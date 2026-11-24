@@ -688,6 +688,13 @@ def test_every_line_of_each_publish_script_runs_in_some_test(tmp_path, workflow,
     runs = list(_scenarios(tmp_path, workflow, job))
     ran = {line for publish in runs for _, line, _ in publish.trace}
     script = runs[0].script
+    # The line a function is defined on is run when the function is called: bash 5
+    # gives the commands of its body other line numbers than bash 3.2 does.
+    called = {_command_word(command) for publish in runs for _, _, command in publish.trace}
+    for number, line in enumerate(script.splitlines(), 1):
+        defined = re.match(r"\s*([A-Za-z_]\w*)\s*\(\)", line)
+        if defined and defined.group(1) in called:
+            ran.add(number)
     missing = sorted(_command_lines(script) - ran)
     assert missing == [], [script.splitlines()[n - 1].strip() for n in missing]
 
