@@ -199,13 +199,14 @@ FULL_ROWS_CIDR = "100.100.0.0/16"
 
 
 def full_rows(count: int, *, notes: str | None, owner: str = "\U0001f600" * 120) -> list[dict]:
-    """`count` import rows with every field at the longest value it has in normal form:
-    a 15-character address in `FULL_ROWS_CIDR`, hostname and domain of 253 characters,
-    a 17-character MAC, a device type of `DEVICE_TYPE_MAX`, status `reserved` (the
-    longest of the four), `owner` as given (the default's characters are four bytes each
-    in UTF-8) and `notes` as given, or no `notes` key when it is None. The address and
-    the MAC have no length limit and a client can write more of either; the other
-    fields are limited, so this is the widest a row is that the limits permit."""
+    """`count` import rows, the measured example of brief §4.3 (not a byte ceiling: see
+    `test_a_row_has_no_largest_size`). Every field is at its longest character count
+    and written in ASCII, but `owner` and `notes`, which are given: a 15-character
+    address in `FULL_ROWS_CIDR` (a padded spelling is refused), hostname and domain of
+    253 characters, a 17-character MAC as normalised, a device type of
+    `DEVICE_TYPE_MAX`, status `reserved` (the longest of the four), `owner` as given
+    (the default's characters are four bytes each in UTF-8) and `notes` as given, or
+    no `notes` key when it is None."""
     addresses = [f"100.100.{c}.{d}" for c in range(100, 256) for d in range(100, 255)]
     rows = [
         {
@@ -369,11 +370,52 @@ def test_notes_json_escapes_take_the_same_call_over_the_cap():
         assert len(_tool_call("x" * 36, rows)) > BODY_MAX, repr(escaped)
 
 
-def test_escaped_ascii_outside_the_notes_takes_the_same_call_over_the_cap():
-    """The example's rows are free of escapes in every field, not just the notes: the
-    same 400 rows with a hostname and an owner of quotes (two bytes each in JSON) are
-    2,114,971 bytes, over the cap, though every character is ASCII."""
-    rows = full_rows(400, notes="a" * HOST_NOTES_MAX, owner='"' * 120)
+@pytest.mark.parametrize("escaped", ['"', "\\", "\t"], ids=["quote", "backslash", "tab"])
+def test_escaped_ascii_outside_the_notes_takes_the_same_call_over_the_cap(escaped):
+    """The example's rows are free of every character JSON escapes in every field, not
+    just the notes: the same 400 rows with a hostname and an owner of quotes,
+    backslashes or tabs (two bytes each in JSON) are 2,114,971 bytes, over the cap,
+    though every character is ASCII and none is a line break."""
+    rows = full_rows(400, notes="a" * HOST_NOTES_MAX, owner=escaped * 120)
     for row in rows:
-        row["hostname"] = '"' * 253
+        row["hostname"] = escaped * 253
     assert len(_tool_call("x" * 36, rows)) == 2_114_971 > BODY_MAX
+
+
+def test_the_limits_count_characters_so_a_unicode_row_is_larger_than_the_example():
+    """Brief §4.3: a hostname and a device type accept characters outside ASCII. 1,000
+    rows with the longest notes that fit the ASCII example (233 four-byte characters),
+    a hostname of 253 four-byte characters and a device type of 40 are 2,973,011 bytes
+    as the UI encodes them, over the cap."""
+    wide = "\U0001f600"
+    rows = full_rows(1000, notes=wide * 233)
+    assert len(encoded({"hosts": rows})) <= BODY_MAX
+    for row in rows:
+        row["hostname"] = wide * 253
+        row["device_type"] = wide * DEVICE_TYPE_MAX
+    assert len(encoded({"hosts": rows})) == 2_973_011 > BODY_MAX
+
+
+async def test_a_row_has_no_largest_size(client):
+    """Brief §4.3: a MAC's punctuation, a domain's leading white space and trailing
+    dots, and a `last_seen`'s extra fractional digits are accepted and dropped on
+    normalising, however many there are, so no row is the largest one accepted; an
+    IPv4 address in a padded spelling is refused, so 15 characters is its longest."""
+    subnet = await _subnet(client, cidr="10.0.0.0/24")
+    padding = 10_000
+    padded = {
+        "mac": "aa:bb:cc:dd:ee:ff" + ":" * padding,
+        "domain": " " * padding + "example.com" + "." * padding,
+        "last_seen": "2026-01-01T00:00:00." + "0" * padding + "1+00:00",
+    }
+    rows = [
+        {"ip": "10.0.0.10", **padded},
+        {"ip": " " * padding + "10.0.0.11"},
+        {"ip": "10.0.0.12" + " " * padding},
+    ]
+    res = await client.post(f"/api/v1/subnets/{subnet['id']}/hosts/bulk", json={"hosts": rows})
+    assert res.status_code == 200, res.text
+    results = res.json()["data"]["results"]
+    assert [r["status"] for r in results] == ["created", "error", "error"], results
+    host = (await client.get(f"/api/v1/hosts?subnet_id={subnet['id']}")).json()["data"][0]
+    assert (host["mac"], host["domain"]) == ("aa:bb:cc:dd:ee:ff", "example.com")
