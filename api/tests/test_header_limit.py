@@ -891,3 +891,24 @@ async def test_an_unfinished_head_is_refused_with_one_byte_past_the_limit_parsed
     assert conn.statuses() == [431]
     assert sum(parsed) == HEADER_MAX + 1
     conn.close()
+
+
+
+def test_on_the_image_an_upgrade_post_with_a_body_is_answered_at_once(image):
+    """httptools hands on nothing after an `Upgrade` request's head, its body included,
+    on plain uvicorn as here: the route sees no body and answers `422` at once. What
+    matters below the app is that the request is answered, not left to the body
+    deadline."""
+    body = json.dumps({"name": "upgrade"}).encode()
+    request = raw_post(
+        "/api/v1/sections",
+        str(len(body)).encode(),
+        f"X-API-Key: {image.key}\r\nContent-Type: application/json\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n".encode(),
+        body,
+    )
+    started = time.monotonic()
+    with connect(image) as sock:
+        sock.sendall(request)
+        answer = one_response(sock)
+    assert time.monotonic() - started < 3
+    assert status_of(answer) == 422, answer[:300]
