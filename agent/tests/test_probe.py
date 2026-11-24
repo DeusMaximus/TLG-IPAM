@@ -608,7 +608,9 @@ def _colliding_names(count, size=20):
 
 def _calls_reading(reply):
     """The Python function calls `read_reply` makes, all of them and those of
-    `Name.fullcompare` (what a name comparison costs), counted by a profiler."""
+    `Name.fullcompare` (what a name comparison costs), counted by a profiler. The
+    profiler hook that was installed before (a coverage or profiling run's, or none)
+    is put back afterwards, whether or not the read raises."""
     calls = {"all": 0, "fullcompare": 0}
     fullcompare = dns.name.Name.fullcompare.__code__
 
@@ -617,12 +619,37 @@ def _calls_reading(reply):
             calls["all"] += 1
             calls["fullcompare"] += frame.f_code is fullcompare
 
+    previous = sys.getprofile()
     sys.setprofile(count)
     try:
         got = probe.read_reply(reply, dns.name.from_text(_Q))
     finally:
-        sys.setprofile(None)
+        sys.setprofile(previous)
     return got, calls
+
+
+def test_counting_the_calls_puts_back_the_profiler_hook_it_found(monkeypatch):
+    """The count above borrows the thread's profiler hook and gives back the one it
+    found, after a read that returns and after one that raises, so a coverage or
+    profiling run, or another test's hook, is not left switched off."""
+    def hook(frame, event, arg):
+        pass
+
+    def raising(reply, question):
+        raise RuntimeError("the read failed")
+
+    found = sys.getprofile()
+    sys.setprofile(hook)
+    try:
+        got, calls = _calls_reading(_reply((_ptr(_Q),)))
+        assert got == _NAME and calls["all"] > 0
+        assert sys.getprofile() is hook
+        monkeypatch.setattr(probe, "read_reply", raising)
+        with pytest.raises(RuntimeError):
+            _calls_reading(_reply((_ptr(_Q),)))
+        assert sys.getprofile() is hook
+    finally:
+        sys.setprofile(found)
 
 
 @pytest.mark.parametrize("ends", ["ptr", "loop"])
