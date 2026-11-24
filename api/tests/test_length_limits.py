@@ -253,9 +253,11 @@ async def test_a_full_import_with_notes_at_the_limit_is_refused_whole(client):
 
 
 async def test_the_mcp_call_the_docstring_names_fits_and_is_served(client):
-    """`bulk_create_hosts`' docstring: 400 records with 4,096 ASCII characters of notes
-    each fit one call, as the JSON-RPC request a client sends, with every other field
-    at its maximum in ASCII (Python's `json` escapes non-ASCII as `\\uXXXX`)."""
+    """`bulk_create_hosts`' docstring: 400 records whose notes are 4,096 characters of
+    plain ASCII text fit one call, as the JSON-RPC request a client sends, with every
+    other field at its maximum in ASCII (Python's `json` escapes non-ASCII as
+    `\\uXXXX`). The byte count decides, not the characters: the same records with notes
+    of characters JSON escapes (a quote, a backslash, a line break) do not fit."""
     subnet = await _subnet(client, cidr="10.0.0.0/22")
     rows = full_rows(400, notes="a" * HOST_NOTES_MAX, owner="a" * 120)
     call = {
@@ -268,6 +270,11 @@ async def test_the_mcp_call_the_docstring_names_fits_and_is_served(client):
         },
     }
     assert len(json.dumps(call).encode()) <= BODY_MAX
+    for escaped in ('"', "\\", "\n"):
+        heavy = full_rows(400, notes=escaped * HOST_NOTES_MAX, owner="a" * 120)
+        arguments = {"subnet_id": subnet["id"], "hosts": heavy}
+        heavy_call = {**call, "params": {**call["params"], "arguments": arguments}}
+        assert len(json.dumps(heavy_call).encode()) > BODY_MAX, repr(escaped)
     result = await _mcp("bulk_create_hosts", {"subnet_id": subnet["id"], "hosts": rows})
     assert not result.is_error, result.content
     assert result.data["created"] == 400

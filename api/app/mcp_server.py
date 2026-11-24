@@ -272,10 +272,13 @@ async def bulk_create_hosts(subnet_id: str, hosts: list[dict]) -> dict:
     Size of a call: the whole request, as JSON, may be at most 2 MiB (2,097,152 bytes).
     A larger call is refused whole before any record is read, and the error may reach
     you without its message, so split a large batch before sending: keep the records
-    of one call under about 2,000,000 bytes of JSON together. 1,000 short records fit;
-    1,000 with long notes do not (at 4,096 characters of notes each they are over
-    4 MB), so send those in smaller calls: 400 records with 4,096 ASCII characters of
-    notes each fit, fewer if the notes use characters outside ASCII."""
+    of one call under about 2,000,000 bytes of JSON together, counted as encoded. That
+    byte count decides, not the number of characters: JSON writes a quote, a backslash
+    or a line break in two bytes or more, and a character outside ASCII in up to
+    twelve. 1,000 short records fit; 1,000 with long notes do not (at 4,096 characters
+    of notes each they are over 4 MB), so send those in smaller calls: 400 records
+    whose notes are 4,096 characters of plain ASCII text with no quotes, backslashes
+    or line breaks fit, and fewer if the notes hold any of those."""
     if not hosts:
         raise ToolError("hosts must contain at least one record")
     if len(hosts) > 1000:
