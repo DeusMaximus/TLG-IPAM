@@ -27,6 +27,30 @@ Template:
 
 ---
 
+## 2026-11-24 — Claude Code (Opus 5.5), worker — #144: a PTR or a negative SOA is read only when it answers the question (PR #146)
+- **Done:**
+  - [PR #146](https://github.com/DeusMaximus/TLG-IPAM/pull/146) (`144-ptr-soa-owner-check`, head `22967e0`) closes #144.
+  - `probe.read_reply` reads one reply against its question:
+    - `answered_name` follows the reply's own CNAME chain from the question to its end; a loop is no usable answer.
+    - A PTR record counts only at that name; a PTR at any other owner makes the reply no usable answer.
+    - `says_no_name(reply, name)` counts an SOA only for a zone containing that name; an SOA only for other zones is no usable answer.
+    - No usable answer keeps the stored name and asks the next configured server, as for a referral.
+  - No new query, no new import, no wire change (`PROTOCOL_VERSION` 2); nothing under `api/` changed.
+  - Spec §5.2 gains "Which records of a reply are read". Agent README and brief §4.6 carry the operating note: a sole non-recursive server returning an unresolved alias warns on every scan; remedy is a recursive resolver or one serving the alias's target zone. `AGENTS.md`'s wire-contract bullet updated.
+  - Tests: agent 1,252 → 1,319 (38-row `read_reply` table, 8 new loopback responder actions, pacing and route tests extended); server 1,129. With `main`'s `probe.py` under the new tests, exactly the 31 new cases fail.
+  - Merged: `af8f49d`, squash, on the owner's go-ahead; the remote branch is deleted. CI green, Codex clean and Greptile 5/5 on `22967e0`, the only head. Briefed round (Codex, GPT-6.1 Sol): GO at `22967e0` with two P3s, no Deliberate call overruled; it measured 1,362 agent tests on the head merged with `main`. The orchestrator ran 1,319 agent and 1,129 server tests on the head. The two P3s are filed as #149 (a reply built from names whose hashes collide makes the CNAME walk quadratic; the spec does not state that a PTR at the chain's end wins over one elsewhere).
+- **Decisions:** Deliberate calls 1–9 in the PR body. The main ones:
+  - A PTR is read at the chain's end only.
+  - An unrelated PTR spoils the whole reply, even beside the right SOA.
+  - An unrelated SOA with an empty answer is no usable answer.
+  - `NXDOMAIN` is read as before.
+  - Two #100 table rows had a fixture SOA that did not contain the question; corrected, and the old fixture kept as `sibling-soa`.
+- **State:** merged. No schema change.
+- **Waiting on the owner:** nothing from this entry.
+- **Untested:** any real network or resolver; DNAME; an `NXDOMAIN` carrying an unrelated SOA; DNSSEC and malformed-message fuzzing.
+- **Next:**
+  - #149, #20 and #93 are all in `probe.py`, so they run one at a time.
+
 ## 2026-11-24 — Claude Code (Opus 5.5), worker — #24: release pipeline for the agent image and wheel (PR #145)
 - **Done:**
   - [PR #145](https://github.com/DeusMaximus/TLG-IPAM/pull/145) (`24-release-pipeline`, head `5801a18`) closes #24. It includes `main` at `b2ba364` (merge `b8c9469`).
@@ -148,15 +172,3 @@ Template:
   - #23 renders `… install --url … --enrol-token -` and the container command with the volume and `IPAM_ENROL_TOKEN`;
   - #24 publishes the image and the wheel;
   - #136, #138 and #140 are the installer's open follow-ups.
-
-## 2026-11-24 — Claude Code (Opus 5.5), worker — #133: list_scan_findings checks a subnet_id by its id alone (PR #137)
-- **Done:** [PR #137](https://github.com/DeusMaximus/TLG-IPAM/pull/137) (`133-findings-subnet-lookup`, head `ee19d28`) closes #133.
-  - `findings.list_named` checks `subnet_id` with `select(Subnet.id)` and `errors.not_found`, not `subnets.get_subnet`. The refusal and the statement count are unchanged.
-  - `test_mcp.py`: the plan test and the work test run with and without `subnet_id`. New `returned_bytes` and `test_no_read_of_a_call_returns_text_the_listing_does_not_use`: every statement of a call returns the same bytes with 10 or 1,000,000 bytes of subnet notes and section description, and 10 or 4,096 of host notes. The start-up test names `ix_reserved_ranges_subnet_excluded`.
-  - With the wide read put back, the new test fails with `'bytes returned': (100, 1000090)`. The command and output are in the PR body.
-  - `AGENTS.md` (only the parenthesis naming the cost tests, in "MCP tools are hand-curated"), brief §5.2 row, spec §5.8 and the `CALL_STATEMENTS` comment: what is counted is SQLite instructions (the rows read or passed over), not returned bytes or Python's processing.
-  - Merged: `cc0cf6e`, squash, on the owner's go-ahead; the remote branch is deleted. CI green, Codex clean and Greptile clean (5/5) on `ee19d28`, the only head. The orchestrator ran 1,084 server tests on that head. No follow-ups.
-- **Decisions:** PR Deliberate calls 1–3: a byte check rather than a column list; the plan test matches the lookup's SQL text; spec §5.8 gets one clarifying sentence. REST `list_findings` still uses `get_subnet` (owner-only, outside the issue).
-- **State:** merged. 1,084 server and 924 agent tests pass. No schema change. Nothing in #132's or #22's areas touched.
-- **Waiting on the owner:** nothing from this entry.
-- **Next:** #135 and #130 both touch the "MCP tools are hand-curated" bullet's neighbours only; #137 changed one parenthesis in it, so a merge with either stays mechanical.
