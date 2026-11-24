@@ -47,12 +47,17 @@ limit on a head's size.
   complete before the parse stops: the connection then takes no more requests
   (`_stop_taking`): those taken are answered, the newest with the connection closed,
   and the rest is discarded.
-- **A refusal after requests taken.** When the parser refuses what follows (malformed
-  bytes) while a request received whole is still being answered or queued, uvicorn
-  would write its `400` and close at once, in front of their answers, one of which may
-  be a write that has committed. Instead the connection takes no more requests in the
-  same way (`send_400_response`). A request refused part way through its own body has
-  nothing ahead of it, and gets uvicorn's `400`.
+- **A refusal by the parser** (malformed bytes, in a request's head or its body).
+  uvicorn writes its `400` and closes at once, which is right only when the refused
+  request is the only one the connection owes an answer for. One rule
+  (`send_400_response`): uvicorn's `400` only when no earlier request is still
+  unanswered (`_owed`, from `_taken`, the requests taken in order, since uvicorn keeps
+  no reference to the one being answered once another is queued). Otherwise, wherever
+  the refusal falls, the connection takes no more requests in the same way, the refused
+  request is dropped without running (taken out of uvicorn's queue if it is there), and
+  the earlier answers are sent in order. The last carries `Connection: close` if its
+  answer has not started; one whose head has gone (a streamed answer) finishes its
+  frame, and the connection closes at its end.
 - **Nothing more read** while bytes wait unparsed or the taking has stopped: uvicorn
   resumes reading whenever a request being answered asks for its body, and the
   transport wrapper (`_Transport`) holds that back.
@@ -168,6 +173,7 @@ class HeaderLimitProtocol(HttpToolsProtocol):
         self._dropped = False  # the connection was dropped inside a parse
         self._stopped = False  # it takes no more requests: those taken are answered (`_stop_taking`)
         self._head_cut = False  # the head being received has been cut at a CRLF CRLF
+        self._taken: list = []  # the requests taken and not yet answered, in order
         self._piece = 0  # the size of the piece being parsed
         self._ended_in_piece = False  # a request ended inside it
         self._lost = False
@@ -290,6 +296,7 @@ class HeaderLimitProtocol(HttpToolsProtocol):
         self._body_left = self._declared_length()
         if size <= HEADER_MAX:
             super().on_headers_complete()
+            self._take(self.cycle)
             return
         if self._answering():
             # behind a response in progress (an event stream, which may never end): a
@@ -305,6 +312,7 @@ class HeaderLimitProtocol(HttpToolsProtocol):
             super().on_headers_complete()
         finally:
             self.app = app
+        self._take(self.cycle)
 
     def on_body(self, body: bytes) -> None:
         if self._dropped or self._stopped:
@@ -323,32 +331,55 @@ class HeaderLimitProtocol(HttpToolsProtocol):
         self._arm_if_waiting()
 
     def on_response_complete(self) -> None:
+        self._taken = [cycle for cycle in self._taken if not cycle.response_complete]
         super().on_response_complete()
         self._arm_if_waiting()
         if (self._unparsed or self._holding) and not self.pipeline:
             self.loop.call_soon(self._resume)
 
     def send_400_response(self, msg: str) -> None:
-        """The parser refused what follows the requests already taken. uvicorn writes its
-        `400` and closes at once, which would put it in front of their answers (one may
-        be a write that has committed): while one received whole is still being
-        answered or queued, the connection takes nothing more instead and closes after
-        the last of them is answered. A request refused part way through its own body
-        is the one being answered, with nothing ahead of it: uvicorn's `400` is its
-        answer."""
-        if self._answering() and not self.cycle.more_body:
-            self._stop_taking()
+        """The parser refused a request: in its head (it has no cycle yet) or in its
+        body (it is `self.cycle`, the newest taken). uvicorn writes its `400` and closes
+        at once, which is the refused request's answer only when no earlier request on
+        the connection is still unanswered; otherwise the `400` would go in front of
+        their answers, one of which may be a write that has committed. So: with an
+        earlier request unanswered, the connection takes no more requests, the refused
+        one is dropped without running, and the earlier answers are sent in order, the
+        connection closing after the last; with none, uvicorn's `400`."""
+        if self._stopped:
+            return  # already taking no more: what follows is discarded
+        refused = None if self._awaiting_head else self.cycle
+        if self._owed(before=refused):
+            self._stop_taking(drop=refused)
             return
         super().send_400_response(msg)
 
-    def _stop_taking(self) -> None:
-        """Take no more requests on this connection: those taken are answered, the
-        newest of them with the connection closed, and nothing more is read or
-        parsed, so the request being parsed and everything after it is discarded."""
+    def _take(self, cycle) -> None:
+        if cycle is not None and cycle not in self._taken:
+            self._taken.append(cycle)
+
+    def _owed(self, before=None) -> list:
+        """The requests taken and not yet answered, in order; those before `before`
+        when it is one of them."""
+        owed = [cycle for cycle in self._taken if not cycle.response_complete]
+        return owed[: owed.index(before)] if before in owed else owed
+
+    def _stop_taking(self, drop=None) -> None:
+        """Take no more requests on this connection: nothing more is read or parsed, so
+        the request being parsed and everything after it is discarded, and `drop`, a
+        request taken but refused, is taken out of uvicorn's queue so it never runs.
+        The requests taken before it are answered in order, the connection closing
+        after the last: with `Connection: close` when its answer has not started, at
+        the end of its answer when it has (its head has been sent)."""
         self._stopped = True
         self._awaiting_head = False
         self._cancel_deadline()
-        self.cycle.keep_alive = False  # the newest taken, queued or being answered
+        if drop is not None:
+            for queued in [entry for entry in self.pipeline if entry[0] is drop]:
+                self.pipeline.remove(queued)
+        owed = self._owed(before=drop)
+        if owed:
+            owed[-1].keep_alive = False
         self.transport.pause_reading()
 
     # The limits

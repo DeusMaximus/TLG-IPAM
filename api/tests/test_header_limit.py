@@ -670,6 +670,14 @@ class Connection:
             message = await receive()
             more = message.get("more_body", False)
         self.seen.append(scope["path"])
+        if scope["path"] == "/stream":  # its head and a first chunk at once, the rest when released
+            event = asyncio.Event()
+            self.held.append(event)
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"first", "more_body": True})
+            await event.wait()
+            await send({"type": "http.response.body", "body": b"last"})
+            return
         if scope["path"] == "/hold":
             event = asyncio.Event()
             self.held.append(event)
@@ -1153,3 +1161,128 @@ async def test_a_request_stopped_part_way_through_its_own_body_gets_uvicorns_400
     assert conn.statuses() == [400]
     assert conn.transport.closed
     conn.close()
+
+
+
+# --- One rule for a refusal by the parser (round 4) ---
+
+
+async def test_a_refused_request_queued_behind_one_unanswered_never_runs():
+    """Round 4's reproduction in process: a chunked request held, then a request whose
+    chunked body is malformed, in one read. The refused request was queued behind the
+    first; it is taken out of the queue, the first is answered with the connection
+    closed, and no `400` is written."""
+    conn = Connection()
+    conn.feed(
+        b"POST /hold HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+        b"POST /broken HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloZZ"
+    )
+    await conn.settle()
+    assert conn.protocol._stopped and not conn.protocol.pipeline
+    conn.held[0].set()
+    for _ in range(3):
+        await conn.settle()
+    assert conn.seen == ["/hold"]
+    assert conn.statuses() == [200]
+    assert b"connection: close" in bytes(conn.transport.written).lower()
+    assert conn.transport.closed and not conn.transport.aborted
+    conn.close()
+
+
+async def test_the_last_answer_owed_carries_connection_close_when_it_has_not_started():
+    conn = Connection()
+    conn.feed(b"GET /hold HTTP/1.1\r\nHost: t\r\n\r\nINVALID\r\n\r\n")
+    await conn.settle()
+    assert conn.protocol._stopped and conn.statuses() == []
+    conn.held[0].set()
+    await conn.settle()
+    head = bytes(conn.transport.written).partition(b"\r\n\r\n")[0].lower()
+    assert conn.statuses() == [200] and b"connection: close" in head
+    assert conn.transport.closed and not conn.transport.aborted
+    conn.close()
+
+
+async def test_an_answer_already_started_finishes_its_frame_and_the_connection_closes_at_its_end():
+    """Round 4, finding 2: a streamed answer whose head has gone cannot gain
+    `Connection: close`; it finishes (its last chunk and the chunked terminator), and
+    the connection closes when it ends."""
+    conn = Connection()
+    conn.feed(b"GET /stream HTTP/1.1\r\nHost: t\r\n\r\n")
+    await conn.settle()
+    assert conn.statuses() == [200]
+    conn.feed(b"INVALID\r\n\r\n")
+    await conn.settle()
+    assert conn.protocol._stopped and not conn.transport.closed
+    conn.held[0].set()
+    await conn.settle()
+    written = bytes(conn.transport.written)
+    head, _, body = written.partition(b"\r\n\r\n")
+    assert b"connection: close" not in head.lower()
+    assert body.endswith(b"0\r\n\r\n") and b"last" in body
+    assert conn.statuses() == [200]
+    assert conn.transport.closed and not conn.transport.aborted
+    conn.close()
+
+
+def _owner_write(key: str, name: str, framing: str) -> bytes:
+    body = json.dumps({"name": name}).encode()
+    head = f"POST /api/v1/sections HTTP/1.1\r\nHost: t\r\nX-API-Key: {key}\r\nContent-Type: application/json\r\n"
+    if framing == "chunked body":
+        return (head + "Transfer-Encoding: chunked\r\n\r\n").encode() + f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n"
+    return (head + f"Content-Length: {len(body)}\r\n\r\n").encode() + body
+
+
+FIRST = ["chunked body", "declared body", "no body"]
+MALFORMED = {
+    "in place of the second head": (b"INVALID\r\n\r\n", False),
+    "inside the second head": (b"GET /health HTTP/1.1\r\nHost: t\r\nBad Header\r\n\r\n", False),
+    "inside the second body": (b"POST /broken HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloZZ", False),
+    "in the third head": (b"GET /health HTTP/1.1\r\nHost: t\r\n\r\nINVALID\r\n\r\n", True),
+    "in the third body": (
+        b"GET /health HTTP/1.1\r\nHost: t\r\n\r\n"
+        b"POST /broken HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloZZ",
+        True,
+    ),
+}
+
+
+def refusal_row(key: str, first: str, malformed: str, name: str) -> tuple[bytes, bytes, list[int]]:
+    """The first request, what follows it, and the answers owed before the refusal."""
+    if first == "no body":
+        request = f"GET /api/v1/sections HTTP/1.1\r\nHost: t\r\nX-API-Key: {key}\r\n\r\n".encode()
+        owed = [200]
+    else:
+        request, owed = _owner_write(key, name, first), [201]
+    rest, second_valid = MALFORMED[malformed]
+    return request, rest, owed + ([200] if second_valid else [])
+
+
+@pytest.mark.parametrize("split", [False, True], ids=["one write", "split after the first"])
+@pytest.mark.parametrize("malformed", MALFORMED)
+@pytest.mark.parametrize("first", FIRST)
+def test_on_the_image_every_request_received_before_a_refusal_is_answered_first(image, first, malformed, split):
+    """The rule for a refusal by the parser, wherever the malformed bytes fall: every
+    request received whole before it is answered, in order, with no `400` in front of
+    any of them, and the connection closes; a write among them is there on readback.
+    uvicorn's `400` may follow the last of them, when the refused request is by then the
+    only one unanswered (the refused request ran, and its own body was refused)."""
+    name = f"row-{first}-{malformed}-{split}".replace(" ", "-")
+    request, rest, owed = refusal_row(image.key, first, malformed, name)
+    with connect(image) as sock:
+        if split:
+            sock.sendall(request)
+            received = one_response(sock)
+            sock.sendall(rest)
+        else:
+            sock.sendall(request + rest)
+            received = b""
+        more, _ = until_closed(sock, 10)
+    statuses = [int(st) for st in re.findall(rb"HTTP/1\.1 (\d{3}) ", received + more)]
+    assert statuses[: len(owed)] == owed, (statuses, (received + more)[:400])
+    assert statuses[len(owed) :] in ([], [400]), statuses
+    if first != "no body":
+        listed = exchange(
+            image.port,
+            f"GET /api/v1/sections HTTP/1.1\r\nHost: t\r\nX-API-Key: {image.key}\r\nConnection: close\r\n\r\n".encode(),
+        )
+        assert name.encode() in listed[2]
