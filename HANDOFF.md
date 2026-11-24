@@ -27,6 +27,20 @@ Template:
 
 ---
 
+## 2026-11-25 — Claude Code (Opus 5.5), worker — #92: say before an enrolment token is issued that the page is on plain HTTP (PR #157)
+- **Merged:** 2026-11-25, squash `2abfcb4`, at head `884cda2`; branch deleted. Entry committed by the orchestrator, with the state lines brought up to date. The orchestrator ran lint, the 188 web tests and the build at the head before the merge.
+- **Done:** [PR #157](https://github.com/DeusMaximus/TLG-IPAM/pull/157) (`92-plain-http-warning`, head `884cda2`) closes #92.
+  - `web/src/components/EnrolmentSteps.jsx`: `PlainHttpBeforeIssue` (new, `agent-plain-http-before`) is shown before the request that issues a token. `PlainHttpWarning` (`agent-needs-https`) now has two wordings. With `issued`, beside the token: the token has already crossed in clear; run the agent soon; if its exchange is refused, revoke and re-enrol over HTTPS; the agent token crosses only over a plain-HTTP exchange, which the commands never make. Without it (update commands): no mention of a token.
+  - `AddAgentModal` form and `ReEnrolModal` confirmation show the notice when `!serverUrlFor(location).secure`; both still issue. The rule stays `install.agentServerUrl`'s; `web/` parses no address. No command changed (`install.js` and its test untouched).
+  - Docs: spec §5.6 has a new bullet, "A page served over plain HTTP"; brief §6.2 has a sentence on it; `AGENTS.md` guided-install bullet has one sentence.
+  - Tests: web 179 → 188 (`Agents.test.jsx`). The before-issue tests fail with the notice removed; the before-issue and update tests fail with the old wording restored. Server 1,340 and agent 1,388 pass (no code changes there).
+  - Review: Codex clean and Greptile 5/5 on `884cda2`; CI green (6 checks). No fix commits. It owed no briefed round.
+- **Decisions:** PR body Deliberate calls 1–4. Re-enrol warns before issuing too. The update dialog's warning drops the token wording. The remedy is revoke then re-enrol, not delete (keeps the scan targets) and not disable (enabling would revive the other party's token). The notice warns and does not block.
+- **State:** merged. No schema change; `PROTOCOL_VERSION` unchanged; no server or agent change.
+- **Waiting on the owner:** nothing from this PR.
+- **Untested:** a real browser on a real plain-HTTP origin (jsdom tests pass a `location` object).
+- **Next:** the owner key crossing in clear from such a page stays #31's (deployment guidance).
+
 ## 2026-11-24 — Claude Code (Opus 5.5), worker — #138: the unit discards the CA trust settings the system manager supplies (PR #152)
 - **Merged:** 2026-11-25, squash `0537950`, at head `cbc4c9c`; branch deleted. Entry committed by the orchestrator, with the review and merge lines brought up to date.
 - **Done:** [PR #152](https://github.com/DeusMaximus/TLG-IPAM/pull/152) (`138-unit-manager-trust`, head `cbc4c9c`) closes #138.
@@ -89,16 +103,3 @@ Template:
 - **Waiting on the owner:** the next server image build is the first real start of the new `CMD`: nobody could build the image here.
 - **Untested:** the Docker image; every proxy setting in spec §8 (no proxy ran); a multi-day MCP stream.
 - **Next:** #31 writes the deployment document from spec §8. #132 no longer blocks exposing `/mcp` (#26, which still waits on #25).
-
-## 2026-11-24 — Claude Code (Sonnet 5.5), worker — #139: qualify the bulk_create_hosts size example and the brief's import figures (PR #148)
-- **Done:**
-  - [PR #148](https://github.com/DeusMaximus/TLG-IPAM/pull/148) (`139-import-size-wording`, head `cc6267c`) closes #139. Documentation and tests only: no limit, route or tool result changed. Three files: `api/app/mcp_server.py` (docstring), `TLG-IPAM-Project-Brief.md` (§5.2 row, §4.3 import-size paragraph only), `api/tests/test_length_limits.py`.
-  - The `bulk_create_hosts` docstring and §5.2: the 400-record example holds only when every field is plain ASCII with no character JSON escapes (quote, backslash, a control character such as a line break or a tab) in any field. Non-BMP owner: 2,493,771 bytes as `json.dumps` writes it, `413` at the real `/mcp` route. A hostname and an owner of quotes, backslashes or tabs: 2,114,971.
-  - §4.3: the measured rows (`full_rows`) are named as measured examples, not a ceiling. They are at every character limit and ASCII (15-character address, 40-character device type). Figures re-measured: 1,000 rows without notes 1,151,011; at most 233 four-byte notes characters (1,295 ASCII with an ASCII owner); notes at the limit 17,546,011 (5,258,011 ASCII); at most 119 rows (398 ASCII notes, 428 with an ASCII owner too); 5-character device type 1,116,011. §4.3 also says a hostname and a device type accept non-ASCII (1,000 rows 2,973,011), that a MAC's punctuation, a domain's leading white space and trailing dots and a `last_seen`'s extra digits are accepted and dropped, and that a padded IPv4 address is refused.
-  - Tests: the example's largest call is posted to the real `/mcp` route and creates all 400 hosts; the non-ASCII-owner variant gets `413`; the escaped-ASCII case runs for quote, backslash and tab; the Unicode-row and no-largest-row cases; every §4.3 figure is asserted. The old in-process example test (`fastmcp.Client(mcp)`) skipped the body cap and is replaced.
-  - Review: Codex clean at `62977ac`, `d29492e` and `cc6267c`. Greptile P2 at `62977ac` (escapes outside notes) fixed in `d29492e`. An outside read (Codex, GPT-6.1 Sol) at `d29492e` was GO with two P3s (tabs; rows are examples, not a ceiling), both fixed in `cc6267c`, answered in one numbered PR comment. CI green on `cc6267c`.
-  - Merged: `1a48707`, squash, on the owner's go-ahead; the remote branch is deleted. Sol's GO was at `d29492e`; the orchestrator read `cc6267c`'s diff against its two remedies and ran 1,136 server tests on that head, and no further round was run for a wording-only change. No follow-ups.
-- **Decisions:** PR body Deliberate calls 1–5. The main ones: rebuilt the rows at every character limit instead of describing the old fixture, so all §4.3 figures changed; no row is "the largest" (limits count characters, padding is accepted on MAC, domain and `last_seen`, an IPv4 address is refused padded); the example is judged as `json.dumps` writes it; `test_body_limit.py` and `body_limit.py` untouched (its "about 1.15 MB" comment is accurate for the no-notes rows).
-- **State:** merged. Tests: server 1,136. No schema change; nothing in `web/` or the agent touched.
-- **Waiting on the owner:** nothing from this entry.
-- **Next:** nothing owed on #139. #132 (PR #135) owns the other §4.3 paragraphs and the `AGENTS.md` bullets "One uvicorn worker" and "One request-body cap".
