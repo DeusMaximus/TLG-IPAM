@@ -27,6 +27,18 @@ Template:
 
 ---
 
+## 2026-11-24 — Claude Code (Opus 5.5), worker — #149: the CNAME walk keyed by wire bytes; which PTR record wins (PR #151)
+- **Done:** [PR #151](https://github.com/DeusMaximus/TLG-IPAM/pull/151) (`149-cname-walk-keys`, head `ad268e2`) closes #149. (Written by the orchestrator from the PR body: the worker's thread was still finishing when the PR merged.)
+  - `probe.answered_name` keys its CNAME map and visited set by `Name.to_digestable()` (the name's wire form, labels lowercased, lengths included), not by `dns.name.Name`, whose hash in dnspython 2.9.2 ignores where labels split. A 512-link chain of colliding names went from about 724,000 `Name.fullcompare` calls to one. The walk visits the same names in the same order.
+  - Spec §5.2, brief §4.6, `AGENTS.md` and `read_reply`'s docstring state the order the code already had: a PTR at the chain's end is the name (its first record when there are several), whatever else the reply holds; a PTR elsewhere is never the name, and with none at the chain's end makes the reply no usable answer.
+  - Tests (`agent/tests/test_probe.py`, +5): a chain of colliding names costs work in step with its links, counted with `sys.setprofile` and never timed, asserting its own premise that the names hash alike; of several PTR records at the answered name the first is read (Greptile's P2); the counting helper puts back the profiler hook it found (the briefed round's P3).
+  - Merged: `fd1e83e`, squash, on the owner's go-ahead; the remote branch is deleted. CI green and Codex clean on `ad268e2`. Briefed round (Codex, GPT-6.1 Sol): GO at `7cc32ec`, both findings from PR #146 closed, one P3 in the new test, fixed in `ad268e2`; the orchestrator read that diff against the remedy and ran 1,367 agent tests on the head, with no further round for a test-only change.
+- **Decisions:** PR body Deliberate calls 1–4: the key is `to_digestable()`; the test counts work; the spec says the first of several PTR records is read; the spec says the parse is dnspython's own cost.
+- **State:** merged. No new import, query or wire change (`PROTOCOL_VERSION` 2). No schema change.
+- **Waiting on the owner:** whether to file an issue for the remaining exposure the review describes: dnspython's parser has the same collision cost before the walk runs (1.67 s for a 65 KB reply, measured by the reviewer with a substituted socket), and the agent does not refuse a reply larger than the 1,232 bytes it advertises. Only a resolver the owner configured can send one.
+- **Untested:** a near-maximum reply over a real UDP path; the full suite on Python 3.11 and 3.13 by the reviewer (CI runs both).
+- **Next:** #20 and #93 are in the same file and untouched.
+
 ## 2026-11-24 — Claude Code (Opus 5.5), worker — #132: bound request heads, idle connections, pipelining and stalled readers below the app (PR #135)
 - **Done:** [PR #135](https://github.com/DeusMaximus/TLG-IPAM/pull/135) (`132-header-idle-bounds`, head `e9855bb`) closes #132. (The worker's own last entry covered round 4 only; the orchestrator has put the whole PR here.)
   - The image's `CMD` is `python -m app.serve` (`api/app/serve.py`): uvicorn's own command line, so `UVICORN_*` settings still apply, with six pinned over it (`workers=1`, no reload, `http=header_limit.HeaderLimitProtocol`, no HTTP/2, `ws="none"`, 5 s keep-alive).
@@ -125,23 +137,3 @@ Template:
   - The owner's first release per `.agents/releases.md`; #147 should land before it.
   - #94 (pin the agent base image by digest) goes with it.
   - #143 has a P3 on release versions not in normal form that `install.releaseVersion` accepts (`01.2`); the release check refuses them.
-
-## 2026-11-24 — Claude Code (Opus 5.5), worker — #100: name lookups reported apart from liveness (PR #142)
-- **Done:**
-  - [PR #142](https://github.com/DeusMaximus/TLG-IPAM/pull/142) (`100-name-lookup-state`, head `9b196e2`) closes #100 under option 4.
-  - **Protocol 2:** `PROTOCOL_VERSION` 1 → 2. Results carry `protocol` (absent means 1), `liveness_complete`, and `rdns_no_name` on each record. Ingest marks the dead by `liveness_complete` and clears a stored name only when the record carries `rdns_no_name`. Protocol-1 result sets keep protocol 1's rule.
-  - **Briefed round 1** (Codex GPT-6.1 Sol, NO-GO at `dfae349`) fixed in `217e525`:
-    - P2: `probe.says_no_name` reads the authority section first, so a CNAME followed by a delegation is no answer and the next server is asked.
-    - P3: every ARP interruption path asserts `liveness_complete` false.
-  - `main` at `7beb687` (#23) merged in `d41b7a6`. `9b196e2` makes `test_guided_install.py` send `PROTOCOL_VERSION + 1` as the mismatch.
-  - Merged: `5ecf088`, squash, on the owner's go-ahead; the remote branch is deleted. CI green and Codex clean on `9b196e2`; Greptile read only the first head (5/5), and the briefed rounds were the outside read after it. Briefed round 2 (Codex, GPT-6.1 Sol): GO at `9b196e2`, both round-1 findings closed, no new finding. The orchestrator ran 1,252 agent and 1,129 server tests on that head. Follow-up filed on the owner's say: #144, the resolver reads a PTR or a negative SOA without checking it belongs to the question (older than #100, described in round 2), with an operating note for a subnet whose only DNS server does not recurse.
-- **Decisions:** Deliberate calls 1–10 in the PR body. The reviewer kept 1–9 and revised 4. Call 10 is new: a CNAME with no PTR and an empty authority is no answer.
-- **State:**
-  - merged. Tests on the merged tree: agent 1,252, server 1,129, web 154.
-  - No schema change, no new import or listed name.
-- **Waiting on the owner:** nothing from this entry.
-- **Untested:** any real network or resolver; the built image; a real protocol-1 agent.
-- **Next:**
-  - #24 publishes the first image at protocol 2.
-  - #20 and #93 untouched; #144 is in the same agent file.
-  - `web/src/pages/Agents.test.jsx` keeps a static fixture message that mentions protocols 2 and 1, which is harmless.
