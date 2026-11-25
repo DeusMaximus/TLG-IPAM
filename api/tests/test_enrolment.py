@@ -866,6 +866,21 @@ def test_a_prune_keeps_every_entry_newer_than_its_generation():
     assert len(store) == 0
 
 
+@pytest.mark.parametrize("step", [timedelta(0), timedelta(days=-1)], ids=["equal", "backward"])
+def test_a_replacement_alone_takes_a_newer_generation(step):
+    """Round 3 of #184's briefed review: with nothing else recorded between, replacing
+    a token's refusal after the generation was read still survives a prune at that
+    generation, whatever its `refused_at` (equal, or a day earlier)."""
+    store = agents_svc.EnrolRefusals(limit=8)
+    first = _now()
+    store.record("token-a", ENROL_TOO_OLD, first)
+    seen = store.generation()
+    store.record("token-a", ENROL_TOO_NEW, first + step)
+    store.keep_only([], seen)
+    kept = store.get("token-a")
+    assert kept is not None and kept.code == ENROL_TOO_NEW and kept.refused_at == first + step
+
+
 def test_the_store_holds_at_most_its_bound(monkeypatch):
     store = agents_svc.EnrolRefusals(limit=3)
     for i in range(5):
