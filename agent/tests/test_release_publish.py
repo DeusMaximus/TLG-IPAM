@@ -154,7 +154,7 @@ class Publish:
 
         # what GitHub and the registry hold before the step runs
         self.github = {
-            "tags": [self.tag], "releases": [], "fail": {}, "list_answers": [], "list_requests": 0, "looked_up": [],
+            "tags": [self.tag], "releases": [], "fail": {}, "list_answers": [], "list_requests": [], "looked_up": [],
         }
         self.registry = {
             "tags": {},
@@ -623,7 +623,7 @@ def test_a_list_that_cannot_be_read_publishes_nothing(release, failure, held):
     result = release.run()
     assert result.returncode == 1
     _nothing_written(release, before)
-    assert len(release.argvs("gh", "api")) == 3 and release.github["list_requests"] == 3
+    assert len(release.argvs("gh", "api")) == 3 and release.github["list_requests"] == [1, 1, 1]
     assert UNREAD.format(version=VERSION) in result.stdout
     assert result.stdout.count("::warning::listing the releases of") == 3
     assert [c["argv"] for c in release.calls if c["program"] == "sleep"] == [["15"], ["30"], ["45"]]
@@ -635,10 +635,12 @@ def _many(publish: Publish, count: int) -> None:
         publish.release(draft=False, tag=f"v0.1.{n}")
 
 
+@pytest.mark.parametrize("failure", ["502-html", "204", "200-object"])
 @pytest.mark.parametrize("where", ["first-page", "second-page", "nowhere"])
-def test_a_list_whose_later_page_fails_is_not_read(tmp_path, workflow, where):
-    """What gh printed before a page failed is not a list: a failed second page stops
-    the job whichever page the tag's release is on, or if it has none."""
+def test_a_list_whose_later_page_is_not_a_list_is_not_read(tmp_path, workflow, failure, where):
+    """Every page asked for must be a list, not only the first: a second page that
+    fails, or that gh passes with exit 0 but prints no marker for (a `204`, review of
+    PR #166), stops the job whichever page the tag's release is on, or if it has none."""
     publish = Publish(tmp_path, workflow, "publish-release")
     if where == "first-page":
         publish.release(draft=True)
@@ -646,12 +648,70 @@ def test_a_list_whose_later_page_fails_is_not_read(tmp_path, workflow, where):
     if where == "second-page":
         publish.release(draft=True)
     before = copy.deepcopy(publish.github["releases"])
-    publish.github["list_answers"] = [None, LIST_FAILURES["502-html"]] * 3
+    publish.github["list_answers"] = [None, LIST_FAILURES[failure]] * 3
     result = publish.run()
     assert result.returncode == 1
     _nothing_written(publish, before)
-    assert publish.github["list_requests"] == 6
+    assert publish.github["list_requests"] == [1, 2] * 3
     assert UNREAD.format(version=VERSION) in result.stdout
+    assert result.stdout.count("failed (attempt") == 3 and "page 2)" in result.stdout
+
+
+def test_a_retry_starts_the_list_again(tmp_path, workflow):
+    """The tag's draft read on page 1 of an attempt whose page 2 then failed is not
+    counted again by the next attempt: it is the one release, and is finished."""
+    publish = Publish(tmp_path, workflow, "publish-release")
+    publish.release(draft=True)
+    _many(publish, 150)
+    publish.github["list_answers"] = [None, LIST_FAILURES["502-html"]]
+    result = publish.run()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert publish.github["list_requests"] == [1, 2, 1, 2]
+    _published_with_this_wheel(publish, publish.github["releases"][0])
+    assert publish.argvs("gh", "create") == []
+
+
+def _full_page() -> dict:
+    """A page of 100 releases of other versions, whatever page was asked for."""
+    body = [{"id": 1000 + n, "tag_name": f"v0.0.{n}", "draft": False} for n in range(100)]
+    return {"status": 200, "json": True, "body": json.dumps(body)}
+
+
+def test_a_list_of_more_than_twenty_pages_is_not_read(release):
+    """A server that answers every page full, as one that ignored `page` would, is not
+    read without end: after 20 pages the attempt fails, and so does the job."""
+    release.release(draft=True)
+    before = copy.deepcopy(release.github["releases"])
+    release.github["list_answers"] = [_full_page()] * 20 + [LIST_FAILURES["500"]] * 2
+    result = release.run()
+    assert result.returncode == 1
+    _nothing_written(release, before)
+    assert release.github["list_requests"] == list(range(1, 21)) + [1, 1]
+    assert "failed (attempt 1, page 20): more than 20 pages of releases" in result.stdout
+    assert UNREAD.format(version=VERSION) in result.stdout
+
+
+def test_a_full_last_page_is_followed_by_an_empty_one(release):
+    """100 releases fill the first page, so the second is asked for, and its empty list
+    ends the listing: the tag's draft among the 100 is finished."""
+    release.release(draft=True)
+    _many(release, 99)
+    result = release.run()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert release.github["list_requests"] == [1, 2]
+    _published_with_this_wheel(release, release.github["releases"][0])
+    assert release.argvs("gh", "create") == []
+
+
+def test_gh_s_error_text_stays_on_the_warning_line(release):
+    """An error message holding a newline is printed on one line, so no part of it is
+    read by the runner as a workflow command of its own (review of PR #166)."""
+    release.github["list_answers"] = [_error(502, "Bad Gateway\n::notice::from the answer\r\n::error::x")] * 3
+    result = release.run()
+    assert result.returncode == 1
+    lines = result.stdout.splitlines()
+    assert not [line for line in lines if line.startswith("::notice::") or line == "::error::x"]
+    assert sum("Bad Gateway ::notice::from the answer  ::error::x" in line for line in lines) == 3
 
 
 @pytest.mark.parametrize("held", ["none", "draft", "published"])
@@ -661,7 +721,7 @@ def test_a_list_that_fails_and_then_answers_is_judged_by_the_answer(release, hel
     release.github["list_answers"] = [LIST_FAILURES["502-html"], LIST_FAILURES["no-answer"]]
     result = release.run()
     assert result.returncode == 0, result.stdout + result.stderr
-    assert release.github["list_requests"] == 3
+    assert release.github["list_requests"] == [1, 1, 1]
     assert result.stdout.count("::warning::listing the releases of") == 2
     (after,) = release.github["releases"]
     if held == "published":
@@ -681,7 +741,7 @@ def test_every_page_of_the_list_is_read(tmp_path, workflow, held):
     before = copy.deepcopy(publish.github["releases"])
     result = publish.run()
     assert result.returncode == 0, result.stdout + result.stderr
-    assert publish.github["list_requests"] == 2
+    assert publish.github["list_requests"] == [1, 2]
     mine = [r for r in publish.github["releases"] if r["tag"] == publish.tag]
     assert len(mine) == 1
     if held == "published":
@@ -742,6 +802,8 @@ def _scenarios(tmp_path, workflow, job):
             yield "draft-other", lambda p: p.release(draft=True, wheel=other)
             yield "published-same", lambda p: p.release(draft=False, wheel=p.wheel)
             yield "unread", lambda p: p.github["list_answers"].extend([LIST_FAILURES["500"]] * 3)
+            yield "empty-page", lambda p: p.github["list_answers"].extend([LIST_FAILURES["204"]] * 3)
+            yield "too-many-pages", lambda p: p.github["list_answers"].extend([_full_page()] * 20 + [LIST_FAILURES["500"]] * 2)
             yield "two", lambda p: (p.release(draft=False, wheel=p.wheel), p.release(draft=True))
     for name, setup in setups():
         publish = Publish(tmp_path / name, workflow, job)

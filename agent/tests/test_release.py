@@ -302,33 +302,65 @@ def test_no_expression_is_expanded_into_a_script(workflow):
         assert "${{" not in step.get("run", ""), step.get("name")
 
 
-# What names a credential in an expression: the `secrets` context in any spelling
-# (`secrets.X`, `secrets['X']`, `toJSON(secrets)`) and `github.token`, which is the job's
-# `GITHUB_TOKEN` under another name. GitHub reads context names in any case.
-SECRET = re.compile(r"\bsecrets\b|\bgithub\s*(\.\s*token\b|\[\s*['\"]token['\"]\s*\])", re.I)
+# The credentials the rule checks are the two an expression can name: the `secrets`
+# context (the repository's and organisation's secrets and `GITHUB_TOKEN`), in any
+# spelling, `secrets.X`, `secrets['X']` or `toJSON(secrets)`; and the job's token through
+# the `github` context, as `github.token`, `github['token']` or the whole object
+# (`toJSON(github)`, `fromJSON(toJSON(github)).token`, `github.*`, `github[x]`), which
+# holds it (review of PR #166). A named property of `github` other than `token`
+# (`github.event_name`, `github['sha']`) is not one. GitHub reads context names in any
+# case.
+SECRETS = re.compile(r"\bsecrets\b", re.I)
+# the `github` context itself, not a property of that name (`steps.github`) or a longer
+# name (`my-github`)
+GITHUB = re.compile(r"(?<![\w.-])github\b(?!-)", re.I)
+# what follows it when one property is read: `.name` or `['name']`
+PROPERTY = re.compile(r"\s*(?:\.\s*([A-Za-z_][\w-]*)|\[\s*'((?:[^']|'')*)'\s*\])")
+# an expression's string literal, in single quotes with '' for a quote
+LITERAL = re.compile(r"'(?:[^']|'')*'")
 EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+
+
+def _names_a_credential(expression):
+    """Whether an expression can hand on a credential the rule checks (above)."""
+    if SECRETS.search(expression):
+        return True
+    # a literal is not the context, so `'github'` is blanked, keeping each position
+    code = LITERAL.sub(lambda m: " " * len(m.group()), expression)
+    for found in GITHUB.finditer(code):
+        read = PROPERTY.match(expression, found.end())
+        name = read and (read.group(1) or read.group(2))
+        if not name or name.lower() == "token":
+            return True
+    return False
 # the one step of each publish job that publishes, and the variable it is given the token in
 TOKEN_ENV = {"publish-image": "TOKEN", "publish-release": "GH_TOKEN"}
 
 
 def _given_secrets(node, path=()):
-    """Every place in the workflow that hands a credential to a job or a step, by its
-    path, with its value: a value whose expression (`${{ }}`) names one, an `if`, which
-    is an expression whole, that does, and a job's `secrets:` (a reusable workflow's
-    `inherit`). Keys are read as values are."""
+    """Every place in the workflow that hands a credential the rule checks (above) to a
+    job or a step, by its path, with its value: a value whose expression (`${{ }}`)
+    names one, an `if`, which is an expression whole, that does, and a job's `secrets:`
+    (a reusable workflow's `inherit`). Keys are read as values are.
+
+    It does not see a credential no expression names: one an action takes by default
+    (`actions/checkout`'s `token` input defaults to the job's token, which
+    `test_checkout_keeps_no_credential` holds it to dropping; the artifact actions use
+    the `ACTIONS_RUNTIME_TOKEN` the runner gives every action), or anything a step reads
+    from the runner's environment or files."""
     found = {}
     if isinstance(node, dict):
         for key, value in node.items():
             if key == "secrets":
                 found[path + (key,)] = value
             found.update(_given_secrets(key, path + ("<key>",)))
-            if key == "if" and isinstance(value, str) and SECRET.search(value):
+            if key == "if" and isinstance(value, str) and _names_a_credential(value):
                 found[path + (key,)] = value
             found.update(_given_secrets(value, path + (key,)))
     elif isinstance(node, list):
         for i, value in enumerate(node):
             found.update(_given_secrets(value, path + (i,)))
-    elif isinstance(node, str) and any(SECRET.search(e) for e in EXPRESSION.findall(node)):
+    elif isinstance(node, str) and any(_names_a_credential(e) for e in EXPRESSION.findall(node)):
         found[path] = node
     return found
 
@@ -378,6 +410,12 @@ GIVEN = {
     "build-step-index": (("build", "Wheel"), ("env", "T"), "${{ secrets['GITHUB_TOKEN'] }}"),
     "build-step-case": (("build", "Wheel"), ("env", "T"), "${{ Secrets.github_token }}"),
     "build-step-github-index": (("build", "Wheel"), ("env", "T"), "${{ github['token'] }}"),
+    # the whole `github` context, which holds the token (review of PR #166)
+    "build-step-github-context": (("build", "Wheel"), ("env", "GH_CONTEXT"), "${{ toJSON(github) }}"),
+    "build-step-github-converted": (("build", "Wheel"), ("env", "T"), "${{ fromJSON(toJSON(github)).token }}"),
+    "build-step-github-filter": (("build", "Wheel"), ("env", "T"), "${{ join(github.*, ' ') }}"),
+    "build-step-github-computed": (("build", "Wheel"), ("env", "T"), "${{ github[format('{0}', 'token')] }}"),
+    "build-step-github-case": (("build", "Wheel"), ("env", "T"), "${{ toJSON(GitHub) }}"),
     "verify-step": (("verify", "The wheel, installed by the systemd tab's command"), ("env", "TOKEN"), "${{ github.token }}"),
     "download-step": (("publish-release", "actions/download-artifact"), ("with", "github-token"), "${{ secrets.GITHUB_TOKEN }}"),
     "publish-step-other": (("publish-release", "Release v<version> with the wheel"), ("env", "PAT"), "${{ secrets.RELEASE_PAT }}"),
@@ -406,6 +444,26 @@ def test_a_credential_given_to_a_whole_job_or_workflow_fails_the_check(workflow,
     changed = copy.deepcopy(workflow)
     _put(changed, path, value)
     assert _given_secrets(changed) != _token_holders(changed)
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "github.event_name == 'push'",
+        "github.repository",
+        "github['sha']",
+        "github . ref_type",
+        "steps.github.outputs.x",
+        "contains(github.ref, 'github')",
+        "format('{0}', 'toJSON(github)')",
+        "github.event.head_commit.message",
+    ],
+)
+def test_a_named_property_of_the_github_context_is_not_a_credential(expression):
+    """The workflow reads `github.event_name`, `github.ref_type` and `github.ref`, and
+    may read any named property but `token`; a literal or a property called `github`
+    is not the context."""
+    assert not _names_a_credential(expression)
 
 
 def test_checkout_keeps_no_credential(workflow):

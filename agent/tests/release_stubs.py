@@ -8,24 +8,25 @@ Standard library only: each stub runs as `python -I -S` with this directory on i
 What they answer is taken from `gh` (2.105, `pkg/cmd/api` and `pkg/cmd/release`) and
 skopeo, as far as the publish steps use them:
 
-- `gh api --paginate repos/<repo>/releases?per_page=100 --jq <RELEASES_JQ>` reads the
-  list of releases (REST `GET /repos/{owner}/{repo}/releases`), drafts included, one
-  page of 100 at a time, following each page's `Link: rel="next"` until a page has
-  none (`pkg/cmd/api/api.go`, `pagination.go`). Each page is answered as gh's
-  `processResponse` handles it: a `204` prints nothing and ends the listing with exit
-  0; a JSON error body with a status above 299 prints `gh: <message> (HTTP <status>)`
-  and exits 1; any other body goes through the jq (`--jq` is evaluated by go-gh's
-  gojq, which reads `env.TAG` from the environment), and a body that is not JSON, or
-  that the jq stops on, exits 1; a status above 299 that the jq did not stop on exits
-  1 as `gh: HTTP <status>`. A request that gets no answer exits 1 with Go's error. What
-  earlier pages printed stays printed. The state's `list_answers` replaces the answer
-  to each page request in turn (`null` for the real page; `json` says whether its
-  `Content-Type` is JSON, `more` whether it links a next page), so a test sends any
-  of these; once it is used up every page is the real one. Taken from GitHub's
-  documentation, not checked against GitHub: the list holds drafts for a token that can
-  push ("only users with push access will receive listings for draft releases"), as
-  this job's `contents: write` token can, and a page links the next whenever more
-  follow.
+- `gh api repos/<repo>/releases?per_page=100&page=<n> --jq <RELEASES_JQ>` reads one page
+  of the list of releases (REST `GET /repos/{owner}/{repo}/releases`), drafts included,
+  the 100 releases from the `n`th hundred on; without `--paginate` gh makes the one
+  request and follows no `Link` (`pkg/cmd/api/api.go`). The page is answered as gh's
+  `processResponse` handles it: a `204` prints nothing and exits 0; a JSON error body
+  with a status above 299 prints `gh: <message> (HTTP <status>)` and exits 1; any other
+  body goes through the jq (`--jq` is evaluated by go-gh's gojq, which reads `env.TAG`
+  from the environment), and a body that is not JSON, or that the jq stops on, exits
+  1; a status above 299 that the jq did not stop on exits 1 as `gh: HTTP <status>`. A
+  request that gets no answer exits 1 with Go's error. The state's `list_answers`
+  replaces the answer to each request in turn (`null` for the real page; `json` says
+  whether its `Content-Type` is JSON), so a test sends any of these; once it is used up
+  every page is the real one. Simpler than gh: its JSON error path prints only the
+  message, where gh can also copy the body to stdout and add scope or SSO advice, and
+  `_jq` is not gojq for an `id` or `draft` that is not a number or a boolean. Taken
+  from GitHub's documentation, not checked against GitHub: the list holds drafts for a
+  token that can push ("only users with push access will receive listings for draft
+  releases"), as this job's `contents: write` token can, and `page` counts pages of
+  `per_page` releases, every page full but the last.
 - `gh release download`, `upload` and `edit` find the release by its tag as gh's
   `FetchRelease` does (`pkg/cmd/release/shared/fetch.go`): it asks for the published
   release with the tag and for a draft with it as its pending tag at once, and takes
@@ -104,10 +105,11 @@ def take_flags(argv: list[str], valued: set[str], plain: set[str]) -> tuple[list
 # --- gh ---
 
 
-# The one jq the step lists releases with: a line `page` for each page that is a JSON
-# array, and a line `<id> <draft>` for each release on it whose tag is `env.TAG`.
+# The one jq the step lists releases with: a first line `page <length>` for a page that
+# is a JSON array, then a line `<id> <draft>` for each release on it whose tag is
+# `env.TAG`.
 RELEASES_JQ = (
-    'if type == "array" then "page", (.[] | select(.tag_name == env.TAG) | "\\(.id) \\(.draft)")'
+    'if type == "array" then "page \\(length)", (.[] | select(.tag_name == env.TAG) | "\\(.id) \\(.draft)")'
     ' else error("not a list of releases") end'
 )
 PER_PAGE = 100
@@ -149,7 +151,7 @@ def _jq(body: str, tag: str | None) -> tuple[list[str], str | None]:
         return [], "invalid character '<' looking for beginning of value"
     if not isinstance(data, list):
         return [], "not a list of releases"
-    lines = ["page"]
+    lines = [f"page {len(data)}"]
     for release in data:
         if not isinstance(release, dict):
             return lines, f"expected an object but got: {type(release).__name__}"
@@ -159,43 +161,46 @@ def _jq(body: str, tag: str | None) -> tuple[list[str], str | None]:
 
 
 def gh_api(stub: Stub, state: dict, argv: list[str]) -> int:
-    """`gh api --paginate <the releases list> --jq RELEASES_JQ`, page by page, as gh's
-    `processResponse` answers each (module docstring)."""
+    """`gh api <one page of the releases list> --jq RELEASES_JQ`, answered as gh's
+    `processResponse` answers it (module docstring)."""
     repo = os.environ.get("GITHUB_REPOSITORY")
-    path = f"repos/{repo}/releases?per_page={PER_PAGE}"
-    if argv != ["api", "--paginate", path, "--jq", RELEASES_JQ] or not os.environ.get("GH_TOKEN"):
+    prefix = f"repos/{repo}/releases?per_page={PER_PAGE}&page="
+    if (
+        len(argv) != 4
+        or argv[0] != "api"
+        or not argv[1].startswith(prefix)
+        or not argv[1].removeprefix(prefix).isdigit()
+        or argv[2:] != ["--jq", RELEASES_JQ]
+        or not os.environ.get("GH_TOKEN")
+    ):
         return refuse("gh", argv)
-    releases = [_release_json(r) for r in state["releases"]]
-    page = 0
-    while True:
-        answer = state["list_answers"].pop(0) if state["list_answers"] else None
-        state["list_requests"] += 1
-        stub.save("github", state)
-        if answer is None:
-            more = len(releases) > (page + 1) * PER_PAGE
-            answer = {"status": 200, "json": True, "body": json.dumps(releases[page * PER_PAGE : (page + 1) * PER_PAGE])}
-        else:
-            more = answer.get("more", False)
-        if "network" in answer:
-            return fail(answer["network"])
-        status = answer["status"]
-        if status == 204:
-            return 0
-        if answer["json"] and status >= 400:
-            error_body = json.loads(answer["body"])
-            message = error_body.get("message") if isinstance(error_body, dict) else None
-            if message:
-                return fail(f"gh: {message} (HTTP {status})")
-        lines, error = _jq(answer["body"], os.environ.get("TAG"))
-        if lines:
-            print("\n".join(lines), flush=True)
-        if error:
-            return fail(error)
-        if status > 299:
-            return fail(f"gh: HTTP {status}")
-        if not more:
-            return 0
-        page += 1
+    page = int(argv[1].removeprefix(prefix))
+    if page < 1:
+        return refuse("gh", argv)
+    answer = state["list_answers"].pop(0) if state["list_answers"] else None
+    state["list_requests"].append(page)
+    stub.save("github", state)
+    if answer is None:
+        releases = [_release_json(r) for r in state["releases"]]
+        answer = {"status": 200, "json": True, "body": json.dumps(releases[(page - 1) * PER_PAGE : page * PER_PAGE])}
+    if "network" in answer:
+        return fail(answer["network"])
+    status = answer["status"]
+    if status == 204:
+        return 0
+    if answer["json"] and status >= 400:
+        error_body = json.loads(answer["body"])
+        message = error_body.get("message") if isinstance(error_body, dict) else None
+        if message:
+            return fail(f"gh: {message} (HTTP {status})")
+    lines, error = _jq(answer["body"], os.environ.get("TAG"))
+    if lines:
+        print("\n".join(lines), flush=True)
+    if error:
+        return fail(error)
+    if status > 299:
+        return fail(f"gh: HTTP {status}")
+    return 0
 
 
 def gh(stub: Stub, argv: list[str]) -> int:
