@@ -2,7 +2,9 @@
 lookups for the addresses either found, inside the job's timeout (spec §5.2, §5.6).
 
 Every packet goes to an address `guard.plan` returned, or, for a PTR lookup, to one of
-the job's DNS servers (the host's own resolvers when the job names none). Every packet
+the job's DNS servers (the host's own resolvers when the job names none) that
+`guard.dns_servers` keeps: with `ALLOWED_DNS_SERVERS` set, none outside it (#93), which
+the job's error says, and when it leaves none the lookups are not made. Every packet
 takes a slot of the agent's one `MAX_PPS` budget (`Pacer`), carried from job to job:
 each echo request, each ARP request (a retry included), and each DNS query, a failover
 to the next server included, each handed to the kernel in the step its slot is
@@ -27,7 +29,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from . import arp
+from . import arp, guard
 from .probe import (
     DNS_PAYLOAD,
     DNS_QUESTIONS_MAX,
@@ -412,15 +414,36 @@ def answered_later(too_large: int, too_many_records: int) -> str:
     return f"rdns: a later server answered after {refused_unread(too_large, too_many_records)}"
 
 
+def outside_allowed(outside: int, chosen: int) -> str:
+    """What `ALLOWED_DNS_SERVERS` took away (#93): of the `chosen` servers the agent
+    would have asked (`Resolver.servers`), `outside` lie outside it and were not asked.
+    When that is all of them the lookups were not made, which this says as NO_DNS_SERVER
+    does: the result set is then incomplete, so the server keeps every stored name.
+    Otherwise the rest were asked, and this is a notice. Counts and fixed words only:
+    nothing says which server, whose address the server sent or the host's resolv.conf
+    holds, as #164's counts name none."""
+    if outside == chosen:
+        if chosen == 1:
+            return "rdns not run: the 1 DNS server to ask is outside ALLOWED_DNS_SERVERS"
+        return f"rdns not run: all {chosen} DNS servers to ask are outside ALLOWED_DNS_SERVERS"
+    verb, passive = ("is", "was") if outside == 1 else ("are", "were")
+    return (
+        f"rdns: {outside} of the {chosen} DNS servers to ask {verb} outside ALLOWED_DNS_SERVERS "
+        f"and {passive} not asked"
+    )
+
+
 def error_text(errors: list[str], *optional: tuple[int, str | None]) -> str | None:
     """A job's error: its parts joined, made printable and capped as the server stores
     it (`scan_error`). Each of `optional` names a part that carries counts, at its
     place in `errors`, with the text that stands there without them (None: nothing),
     in the order they are given up: `scan.run` gives the notice of lookups a later
     server answered first (#170), then the refusal counts of the lookups without a
-    usable answer (#164). While the whole would not fit SCAN_ERROR_MAX, the next of
-    them is left out whole, never cut short of its number (round 1 of #164's briefed
-    review, finding 2); what is left is capped as before."""
+    usable answer (#164), then the notice of servers `ALLOWED_DNS_SERVERS` left out
+    (#93), which is short and says a cause no count does. While the whole would not
+    fit SCAN_ERROR_MAX, the next of them is left out whole, never cut short of its
+    number (round 1 of #164's briefed review, finding 2); what is left is capped as
+    before."""
     if not errors:
         return None
     parts: list[str | None] = list(errors)
@@ -460,12 +483,14 @@ async def run(
     max_pps: int,
     clock: Clock,
     pacer: Pacer | None = None,
+    allowed_dns: tuple[Network, ...] | None = None,
 ) -> dict:
     """Sweep `addresses` (from `guard.plan`) and build the result set. `arp_link`
     opens the ARP socket on an interface named in `interfaces`, the host's own as
     `interfaces.discover` reads them when the job starts. `pacer` is the agent's packet
     budget, carried from job to job (`loop.Agent`); without one, the job has its own
-    at `max_pps`."""
+    at `max_pps`. `allowed_dns` is `ALLOWED_DNS_SERVERS` (None: unset), which the
+    servers the PTR lookups ask must lie in (`guard.dns_servers`)."""
     started = clock.now()
     deadline = clock.monotonic() + job.timeout_s
     if pacer is None:
@@ -552,6 +577,8 @@ async def run(
     # fit (`error_text`)
     notice: tuple[int, str | None] | None = None
     counts: tuple[int, str | None] | None = None
+    # the notice of servers ALLOWED_DNS_SERVERS left out, while some are still asked
+    narrowed: tuple[int, str | None] | None = None
     servers: tuple[str, ...] = ()
     if "rdns" in job.methods and alive and not timed_out:
         # chosen once for the job: its own servers, else the host's resolvers as they
@@ -570,9 +597,19 @@ async def run(
             timed_out = True
             errors.append(f"timed out after {job.timeout_s} s during the PTR lookups")
         else:
+            # the host's limit, before any query: a server outside it is never asked,
+            # whether the job named it or resolv.conf lists it (#93)
+            chosen = len(servers)
+            servers, outside = guard.dns_servers(servers, allowed_dns)
             if not servers:
+                # no lookup is made: so the result set is incomplete, and the server
+                # keeps the names it has, as with no server at all
                 complete = False
-                errors.append(NO_DNS_SERVER)
+                errors.append(outside_allowed(outside, chosen) if outside else NO_DNS_SERVER)
+            elif outside:
+                # the rest are asked, as they would be were the others silent
+                errors.append(outside_allowed(outside, chosen))
+                narrowed = (len(errors) - 1, None)
     if servers:
 
         async def lookup(address: Address, _timeout: float) -> None:
@@ -668,5 +705,5 @@ async def run(
         "liveness_complete": liveness_complete,
         "observations": observations,
         "fdns": [],
-        "error": error_text(errors, *(part for part in (notice, counts) if part is not None)),
+        "error": error_text(errors, *(part for part in (notice, counts, narrowed) if part is not None)),
     }

@@ -150,9 +150,11 @@ export default function EnrolmentSteps({ token, expires, serverVersion, location
                 On its first start the agent exchanges the enrolment token for its own and keeps
                 that in the <code>tlg-ipam-agent</code> volume, so the container can be updated
                 without enrolling again. Add <code>-e ALLOWED_CIDRS=…</code> to narrow what it may
-                scan (default: the private and CGNAT ranges) or <code>-e MAX_PPS=…</code> to
-                change its rate limit (default 200 packets/s). For a server certificate from a
-                private CA, mount the CA bundle and name it in <code>-e SSL_CERT_FILE=…</code>.
+                scan (default: the private and CGNAT ranges), <code>-e ALLOWED_DNS_SERVERS=…</code>{' '}
+                to limit the DNS servers its reverse lookups may ask (default: any), or{' '}
+                <code>-e MAX_PPS=…</code> to change its rate limit (default 200 packets/s). For a
+                server certificate from a private CA, mount the CA bundle and name it in{' '}
+                <code>-e SSL_CERT_FILE=…</code>.
               </p>
             </>
           ) : (
@@ -184,7 +186,12 @@ export default function EnrolmentSteps({ token, expires, serverVersion, location
                 agent&apos;s token for the service, and starts the <code>tlg-ipam-agent</code>{' '}
                 unit. Add <code>--allowed-cidrs …</code>, <code>--max-pps …</code> or{' '}
                 <code>--ca-file …</code> (a CA bundle for a server certificate from a private CA)
-                to the last command to set them.
+                to the last command to set them. To limit the DNS servers its reverse lookups may
+                ask, set <code>ALLOWED_DNS_SERVERS</code> in a drop-in (
+                <code>sudo systemctl edit tlg-ipam-agent</code>), since <code>install</code>{' '}
+                rewrites its settings file each time it runs, then run{' '}
+                <code>sudo systemctl restart tlg-ipam-agent</code>: the agent reads it when it
+                starts, and logs the value it took.
               </p>
             </>
           )

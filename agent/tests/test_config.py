@@ -5,7 +5,7 @@ import ipaddress
 import pytest
 
 from conftest import ENROL_TOKEN, TOKEN
-from tlg_ipam_agent.config import DEFAULT_MAX_PPS, ConfigError, load, parse_allowed
+from tlg_ipam_agent.config import DEFAULT_MAX_PPS, ConfigError, load, parse_allowed, parse_allowed_dns
 
 GOOD = {"IPAM_URL": "https://ipam.home.arpa", "IPAM_AGENT_TOKEN": TOKEN}
 
@@ -17,6 +17,8 @@ def test_defaults():
     cfg = settings.config(settings.agent_token)
     assert cfg.token == TOKEN and cfg.url == settings.url
     assert cfg.max_pps == DEFAULT_MAX_PPS == 200
+    # unset: no limit on the DNS servers, as before #93
+    assert settings.allowed_dns is None and cfg.allowed_dns is None
     assert [str(n) for n in cfg.allowed] == [
         "10.0.0.0/8",
         "172.16.0.0/12",
@@ -171,3 +173,61 @@ def test_an_item_that_is_not_a_network_is_named_by_its_place(name, value, place)
     message = str(refused.value)
     assert message == f"{name}: {place} is not a network (host bits must be zero); it is not repeated here"
     assert "y" * 43 not in message and "x" * 43 not in message and "10.0.0.1" not in message
+
+
+# --- ALLOWED_DNS_SERVERS (#93) ---
+
+
+def test_allowed_dns_servers_parsed_and_carried_into_the_config():
+    """Addresses and networks, separated as ALLOWED_CIDRS's are: an address alone is
+    the network of that one address."""
+    settings = load({**GOOD, "ALLOWED_DNS_SERVERS": "10.0.0.53, 192.168.1.0/24  fd00::53"})
+    expected = (
+        ipaddress.ip_network("10.0.0.53/32"),
+        ipaddress.ip_network("192.168.1.0/24"),
+        ipaddress.ip_network("fd00::53/128"),
+    )
+    assert settings.allowed_dns == expected
+    assert settings.config(TOKEN).allowed_dns == expected
+    assert "10.0.0.53/32" in repr(settings.config(TOKEN)) and TOKEN not in repr(settings.config(TOKEN))
+    assert parse_allowed_dns(None) is None
+
+
+@pytest.mark.parametrize("value", ["", "  ", ",", "10.0.0.53/24", "10.0.0.0/33", "dns.home.arpa", "https://dns.example.com/dns-query"])
+def test_bad_allowed_dns_servers_stop_the_agent(value):
+    """Set but empty is refused, not read as "ask no server" or "any": a job that should
+    make no lookup is one whose target does not issue rdns. A name or a URL is refused,
+    since the agent asks addresses only, and so is a network with host bits set."""
+    with pytest.raises(ConfigError, match="ALLOWED_DNS_SERVERS") as refused:
+        load({**GOOD, "ALLOWED_DNS_SERVERS": value})
+    assert "dns.home.arpa" not in str(refused.value) and "example.com" not in str(refused.value)
+
+
+def test_an_allowed_dns_item_that_is_not_a_network_is_named_by_its_place():
+    with pytest.raises(ConfigError) as refused:
+        load({**GOOD, "ALLOWED_DNS_SERVERS": "10.0.0.53 tlge_" + "y" * 43})
+    assert str(refused.value) == (
+        "ALLOWED_DNS_SERVERS: item 2 of 2 is not a network (host bits must be zero); it is not repeated here"
+    )
+
+
+@pytest.mark.parametrize(
+    "value, place",
+    [
+        ("fe80::53%1", "item 1 of 1"),
+        ("fe80::53%eth0", "item 1 of 1"),
+        ("10.0.0.53, fe80::%2/64", "item 2 of 2"),
+        ("10.0.0.53 fd00::53 fe80::%eth1/64", "item 3 of 3"),
+    ],
+)
+def test_an_allowed_dns_item_with_a_scope_is_refused_by_its_place(value, place):
+    """Round 1 of the briefed review, finding 1: `ipaddress` compares networks without
+    the scope, so `fe80::53%1` would let `fe80::53%2`, another interface's resolver,
+    through. A scoped item stops the agent at start, named by its place."""
+    with pytest.raises(ConfigError) as refused:
+        load({**GOOD, "ALLOWED_DNS_SERVERS": value})
+    assert str(refused.value) == (
+        f"ALLOWED_DNS_SERVERS: {place} names an IPv6 scope (%…), which is not supported: a DNS server "
+        "with a scope is never allowed; it is not repeated here"
+    )
+    assert "eth" not in str(refused.value) and "fe80" not in str(refused.value)

@@ -10,7 +10,7 @@ from app import agent_protocol as server
 
 from conftest import ETH0, FakeArp, FakeClock, FakeProber, FakeResolver, job
 from tlg_ipam_agent import guard, probe, scan
-from tlg_ipam_agent.config import parse_allowed
+from tlg_ipam_agent.config import parse_allowed, parse_allowed_dns
 from tlg_ipam_agent.probe import NO_DNS_SERVER, IcmpProber, ProbeError, UnreadReplies, no_query_sent
 from tlg_ipam_agent.protocol import (
     INTERFACE_NAME_MAX,
@@ -30,7 +30,9 @@ def planned(**overrides):
     return parsed, guard.plan(parsed, parse_allowed(None))
 
 
-async def sweep(parsed, addresses, *, prober, resolver=None, arp=None, interfaces=ETH0, clock=None, max_pps=200):
+async def sweep(
+    parsed, addresses, *, prober, resolver=None, arp=None, interfaces=ETH0, clock=None, max_pps=200, allowed_dns=None
+):
     return await scan.run(
         parsed,
         addresses,
@@ -40,6 +42,7 @@ async def sweep(parsed, addresses, *, prober, resolver=None, arp=None, interface
         interfaces=interfaces,
         max_pps=max_pps,
         clock=clock or FakeClock(),
+        allowed_dns=allowed_dns,
     )
 
 
@@ -490,6 +493,118 @@ async def test_the_fake_resolver_keeps_the_real_ones_rules():
     assert taken == []
 
 
+# --- ALLOWED_DNS_SERVERS: no server outside it is asked (#93) ---
+
+
+def dns_nets(value):
+    return parse_allowed_dns(value)
+
+
+async def test_unset_the_jobs_servers_are_asked_as_before():
+    """Acceptance 1: with the setting unset every server the job names is asked, in
+    its order, and the result set is what it was before #93."""
+    live = ["10.0.0.3", "10.0.0.9"]
+    parsed, addresses = planned(dns_servers=["192.0.2.1", "198.51.100.1", "10.0.0.53"])
+    resolver = FakeResolver({"10.0.0.3": "printer.home.arpa"})
+    result = await sweep(parsed, addresses, prober=FakeProber(alive=live), resolver=resolver)
+    assert {servers for _, servers in resolver.asked} == {("192.0.2.1", "198.51.100.1", "10.0.0.53")}
+    assert result["error"] is None and result["complete"] is True
+    assert result["observations"] == [{"ip": "10.0.0.3", "rdns_name": "printer.home.arpa"},
+                                      {"ip": "10.0.0.9", "rdns_no_name": True}]
+
+
+async def test_servers_outside_the_list_are_not_asked_and_the_error_says_how_many():
+    """The rest are asked, in the job's order, and their answers decide the records as
+    they would were the others silent: the scan is complete, and the error is the
+    notice, counts only."""
+    live = ["10.0.0.3", "10.0.0.9"]
+    parsed, addresses = planned(dns_servers=["192.0.2.1", "10.0.0.53", "198.51.100.1"])
+    resolver = FakeResolver({"10.0.0.3": "printer.home.arpa"})
+    result = await sweep(
+        parsed, addresses, prober=FakeProber(alive=live), resolver=resolver, allowed_dns=dns_nets("10.0.0.0/24")
+    )
+    assert {servers for _, servers in resolver.asked} == {("10.0.0.53",)}
+    assert result["error"] == scan.outside_allowed(2, 3) == (
+        "rdns: 2 of the 3 DNS servers to ask are outside ALLOWED_DNS_SERVERS and were not asked"
+    )
+    assert "192.0.2" not in result["error"] and "198.51" not in result["error"]
+    assert result["complete"] is True and result["liveness_complete"] is True
+    assert result["observations"] == [{"ip": "10.0.0.3", "rdns_name": "printer.home.arpa"},
+                                      {"ip": "10.0.0.9", "rdns_no_name": True}]
+
+
+@pytest.mark.parametrize("named, said", [
+    (["192.0.2.1"], "rdns not run: the 1 DNS server to ask is outside ALLOWED_DNS_SERVERS"),
+    (["192.0.2.1", "198.51.100.1", "2001:db8::53"], "rdns not run: all 3 DNS servers to ask are outside ALLOWED_DNS_SERVERS"),
+])
+async def test_no_server_left_makes_no_lookup_and_clears_no_name(named, said):
+    """Acceptance 3: when the list leaves no server, no lookup is made and no query
+    sent. The error names the cause; the result set is incomplete and no record says
+    there is no name, so the server keeps every stored name (spec §5.7); the liveness
+    sweep completed, so the dead are still marked. The host's resolvers are not asked
+    in the job's servers' place."""
+    live = ["10.0.0.3", "10.0.0.9"]
+    parsed, addresses = planned(dns_servers=named)
+    resolver = FakeResolver({"10.0.0.3": "printer.home.arpa"}, host=("10.0.0.53",))
+    result = await sweep(
+        parsed, addresses, prober=FakeProber(alive=live), resolver=resolver, allowed_dns=dns_nets("10.0.0.0/8")
+    )
+    assert resolver.asked == []
+    assert result["error"] == said
+    assert result["complete"] is False and result["liveness_complete"] is True
+    assert result["observations"] == [{"ip": "10.0.0.3"}, {"ip": "10.0.0.9"}]
+    assert not any("rdns_no_name" in o or "rdns_name" in o for o in result["observations"])
+
+
+async def test_the_list_holds_the_hosts_resolvers_too():
+    """A job that names no server asks the host's resolvers, and the list holds them as
+    it holds the job's: no DNS packet goes outside it, whoever chose the server."""
+    live = ["10.0.0.3"]
+    parsed, addresses = planned(dns_servers=[])
+    resolver = FakeResolver({"10.0.0.3": "printer.home.arpa"}, host=("192.0.2.53", "10.0.0.53"))
+    result = await sweep(
+        parsed, addresses, prober=FakeProber(alive=live), resolver=resolver, allowed_dns=dns_nets("10.0.0.53")
+    )
+    assert {servers for _, servers in resolver.asked} == {("10.0.0.53",)}
+    assert result["error"] == scan.outside_allowed(1, 2)
+    assert result["complete"] is True
+    alone = FakeResolver(host=("192.0.2.53",))
+    result = await sweep(
+        parsed, addresses, prober=FakeProber(alive=live), resolver=alone, allowed_dns=dns_nets("10.0.0.53")
+    )
+    assert alone.asked == [] and result["error"] == scan.outside_allowed(1, 1) and result["complete"] is False
+
+
+async def test_with_no_server_at_all_the_error_is_still_no_dns_server():
+    """The list takes nothing from an empty choice: that is #78's error, not #93's."""
+    parsed, addresses = planned(dns_servers=[])
+    resolver = FakeResolver(host=())
+    result = await sweep(
+        parsed, addresses, prober=FakeProber(alive=["10.0.0.3"]), resolver=resolver, allowed_dns=dns_nets("10.0.0.53")
+    )
+    assert result["error"] == NO_DNS_SERVER and result["complete"] is False
+
+
+async def test_a_job_with_no_live_address_needs_no_allowed_server():
+    parsed, addresses = planned(dns_servers=["192.0.2.1"])
+    result = await sweep(parsed, addresses, prober=FakeProber(alive=[]), allowed_dns=dns_nets("10.0.0.53"))
+    assert result["error"] is None and result["complete"] is True
+
+
+async def test_the_notice_comes_before_what_the_lookups_met():
+    """The notice is said where the servers are chosen, ahead of the lookups' own
+    errors, and the refusal counts of the lookups the rest of the servers answered
+    follow it."""
+    live = ["10.0.0.3", "10.0.0.4"]
+    parsed, addresses = planned(dns_servers=["192.0.2.1", "10.0.0.53"])
+    resolver = FakeResolver(unread={"10.0.0.3": BOTH}, unanswered=["10.0.0.4"])
+    result = await sweep(
+        parsed, addresses, prober=FakeProber(alive=live), resolver=resolver, allowed_dns=dns_nets("10.0.0.53")
+    )
+    assert result["error"] == f"{scan.outside_allowed(1, 2)}; {scan.no_answer(2, 2, 1, 1)}"
+    assert result["complete"] is True
+
+
 # --- the job's error counts the replies the agent refused unread (#164) ---
 
 
@@ -766,14 +881,16 @@ async def arp_errors(monkeypatch) -> list[str]:
 
 
 async def longest_job(
-    monkeypatch, exception_name: str, cut_off: bool = False, later: bool = False
+    monkeypatch, exception_name: str, cut_off: bool = False, later: bool = False, narrowed: bool = False
 ) -> tuple[dict, list[str], int]:
     """A job that carries the longest text of each of its steps at once: what it
     reported, the parts its error is made of, as `scan.run` joins them, and the
     count of lookups it counted. With `cut_off`, the PTR lookups end in the deadline's
     timeout instead of a lookup that could send nothing (finding 1's form). With
     `later`, every other lookup is answered by a later server after a refusal of each
-    limit (#170), so both its notice and #164's counts carry four digits."""
+    limit (#170), so both its notice and #164's counts carry four digits. With
+    `narrowed`, two of the job's three DNS servers are outside ALLOWED_DNS_SERVERS
+    (#93), the longest form of that notice."""
     icmp, arp = await icmp_errors(monkeypatch), await arp_errors(monkeypatch)
     longest_icmp, longest_arp = max(icmp, key=len), max(arp, key=len)
     assert longest_icmp.startswith("ICMP needs CAP_NET_RAW") and longest_arp.startswith("arp not run")
@@ -781,11 +898,12 @@ async def longest_job(
         cidr=LONGEST_NETWORK,
         ranges=[{"start": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:f000", "end": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"}],
         methods=["icmp", "arp", "rdns", "fdns"],
-        dns_servers=["127.0.0.1"],
+        dns_servers=["192.0.2.1", "127.0.0.1", "192.0.2.2"] if narrowed else ["127.0.0.1"],
         timeout_s=JOB_TIMEOUT_S,
     )
     parsed = parse_job(job_ref(raw), raw)
     addresses = guard.plan(parsed, parse_allowed(LONGEST_NETWORK))
+    allowed_dns = parse_allowed_dns("127.0.0.1") if narrowed else None
     assert len(addresses) == OBSERVATIONS_MAX and str(parsed.network) == LONGEST_NETWORK
     last = addresses[-1]
     # addresses[-2] is the lookup that fails or is cut off; half the rest are answered
@@ -814,7 +932,7 @@ async def longest_job(
 
     result = await sweep(
         parsed, addresses, prober=Prober(), resolver=Resolver(), arp=FakeArp(), interfaces=(),
-        clock=clock, max_pps=1000,
+        clock=clock, max_pps=1000, allowed_dns=allowed_dns,
     )
     counted = OBSERVATIONS_MAX - 2  # the address ICMP failed on is not alive; one lookup failed
     assert len(str(counted)) == len(str(OBSERVATIONS_MAX))
@@ -826,6 +944,8 @@ async def longest_job(
         lookups = [no_query_sent(exception_name), scan.no_answer(unanswered, counted, unanswered, unanswered)]
     if answered_later:
         lookups.append(scan.answered_later(len(answered_later), len(answered_later)))
+    if narrowed:
+        lookups.insert(0, scan.outside_allowed(2, 3))
     return result, ["not run by this agent release: fdns", longest_icmp, longest_arp, *lookups], counted
 
 
@@ -888,6 +1008,29 @@ async def test_the_notice_is_the_first_part_given_up_by_the_longest_error(monkey
         assert "answered after" not in error
         # the answers decided the records, as they would alone
         assert sum(1 for record in result["observations"] if record.get("rdns_name") == "h.home.arpa") == 2047
+
+
+async def test_the_notice_of_servers_left_out_is_kept_over_the_refusal_counts(monkeypatch):
+    """#93: the longest job of #164's test with two of its three DNS servers outside
+    ALLOWED_DNS_SERVERS, the longest form of that notice. With it the whole would pass
+    SCAN_ERROR_MAX, so #164's refusal counts are left out whole, the count of lookups
+    without a usable answer in its words before #164, and the notice kept: it names a
+    cause on the agent's own host that no count shows. After a timeout the whole fits,
+    and all of it is kept. With #170's notice as well, that goes first, and the rest is
+    the same."""
+    for later in (False, True):
+        result, parts, counted = await longest_job(monkeypatch, LONGEST_EXCEPTION.__name__, later=later, narrowed=True)
+        notice = scan.outside_allowed(2, 3)
+        assert parts[3] == notice and len("; ".join(parts)) > SCAN_ERROR_MAX
+        unanswered = counted - (counted // 2 if later else 0)
+        kept = parts[:5] + [scan.no_answer(unanswered, counted)]
+        error = result["error"]
+        assert error == "; ".join(kept)
+        assert len(error) == 494 <= SCAN_ERROR_MAX and server.scan_error(error) == error
+        assert "refused" not in error and "answered after" not in error
+    result, parts, _ = await longest_job(monkeypatch, LONGEST_EXCEPTION.__name__, cut_off=True, narrowed=True)
+    assert result["error"] == "; ".join(parts) and len(result["error"]) == 405 + 2 + len(scan.outside_allowed(2, 3))
+    assert server.scan_error(result["error"]) == result["error"]
 
 
 # --- the lookups a later server answered after a refused reply are said, as a notice (#170) ---
