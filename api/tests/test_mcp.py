@@ -32,6 +32,7 @@ from .test_findings import (
     LONG_AGO,
     MAC,
     OTHER_MAC,
+    answer,
     backdate,
     dismiss,
     key,
@@ -337,9 +338,9 @@ async def test_list_scan_findings_refusals(client):
     assert unknown.is_error
     assert unknown.content[0].text == "Subnet nope not found"
     # FastMCP checks the type against the schema's enum before the tool runs
-    bad_type = await call("list_scan_findings", {"type": "fdns_mismatch"})
+    bad_type = await call("list_scan_findings", {"type": "dns_mismatch"})
     assert bad_type.is_error
-    assert "fdns_mismatch" in bad_type.content[0].text
+    assert "dns_mismatch" in bad_type.content[0].text
     # no subnets: no findings, not an error
     assert await scan_findings() == []
 
@@ -433,7 +434,7 @@ WRONG_IN_SLOT = {
     1: [1, None, True, [], {}],
     2: [1, None, True, [], {}],
     3: ["167772170", True, -1, 1.5, None, [], {}],
-    4: [1, None, True, [], {}, ["stale"], "fdns_mismatch"],
+    4: [1, None, True, [], {}, ["stale"], "dns_mismatch"],
 }
 
 
@@ -1021,7 +1022,11 @@ async def test_no_statement_of_a_call_scans_or_sorts(client):
                 assert all("ix_reserved_ranges_subnet_excluded" in s for s in searches), plan
             for table in ("hosts", "observations", "finding_dismissals"):
                 if f"FROM {table} " in sql + " " and "EXISTS" not in sql:
-                    assert all("_subnet_ip_int" in s for s in searches), (sql, plan)
+                    # a host's forward-DNS answer is joined by its unique host id (#20):
+                    # one row a host, found by the index, never a scan
+                    joined = [s for s in searches if " fdns_results " in s]
+                    assert all("(host_id=?)" in s and "INDEX sqlite_autoindex_fdns_results" in s for s in joined), plan
+                    assert all("_subnet_ip_int" in s for s in searches if s not in joined), (sql, plan)
 
 
 async def vm_instructions(statements: list) -> int:
@@ -1307,13 +1312,15 @@ async def test_a_walk_that_stops_early_still_lists_every_finding_once(client, mo
     quiet = await make_subnet(client, section["id"], "10.0.2.0/24", name="quiet")
     await make_host(client, quiet["id"], "10.0.2.10", hostname="unscanned")
     res = await client.post(
-        "/api/v1/scan-targets", json={"subnet_id": lab["id"], "scan_dhcp_pool": True}
+        "/api/v1/scan-targets",
+        json={"subnet_id": lab["id"], "scan_dhcp_pool": True, "methods": ["icmp", "rdns", "fdns"]},
     )
     assert res.status_code == 201, res.text
     await backdate(ScanTarget, res.json()["data"]["id"])
     await unknown_hosts(lab["id"], "10.0.0", range(10, 18))
-    await make_host(client, lab["id"], "10.0.0.30", hostname="nas")
+    nas = await make_host(client, lab["id"], "10.0.0.30", hostname="nas")
     await observe(lab["id"], "10.0.0.30", mac=MAC, rdns="storage.home.arpa")
+    await answer(nas["id"], "nas.home.arpa", ["10.0.0.99"])  # three at one: fdns_mismatch
     old = await make_host(client, lab["id"], "10.0.0.40", hostname="old")
     await backdate(Host, old["id"])  # never seen: stale
     await make_host(client, lab["id"], "10.0.0.50", hostname="quiet", mac=MAC)

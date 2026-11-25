@@ -13,7 +13,7 @@ from sqlalchemy import event, func, select, update
 from app.config import settings
 from app.database import SessionLocal, engine
 from app.ipnet import parse_ip
-from app.models import Change, FindingDismissal, Host, Observation, ScanTarget, Section
+from app.models import Change, FdnsResult, FindingDismissal, Host, Observation, ScanTarget, Section
 from app.schemas import HostCreate
 from app.services import findings as findings_svc
 from app.services import scans
@@ -62,6 +62,13 @@ async def observe(subnet_id, ip, *, mac=None, rdns=None, alive=True, seen=RECENT
                 last_seen_at=seen,
             )
         )
+        await session.commit()
+
+
+async def answer(host_id, fqdn, addresses, checked=RECENT):
+    """A forward-DNS answer for the host, as results ingest stores one (#20)."""
+    async with SessionLocal() as session:
+        session.add(FdnsResult(host_id=host_id, fqdn=fqdn, addresses=list(addresses), checked_at=checked))
         await session.commit()
 
 

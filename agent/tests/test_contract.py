@@ -35,6 +35,8 @@ AGENT = Path(__file__).resolve().parents[1]
         "INTERFACE_NAME_MAX",
         "INTERFACES_MAX",
         "OBSERVATIONS_MAX",
+        "FDNS_MAX",
+        "FDNS_ADDRESSES_MAX",
         "RDNS_NAME_MAX",
         "SCAN_ERROR_MAX",
         "ENROL_TOO_OLD",
@@ -180,7 +182,7 @@ def test_the_checkin_body_is_what_the_server_accepts():
     body = loop.checkin_body([{"name": "eth0", "cidr": "10.0.0.5/24", "mac": "02:00:00:00:00:05"}])
     parsed = server.CheckinRequest.model_validate(body)
     assert parsed.protocol == server.PROTOCOL_VERSION
-    assert parsed.capabilities == ["arp", "icmp", "rdns"]
+    assert parsed.capabilities == ["arp", "fdns", "icmp", "rdns"]
 
 
 def _server_job(**overrides) -> dict:
@@ -268,6 +270,39 @@ def test_the_boundary_names_sit_either_side_of_the_cap():
 @pytest.mark.parametrize("value", NAMES)
 def test_rdns_rule_matches_the_server(value):
     assert protocol.rdns_name(value) == server.rdns_name(value)
+
+
+@pytest.mark.parametrize("value", NAMES)
+def test_fdns_rule_matches_the_server(value):
+    """The names a forward-DNS job may carry (#20): the server sends only these, and the
+    agent refuses a job naming any other, so the two rules must be one."""
+    assert protocol.fdns_name(value) == server.fdns_name(value)
+
+
+async def test_the_servers_forward_dns_job_parses_and_its_answers_are_what_the_server_accepts():
+    """#20: a job with names, as the server's model serialises it, and the result set's
+    `fdns` the agent builds from what its lookups found: each entry the server's own
+    model reads back unchanged, a name no server answered usably left out."""
+    a, b, c = (f"00000000-0000-4000-8000-00000000000{x}" for x in "abc")
+    raw = _server_job(
+        methods=["icmp", "fdns"],
+        fdns=[{"host_id": a, "fqdn": "nas.home.arpa"}, {"host_id": b, "fqdn": "gone.home.arpa"},
+              {"host_id": c, "fqdn": "quiet.home.arpa"}],
+    )
+    parsed = protocol.parse_job(protocol.job_ref(raw), raw)
+    result = await scan.run(
+        parsed,
+        guard.plan(parsed, parse_allowed(None)),
+        prober=FakeProber(),
+        resolver=FakeResolver(addresses={"nas.home.arpa": ("10.0.0.9", "10.0.0.19"), "quiet.home.arpa": None}),
+        max_pps=200,
+        clock=FakeClock(),
+    )
+    request = server.ResultsRequest.model_validate(result)
+    assert [answer.model_dump() for answer in request.fdns] == [
+        {"host_id": a, "addresses": ["10.0.0.9", "10.0.0.19"]},
+        {"host_id": b, "addresses": []},
+    ]
 
 
 @pytest.mark.parametrize(

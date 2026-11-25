@@ -188,7 +188,7 @@ async def test_checkin_reports_the_protocol_and_interfaces():
     [body] = server.checkins_posted
     assert body["protocol"] == PROTOCOL_VERSION
     assert body["interfaces"] == [{"name": "eth0", "cidr": "10.0.0.5/24", "mac": "02:00:00:00:00:05"}]
-    assert body["capabilities"] == ["arp", "icmp", "rdns"]
+    assert body["capabilities"] == ["arp", "fdns", "icmp", "rdns"]
     assert body["version"] and body["hostname"] and body["platform"]
 
 

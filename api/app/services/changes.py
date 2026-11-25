@@ -16,6 +16,9 @@ _SNAPSHOT_EXCLUDE = {
     "name_key",
     "token_hash",
     "last_scan_error",
+    # the names a leased job was sent (`scan_targets.job_fdns`): up to a job's worth of
+    # FQDNs, scheduling state that is cleared with the lease
+    "job_fdns",
 }
 
 # What an agent reports about itself at check-in: free text from a credential the

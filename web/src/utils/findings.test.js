@@ -9,6 +9,7 @@ import {
   notDone,
   observedText,
   proposedFields,
+  recordedText,
   scopeChecker,
 } from './findings'
 
@@ -29,13 +30,15 @@ describe('grouping and keys', () => {
   it('groups by type in a fixed order, then types it does not know, keeping the server’s order', () => {
     const groups = groupFindings([
       f('stale', '10.0.0.9'),
+      f('later_type', '10.0.0.7'),
       f('fdns_mismatch', '10.0.0.8'),
       f('unknown_host', '10.0.0.2'),
       f('stale', '10.0.0.3'),
     ])
-    expect(groups.map((g) => g.type.id)).toEqual(['unknown_host', 'stale', 'fdns_mismatch'])
-    expect(groups[1].findings.map((x) => x.ip)).toEqual(['10.0.0.9', '10.0.0.3'])
-    expect(groups[2].type.label).toBe('fdns_mismatch')
+    expect(groups.map((g) => g.type.id)).toEqual(['unknown_host', 'fdns_mismatch', 'stale', 'later_type'])
+    expect(groups[2].findings.map((x) => x.ip)).toEqual(['10.0.0.9', '10.0.0.3'])
+    expect(groups[1].type).toMatchObject({ label: 'Forward DNS mismatch', action: null })
+    expect(groups[3].type.label).toBe('later_type')
   })
 
   it('a key is the four fields and the fingerprint, nothing else', () => {
@@ -169,5 +172,19 @@ describe('scope and last seen', () => {
     const cell = lastSeenCell({ last_seen: '2026-11-15T23:30:00.123456', last_seen_source: 'manual' }, null)
     expect(cell).toMatchObject({ text: at.toLocaleDateString(), source: 'manual', notScanned: false })
     expect(cell.title).toBe(`${new Date(Date.UTC(2026, 10, 15, 23, 30, 0, 123)).toLocaleString()} (set by hand)`)
+  })
+})
+
+describe('forward DNS findings (#20)', () => {
+  it('says what the host’s name resolved to, or that it does not resolve', () => {
+    expect(observedText(f('fdns_mismatch', '10.0.0.8', { observed: 'unresolved' }))).toBe('does not resolve')
+    expect(observedText(f('fdns_mismatch', '10.0.0.8', { observed: '10.0.0.9, 10.0.0.10' }))).toBe(
+      'resolves to 10.0.0.9, 10.0.0.10'
+    )
+  })
+
+  it('records the host’s FQDN and address beside it', () => {
+    const host = { ip: '10.0.0.8', fqdn: 'nas.home.arpa', hostname: 'nas' }
+    expect(recordedText(f('fdns_mismatch', '10.0.0.8', { host_id: 'h' }), host)).toBe('nas.home.arpa at 10.0.0.8')
   })
 })

@@ -35,9 +35,12 @@ export function FindingsBadge({ count, onClick }) {
 
 // What accepting writes. A proposal that sets a domain override says so, with the
 // domain the host follows now, because accepting it stops the host following it.
-function Proposal({ finding, subnet, host }) {
+function Proposal({ finding, subnet, host, informational }) {
   const fields = proposedFields(finding)
   const override = domainOverride(finding, subnet, host)
+  if (informational) {
+    return <span className="text-slate-500">nothing: correct the host or its DNS record, or dismiss</span>
+  }
   return (
     <div>
       <span className="font-mono">
@@ -142,6 +145,7 @@ function Group({ group, subnet, hostsById, busy, onRun }) {
             </button>
           </span>
         ) : (
+          type.action &&
           findings.length > 1 && (
             <button
               type="button"
@@ -182,19 +186,21 @@ function Group({ group, subnet, hostsById, busy, onRun }) {
                 <td className="break-words py-1.5 pr-3 text-slate-400">{recordedText(f, host)}</td>
                 <td className="break-words py-1.5 pr-3 font-mono text-slate-200">{observedText(f)}</td>
                 <td className="break-words py-1.5 pr-3 text-slate-300">
-                  <Proposal finding={f} subnet={subnet} host={host} />
+                  <Proposal finding={f} subnet={subnet} host={host} informational={!type.action} />
                 </td>
                 <td className="py-1.5 text-right">
                   <span className="inline-flex gap-1.5">
-                    <button
-                      type="button"
-                      className={`${smallBtn} bg-blue-600 text-white hover:bg-blue-500`}
-                      disabled={busy}
-                      onClick={() => onRun('accept', [f])}
-                      aria-label={`${type.action} ${f.ip}`}
-                    >
-                      {type.action}
-                    </button>
+                    {type.action && (
+                      <button
+                        type="button"
+                        className={`${smallBtn} bg-blue-600 text-white hover:bg-blue-500`}
+                        disabled={busy}
+                        onClick={() => onRun('accept', [f])}
+                        aria-label={`${type.action} ${f.ip}`}
+                      >
+                        {type.action}
+                      </button>
+                    )}
                     <button
                       type="button"
                       className={`${smallBtn} border border-slate-600 text-slate-300 hover:bg-slate-700`}

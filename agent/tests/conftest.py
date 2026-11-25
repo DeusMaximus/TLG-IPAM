@@ -40,7 +40,7 @@ from tlg_ipam_agent import scan  # noqa: E402
 from tlg_ipam_agent.client import AgentClient  # noqa: E402
 from tlg_ipam_agent.config import Config, parse_allowed  # noqa: E402
 from tlg_ipam_agent.loop import Agent  # noqa: E402
-from tlg_ipam_agent.probe import NO_DNS_SERVER, NO_NAME, ProbeError, usable_servers  # noqa: E402
+from tlg_ipam_agent.probe import NO_DNS_SERVER, NO_NAME, ProbeError, no_dns_server, usable_servers  # noqa: E402
 
 TOKEN = "tlga_" + "x" * 43
 ENROL_TOKEN = "tlge_" + "y" * 43
@@ -123,13 +123,18 @@ class FakeResolver:
     server's reply refused unread, #164), the `probe.AnsweredPastRefusal` given for an
     address in `later` (a later server's answer after such a refusal, #170), and
     NO_NAME for any other, as a server's
-    NXDOMAIN; a lookup whose slot left it no time is None. The real resolver's tests
-    are in test_probe.py."""
+    NXDOMAIN; a lookup whose slot left it no time is None. The forward lookups (`a`,
+    #20) answer by name the same way, from `addresses`: an entry's value is what `a`
+    returns (a tuple of addresses, NO_NAME, None, UnreadReplies or
+    AnsweredPastRefusal), and a name not there is NO_NAME. `resolved` records the
+    names asked, in order. The real resolver's tests are in test_probe.py."""
 
     def __init__(
         self, names=None, clock: FakeClock | None = None, delay: float = 0.0, host=HOST_DNS, unanswered=(),
-        unread=None, later=None,
+        unread=None, later=None, addresses=None,
     ):
+        self.addresses = dict(addresses or {})
+        self.resolved: list = []
         self.names = {ipaddress.ip_address(k): v for k, v in (names or {}).items()}
         # addresses no server gives a usable answer for; any other address not in
         # `names` is answered "no name" (NO_NAME), as NXDOMAIN is
@@ -167,6 +172,19 @@ class FakeResolver:
         if address in self.later:
             return self.later[address]
         return self.names.get(address, NO_NAME)
+
+    async def a(self, name, servers, slot):
+        if not servers:
+            raise ProbeError(no_dns_server("fdns"))
+        timeout = await slot()
+        if timeout <= 0:
+            return None
+        self.resolved.append((name, servers))
+        if self.delay and self.clock is not None:
+            await self.clock.sleep(self.delay)
+        else:
+            await asyncio.sleep(0)
+        return self.addresses.get(name, NO_NAME)
 
 
 # ARP frames written out here from RFC 826, not with the agent's own `arp` module, so a

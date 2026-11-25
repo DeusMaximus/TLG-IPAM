@@ -294,7 +294,10 @@ class ScanRange(BaseModel):
 
 
 class FdnsName(BaseModel):
-    """A host whose name the agent should resolve (`fdns`, spec §5.2)."""
+    """A host whose name the agent should resolve (`fdns`, spec §5.2): only a host in
+    the job's scan scope whose FQDN is under the subnet's domain (spec §7.2, invariant
+    5; `services/fdns.names_for_job`), and only an FQDN that is a DNS hostname in the
+    form `fdns_name` keeps, which the agent checks again before it asks anything."""
 
     host_id: str
     fqdn: str
@@ -323,7 +326,8 @@ class Job(BaseModel):
     # means the agent's own resolver
     dns_servers: list[str] = Field(max_length=DNS_SERVERS_MAX)
     timeout_s: int
-    # the names to resolve for fdns; only ever names under the subnet's domain
+    # the names to resolve for fdns; only ever names under the subnet's domain, of hosts
+    # in the scan scope, and none unless `methods` holds fdns
     fdns: list[FdnsName]
 
 
@@ -344,7 +348,12 @@ class CheckinResponse(BaseModel):
 # 253-character name is under 330 bytes: a full result set is about 1.3 MB.
 # records in one result set: every address of a /20
 OBSERVATIONS_MAX = 4096
+# names in one job, and answers in one result set: every address of a /20. The server
+# sends at most `fdns.FDNS_JOB_MAX` in a job, so that the check-in answer stays inside
+# what the agent reads (`client.RESPONSE_MAX`)
 FDNS_MAX = 4096
+# addresses in one answer: more than a reply inside the agent's limits can carry (at
+# most DNS_RECORDS_MAX records, its OPT among them)
 FDNS_ADDRESSES_MAX = 32
 RDNS_NAME_MAX = 253
 SCAN_ERROR_MAX = 500
@@ -385,6 +394,17 @@ def rdns_name(value: Any) -> str | None:
     if all(_HOST_LABEL.fullmatch(label) for label in name.split(".")):
         return name
     return None
+
+
+def fdns_name(value: Any) -> str | None:
+    """A name a forward-DNS job may send (spec §5.2), or None: a DNS hostname exactly as
+    `rdns_name` keeps one, already in that form (lowercase, no trailing dot), so that
+    what the agent is asked is what the server checked. A host whose FQDN is anything
+    else (a hostname with a space or an underscore, say, which the hosts service
+    allows) is not sent. The agent refuses a job naming anything else
+    (`protocol.parse_job`, its copy)."""
+    name = rdns_name(value)
+    return name if name is not None and name == value else None
 
 
 def scan_error(value: str | None) -> str | None:
@@ -481,11 +501,14 @@ def echo_ip(raw: Any) -> str | None:
 
 
 class FdnsAnswer(BaseModel):
-    """The forward-DNS answer for one host the job named (`fdns`, spec §5.2). No job
-    names a host until the forward-DNS check exists (#20), so none is accepted yet."""
+    """The forward-DNS answer for one host the job named (`fdns`, spec §5.2). Ingest
+    stores it only for a host the server sent in that job, under the name it sent
+    (`services/fdns.store`), and only when every address is an IPv4 address. A name
+    no DNS server gave a usable answer for has no entry: the stored answer stays."""
 
     host_id: str = Field(max_length=_ID_MAX)
-    # the IPv4 addresses the name resolved to; empty when it did not resolve
+    # the IPv4 addresses the name resolved to; empty when a DNS server answered that it
+    # does not resolve (NXDOMAIN, or no A record)
     addresses: list[str] = Field(max_length=FDNS_ADDRESSES_MAX)
 
 
@@ -510,6 +533,7 @@ class ResultsRequest(BaseModel):
     liveness_complete: StrictBool | None = None
     # live addresses only; each record is checked on its own (`parse_observation`)
     observations: list[Any] = Field(max_length=OBSERVATIONS_MAX)
+    # the answers of the names the job sent; a name that got no usable answer has none
     fdns: list[FdnsAnswer] = Field(default=[], max_length=FDNS_MAX)
     # what went wrong, if anything; sanitised (`scan_error`) and kept on the target
     error: str | None = None
