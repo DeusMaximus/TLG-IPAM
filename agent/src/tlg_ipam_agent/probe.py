@@ -76,9 +76,23 @@ class UnreadReplies(NamedTuple):
     It is no usable answer, as None is, and the stored name stays: it only says which
     of the agent's own limits refused a reply, so that the job's error can count them
     (`scan.no_answer`). It holds nothing of the reply, its sender or the address. A
-    lookup a later server answered returns that answer, whatever an earlier server
-    sent."""
+    lookup a later server answered returns that answer, wrapped in AnsweredPastRefusal
+    when an earlier server's reply was refused (#170)."""
 
+    too_large: bool
+    too_many_records: bool
+
+
+class AnsweredPastRefusal(NamedTuple):
+    """What `ptr` returns in place of its answer for a lookup a later server answered
+    (`answer`: a name, or NO_NAME) after an earlier attempt ended with a reply from
+    that attempt's own server that the agent refused unread (#170), saying which
+    limits refused one, as UnreadReplies does. The answer decides the record exactly
+    as it would alone; the flags only let the job's error say that an earlier server's
+    replies cost a query more (`scan.answered_later`). It holds nothing of the reply,
+    its sender or the address."""
+
+    answer: str | NoName
     too_large: bool
     too_many_records: bool
 
@@ -91,14 +105,26 @@ def no_usable_answer(too_large: bool, too_many_records: bool) -> UnreadReplies |
     return None
 
 
+def answered(answer: str | NoName, too_large: bool, too_many_records: bool) -> str | NoName | AnsweredPastRefusal:
+    """What `ptr` returns for a lookup a server answered: the answer itself, as before
+    #170, when no earlier attempt's reply was refused unread, and AnsweredPastRefusal
+    otherwise."""
+    if too_large or too_many_records:
+        return AnsweredPastRefusal(answer, too_large, too_many_records)
+    return answer
+
+
 class Resolver(Protocol):
     # the servers one job's lookups ask, chosen once as the job's lookups start
     async def servers(self, job_servers: tuple[str, ...]) -> tuple[str, ...]: ...
-    # the name, NO_NAME when a server said there is none, or, when no server gave a
-    # usable answer, None, or UnreadReplies when a server's reply was refused unread
-    # for the agent's own limits; raises ProbeError when no query of the lookup could
-    # be sent: that is no lookup
-    async def ptr(self, address: Address, servers: tuple[str, ...], slot: Slot) -> str | NoName | UnreadReplies | None: ...
+    # the name, NO_NAME when a server said there is none, either wrapped in
+    # AnsweredPastRefusal when an earlier server's reply was refused unread for the
+    # agent's own limits, or, when no server gave a usable answer, None, or
+    # UnreadReplies when a server's reply was so refused; raises ProbeError when no
+    # query of the lookup could be sent: that is no lookup
+    async def ptr(
+        self, address: Address, servers: tuple[str, ...], slot: Slot
+    ) -> str | NoName | AnsweredPastRefusal | UnreadReplies | None: ...
 
 
 class IcmpProber:
@@ -593,7 +619,8 @@ class DnsResolver:
     rest, a lookup one of whose attempts met a reply refused unread (ReplyTooLarge,
     ReplyTooManyRecords) is UnreadReplies instead of None, saying which, so the job's
     error can say the agent's own limit refused a server's reply (#164); it clears no
-    name either."""
+    name either. A lookup a later server answered after such a refusal returns its
+    answer wrapped in AnsweredPastRefusal, so the job's error can say that too (#170)."""
 
     def __init__(
         self,
@@ -659,7 +686,9 @@ class DnsResolver:
         except TimeoutError:
             return ()
 
-    async def ptr(self, address: Address, servers: tuple[str, ...], slot: Slot) -> str | NoName | UnreadReplies | None:
+    async def ptr(
+        self, address: Address, servers: tuple[str, ...], slot: Slot
+    ) -> str | NoName | AnsweredPastRefusal | UnreadReplies | None:
         """The PTR name of `address`, or NO_NAME when a server says there is none
         (NXDOMAIN, or NOERROR without a PTR record that `says_no_name`), as one reply
         is read by `read_reply`, or None when
@@ -671,8 +700,10 @@ class DnsResolver:
         parsed), or when the lookup's time ran out after a query was sent (or before its first attempt, which only
         the job's deadline does). In place of None it returns UnreadReplies when any of
         those attempts ended with a reply refused unread for its size or its header's
-        counts (`no_usable_answer`). Raises ProbeError when there is no server to ask, or
-        when no query was sent before the servers or the lookup's time ran out."""
+        counts (`no_usable_answer`), and in place of a name or NO_NAME it returns
+        AnsweredPastRefusal when an attempt before the answer ended so (`answered`,
+        #170). Raises ProbeError when there is no server to ask, or when no query was
+        sent before the servers or the lookup's time ran out."""
         if not servers:
             raise ProbeError(NO_DNS_SERVER)
         name = dns.reversename.from_address(str(address))
@@ -739,8 +770,8 @@ class DnsResolver:
                     # (ReplyTooLarge), or one claiming too many records
                     # (ReplyTooManyRecords): the query was sent, and the next server
                     # is asked. (TimeoutError is an OSError: caught first.) The two
-                    # refusals are remembered for the job's error, should no later
-                    # server answer
+                    # refusals are remembered for the job's error, whether a later
+                    # server answers or not (#164, #170)
                     asked = True
                     too_large = too_large or isinstance(exc, ReplyTooLarge)
                     too_many_records = too_many_records or isinstance(exc, ReplyTooManyRecords)
@@ -761,7 +792,7 @@ class DnsResolver:
                 # SERVFAIL, REFUSED, a referral, an alias left unresolved, or records
                 # that do not answer the question: the next server
                 continue
-            return answer
+            return answered(answer, too_large, too_many_records)
         if not asked:
             # every server was tried, and none could be sent the query
             raise ProbeError(no_query_sent(unsent or "unknown"))

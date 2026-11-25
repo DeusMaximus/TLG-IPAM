@@ -571,7 +571,9 @@ async def test_a_job_with_no_refused_reply_reports_what_it_did():
     """Acceptance 2, through a job: lookups without a usable answer that met no
     refused reply give the text before #164; a job whose every lookup was answered
     has no error, whatever a server's reply before the answer was (the resolver returns
-    the answer, `test_probe.py`'s `test_a_refused_reply_a_later_server_answered_past_is_not_reported`)."""
+    the bare answer when no reply before it was refused, `test_probe.py`'s
+    `test_an_answer_with_no_refusal_before_it_is_the_bare_answer`; one after a refusal
+    is #170's notice, `test_a_job_whose_every_first_reply_was_refused_and_every_lookup_answered_says_so`)."""
     parsed, addresses = planned()
     result = await sweep(
         parsed, addresses, prober=FakeProber(alive=["10.0.0.3", "10.0.0.4"]),
@@ -763,11 +765,15 @@ async def arp_errors(monkeypatch) -> list[str]:
     ]
 
 
-async def longest_job(monkeypatch, exception_name: str, cut_off: bool = False) -> tuple[dict, list[str], int]:
+async def longest_job(
+    monkeypatch, exception_name: str, cut_off: bool = False, later: bool = False
+) -> tuple[dict, list[str], int]:
     """A job that carries the longest text of each of its steps at once: what it
     reported, the parts its error is made of, as `scan.run` joins them, and the
     count of lookups it counted. With `cut_off`, the PTR lookups end in the deadline's
-    timeout instead of a lookup that could send nothing (finding 1's form)."""
+    timeout instead of a lookup that could send nothing (finding 1's form). With
+    `later`, every other lookup is answered by a later server after a refusal of each
+    limit (#170), so both its notice and #164's counts carry four digits."""
     icmp, arp = await icmp_errors(monkeypatch), await arp_errors(monkeypatch)
     longest_icmp, longest_arp = max(icmp, key=len), max(arp, key=len)
     assert longest_icmp.startswith("ICMP needs CAP_NET_RAW") and longest_arp.startswith("arp not run")
@@ -782,6 +788,8 @@ async def longest_job(monkeypatch, exception_name: str, cut_off: bool = False) -
     addresses = guard.plan(parsed, parse_allowed(LONGEST_NETWORK))
     assert len(addresses) == OBSERVATIONS_MAX and str(parsed.network) == LONGEST_NETWORK
     last = addresses[-1]
+    # addresses[-2] is the lookup that fails or is cut off; half the rest are answered
+    answered_later = set(addresses[:-2][::2]) if later else set()
     clock = FakeClock()
 
     class Prober(FakeProber):
@@ -800,6 +808,8 @@ async def longest_job(monkeypatch, exception_name: str, cut_off: bool = False) -
                     await clock.sleep(left + JOB_TIMEOUT_S)  # past the deadline
                     return None
                 raise ProbeError(no_query_sent(exception_name))
+            if address in answered_later:
+                return probe.AnsweredPastRefusal("h.home.arpa", True, True)
             return BOTH
 
     result = await sweep(
@@ -808,10 +818,14 @@ async def longest_job(monkeypatch, exception_name: str, cut_off: bool = False) -
     )
     counted = OBSERVATIONS_MAX - 2  # the address ICMP failed on is not alive; one lookup failed
     assert len(str(counted)) == len(str(OBSERVATIONS_MAX))
+    unanswered = counted - len(answered_later)
+    assert len(str(unanswered)) == len(str(len(answered_later) or unanswered)) == len(str(OBSERVATIONS_MAX))
     if cut_off:
-        lookups = [f"timed out after {JOB_TIMEOUT_S} s during the PTR lookups", scan.cut_short(counted, counted)]
+        lookups = [f"timed out after {JOB_TIMEOUT_S} s during the PTR lookups", scan.cut_short(unanswered, unanswered)]
     else:
-        lookups = [no_query_sent(exception_name), scan.no_answer(counted, counted, counted, counted)]
+        lookups = [no_query_sent(exception_name), scan.no_answer(unanswered, counted, unanswered, unanswered)]
+    if answered_later:
+        lookups.append(scan.answered_later(len(answered_later), len(answered_later)))
     return result, ["not run by this agent release: fdns", longest_icmp, longest_arp, *lookups], counted
 
 
@@ -854,3 +868,181 @@ async def test_an_error_too_long_for_the_counts_stores_none_of_them(monkeypatch)
     assert error == "; ".join(parts[:-1] + [scan.no_answer(counted, counted)])
     assert len(error) <= SCAN_ERROR_MAX and server.scan_error(error) == error
     assert "refused" not in error
+
+
+async def test_the_notice_is_the_first_part_given_up_by_the_longest_error(monkeypatch):
+    """#170, acceptance 3: the longest job of #164's test with half its lookups answered
+    by a later server after a refusal of each limit, every count at four digits. With
+    the notice the whole would pass SCAN_ERROR_MAX, so the notice is left out whole and
+    the rest is what #164 stores: 495 characters, and 405 after a timeout, the refusal
+    counts of the lookups without a usable answer whole, and stored as sent."""
+    for cut_off, length in ((False, 495), (True, 405)):
+        result, parts, _ = await longest_job(monkeypatch, LONGEST_EXCEPTION.__name__, cut_off, later=True)
+        assert parts[-1].startswith("rdns: a later server answered after")
+        assert len("; ".join(parts)) > SCAN_ERROR_MAX
+        error = result["error"]
+        assert error == "; ".join(parts[:-1])
+        assert len(error) == length <= SCAN_ERROR_MAX
+        assert server.scan_error(error) == error
+        assert "the agent refused a reply over 1232 bytes in 2047 lookups, over 1 question or 32 records in 2047 lookups" in error
+        assert "answered after" not in error
+        # the answers decided the records, as they would alone
+        assert sum(1 for record in result["observations"] if record.get("rdns_name") == "h.home.arpa") == 2047
+
+
+# --- the lookups a later server answered after a refused reply are said, as a notice (#170) ---
+
+
+LATER_TOO_LARGE = (True, False)
+LATER_TOO_MANY = (False, True)
+LATER_BOTH = (True, True)
+
+
+async def test_a_job_whose_every_first_reply_was_refused_and_every_lookup_answered_says_so():
+    """Acceptance 2: every lookup's first reply was refused, for its size or its
+    header's counts, and every lookup was answered by a later server, with a name or
+    that there is none. The error is the notice alone, by limit, in lookups, counts
+    only; the scan is complete, and each record is what the answer alone makes it: the
+    same records as a job whose servers answered at once, which has no error."""
+    live = ["10.0.0.3", "10.0.0.4", "10.0.0.5", "10.0.0.6"]
+    answers = {"10.0.0.3": "three.home.arpa", "10.0.0.4": "four.home.arpa", "10.0.0.5": probe.NO_NAME,
+               "10.0.0.6": "six.home.arpa"}
+    flags = {"10.0.0.3": LATER_TOO_LARGE, "10.0.0.4": LATER_TOO_LARGE, "10.0.0.5": LATER_TOO_MANY,
+             "10.0.0.6": LATER_BOTH}
+    later = {a: probe.AnsweredPastRefusal(answers[a], *flags[a]) for a in live}
+    parsed, addresses = planned()
+    result = await sweep(parsed, addresses, prober=FakeProber(alive=live), resolver=FakeResolver(later=later))
+    assert result["error"] == (
+        "rdns: a later server answered after the agent refused a reply over 1232 bytes in 3 lookups, "
+        "over 1 question or 32 records in 2 lookups"
+    )
+    assert result["error"] == scan.answered_later(3, 2)
+    assert "10.0." not in result["error"] and "home.arpa" not in result["error"]
+    assert result["complete"] is True and result["liveness_complete"] is True
+    assert result["observations"] == [
+        {"ip": "10.0.0.3", "rdns_name": "three.home.arpa"}, {"ip": "10.0.0.4", "rdns_name": "four.home.arpa"},
+        {"ip": "10.0.0.5", "rdns_no_name": True}, {"ip": "10.0.0.6", "rdns_name": "six.home.arpa"},
+    ]
+    # acceptance 2's other half: no refusal, the same answers, and no error, as before
+    plain = FakeResolver({a: n for a, n in answers.items() if isinstance(n, str)})
+    before = await sweep(parsed, addresses, prober=FakeProber(alive=live), resolver=plain)
+    assert before["error"] is None and before["complete"] is True
+    assert before["observations"] == result["observations"]
+
+
+async def test_a_name_a_later_server_answered_is_sanitised_as_any_other():
+    """The wrapped answer goes through `rdns_name` as a bare one does: a name that is
+    not a hostname is dropped, the record carries neither, and the lookup is still
+    one a later server answered."""
+    later = {"10.0.0.3": probe.AnsweredPastRefusal("Evil<b>.home.arpa", True, False),
+             "10.0.0.4": probe.AnsweredPastRefusal("NAS.Home.Arpa.", False, True)}
+    parsed, addresses = planned()
+    result = await sweep(
+        parsed, addresses, prober=FakeProber(alive=list(later)), resolver=FakeResolver(later=later)
+    )
+    assert result["observations"] == [{"ip": "10.0.0.3"}, {"ip": "10.0.0.4", "rdns_name": "nas.home.arpa"}]
+    assert result["error"] == scan.answered_later(1, 1)
+
+
+@pytest.mark.parametrize(
+    "counts, said",
+    [
+        ((3, 0), "rdns: a later server answered after the agent refused a reply over 1232 bytes in 3 lookups"),
+        ((0, 1), "rdns: a later server answered after the agent refused a reply over 1 question or 32 records in 1 lookup"),
+        ((1, 2), "rdns: a later server answered after the agent refused a reply over 1232 bytes in 1 lookup, "
+                 "over 1 question or 32 records in 2 lookups"),
+    ],
+)
+def test_the_notice_names_only_the_limits_that_refused_a_reply(counts, said):
+    assert scan.answered_later(*counts) == said
+    assert " 0 " not in said
+
+
+async def test_the_notice_follows_the_count_of_lookups_without_a_usable_answer():
+    """Lookups of both kinds in one job: one without a usable answer whose reply was
+    refused (#164's count), one a later server answered after a refusal, one answered
+    at once. #164's part comes first, unchanged, then the notice; each counts only its
+    own lookups."""
+    live = ["10.0.0.3", "10.0.0.4", "10.0.0.5"]
+    resolver = FakeResolver(
+        {"10.0.0.5": "five.home.arpa"},
+        unread={"10.0.0.3": TOO_LARGE},
+        later={"10.0.0.4": probe.AnsweredPastRefusal("four.home.arpa", False, True)},
+    )
+    parsed, addresses = planned()
+    result = await sweep(parsed, addresses, prober=FakeProber(alive=live), resolver=resolver)
+    assert result["error"] == f"{scan.no_answer(1, 3, 1, 0)}; {scan.answered_later(0, 1)}"
+    assert result["complete"] is True
+    assert result["observations"] == [
+        {"ip": "10.0.0.3"}, {"ip": "10.0.0.4", "rdns_name": "four.home.arpa"},
+        {"ip": "10.0.0.5", "rdns_name": "five.home.arpa"},
+    ]
+
+
+async def test_the_notice_follows_a_timeout_and_counts_the_lookups_that_returned():
+    """A lookup a later server answered after a refusal returns at once, the other runs
+    past the deadline: the timeout's error, then the notice; nothing of #164's, since
+    no lookup that returned went without an answer."""
+    clock = FakeClock()
+    parsed, addresses = planned(ranges=[{"start": "10.0.0.1", "end": "10.0.0.2"}], timeout_s=1)
+    first = probe.AnsweredPastRefusal("one.home.arpa", True, False)
+    result = await sweep(
+        parsed, addresses, prober=FakeProber(alive=["10.0.0.1", "10.0.0.2"]),
+        resolver=DeadlineResolver(clock, first, None), clock=clock,
+    )
+    assert result["error"] == f"timed out after 1 s during the PTR lookups; {scan.answered_later(1, 0)}"
+    assert result["complete"] is False
+    assert result["observations"][0] == {"ip": "10.0.0.1", "rdns_name": "one.home.arpa"}
+
+
+async def test_the_notice_follows_a_lookup_that_could_send_nothing():
+    live = ["10.0.0.1", "10.0.0.2"]
+
+    class Resolver(FakeResolver):
+        async def ptr(self, address, servers, slot):
+            if address == ipaddress.ip_address("10.0.0.2"):
+                for _ in range(20):
+                    await asyncio.sleep(0)  # the lookup before it ends first
+                raise ProbeError(no_query_sent("OSError"))
+            return await super().ptr(address, servers, slot)
+
+    resolver = Resolver(later={"10.0.0.1": probe.AnsweredPastRefusal(probe.NO_NAME, True, True)})
+    parsed, addresses = planned()
+    result = await sweep(parsed, addresses, prober=FakeProber(alive=live), resolver=resolver)
+    assert result["error"] == f"{no_query_sent('OSError')}; {scan.answered_later(1, 1)}"
+    assert result["complete"] is False
+    assert result["observations"] == [{"ip": "10.0.0.1", "rdns_no_name": True}, {"ip": "10.0.0.2"}]
+
+
+def test_the_notice_is_given_up_whole_before_the_refusal_counts():
+    """Acceptance 3, across every length of the rest of an error: the notice is kept
+    whole while the whole fits the cap and is left out whole once it would not; only
+    once the rest with #164's counts would not fit either are those counts given up,
+    as #164 gives them up; no count is ever stored cut short, and what is stored is
+    what the server stores."""
+    full, plain = scan.no_answer(3, 9, 1, 2), scan.no_answer(3, 9)
+    notice = scan.answered_later(4, 5)
+    timeout = "timed out after 1 s during the PTR lookups"
+    cut = scan.cut_short(1, 2)
+    for length in range(1, SCAN_ERROR_MAX):
+        head = "x" * length
+        stored = scan.error_text([head, full, notice], (2, None), (1, plain))
+        if length + 4 + len(full) + len(notice) <= SCAN_ERROR_MAX:
+            assert stored == f"{head}; {full}; {notice}"
+        elif length + 2 + len(full) <= SCAN_ERROR_MAX:
+            assert stored == f"{head}; {full}"
+        else:
+            assert stored == scan_error(f"{head}; {plain}")
+        assert server.scan_error(stored) == stored and len(stored) <= SCAN_ERROR_MAX
+        assert "refused" not in stored or stored.endswith(("lookup", "lookups"))
+        # the notice alone, and after a timeout's refusals
+        stored = scan.error_text([head, notice], (1, None))
+        assert stored == (f"{head}; {notice}" if length + 2 + len(notice) <= SCAN_ERROR_MAX else scan_error(head))
+        stored = scan.error_text([head, timeout, cut, notice], (3, None), (2, None))
+        if length + 6 + len(timeout) + len(cut) + len(notice) <= SCAN_ERROR_MAX:
+            assert stored == f"{head}; {timeout}; {cut}; {notice}"
+        elif length + 4 + len(timeout) + len(cut) <= SCAN_ERROR_MAX:
+            assert stored == f"{head}; {timeout}; {cut}"
+        else:
+            assert stored == scan_error(f"{head}; {timeout}")
+        assert "refused" not in stored or stored.endswith(("lookup", "lookups"))
