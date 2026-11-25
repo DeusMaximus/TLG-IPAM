@@ -27,6 +27,45 @@ Template:
 
 ---
 
+## 2026-11-25 — Claude Code (Opus 5.5), worker — #159: publish-release stops when it cannot tell whether the tag has a release (PR #166)
+- **Merged:** 2026-11-25, squash `bc3ba04`, at head `5efdd34`; branch deleted, #159 closed. Tests: 1,723 agent at the head; 1,741 passed and 4 skipped on the tree merged with `main` after PR #167 (orchestrator's run).
+- **Done:** [PR #166](https://github.com/DeusMaximus/TLG-IPAM/pull/166).
+  - `release.yml`, `publish-release`: it reads the repository's releases page by page (`gh api …/releases?per_page=100&page=N`, no `--paginate`). The jq prints `page <length>` first for a JSON array, then `<id> <draft>` for each release whose tag is the tag (`env.TAG`). Each answer must print its marker. The list ends at the first page shorter than 100, and an attempt that reaches page 20 full fails.
+    - No release → `gh release create`, as before.
+    - One release → the wheel is checked or attached, and a draft is published, as before.
+    - More than one → stop with nothing changed (gh's `FetchRelease` would answer with either).
+    - Could not tell → three attempts (15/30/45 s), each from page 1 with the list emptied, then stop with nothing created, uploaded or edited.
+    - gh's error text goes on one warning line.
+    - `publish-image`, the names and the permissions are unchanged.
+  - `release_stubs.py`: the `gh release view` model and `lookup_wins` are gone. A one-page `gh api` stand-in, from gh 2.105 `pkg/cmd/api` and go-gh 2.17 jq, refuses any other argument list. `FetchRelease` calls are refused when a published release and a draft share the tag.
+  - `test_release.py`: `test_only_the_two_publish_steps_are_given_the_token`. A credential is the `secrets` context, or the `github` context reached any way but one named property other than `token` (`toJSON(github)` included). 21 placements are refused and 8 named-property expressions allowed.
+  - Docs: `.agents/releases.md` (the jobs table, and what the owner sees and does for each stop); the `AGENTS.md` "One version" bullet; one sentence each in spec §5.6 and brief §2.4.
+- **Review:**
+  - Briefed round (Codex, GPT-6.1 Sol) at `640b30d`: GO with two P3s, the whole `github` context and a later-page `204`. Both were fixed in `5efdd34` and read by the orchestrator against the remedies (a page with no marker taken for the end of the list failed five tests).
+  - Automatic reviews: Codex clean at `640b30d` and `5efdd34`; Greptile no findings at `640b30d`, not retriggered.
+- **Decisions:** PR Deliberate calls 1–6:
+  - the list endpoint rather than get-by-tag, whose 404 is not proof of absence;
+  - more than one release stops the job;
+  - a marker on every page, asked for page by page, at most 20 pages;
+  - the retry copied from `publish-image`;
+  - the scope of the token rule;
+  - the tripwire changed only in the stub's accepted call, with no new shell word.
+- **State:** merged.
+  - Mutations caught at `5efdd34` (bash 5, publish tests, the author's): old behaviour 38 failed, no retry 41, `TAG=` dropped 25, more-than-one branch 8, a page without its marker ending the list 6, page 1 as the whole list 16, no page bound 2, list not emptied 1, newlines kept 1.
+  - Publish tests pass on bash 3.2 (macOS) and 5.2.37 (`--network none`).
+  - No schema change, no agent code change.
+- **Untested or assumed (nothing has ever been published by this workflow):**
+  - that the job's `contents: write` token counts as "push access", so drafts appear in the list;
+  - that a draft's `tag_name` in the list is the tag it will publish under;
+  - that GitHub fills every page but the last and leaves no release out;
+  - gh's real output for each answer (the stand-in is read from source, not run against gh);
+  - the 20-page stop, which no real repository has reached;
+  - that a re-run attempt can download the artefact (still `.agents/releases.md` step 5).
+- **Waiting on the owner:** the first tag, and the release checklist with it.
+- **Next:**
+  - On the first release, check that `publish-release` lists the tag's draft or release as expected (its log shows each page read).
+  - Optional follow-up, not filed: `publish-image`'s warning prints skopeo's stderr with its newlines.
+
 ## 2026-11-25 — Claude Code (Opus 5.5), worker — #136: the CA bundle's access asked of the kernel, as the service account (PR #167)
 - **Merged:** 2026-11-25, squash `069af99`, at head `6429037`; branch deleted, #136 closed. Agent suite at the head, merged with `main` at `3feec43`: 1,662 passed, 4 skipped (the root-only cases). As root on Linux, `test_install.py` + `test_invariants.py`: 595 passed, 2 skipped. Server 1,357, web 188.
 - **Done:** [PR #167](https://github.com/DeusMaximus/TLG-IPAM/pull/167) (`136-ca-access-as-service`).
@@ -120,24 +159,3 @@ Template:
 - **Waiting on the owner:** nothing from this PR.
 - **Untested:** a real root or systemd install; the container image locally (CI's `agent` job checks it); translated argparse messages.
 - **Next:** #136 (the CA bundle's access checked as the service account), which edits `install.py`, the CA access message changed here included. The enrolment compatibility mechanism is filed as a follow-up.
-
-## 2026-11-25 — Claude Code (Opus 5.5), worker — #94: pin the agent's base image by digest (PR #161)
-- **Merged:** 2026-11-25, squash `c652f2d`, at head `7d298f1`; branch deleted. Entry committed by the orchestrator, with the state lines brought up to date.
-- **Done:** [PR #161](https://github.com/DeusMaximus/TLG-IPAM/pull/161) (`94-agent-base-image-digest`) closes #94.
-  - `agent/Dockerfile`: `FROM python:3.13-slim@sha256:7249d558…`, the tag's multi-platform index (covers amd64 and arm64).
-  - `release.yml` build job: the new step *The base image's pin, against its tag* warns, never fails, when the tag has moved on from the pin. Its comment names the one `FROM` shape its `sed` reads. The publish jobs are unchanged.
-  - `AGENTS.md`: Commands gets "The agent's base image": a one-line `&&` chain that reads the digest, checks its form and moves the pin. The subsection says the test holds the pin's shape, not that the digest is the index. The "One version" bullet names the base pin.
-  - `.agents/releases.md`, checklist step 3: refresh the base in its own PR before the bump PR, whose Tests section records the base digest and that its Release run reported it current.
-  - `.agents/releases.md`, *Re-run all jobs*: corrected; the base is now fixed and only timestamps differ (measured: file times and 296 `.pyc` files).
-  - Brief §2.4 and spec §5.6: one sentence each.
-- **Tests:** 26 new in `test_release.py`.
-  - Parsing: the `FROM` parser splits at Docker's white space and lines only at newlines. The one-stage test holds the shape the step's `sed` reads, and a tab-separated second stage is counted and refused.
-  - Workflow: the step runs under bash against a stand-in `docker` for three registry answers (current, moved on, unreadable). On the PR's own Release run on the runner it printed `python:3.13-slim still names sha256:7249…`, and both platforms built from the pin.
-  - Documentation: the `AGENTS.md` line runs as written without `set -e`, for one good answer and six bad ones.
-- **Decisions:** PR Deliberate calls 1–7. The pin is the index digest. The digest moves by hand at each release, not by Dependabot. The server's Dockerfile is not pinned: it is built where it runs and never published. A stale pin is a warning, not a failure. Rebuilding a tag to the same digest is out of scope. The outside read overruled none.
-- **Review:** Greptile read `b6fbc68` (one P2, fixed in `df40a87`). In place of its re-run, an outside read by Codex (GPT-6.1 Sol) at `df40a87`: GO, one P3 (a tab-separated second `FROM` went uncounted) and three corrections, all fixed in `7d298f1` and read by the orchestrator against the remedy, with the reviewer's mutant replayed. Codex automatic review clean on every head.
-- **State:** merged. No schema change; `PROTOCOL_VERSION` unchanged; no new agent import or listed name.
-- **Waiting on the owner:** nothing from this PR. At each release, checklist step 3's base refresh comes first.
-- **Known gap, not this PR's:** a secret given to a `build` step through `env` passes every shape test in `test_release.py`. Added to #159's scope with the owner's go-ahead.
-- **Untested:** Docker Hub's anonymous rate limit on the extra lookup (it would show as the "could not read" warning); GNU sed running the documented line outside CI.
-- **Next:** #159 (fail-closed release lookup in `publish-release`).
