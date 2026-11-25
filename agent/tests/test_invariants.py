@@ -305,9 +305,14 @@ SUBPROCESS_NAMES = {"run", "DEVNULL", "SubprocessError"}
 def _process_starts(tree) -> tuple[dict[str, set[str]], list[str]]:
     """The `subprocess.run` calls of a module, by the dotted name of the function that
     holds each, with the keywords each passes; and what else it does with `subprocess`
-    that PROCESSES_STARTED_IN does not allow (an alias, a `from` import, another name, a
-    reference to `run` that is not a call, a second call in one function, an `env`
-    other than COMMAND_ENV). Names, not behaviour: review holds what a call runs."""
+    that PROCESSES_STARTED_IN does not allow: the module named anywhere but as the base
+    of one of SUBPROCESS_NAMES (so an import alias, an assignment alias such as
+    `process = subprocess`, or the module passed as a value), its name as a string
+    (`sys.modules["subprocess"]`), a `from` import, another name, a reference to `run`
+    that is not a call, a second call in one function, an `env` other than
+    COMMAND_ENV. Spellings, not behaviour: review holds what a call runs, and what
+    reaches the module without spelling its name (#136's review, round 1: an
+    assignment alias passed an earlier version of this check)."""
     starts: dict[str, set[str]] = {}
     refused: list[str] = []
 
@@ -336,6 +341,11 @@ def _process_starts(tree) -> tuple[dict[str, set[str]], list[str]]:
                 refused.append(f"subprocess.{node.attr}")
             elif node.attr == "run":
                 refused.append("subprocess.run, not called")
+            return  # the module's name as the base of the attribute: checked above
+        if isinstance(node, ast.Name) and node.id == "subprocess":
+            refused.append("subprocess, not as the base of one of its names")
+        elif isinstance(node, ast.Constant) and node.value == "subprocess":
+            refused.append("'subprocess' as a string")
         elif isinstance(node, ast.Import):
             refused.extend(f"import subprocess as {a.asname}" for a in node.names if a.name == "subprocess" and a.asname)
         elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
@@ -375,6 +385,12 @@ def test_the_installer_starts_processes_only_where_listed():
         ("subprocess.Popen(['x'])\n", {}, ["subprocess.Popen"]),
         ("import subprocess as s\n", {}, ["import subprocess as s"]),
         ("from subprocess import run\n", {}, ["from subprocess import"]),
+        # the review of #136, round 1: an assignment alias, then a call through it
+        ("process = subprocess\ndef f():\n    process.run(['head'], env=COMMAND_ENV)\n", {},
+         ["subprocess, not as the base of one of its names"]),
+        ("def f(m=subprocess):\n    m.run(['head'], env=COMMAND_ENV)\n", {},
+         ["subprocess, not as the base of one of its names"]),
+        ("import sys\nsys.modules['subprocess'].run(['head'], env=COMMAND_ENV)\n", {}, ["'subprocess' as a string"]),
     ],
 )
 def test_a_process_started_anywhere_else_or_otherwise_is_refused(source, extra, reasons):

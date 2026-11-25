@@ -246,8 +246,12 @@ def _plain(value: str, name: str) -> str:
 # their errors, which name the path, go to /dev/null.
 CA_READ = ("head", "-c", "1", "--")
 CA_REACH = ("test", "-e")
-# ample for a local file; a FIFO swapped in for the file, or a stuck network mount, is
-# killed at it, and the install refused
+# ample for a local file. A FIFO swapped in for the file is killed at it and the install
+# refused (measured: `test_a_fifo_put_in_the_files_place_is_cut_off_and_not_taken_for_a_file`).
+# It bounds only the wait for an interruptible program: `subprocess.run` kills the child
+# at it and then waits for it, so one held in an uninterruptible kernel wait (a hard
+# network mount, say) is not reaped promptly; and `_ca_file`'s own stat, the group
+# lookup and starting the process are outside it
 CA_CHECK_TIMEOUT_S = 10
 # where the check stopped, by its kind (#140: never by the path)
 AT_THE_FILE = "the file itself"

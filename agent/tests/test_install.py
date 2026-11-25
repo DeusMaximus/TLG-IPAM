@@ -15,11 +15,14 @@ PR of #136 records."""
 import asyncio
 import os
 import shutil
+import signal
 import stat
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -646,13 +649,57 @@ def test_the_check_says_where_it_stopped_by_what_the_kernel_answered(tmp_path):
     assert _read_as_me(tmp_path / "dangling.pem") == install.ON_THE_WAY
 
 
+# how long the FIFO case may take, the deadline it sets included, before the test
+# stops it itself
+FIFO_BOUND_S = 5
+
+
 def test_a_fifo_put_in_the_files_place_is_cut_off_and_not_taken_for_a_file(tmp_path, monkeypatch):
     """A FIFO swapped in after `_ca_file` looked: `head` waits on a writer that never
-    comes, is killed at the deadline, and the check is not made."""
+    comes, is killed at the deadline, and the check is not made.
+
+    The check runs in a thread, under a bound of the test's own, with every program in
+    a process group of its own: a check the deadline does not cut off (its `timeout`
+    taken away, say) fails here on the bound, its groups killed and the programs
+    reaped, rather than holding the suite (#136's review, round 1)."""
     fifo = tmp_path / "ca.pem"
     os.mkfifo(fifo)
     monkeypatch.setattr(install, "CA_CHECK_TIMEOUT_S", 0.5)
-    assert _read_as_me(fifo) == install.NOT_CHECKED
+    started: list[subprocess.Popen] = []
+
+    class Recorded(subprocess.Popen):
+        def __init__(self, *args, **keywords):
+            super().__init__(*args, **keywords)
+            started.append(self)
+
+    inner = as_the_test_user([])
+
+    def run(argv, **keywords):
+        return inner(argv, **keywords, process_group=0)
+
+    answer = []
+    with mock.patch.object(install.subprocess, "run", run), mock.patch.object(subprocess, "Popen", Recorded):
+        worker = threading.Thread(
+            target=lambda: answer.append(install.read_as(str(fifo), os.getuid(), os.getgid(), [os.getgid()])),
+            daemon=True,
+        )
+        began = time.monotonic()
+        worker.start()
+        worker.join(FIFO_BOUND_S)
+        if worker.is_alive():
+            for _ in range(3):  # `head`, and `test` if it follows it
+                for proc in list(started):
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                worker.join(1)
+            for proc in started:
+                proc.wait(timeout=5)
+            pytest.fail(f"the check was not cut off within {FIFO_BOUND_S} s; its programs were killed and reaped")
+    assert answer == [install.NOT_CHECKED]
+    assert time.monotonic() - began < FIFO_BOUND_S
+    assert [proc.args[0] for proc in started] == ["head"] and all(proc.returncode is not None for proc in started)
 
 
 def test_programs_that_cannot_be_run_are_no_answer(tmp_path, monkeypatch):
