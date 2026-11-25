@@ -743,6 +743,40 @@ async def test_a_late_attempt_with_a_replaced_token_leaves_the_current_refusal(
     assert _refusals() == 1  # A's, no token's current one, went with that read
 
 
+@pytest.mark.parametrize("late", [False, True], ids=["recorded-before", "recorded-after"])
+async def test_a_replaced_token_never_returns_once_the_replacement_enrols(
+    client, agent_api, during_the_body, late
+):
+    """Codex on #184 at 54a83c9: A, refused, expires; the owner re-enrols to B and B
+    enrols. A stays unused and unrevoked (re-enrol revokes only a live token), whether
+    its refusal was recorded before or lands after B's exchange, its body having arrived
+    late: it is not shown, since only a pending agent falls back to an expired token."""
+    created = await create(client)
+    [a] = await tokens_of(created["id"])
+    if not late:
+        await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+
+    async def expire_a_then_enrol_b():
+        await set_token(a.id, expires_at=_now() - timedelta(seconds=1))
+        res = await re_enrol(client, created["id"])
+        assert res.status_code == 201, res.text
+        res = await enrol(agent_api, res.json()["data"]["enrol_token"], **REPORT)
+        assert res.status_code == 200, res.text
+
+    if late:
+        during_the_body.append(expire_a_then_enrol_b)
+        res = await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+        assert res.status_code == 409, res.text
+    else:
+        await expire_a_then_enrol_b()
+    agent = await get_agent(client, created["id"])
+    assert agent["state"] == "active"
+    old = next(t for t in agent["tokens"] if t["id"] == a.id)
+    assert old["used_at"] is None and old["revoked_at"] is None
+    assert agent["enrol_refusal"] is None
+    assert _refusals() == 0
+
+
 async def test_an_attempt_whose_agent_is_deleted_during_its_body_leaves_nothing_behind(
     client, agent_api, during_the_body
 ):

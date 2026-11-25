@@ -276,8 +276,9 @@ async def _exchange(
     except OperationalError as exc:
         await session.rollback()
         raise database_unavailable("enrolment", exc) from exc
-    # tidiness only: a spent token is no agent's current one (`agents.current_enrolment`)
-    agents.enrol_refusals.drop([token.id])
+    # tidiness only: an enrolled agent's only current token is a live one, and it has
+    # none now (`agents.current_enrolment`)
+    agents.enrol_refusals.drop(t.id for t in agent.tokens)
     return answer
 
 

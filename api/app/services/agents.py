@@ -127,7 +127,7 @@ class EnrolRefusals:
     (`enrol_refusal`). The keys are ids of tokens found usable and the codes the
     server's own constants: never a value the caller sent. Bounded: at most
     ENROL_REFUSALS_MAX entries, the oldest recorded dropped first; a successful
-    exchange drops its token's, deleting an agent its tokens', and every read of an
+    exchange drops its agent's tokens', deleting an agent its tokens', and every read of an
     agent drops those of its tokens that are no longer its current one (`prune`), the
     agents list every one whose token it does not hold as current (`keep_only`). An
     entry recorded for an agent deleted while the attempt's body arrived goes at the
@@ -169,16 +169,21 @@ enrol_refusals = EnrolRefusals()
 
 def current_enrolment(agent: Agent, now: datetime) -> Token | None:
     """The enrolment token an agent's refusal is shown for: its one live enrolment token
-    (`live`), or, when it has none, its one enrolment token neither used nor revoked
-    (expired, with no re-enrol since: still why a pending agent never arrived). None when
-    there are two or more of either, which is never to be guessed between. Judged from
-    the tokens alone, by identity, never by when they were issued: a re-enrol revokes a
-    live token and adds one, so after it the new token is the one live, or, once both
-    have expired, there are two unused and none is chosen."""
+    (`live`), or, for a `pending` agent with none, its one enrolment token neither used
+    nor revoked (expired, with no re-enrol since: still why the agent never arrived).
+    None when there are two or more of either, which is never to be guessed between.
+    Judged from the tokens and the agent's state alone, by identity, never by when the
+    tokens were issued: a re-enrol revokes a live token and adds one, so after it the
+    new token is the one live, or, once both have expired, there are two unused and none
+    is chosen. The expired fallback is a `pending` agent's alone, so once any exchange
+    has succeeded (the agent has held an agent token) an expired token it replaced never
+    becomes current again, whatever refusal lands for it later (Codex on #184)."""
     enrols = [t for t in agent.tokens if t.kind == "enrol"]
     live_now = [t for t in enrols if live(t, now)]
     if live_now:
         return live_now[0] if len(live_now) == 1 else None
+    if agent.state != "pending":
+        return None
     unspent = [t for t in enrols if t.used_at is None and t.revoked_at is None]
     return unspent[0] if len(unspent) == 1 else None
 
