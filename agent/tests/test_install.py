@@ -18,6 +18,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from unittest import mock
 
@@ -705,7 +706,14 @@ NOBODY = 65534
 
 @pytest.fixture
 def shared(tmp_path):
-    """A directory every user can enter, with a CA bundle in it, root's."""
+    """A directory every user can enter, with a CA bundle in it, root's. pytest makes
+    its directories 0700: they are opened to others up to the system's temporary
+    directory."""
+    top = Path(tempfile.gettempdir()).resolve()
+    for directory in (tmp_path, *tmp_path.parents):
+        if directory.resolve() == top:
+            break
+        directory.chmod(0o755)
     for directory in (tmp_path, *tmp_path.parents):
         assert os.stat(directory).st_mode & stat.S_IXOTH, "the test's directory must be reachable by others"
     ca = tmp_path / "ca.pem"
