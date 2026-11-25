@@ -200,7 +200,7 @@ Rules: disabling an agent refuses its token without revoking it, and enabling it
 
 ### 3.9 Token
 
-A credential bound to an agent (v0.2 spec §4.2). An agent token is `tlga_` followed by 43 URL-safe random characters (256 bits); an enrolment token is `tlge_` and 43 more. An enrolment token is single-use, expires an hour after it is issued, and reaches one route, `POST /api/v1/agent/enrol` (§4.8), which exchanges it for the agent token.
+A credential bound to an agent (v0.2 spec §4.2). An agent token is `tlga_` followed by 43 URL-safe random characters (256 bits); an enrolment token is `tlge_` and 43 more. That form, the prefix and 43 characters of the URL-safe base64 alphabet, is part of the agent wire contract (`agent_protocol.AGENT_TOKEN_FORM` and `ENROL_TOKEN_FORM`, #140): an agent stores only an agent token of exactly it, so a server that issued another would raise `PROTOCOL_VERSION`. An enrolment token is single-use, expires an hour after it is issued, and reaches one route, `POST /api/v1/agent/enrol` (§4.8), which exchanges it for the agent token.
 
 | Field | Type / notes |
 |---|---|

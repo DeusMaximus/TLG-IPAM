@@ -103,11 +103,23 @@ def printable(value: str, cap: int) -> str:
 
 # --- Enrolment ---
 
-# The two kinds of token an agent holds (spec §4.2), each the prefix followed by 43
-# URL-safe random characters. An enrolment token is exchanged once, at
-# `POST /api/v1/agent/enrol`, for the agent token every other agent route takes.
+# The two kinds of token an agent holds (spec §4.2). An enrolment token is exchanged
+# once, at `POST /api/v1/agent/enrol`, for the agent token every other agent route
+# takes.
 AGENT_TOKEN_PREFIX = "tlga_"
 ENROL_TOKEN_PREFIX = "tlge_"
+# A token's form on the wire, both kinds: its prefix, then TOKEN_SECRET_LENGTH
+# characters of the URL-safe base64 alphabet (RFC 4648 §5, no padding), the
+# `secrets.token_urlsafe(TOKEN_SECRET_BYTES)` the server issues (#140). An agent stores
+# only an enrol answer whose `agent_token` is exactly AGENT_TOKEN_FORM (its
+# `client.ISSUED_AGENT_TOKEN`), and takes any other answer as a malformed `200` after
+# the enrolment token is spent: a server that issues another form, longer or shorter,
+# raises PROTOCOL_VERSION.
+TOKEN_SECRET_BYTES = 32
+TOKEN_SECRET_LENGTH = 43
+TOKEN_SECRET_ALPHABET = "A-Za-z0-9_-"
+AGENT_TOKEN_FORM = re.compile(f"{re.escape(AGENT_TOKEN_PREFIX)}[{TOKEN_SECRET_ALPHABET}]{{{TOKEN_SECRET_LENGTH}}}")
+ENROL_TOKEN_FORM = re.compile(f"{re.escape(ENROL_TOKEN_PREFIX)}[{TOKEN_SECRET_ALPHABET}]{{{TOKEN_SECRET_LENGTH}}}")
 
 
 class EnrolRequest(BaseModel):
