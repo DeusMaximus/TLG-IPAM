@@ -63,13 +63,24 @@ def rdns_name(value: Any) -> str | None:
     return None
 
 
+def _scan_error_uncut(value: str) -> str:
+    text = "".join(c if c.isprintable() else " " for c in value)
+    return " ".join(text.split())
+
+
 def scan_error(value: str | None) -> str | None:
     """agent_protocol.scan_error, copied: printable, whitespace collapsed, capped."""
     if value is None:
         return None
-    text = "".join(c if c.isprintable() else " " for c in value)
-    text = " ".join(text.split())[:SCAN_ERROR_MAX].strip()
+    text = _scan_error_uncut(value)[:SCAN_ERROR_MAX].strip()
     return text or None
+
+
+def scan_error_fits(value: str) -> bool:
+    """Whether `scan_error` keeps `value` whole: what is left once it is made printable
+    and its whitespace collapsed is within SCAN_ERROR_MAX, the agent's copy of the
+    server's cap (`test_contract.py` holds the two equal), so nothing of it is cut."""
+    return len(_scan_error_uncut(value)) <= SCAN_ERROR_MAX
 
 
 def printable(value: str, cap: int) -> str:

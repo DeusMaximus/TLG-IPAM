@@ -1173,6 +1173,11 @@ BOTH = probe.UnreadReplies(too_large=True, too_many_records=True)
         (("referral", "two-questions"), TOO_MANY),
         (("silent", "silent"), None),
         (("servfail", "truncated"), None),
+        # round 1 of the briefed review, finding 4: a malformed or truncated reply on
+        # its own is no refusal of either limit
+        (("malformed", "malformed"), None),
+        (("truncated", "truncated"), None),
+        (("malformed", "truncated"), None),
     ],
 )
 async def test_a_lookup_no_server_answered_says_which_limits_refused_its_replies(script, expected):

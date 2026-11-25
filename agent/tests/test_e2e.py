@@ -824,16 +824,18 @@ async def test_what_the_responder_answers_decides_the_names_and_never_the_dead(o
 
 async def test_the_owner_is_told_how_many_replies_the_agents_limits_refused(owner):
     """#164 through the real routes, the real resolver and a DNS responder on loopback.
-    A first scan stores three names. In the second, the one server answers one address
-    with a reply over the payload the query advertised, another with one whose header
-    claims a record over the budget, and the third with its name. The target's error
-    counts both refusals, with no reply text, name or address, as the agent sent it;
-    the two names stay, the third is replaced, and the scan is complete."""
+    A first scan stores four names. In the second, the one server answers two
+    addresses with a reply over the payload the query advertised, a third with one
+    whose header claims a record over the budget, and the fourth with its name. The
+    target's error counts both refusals, each by its own count (two and one, so a
+    count given the other's words fails here), in lookups, with no reply text, name
+    or address, as the agent sent it; the three names stay, the fourth is replaced,
+    and the scan is complete."""
     from test_probe import ANSWERS, responder
 
     from tlg_ipam_agent.probe import DnsResolver
 
-    live = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+    live = ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"]
     keys = {ip: f"{ip[-1]}.0.0.10.in-addr.arpa." for ip in live}
     for ip in live:
         ANSWERS[keys[ip]] = f"kept{ip[-1]}.home.arpa."
@@ -853,19 +855,21 @@ async def test_the_owner_is_told_how_many_replies_the_agents_limits_refused(owne
 
         await _ok(await owner.post(f"/api/v1/subnets/{subnet['id']}/scan"), 202)
         await past_the_checkin_gap(agent_row["id"])
-        ANSWERS[keys["10.0.0.3"]] = "new3.home.arpa."
-        dns_responder.by_name = {keys["10.0.0.1"]: "oversize", keys["10.0.0.2"]: "over-budget"}
+        ANSWERS[keys["10.0.0.4"]] = "new4.home.arpa."
+        dns_responder.by_name = {
+            keys["10.0.0.1"]: "oversize", keys["10.0.0.2"]: "oversize", keys["10.0.0.3"]: "over-budget",
+        }
         await agent.checkin_once()
         await run_queued(agent)
 
-        assert len(dns_responder.arrivals) == 3 + 3
-        assert await _names(subnet) == {**stored, "10.0.0.3": "new3.home.arpa"}
+        assert len(dns_responder.arrivals) == 4 + 4
+        assert await _names(subnet) == {**stored, "10.0.0.4": "new4.home.arpa"}
         shown = await target_of(owner, target["id"])
         assert shown["last_scan_complete"] is True
         assert shown["last_scan_error"] == (
-            "rdns: no DNS server gave a usable answer for 2 of 3 addresses; their stored names "
-            "are kept; the agent refused a reply over 1232 bytes for 1, over 32 records or 1 "
-            "question for 1"
+            "rdns: no DNS server gave a usable answer for 3 of 4 addresses, names kept; the "
+            "agent refused a reply over 1232 bytes in 2 lookups, over 1 question or 32 records "
+            "in 1 lookup"
         )
         assert not any(text in shown["last_scan_error"] for text in ("10.0.0", "in-addr", "home.arpa", "127.0.0.1"))
     finally:
