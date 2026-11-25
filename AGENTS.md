@@ -65,7 +65,7 @@ All three are constrained to `api/requirements-dev.txt`, so a package the agent 
 
 ### The agent's base image
 
-`agent/Dockerfile` names its base by tag and digest (`FROM python:3.13-slim@sha256:…`, #94): the digest of the tag's multi-platform index, which holds the `linux/amd64` and `linux/arm64` images the release builds from that one line. `test_release.py` fails on a `FROM` without both. The digest is moved forward by hand, from the repository root:
+`agent/Dockerfile` names its base by tag and digest (`FROM python:3.13-slim@sha256:…`, #94): the digest of the tag's multi-platform index, which holds the `linux/amd64` and `linux/arm64` images the release builds from that one line. `test_release.py` fails on a `FROM` without both, or on a second `FROM`; it holds the shape of the pin, not what the digest names, so one platform's manifest digest would pass it, and it is the `imagetools inspect` below that shows the digest is the index. The digest is moved forward by hand, from the repository root:
 
 ```sh
 docker buildx imagetools inspect python:3.13-slim     # the index: its Digest, with linux/amd64 and linux/arm64 among its manifests

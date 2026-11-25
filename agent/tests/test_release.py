@@ -325,13 +325,18 @@ DOCKERFILE = AGENT / "Dockerfile"
 # a name, its tag (kept for the reader) and the digest the build resolves it by
 PINNED_BASE = re.compile(r"[\w.-]+(?:/[\w.-]+)*:[\w.-]+@sha256:[0-9a-f]{64}")
 PIN_STEP = "The base image's pin, against its tag"
+# what Docker takes between an instruction and its arguments, and between arguments
+# (BuildKit's parser, `reWhitespace`)
+DOCKER_SPACE = re.compile(r"[\t\v\f\r ]+")
 
 
 def _instructions(text):
-    """The Dockerfile's instructions as Docker joins them: a comment line is dropped,
-    inside a continued instruction too, and a line ending in a backslash continues."""
+    """The Dockerfile's instructions as Docker joins them: lines end at a newline alone
+    (not at the vertical tab or form feed `str.splitlines` also breaks at), a comment
+    line is dropped, inside a continued instruction too, and a line ending in a
+    backslash continues."""
     found, held = [], ""
-    for line in text.splitlines():
+    for line in text.split("\n"):
         if line.lstrip().startswith("#"):
             continue
         if line.rstrip().endswith("\\"):
@@ -347,11 +352,13 @@ def _instructions(text):
 
 
 def _bases(text):
-    """The arguments of each FROM, in any case."""
+    """The arguments of each FROM, in any case, split from it and from each other at
+    any of Docker's white space (a tab included, review of #94)."""
     for instruction in _instructions(text):
-        word, _, rest = instruction.partition(" ")
+        # `_instructions` strips each, so neither end holds white space
+        word, *rest = DOCKER_SPACE.split(instruction, maxsplit=1)
         if word.upper() == "FROM":
-            yield rest.split()
+            yield DOCKER_SPACE.split(rest[0]) if rest else []
 
 
 def _unpinned(text):
@@ -370,10 +377,25 @@ def _unpinned(text):
 def test_the_agent_image_is_built_from_one_base_named_by_digest():
     """Every build of a commit starts from the same operating-system layer, and the tag
     records which one a release shipped. One FROM, because the release's pin step reads
-    that line."""
+    that line, in the one shape its `sed` reads: `FROM <name>:<tag>@sha256:<digest>` on
+    a line of its own, upper case, one space, nothing after.
+
+    This holds the shape of a pin, not what it names: a 64-hex digest of one platform's
+    manifest passes as well as the index's. That the digest is the tag's multi-platform
+    index is shown by `imagetools inspect` (AGENTS.md's procedure) and by the release
+    building both platforms from it."""
     text = DOCKERFILE.read_text()
-    assert len(list(_bases(text))) == 1
+    (args,) = list(_bases(text))
     assert _unpinned(text) == []
+    assert re.findall(r"^FROM ([^ ]*)$", text, re.M) == args
+
+
+def test_a_tab_separated_second_stage_is_counted_and_refused():
+    """Docker takes a tab between an instruction and its arguments, and builds the last
+    stage: a lower-case, tab-separated second FROM is a stage, and an unpinned one."""
+    text = f"FROM python:3.13-slim@{DIGEST}\nfrom\tpython:3.13-slim\n"
+    assert len(list(_bases(text))) == 2
+    assert _unpinned(text) == ["python:3.13-slim"]
 
 
 DIGEST = "sha256:" + "ab" * 32

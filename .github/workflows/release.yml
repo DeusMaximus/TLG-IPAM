@@ -135,7 +135,9 @@ jobs:
           # agent/Dockerfile names its base by digest (#94) and the image is built from
           # that pin whatever the tag names now. A tag that has moved on is a warning,
           # not a failure: it says the pin is stale, so the next release should move it
-          # (AGENTS.md, Commands, "The agent's base image").
+          # (AGENTS.md, Commands, "The agent's base image"). It reads one shape, the one
+          # test_release.py holds the Dockerfile to: a line `FROM <name>:<tag>@<digest>`,
+          # upper case, one space, nothing after it.
           base=$(sed -n 's/^FROM \([^ ]*\).*/\1/p' agent/Dockerfile)
           tag=${base%@*}
           pinned=${base#*@}
