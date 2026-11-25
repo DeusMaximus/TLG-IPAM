@@ -27,6 +27,21 @@ Template:
 
 ---
 
+## 2026-11-25 — Claude Code (Opus 5.5), worker — #156: the answer-cap memory tests measure the client in a fresh interpreter (PR #158)
+- **Merged:** 2026-11-25, squash `606e1d4`, at head `34c9b40`; branch deleted. Entry committed by the orchestrator, with the review and state lines brought up to date.
+- **Done:** [PR #158](https://github.com/DeusMaximus/TLG-IPAM/pull/158) (`156-answer-cap-memory-test`, head `34c9b40`) closes #156. Tests only; `client.py` and `RESPONSE_MAX` unchanged.
+  - Cause: each check-in makes httpcore try `import sniffio` (not installed). Under pytest the attempt passes the assertion-rewriting hook, whose `PurePath` interns a fresh string that is then freed (mortal in 3.13). That uses up a slot of the interned-string dict, and when the slots run out the dict rebuilds its table (3,844,800 B in a full run). `tracemalloc` counts the new table in full. The free-slot count at the test moves with every collected module's text: 49 on `main`, 20 on `main` + PR #155 in a `python:3.13-slim` container.
+  - Reproduced in that container with the test unchanged. A plugin (`edge156.py`, in the PR body) uses up interned slots before the test, and the merged tree then fails with CI's figures: 4,022,997–4,028,543 and 5,314,720–5,315,023 B. After the fix, all 10 shifts pass. The orchestrator re-ran one shift of each: 5,313,160 B held before, passing after.
+  - `agent/tests/answer_memory.py` (new, not collected) runs the client in `python -I`: no pytest, no hook, no server. It warms up with one check-in and measures the second. `test_answers._held` runs it, with kill and reap on timeout or cancel (Greptile P2, fixed in `34c9b40`). The compressed-answer, plain-answer and raw-chunk tests use it with their limits unchanged.
+  - New `test_the_measurement_sees_a_client_that_holds_too_much`: a reader with twice the cap (2.7 MB) and one that decodes first (81 MB) are each over their limit.
+  - Tests: agent 1,388 → 1,390. Container: 1,388 + 2 skipped on the branch, 1,403 + 2 skipped merged with PR #155.
+  - Review: Codex clean on `34c9b40`; CI green (9 checks). Greptile read `0b0d71e` (one P2, fixed); in place of its re-run, an outside read by Codex (GPT-6.1 Sol) at `34c9b40`: GO, no findings (`.dev/156/review-1.md` and the PR). It read the interned dict's free slots directly (unchanged over 20 check-ins in the child) and ran the plain test 50 times: largest 1.84 MB, 1.87 MB under CPU load, against 2.10 MB.
+- **Decisions:** PR body Deliberate calls 1–4. A child process, because `tracemalloc` has no filtered peak and the rebuild is on the client's own stack. Limits kept, with the budget and measured figures stated: plain 1.47 MB on Linux, 1.57–1.87 MB on macOS, against 2.10 MB; measured, not derived as a bound. The raw-chunk test moved too, for one rule.
+- **State:** merged. No schema, protocol, brief or `AGENTS.md` change.
+- **Waiting on the owner:** nothing from this PR.
+- **Untested:** the CI runner's exact interned-slot state; Python other than 3.13.
+- **Next:** PR #155's `agent` job on a head that holds this fix.
+
 ## 2026-11-25 — Claude Code (Opus 5.5), worker — #92: say before an enrolment token is issued that the page is on plain HTTP (PR #157)
 - **Merged:** 2026-11-25, squash `2abfcb4`, at head `884cda2`; branch deleted. Entry committed by the orchestrator, with the state lines brought up to date. The orchestrator ran lint, the 188 web tests and the build at the head before the merge.
 - **Done:** [PR #157](https://github.com/DeusMaximus/TLG-IPAM/pull/157) (`92-plain-http-warning`, head `884cda2`) closes #92.
@@ -81,25 +96,3 @@ Template:
 - **Waiting on the owner:** whether to file an issue for the remaining exposure the review describes: dnspython's parser has the same collision cost before the walk runs (1.67 s for a 65 KB reply, measured by the reviewer with a substituted socket), and the agent does not refuse a reply larger than the 1,232 bytes it advertises. Only a resolver the owner configured can send one.
 - **Untested:** a near-maximum reply over a real UDP path; the full suite on Python 3.11 and 3.13 by the reviewer (CI runs both).
 - **Next:** #20 and #93 are in the same file and untouched.
-
-## 2026-11-24 — Claude Code (Opus 5.5), worker — #132: bound request heads, idle connections, pipelining and stalled readers below the app (PR #135)
-- **Done:** [PR #135](https://github.com/DeusMaximus/TLG-IPAM/pull/135) (`132-header-idle-bounds`, head `e9855bb`) closes #132. (The worker's own last entry covered round 4 only; the orchestrator has put the whole PR here.)
-  - The image's `CMD` is `python -m app.serve` (`api/app/serve.py`): uvicorn's own command line, so `UVICORN_*` settings still apply, with six pinned over it (`workers=1`, no reload, `http=header_limit.HeaderLimitProtocol`, no HTTP/2, `ws="none"`, 5 s keep-alive).
-  - `api/app/header_limit.py`, a subclass of uvicorn's httptools protocol:
-    - a head (request line and headers) of at most 64 KiB as received, `431 HEADERS_TOO_LARGE`, counted exactly by cutting reads where a head and a declared body end; a head after a chunked body in the same 4 KiB piece is the one stated exception;
-    - 10 s for a connection to deliver a head, closed without an answer;
-    - one pipelined request held ahead, with reading paused meanwhile;
-    - 60 s for a client that stops reading (a paused send buffer, or a closed connection that does not flush), then abort;
-    - a refusal by the parser follows one rule: uvicorn's `400` only when no earlier request is still unanswered; otherwise the refused request is dropped without running and the earlier answers go out in order, the connection closing after the last. Plain uvicorn, and `main` before this, wrote the `400` in front of them, which could hide a committed write;
-    - a stated bound on parser calls a sender can force.
-  - Docs: brief §2.2, §4.3 (the "below the app" paragraph and "Left to the reverse proxy or tunnel"), the `/mcp` refusal table and §9 row; spec §5.7 and §8 (the proxy checklist for nginx, Caddy and Cloudflare Tunnel, every line from documentation); `AGENTS.md` bullets "One uvicorn worker" and "One request-body cap"; README. Four decision comments on #132 record what the image bounds and what stays the proxy's.
-  - Merged: `83e392e`, squash, on the owner's go-ahead; the remote branch is deleted. CI green and Codex clean on `e9855bb`; Greptile last read `e2c2ff3`, and the briefed rounds were the outside read after it. The briefed review took six sessions:
-    - GPT-6.1 Sol at `e2c2ff3` was stopped by its provider's safety filter before a verdict (hand-over in `.dev/132/manual-handover.md`); its five leads went to the worker.
-    - GPT-6 Sol with Daybreak Blue, started from T3 Code, then gave NO-GO at `9ec525c` (two P2s in §8's proxy advice), NO-GO at `48148de` (P2: a committed write lost its answer behind a parser refusal), NO-GO at `4df1508` (P2: the same by another route), and GO at `e9855bb` with no finding. The owner kept the Opus 5.5 worker after the second and third NO-GO.
-    - Between the second and third, the orchestrator measured that a fix it had suggested (cutting chunked bodies at every CRLF CRLF) let a sender hold the worker 1.3 s per 1.9 MB body, and sent it back before the round; `.dev/132/crlf_cost.py` and `lost_answer.py` are the scripts.
-    - The orchestrator ran 1,321 server tests on `e9855bb`. No follow-ups filed.
-- **Decisions:** Deliberate calls in the PR body. A floor in the image plus the proxy in front; httptools kept, not h11; the limit is on bytes as received; 64 KiB although Cloudflare passes 128 KB; no concurrency limit in the image; the subclass relies on uvicorn 0.54 internals (`cycle`, `pipeline`, `flow`, the parser callbacks), held by the tests on both event loops.
-- **State:** merged. Server 1,321 on its head (192 of them this PR's). No schema change.
-- **Waiting on the owner:** the next server image build is the first real start of the new `CMD`: nobody could build the image here.
-- **Untested:** the Docker image; every proxy setting in spec §8 (no proxy ran); a multi-day MCP stream.
-- **Next:** #31 writes the deployment document from spec §8. #132 no longer blocks exposing `/mcp` (#26, which still waits on #25).
