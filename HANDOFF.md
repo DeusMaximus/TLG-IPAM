@@ -27,6 +27,19 @@ Template:
 
 ---
 
+## 2026-11-25 — Claude Code (Opus 5.5), worker — #173: the server image runs as uid 10001, never root (PR #181)
+- **Merged:** 2026-11-25, squash `3182482`, at head `c95c517`; branch deleted, #173 closed. Three briefed rounds on GPT-6.1 Sol (`.dev/181/review-{1,2,3}-sol.md`). Round 1 (`ff25814`) NO-GO: P2 `DB_PATH=:memory:` refused, P3 an unquoted path in the printed command; with the orchestrator's note that an upgraded `/data` kept mode 755. Fixed in `05ea2e4`. Round 2 (`05ea2e4`) NO-GO: P1 exempting every `file:` target let a persistent database open read-only on a root volume, P3 an escaped control-character path in the commands. Fixed in `c95c517`. Round 3 (`c95c517`) GO, no findings. Codex clean on `c95c517`, CI 10/10 green; Greptile did not review (free-plan credits spent). Backend 1,420 passed (Sol's re-measure).
+- **Done:** [PR #181](https://github.com/DeusMaximus/TLG-IPAM/pull/181) closes #173.
+  - Root `Dockerfile`: `ipam` uid/gid 10001 (literals); `/data` 10001's, 0700, which a new volume takes; `USER 10001:10001` after the last RUN; the code stays root's.
+  - `api/app/database.py`: the storage check runs at import, before the engine. An unwritable directory, or an existing db/-wal/-shm that cannot be read and written, exits 1 with the one-time `chown -R` and `chmod 700` commands (`volume_commands`, `shlex.quote`d; none for a directory holding a control character). Only `:memory:` and `""` are not checked (`on_filesystem`).
+  - `api/app/config.py`: `load_settings` refuses a `DB_PATH` that is a `file:` name in any case, or that SQLAlchemy's URL would read otherwise than as the path (a query, a `%` escape), with the fixed message "DB_PATH must be a filesystem path or :memory:.".
+  - Restore script: `check_writable` before the stop; the snapshot goes in on stdin (`run -T`, `umask 077`), so the restored file is 10001's, mode 0600.
+  - README "The container's user" / "Upgrading from an image that ran as root"; brief §2.2 "Not root"; `AGENTS.md` invariant bullet; CI `server-image` job and `.github/scripts/check-server-image.sh`.
+- **Decisions:** PR Deliberate calls 1–10: an owner-run `chown` (and `chmod 700`), never a root entrypoint; uid 10001; the check at import; restore through stdin; `file:` names, queries and `%` escapes refused at settings load rather than resolved.
+- **State:** the orchestrator repeated the upgrade, restore and undo on the owner's test deployment (unprivileged LXC) at `ff25814` (PR comment), rebuilt it at `c95c517`, and after the merge moved it to `main` `3182482` with `/data` made 0700: runs as 10001, health ok, data intact. Untested: Podman, rootless runtimes, userns-remap.
+- **Waiting on the owner:** nothing. **An existing deployment's first start on this image refuses until the one-time command in the README is run.**
+- **Next:** #175 is in flight; #183 (keep `ALLOWED_CIDRS`/`MAX_PPS` on update) is filed, not started; #26 opens M3 on Fable after the reset.
+
 ## 2026-11-25 — Claude Code (Opus 5.5), worker — #179: `install --allowed-dns-servers` (PR #180)
 - **Merged:** 2026-11-25, squash `b88b539`, at head `90ca0d0`; branch deleted, #179 closed. Round 1 (GPT-6.1 Sol, `f158f01`) NO-GO, one P2: the keep-on-update reader read `agent.env` line by line, so an `ALLOWED_DNS_SERVERS=` line inside another variable's multi-line quoted value was taken as the setting and widened `10.0.0.53` to `0.0.0.0/0` (reproduced under systemd 257). Fixed in `22196e4`: `install.env_assignments` checks the whole file against the grammar `install` writes (split at `\n` alone, printable ASCII, no backslash, no quotes, unquoted single-line values) before reading any assignment, and refuses otherwise with the line's number and no content. Round 2 (`22196e4`) GO with one P3 (a wrong claim that systemd continues a comment ending in `\`), fixed in wording in `90ca0d0` and read by the orchestrator against the remedy; no third round. Codex clean on `90ca0d0`, CI green. Greptile did not review (free-plan credits spent). Reviews at `.dev/180/review-1-sol.md` and `review-2-sol.md`.
 - **Done:** [PR #180](https://github.com/DeusMaximus/TLG-IPAM/pull/180) closes #179. `install --allowed-dns-servers` writes `ALLOWED_DNS_SERVERS` to `agent.env`, checked by `config.parse_allowed_dns` before anything changes, a bad item named by its place. Docs (spec §5.6, both READMEs, `EnrolmentSteps`/`UpdateModal` hints, `AGENTS.md` "Enrolment tokens") make the option the way; no drop-in.
@@ -71,14 +84,4 @@ Template:
 - **State:** agent 1,858 passed, 14 skipped (macOS); as root, Debian 13, `--network none`: 1,852 passed, 20 skipped. Live systemd replay (branch vs `main`: ACL on venv, ACL on a module, supplementary group, umask 077) in the PR body. No schema or wire change; `PROTOCOL_VERSION` 2.
 - **Disclosed limits the reviewer measured:** a dependency outside the two trees (via `.pth` or a link) is accepted though the account cannot import it, as before; no AppArmor/SELinux; no drop-ins.
 - **Next:** PR #177 (#93) conflicts with this one in one `AGENTS.md` line and resolves it. #179 (`install --allowed-dns-servers`) can start once #177 merges.
-
-## 2026-11-25 — Claude Code (Sonnet 5.5), worker — #174: three gaps in the backup and restore doc (PR #176)
-- **Merged:** 2026-11-25, squash `f7a9aa3`, at head `238f789`; branch deleted, #174 closed. CI green, Codex clean and Greptile 5/5 on `238f789`; no briefed round owed. The open acceptance line (the unit, copied as written with the URL edited, pulls a snapshot) was run by the orchestrator on the owner's test host, Debian 13 with systemd 257: `systemctl start` exit 0, journal `wrote …` (output on the PR). That host's nightly timer now runs this unit.
-- **Done:** [PR #176](https://github.com/DeusMaximus/TLG-IPAM/pull/176) closes #174. Only `docs/backup-and-restore.md` changes.
-  - The service unit has `Environment=TLG_IPAM_URL=https://ipam.home.arpa`; the crontab has a `TLG_IPAM_URL=` line; the by-hand run passes it through `sudo -u backup env`. A paragraph says the default is a placeholder and covers plain HTTP on port 8080.
-  - The restore section says `curl` errors while the app starts are expected, and what success and a final failure look like.
-  - "A second copy" records #5's restore from a whole-container hypervisor backup: one run, quiet database, no guarantee.
-- **Decisions:** PR Deliberate calls 1–5. The retries are documented, not quieted, so both scripts are byte for byte as on `main`. `curl` prints one line per failed try, so the doc does not promise just one.
-- **State:** no code change. Untested: the crontab line and the `sudo` part of the by-hand command.
-- **Next:** #173 (the server image runs as root) will change the restore steps in this doc.
 
