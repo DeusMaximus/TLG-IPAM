@@ -104,6 +104,8 @@ class EnrolRefusal:
 
     code: str
     refused_at: datetime
+    # the store's generation when it was recorded (`EnrolRefusals.generation`)
+    generation: int
 
 
 # The most refusals kept at once. One entry per enrolment token, and an attempt is
@@ -127,21 +129,35 @@ class EnrolRefusals:
     (`enrol_refusal`). The keys are ids of tokens found usable and the codes the
     server's own constants: never a value the caller sent. Bounded: at most
     ENROL_REFUSALS_MAX entries, the oldest recorded dropped first; a successful
-    exchange drops its agent's tokens', deleting an agent its tokens', and every read of an
-    agent drops those of its tokens that are no longer its current one (`prune`), the
-    agents list every one whose token it does not hold as current (`keep_only`). An
-    entry recorded for an agent deleted while the attempt's body arrived goes at the
-    next read of the list, or to the cap, whichever comes first."""
+    exchange drops its agent's tokens', deleting an agent its tokens', and the agents
+    list every one recorded before the list began whose token it does not hold as
+    current (`keep_only`). An entry recorded for an agent deleted while the attempt's
+    body arrived goes at the next read of the list, or to the cap, whichever comes
+    first. No other read deletes an entry.
+
+    Every record takes the next generation, a counter in this process, never the wall
+    clock. The list reads its generation before its first database await and prunes
+    only entries of that generation or older: an entry recorded or replaced after the
+    list began was refused for a token the list's rows may not hold yet (an agent
+    created, or re-enrolled, meanwhile), so a list read before it never deletes it
+    (round 2 of #184's briefed review)."""
 
     def __init__(self, limit: int = ENROL_REFUSALS_MAX) -> None:
         self.limit = limit
         self._last: dict[str, EnrolRefusal] = {}
+        self._generation = 0
+
+    def generation(self) -> int:
+        """The generation of the newest record: an entry with a higher one was
+        recorded after this was read."""
+        return self._generation
 
     def record(self, token_id: str, code: str, refused_at: datetime) -> None:
         if code not in (ENROL_TOO_OLD, ENROL_TOO_NEW):
             raise ValueError("an enrolment refusal is one of the server's two codes")
+        self._generation += 1
         self._last.pop(token_id, None)  # a token refused again is the newest recorded
-        self._last[token_id] = EnrolRefusal(code, refused_at)
+        self._last[token_id] = EnrolRefusal(code, refused_at, self._generation)
         while len(self._last) > self.limit:
             del self._last[next(iter(self._last))]
 
@@ -152,9 +168,12 @@ class EnrolRefusals:
         for token_id in token_ids:
             self._last.pop(token_id, None)
 
-    def keep_only(self, token_ids) -> None:
+    def keep_only(self, token_ids, seen: int) -> None:
+        """Drop every entry of generation `seen` or older whose token is not in
+        `token_ids`; keep every newer one, which the caller's read may not cover."""
         keep = set(token_ids)
-        for token_id in [t for t in self._last if t not in keep]:
+        stale = [t for t, e in self._last.items() if t not in keep and e.generation <= seen]
+        for token_id in stale:
             del self._last[token_id]
 
     def __len__(self) -> int:
@@ -192,20 +211,12 @@ def current_enrolment(agent: Agent, now: datetime) -> Token | None:
     return unspent[0] if len(unspent) == 1 else None
 
 
-def prune(agent: Agent, now: datetime) -> Token | None:
-    """Drop the refusals of the agent's tokens other than its current enrolment token,
-    and return that token."""
-    current = current_enrolment(agent, now)
-    enrol_refusals.drop(t.id for t in agent.tokens if current is None or t.id != current.id)
-    return current
-
-
 def enrol_refusal(agent: Agent, now: datetime) -> EnrolRefusalOut | None:
     """The last refusal of the agent's current enrolment token (`current_enrolment`) for
     the agent's protocol; None when it has none, when that token has no refusal, and
     while the agent is disabled, since its token is then refused whatever it runs (the
-    record is kept, and shown again once it is enabled)."""
-    current = prune(agent, now)
+    record is kept, and shown again once it is enabled). It only reads the store."""
+    current = current_enrolment(agent, now)
     last = enrol_refusals.get(current.id) if current is not None else None
     if last is None or agent.state == "disabled":
         return None
@@ -246,13 +257,17 @@ async def list_agents(session: AsyncSession) -> list[Agent]:
     return list((await session.scalars(query)).all())
 
 
-def agents_out(agents: list[Agent], now: datetime | None = None) -> list[dict]:
+async def list_agents_out(session: AsyncSession) -> list[dict]:
     """The agents list as the owner route answers it (`agent_out` for each). The list
     holds every agent, so it keeps only the refusals of their current enrolment tokens
-    (`EnrolRefusals.keep_only`): one recorded for an agent deleted meanwhile goes here."""
-    now = _now() if now is None else now
+    (`EnrolRefusals.keep_only`), one recorded for an agent deleted meanwhile included;
+    fenced by the store's generation read before the list's first database await, so
+    a refusal recorded after the rows were read is kept."""
+    seen = enrol_refusals.generation()
+    agents = await list_agents(session)
+    now = _now()
     current = [current_enrolment(agent, now) for agent in agents]
-    enrol_refusals.keep_only(t.id for t in current if t is not None)
+    enrol_refusals.keep_only((t.id for t in current if t is not None), seen)
     return [agent_out(agent, now) for agent in agents]
 
 

@@ -652,7 +652,9 @@ async def test_a_refusal_is_shown_only_while_its_token_is_current(client, agent_
     assert (await enrol(agent_api, created["enrol_token"])).status_code == 200
     agents_svc.enrol_refusals.record(token.id, ENROL_TOO_OLD, _now())
     assert (await get_agent(client, created["id"]))["enrol_refusal"] is None
-    assert _refusals() == 0  # and that read dropped it
+    assert _refusals() == 1  # one agent's read only reads the store
+    await client.get("/api/v1/agents")
+    assert _refusals() == 0  # the list, begun after it was recorded, drops it
 
 
 @pytest.mark.parametrize("action", ["re-enrol", "revoke"])
@@ -740,7 +742,8 @@ async def test_a_late_attempt_with_a_replaced_token_leaves_the_current_refusal(
     assert res.status_code == 409 and res.json()["error"]["code"] == ENROL_TOO_OLD
     refusal = (await get_agent(client, created["id"]))["enrol_refusal"]
     assert refusal is not None and refusal["code"] == ENROL_TOO_NEW
-    assert _refusals() == 1  # A's, no token's current one, went with that read
+    await client.get("/api/v1/agents")
+    assert _refusals() == 1  # A's, no token's current one, went with the list
 
 
 @pytest.mark.parametrize("late", [False, True], ids=["recorded-before", "recorded-after"])
@@ -774,6 +777,7 @@ async def test_a_replaced_token_never_returns_once_the_replacement_enrols(
     old = next(t for t in agent["tokens"] if t["id"] == a.id)
     assert old["used_at"] is None and old["revoked_at"] is None
     assert agent["enrol_refusal"] is None
+    await client.get("/api/v1/agents")
     assert _refusals() == 0
 
 
@@ -796,6 +800,70 @@ async def test_an_attempt_whose_agent_is_deleted_during_its_body_leaves_nothing_
     assert _refusals() == 3  # recorded after each delete committed
     assert (await client.get("/api/v1/agents")).json()["data"] == []
     assert _refusals() == 0
+
+
+@pytest.fixture
+def after_the_lists_rows(monkeypatch):
+    """Run steps after the agents list has read its rows and before it answers, as a
+    list whose fetch is slow would (round 2 of #184's briefed review held it in
+    aiosqlite's fetch; the list's generation is read before that await)."""
+    steps = []
+    real = agents_svc.list_agents
+
+    async def rows_then_steps(session):
+        rows = await real(session)
+        while steps:
+            await steps.pop(0)()
+        return rows
+
+    monkeypatch.setattr(agents_svc, "list_agents", rows_then_steps)
+    return steps
+
+
+@pytest.mark.parametrize("change", ["create", "re-enrol"])
+async def test_a_list_read_before_a_refusal_never_deletes_it(
+    client, agent_api, after_the_lists_rows, change
+):
+    """Round 2 of #184's briefed review, finding 1: while a list is between its rows
+    and its answer, an agent is created (the list's rows hold no agent) or re-enrolled
+    from A to B (they hold A alone), and the new token is refused. The list, whose rows
+    hold neither the agent nor B, keeps the newer refusal; a list begun afterwards
+    still does, since it is the current token's."""
+    existing = await create(client, name="existing") if change == "re-enrol" else None
+    made = {}
+
+    async def change_then_refuse():
+        if change == "create":
+            made["agent"] = await create(client, name="late")
+            token = made["agent"]["enrol_token"]
+        else:
+            made["agent"] = existing
+            res = await re_enrol(client, existing["id"])
+            assert res.status_code == 201, res.text
+            token = res.json()["data"]["enrol_token"]
+        res = await enrol(agent_api, token, protocol=PROTOCOL_VERSION + 1)
+        assert res.status_code == 409, res.text
+
+    after_the_lists_rows.append(change_then_refuse)
+    stale = (await client.get("/api/v1/agents")).json()["data"]
+    assert [a["name"] for a in stale] == ([] if change == "create" else ["existing"])
+    assert _refusals() == 1
+    refusal = (await get_agent(client, made["agent"]["id"]))["enrol_refusal"]
+    assert refusal is not None and refusal["code"] == ENROL_TOO_NEW
+    [fresh] = (await client.get("/api/v1/agents")).json()["data"]
+    assert fresh["enrol_refusal"]["code"] == ENROL_TOO_NEW and _refusals() == 1
+
+
+def test_a_prune_keeps_every_entry_newer_than_its_generation():
+    store = agents_svc.EnrolRefusals(limit=8)
+    store.record("token-a", ENROL_TOO_OLD, _now())
+    seen = store.generation()
+    store.record("token-b", ENROL_TOO_NEW, _now())  # recorded after the read began
+    store.record("token-a", ENROL_TOO_NEW, _now())  # replaced after it: kept too
+    store.keep_only([], seen)
+    assert len(store) == 2
+    store.keep_only([], store.generation())
+    assert len(store) == 0
 
 
 def test_the_store_holds_at_most_its_bound(monkeypatch):
