@@ -143,17 +143,25 @@ enrol_refusals = EnrolRefusals()
 
 def enrol_refusal(agent: Agent) -> EnrolRefusalOut | None:
     """The agent's last enrolment refused for its protocol, while the enrolment token it
-    was refused for is neither used nor revoked; None otherwise. An expired token keeps
-    it: a pending agent's refusal is still why the agent never arrived. Judged on read
-    from the agent's tokens, so an exchange that spent the token, or a re-enrol, revoke
-    or delete that revoked it, hides the refusal whatever the order in which the record
-    and that write happened."""
+    was refused for is neither used nor revoked and no enrolment token has been issued
+    after it; None otherwise. An expired token keeps it until a re-enrol replaces it: a
+    pending agent's refusal is still why the agent never arrived, and a re-enrol, which
+    revokes only a live token, starts an enrolment that has not been tried. Judged on
+    read from the agent's tokens, so an exchange that spent the token, or a re-enrol,
+    revoke or delete, hides the refusal whatever the order in which the record and that
+    write happened."""
     last = enrol_refusals.get(agent.id)
     if last is None:
         return None
     token = next((t for t in agent.tokens if t.id == last.token_id), None)
     if token is None or token.used_at is not None or token.revoked_at is not None:
         return None
+    issued = utc(token.created_at)
+    if any(
+        t.kind == "enrol" and t.id != token.id and utc(t.created_at) >= issued
+        for t in agent.tokens
+    ):
+        return None  # superseded (an issue in the same instant counts as later)
     return EnrolRefusalOut(code=last.code, refused_at=last.refused_at)
 
 

@@ -646,8 +646,10 @@ async def test_re_enrol_or_revoke_ends_the_refusal(client, agent_api, action):
         assert refusal["code"] == ENROL_TOO_NEW
 
 
-async def test_an_expired_token_keeps_the_refusal(client, agent_api):
-    """It is still why a pending agent never arrived."""
+async def test_an_expired_token_keeps_the_refusal_until_a_re_enrol_replaces_it(client, agent_api):
+    """It is still why a pending agent never arrived. Re-enrol revokes only a live token,
+    so the expired one stays unrevoked; the new token is what hides it (Codex on #184:
+    the page showed the old refusal beside a token not yet tried)."""
     created = await create(client)
     [token] = await tokens_of(created["id"])
     await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
@@ -655,6 +657,21 @@ async def test_an_expired_token_keeps_the_refusal(client, agent_api):
     agent = await get_agent(client, created["id"])
     assert agent["enrol_refusal"]["code"] == ENROL_TOO_OLD
     assert agent["tokens"][0]["expires_in_s"] is None
+    assert (await re_enrol(client, created["id"])).status_code == 201
+    old = next(t for t in await tokens_of(created["id"]) if t.id == token.id)
+    assert old.revoked_at is None  # expired, so not revoked: the newer token hides it
+    assert (await get_agent(client, created["id"]))["enrol_refusal"] is None
+
+
+async def test_a_token_issued_in_the_same_instant_hides_the_refusal(client, agent_api):
+    created = await create(client)
+    await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+    async with SessionLocal() as session:
+        agent = await session.scalar(select(Agent).where(Agent.id == created["id"]))
+        [first] = await session.scalars(select(Token).where(Token.agent_id == agent.id))
+        again, _ = agents_svc.issue_token(session, agent, "enrol", first.created_at)
+        await session.commit()
+    assert (await get_agent(client, created["id"]))["enrol_refusal"] is None
 
 
 async def test_deleting_the_agent_forgets_its_refusal(client, agent_api):
