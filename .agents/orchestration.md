@@ -28,7 +28,7 @@ The owner's working experience, as of 2026-11-13. Edit in place when a seat chan
 | Implementer, mechanical | Claude Sonnet 5.5, high | Docs, configuration, dependencies, test plumbing. Proven here on #3, #4 and #35 (dependencies, docs, test plumbing); give it one UI issue and record the result in this table before relying on it for more |
 | Briefed reviewer | GPT-6.1 Sol through Codex, high | Every briefed round. It is strict and finds what the implementer missed. Quota is ample: when unsure whether a PR owes a briefed round, run one. Three rounds so far (#44, #48, #49): each GO, each with P3s the automatic reviews had not raised |
 | Light second read | GLM 5.3, or Mistral Large 4 | Optional, for a PR that owes no briefed round but where you want one more reader. Mistral Large 4 is nearly as good and much cheaper on its plan |
-| Manual fallback | GPT-6 with Daybreak Blue, in the Codex app | Work a model here has refused. The owner runs it by hand; no session here can start it. See "When a model refuses" |
+| Refusal fallback | GPT-6 Sol with Daybreak Blue | Work a model here has refused. A review round GPT-6.1 Sol was stopped on can be started from T3 Code on this model (the owner's word, 2026-11-24; used so far on #132, #153 and #147). Refused implementation work is still the owner's, by hand in the Codex app. See "When a model refuses" |
 
 - Implementers are Claude models and the reviewers are not, so every PR gets a read from outside the author's model family. Keep that true when a seat changes.
 - Move an issue up to Fable 5.2 as implementer when it has failed two review rounds, or when the work is deciding what to build (a spike's write-up, a spec change).
@@ -101,7 +101,7 @@ The briefs used so far are in `.dev/6/`, `.dev/45/` and `.dev/8/` in the main ch
 
 Parts of v0.2 look like offensive tooling to a safety filter although they are ordinary network administration on the owner's own network: the ICMP and ARP sweeps (#13, #14), the OAuth server and its consent page (#26–#29), and tests that feed hostile input to ingest. A worker, a reviewer, or you may be refused or cut off partway through.
 
-A refusal is a hand-over to the owner. They continue the work by hand in the Codex app with the manual-fallback model from the roster.
+A refusal is a hand-over to the owner. They continue the work by hand in the Codex app with the refusal-fallback model from the roster. (A refused review round is the exception: see the end of this section.)
 
 1. Leave the branch as it is, with everything committed and pushed.
 2. Write `.dev/<issue>/manual-handover.md` in the main checkout. The session that picks it up has no context, so the file stands alone:
@@ -114,6 +114,8 @@ A refusal is a hand-over to the owner. They continue the work by hand in the Cod
 4. When the branch moves again, verify it as you would any worker's result. The part written by the fallback model is from the briefed reviewer's own model family, so its briefed round goes to a Claude model that did not write the PR.
 
 Send the same task to another model in the roster first only when the refusal is plainly about wording in your brief. One retry; then hand over.
+
+**A refused review round is the one case you restart yourself.** When GPT-6.1 Sol is stopped part way through a briefed round or an outside read, still write the hand-over file (what it had established, the message word for word), keep its logs under `.dev/<issue>/`, remove its scratch directory and throwaway worktrees, and tell the owner. Then start the same brief as a delegated task on Codex `gpt-6-sol` with `reasoningEffort: high` and `cyberAccessProgram: daybreakBlue`, adding to the brief any unrated leads the stopped session reported, for the new reviewer to reproduce before using. The later rounds on that PR go to the same model, since it wrote the review being answered. It is in the same family as GPT-6.1 Sol, so the round still counts as one from outside the author's.
 
 ## Hand-off entries
 
