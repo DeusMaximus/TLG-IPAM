@@ -27,6 +27,27 @@ Template:
 
 ---
 
+## 2026-11-25 — Claude Code (Opus 5.5), worker — #160: a record budget on DNS replies before parsing (PR #163)
+- **Merged:** 2026-11-25, squash `6cb82b6`, at head `78aa7b3`; branch deleted. Entry committed by the orchestrator, with the review and state lines brought up to date. The head held `main` with PRs #161 and #162, and all nine checks passed on it.
+- **Done:** [PR #163](https://github.com/DeusMaximus/TLG-IPAM/pull/163) (`160-dns-record-budget`) closes #160.
+  - `agent/src/tlg_ipam_agent/probe.py`:
+    - `DNS_QUESTIONS_MAX = 1`, `DNS_RECORDS_MAX = 32` (answer, authority and additional together, as the header claims, OPT included).
+    - `unread(data)` judges both limits from the length and the header alone; `ReplyTooManyRecords(DNSException)` sits beside `ReplyTooLarge`.
+    - `QuerySocket.datagram_received` applies #155's source rule to both: from the server, the attempt ends and the next server is asked; from anywhere else, dropped.
+  - Spec §5.2: the budget, what it refuses (the 32-PTR-plus-OPT reply among them), understated and overstated counts, and the derived ceiling in place of the 29,646 estimate.
+  - Brief §4.6 and the `AGENTS.md` invariant are updated, and a recheck step is added to #94's base-image procedure (`AGENTS.md`, Commands): when the image's Python changes, rerun the premise tests on it.
+  - Tests: 36 new in `test_probe.py`. Agent suite on `main`: 1,644.
+- **Review:** Codex and Greptile were clean on `002a5ef`. GPT-6.1 Sol was stopped by its safety filter a few minutes into the briefed round and posted nothing (`.dev/160/manual-handover.md`); the round ran on GPT-6 Sol with Daybreak Blue: GO at `002a5ef`, the ceiling held (its strongest accepted reply made 1,528 comparisons), seven mutations red, two P3s.
+  - P3 1 (the ceiling's argument) fixed in `91ca355` and `78aa7b3`: the 13th visit is the predecessor of the zero-perturb cycle, OPT is counted (1,651 with one), the premise test is called a tripwire, the 1,736 is scoped to 64-bit CPython with 3.13's probe, and named hashes are tested. Read by the orchestrator against the remedy; Codex clean on `78aa7b3`.
+  - P3 2 (say why a reply was refused) is filed as #164.
+  - Before the round the orchestrator checked the dictionary premise independently: 350,800 hashes on Python 3.15, worst total 1,694, no probe more than 12 over.
+- **Decisions:** PR Deliberate calls 1–7: one budget across the three sections, 32 = 2 × 16; zero questions allowed (FORMERR, NOTIMP); a datagram shorter than a header is left to dnspython; the ceiling is derived, its premise test is a tripwire, and the premise is rechecked whenever the interpreter changes; no per-reason count in the job's error here; TC replies are still parsed before refusal.
+- **Measured (M1 Ultra):** the ceiling is 1,736 name comparisons (1,651 with an OPT). Worst reply built: 1,426 comparisons, 23 ms parse, loop held 24–25 ms (was about 116 ms). The premise held on 3.13.12 (200,000 hashes) and in the image's 3.13.18 (20,007 hashes): at most 12 over.
+- **State:** merged. No schema change; `PROTOCOL_VERSION` 2; `test_invariants.py` unchanged.
+- **Waiting on the owner:** nothing from this PR.
+- **Untested:** the ceiling over every hash, and on Python 3.11, 3.12 and 3.14, which a native install can run; 32-bit builds; real network paths.
+- **Next:** #164, then #93 or #20, one at a time: all touch `probe.py`.
+
 ## 2026-11-25 — Claude Code (Opus 5.5), worker — #140: parser and validation errors repeat no argument; the token's form in the wire contract (PR #162)
 - **Merged:** 2026-11-25, squash `873b52a`, at head `46c450e`; branch deleted. Entry committed by the orchestrator, with the state lines brought up to date. Before the merge the orchestrator ran the agent suite on this head merged with `main` after PR #161: 1,608 passed.
 - **Done:** [PR #162](https://github.com/DeusMaximus/TLG-IPAM/pull/162) (`140-parser-errors-token-form`) closes #140.
@@ -125,24 +146,3 @@ Template:
   - anything a script written to get past the record would do;
   - `actionlint` (not installed; workflows unchanged).
 - **Next:** #159 (fail-closed release lookup) and #94 (pin the agent's base image by digest), one at a time: both touch the release workflow.
-
-## 2026-11-25 — Claude Code (Opus 5.5), worker — #153: no DNS reply over the advertised payload is parsed (PR #155)
-- **Merged:** 2026-11-25, squash `c128179`, at head `793eff3`; branch deleted. Entry committed by the orchestrator, with the review, CI and state lines brought up to date. `793eff3` is GitHub's merge of `main` (holding PR #158) into the worker's last head `9b2acdc`, with no hand-written change (its tree equals `git merge-tree` of the two); the orchestrator made it so CI would test the PR with the #156 fix, and the `agent` job passed there.
-- **Done:** [PR #155](https://github.com/DeusMaximus/TLG-IPAM/pull/155) (`153-dns-reply-size`) closes #153.
-  - `agent/src/tlg_ipam_agent/probe.py`:
-    - `DNS_PAYLOAD = 1232` is both the advertised payload and the largest reply the agent reads.
-    - `QuerySocket.datagram_received` answers an over-size datagram from the query's server and port with `ReplyTooLarge` (a `DNSException`): that attempt ends as no usable answer and the next server is asked.
-    - An over-size datagram from any other source is dropped. `_from_server` matches dnspython's source rule or is stricter.
-  - Spec §5.2 (the limit, what it refuses, the entry count and the estimate), brief §4.6 and `AGENTS.md` are updated.
-  - Tests: 15 new in `test_probe.py`. Agent suite on `main` after this and PR #158: 1,405. Server suite 1,340, unchanged.
-  - Review: GPT-6.1 Sol was stopped by its safety filter a few minutes into the briefed round and posted nothing (`.dev/153/manual-handover.md`); the round ran on GPT-6 Sol with Daybreak Blue: GO at `a06bd29` with one P3 (the comparison figure was called a ceiling on a false premise), fixed in `9b2acdc` with a numbered reply on the PR, and read by the orchestrator against the remedy. Before the round the orchestrator sent back one wrong figure (203 records; a root question is 5 bytes, so 244). Codex clean on `793eff3`; Greptile last read `051cd71`, clean.
-- **Decisions:** PR body Deliberate calls 1–7. Size checked at arrival, in the agent's socket. An over-size reply ends the attempt only when it comes from the server. 1,232 kept: 710 bytes is the largest ordinary answer built, not the largest possible. No exhaustive bound on parse work is claimed.
-- **Measured (M1 Ultra):**
-  - At most 244 entries (5-byte root question); 29,646 comparisons is an estimate, 0.40 s here.
-  - The worst reply built parses in about 0.116 s and holds the loop 115–119 ms; root entries do not raise that.
-  - A 9,856-byte reply takes 8.7 s.
-  - Two colliding answer records make 2, 4 or 6 comparisons, depending on the hash.
-- **State:** merged. No schema change; `PROTOCOL_VERSION` 2; no new import or listed name. Its CI `agent` job failed three times before PR #158, only in `test_answers.py`'s memory test (#156, not this PR's).
-- **Waiting on the owner:** nothing from this PR. The record budget before parsing (Deliberate call 7) is filed as #160.
-- **Untested:** an over-size reply over a real network path; the timings on CI hardware; the full suite on Python 3.11 (the reviewer ran the new cases on 3.11.18).
-- **Next:** #160. #20 and #93 are still open in `probe.py`.
