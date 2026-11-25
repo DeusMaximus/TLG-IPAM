@@ -12,6 +12,8 @@ import os
 import queue
 import re
 import secrets
+import shlex
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -126,14 +128,17 @@ def _uvicorn(tmp_path, api_key, *args):
     )
 
 
-def _image(tmp_path, api_key, env=None):
+def _image(tmp_path, api_key, env=None, cwd=API_DIR):
     """Start the server as the image's `CMD` does (`python -m app.serve`), on a loopback
-    port it picks; `env` is added to the child's environment as it is."""
+    port it picks; `env` is added to the child's environment as it is. Another `cwd`
+    finds `app` through `PYTHONPATH`, as the image's `/app` holds it."""
     child_env = _child_env(tmp_path, api_key)
     child_env.update(env or {})
+    if cwd != API_DIR:
+        child_env["PYTHONPATH"] = str(API_DIR)
     return subprocess.Popen(
         [sys.executable, "-m", "app.serve", "--host", "127.0.0.1", "--port", "0"],
-        cwd=API_DIR,
+        cwd=cwd,
         env=child_env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -324,3 +329,302 @@ def test_a_start_that_exits_fails_at_once():
         assert time.monotonic() - started < 5
     finally:
         _stop(proc, reader)
+
+
+# --- Not root (#173) -----------------------------------------------------------------
+
+
+def _final_stage():
+    """The Dockerfile's last stage, one instruction per entry, continuation lines joined
+    and comments left out."""
+    text = (API_DIR.parent / "Dockerfile").read_text()
+    lines = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+    instructions = " ".join(line.strip() for line in "\n".join(lines).replace("\\\n", " ").splitlines() if line.strip())
+    joined = re.split(r" (?=(?:FROM|WORKDIR|COPY|RUN|ENV|EXPOSE|USER|CMD|ENTRYPOINT|ARG|VOLUME) )", " " + instructions)
+    stages = [i.strip() for i in joined if i.strip()]
+    last_from = max(n for n, i in enumerate(stages) if i.startswith("FROM "))
+    return stages[last_from:]
+
+
+def test_the_image_runs_as_uid_10001_and_gives_it_data():
+    """The server image runs as `ipam`, uid and gid 10001, written as literals (no build
+    argument can change them), and makes `/data` that user's, mode 0700, so a new volume
+    takes it. `USER` comes after the last `RUN`, so nothing after it runs as root, and
+    there is no `ENTRYPOINT`, so nothing runs before the `CMD`: CI's `server-image` job
+    (`.github/scripts/check-server-image.sh`) starts the image to see the process's ids."""
+    stage = _final_stage()
+    kinds = [i.split(" ", 1)[0] for i in stage]
+    assert kinds.count("USER") == 1
+    assert "USER 10001:10001" in stage
+    assert "ARG" not in kinds and "ENTRYPOINT" not in kinds and "VOLUME" not in kinds
+    assert max(n for n, k in enumerate(kinds) if k == "RUN") < kinds.index("USER") < kinds.index("CMD")
+    (account,) = [i for i in stage if "useradd" in i]
+    for part in [
+        "groupadd --system --gid 10001 ipam",
+        "useradd --system --uid 10001 --gid 10001 ",
+        "install -d -m 0700 -o 10001 -g 10001 /data",
+    ]:
+        assert part in account, part
+    assert any("DB_PATH=/data/ipam.db" in i for i in stage if i.startswith("ENV "))
+
+
+needs_non_root = pytest.mark.skipif(os.geteuid() == 0, reason="root passes every permission check")
+
+
+@needs_non_root
+def test_storage_is_usable_in_a_writable_directory_with_or_without_files(tmp_path):
+    from app import database
+
+    path = tmp_path / "ipam.db"
+    assert database.storage_problem(str(path)) is None
+    for name in ["ipam.db", "ipam.db-wal", "ipam.db-shm"]:
+        (tmp_path / name).write_bytes(b"")
+    assert database.storage_problem(str(path)) is None
+
+
+@needs_non_root
+def test_storage_problem_names_a_missing_or_unwritable_directory(tmp_path):
+    from app import database
+
+    missing = tmp_path / "missing"
+    assert database.storage_problem(str(missing / "ipam.db")) == (
+        f"the database's directory {missing} does not exist"
+    )
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o555)
+    try:
+        assert database.storage_problem(str(locked / "ipam.db")) == (
+            f"the database's directory {locked} is not writable by this process"
+        )
+    finally:
+        locked.chmod(0o755)
+
+
+@needs_non_root
+@pytest.mark.parametrize("name", ["ipam.db", "ipam.db-wal", "ipam.db-shm"])
+@pytest.mark.parametrize("mode", [0o444, 0o200, 0o000])
+def test_storage_problem_names_a_database_file_it_cannot_read_and_write(tmp_path, name, mode):
+    """A volume an image that ran as root made holds root's files in a directory that
+    may be writable (one given to uid 10001 by hand, say): each file is checked too."""
+    from app import database
+
+    for each in ["ipam.db", "ipam.db-wal", "ipam.db-shm"]:
+        (tmp_path / each).write_bytes(b"")
+    (tmp_path / name).chmod(mode)
+    try:
+        assert database.storage_problem(str(tmp_path / "ipam.db")) == (
+            f"{tmp_path / name} is not readable and writable by this process"
+        )
+    finally:
+        (tmp_path / name).chmod(0o644)
+
+
+@needs_non_root
+def test_the_image_refuses_to_start_on_storage_it_cannot_write(tmp_path):
+    """SQLite opens a database it cannot write read-only, so without the check the
+    server would start and refuse every write (#173). The start stops before uvicorn
+    serves anything, with the one-time command for this process's own ids."""
+    data = tmp_path / "data"
+    data.mkdir()
+    data.chmod(0o555)
+    try:
+        proc = _image(tmp_path, REAL_KEY, {"DB_PATH": str(data / "ipam.db")})
+        try:
+            _, stderr = proc.communicate(timeout=START_DEADLINE)
+        finally:
+            _stop(proc)
+    finally:
+        data.chmod(0o755)
+    assert proc.returncode == 1, stderr
+    assert f"TLG-IPAM will not start: the database's directory {data} is not writable" in stderr
+    assert f"--user root --entrypoint chown ipam -R {os.getuid()}:{os.getgid()} {data}`" in stderr
+    assert f"--user root --entrypoint chmod ipam 700 {data}`" in stderr
+    assert "Uvicorn running on" not in stderr
+    assert REAL_KEY not in stderr
+    assert not (data / "ipam.db").exists()
+
+
+@needs_non_root
+def test_a_missing_directory_is_refused_without_the_volume_command(tmp_path):
+    from app import database
+
+    missing = tmp_path / "missing"
+    with pytest.raises(SystemExit) as refused:
+        database.refuse_unwritable_storage(str(missing / "ipam.db"))
+    assert str(refused.value.code) == (
+        f"TLG-IPAM will not start: the database's directory {missing} does not exist (DB_PATH)."
+    )
+    assert database.refuse_unwritable_storage(str(tmp_path / "ipam.db")) is None
+
+
+@pytest.mark.parametrize("target", ["", ":memory:"])
+def test_a_target_with_no_file_is_not_checked(tmp_path, monkeypatch, target):
+    """`:memory:` and the empty name, which this engine opens in memory, have no
+    directory this process must write (round 1 of #181's briefed review, finding 1)."""
+    from app import database
+
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o555)
+    monkeypatch.chdir(locked)
+    try:
+        assert not database.on_filesystem(target)
+        assert database.storage_problem(target) is None
+        assert database.refuse_unwritable_storage(target) is None
+    finally:
+        locked.chmod(0o755)
+
+
+@needs_non_root
+def test_an_in_memory_database_starts_writes_and_reads_in_a_directory_it_cannot_write(tmp_path):
+    """`DB_PATH=:memory:` with a working directory this process cannot write (the image's
+    `/app`, root's) initialises, takes a write and reads it back, in a fresh interpreter
+    as the server imports the module, and changes nothing about the directory."""
+    workdir = tmp_path / "app"
+    workdir.mkdir()
+    workdir.chmod(0o555)
+    before = os.stat(workdir)
+    script = (
+        "from fastapi.testclient import TestClient\n"
+        "from app.main import app\n"
+        "with TestClient(app) as client:\n"
+        "    headers = {'X-API-Key': %r}\n"
+        "    made = client.post('/api/v1/sections', json={'name': 'in memory'}, headers=headers)\n"
+        "    assert made.status_code == 201, made.text\n"
+        "    listed = client.get('/api/v1/sections', headers=headers).json()['data']\n"
+        "    assert [s['name'] for s in listed] == ['in memory'], listed\n"
+        "print('wrote and read')\n"
+    ) % REAL_KEY
+    env = _child_env(tmp_path, REAL_KEY)
+    env["DB_PATH"] = ":memory:"
+    env["PYTHONPATH"] = str(API_DIR)
+    try:
+        done = subprocess.run(
+            [sys.executable, "-c", script], cwd=workdir, env=env, capture_output=True, text=True,
+            timeout=START_DEADLINE,
+        )
+        after = os.stat(workdir)
+        assert done.returncode == 0, done.stderr
+        assert done.stdout.strip().endswith("wrote and read")
+        assert "will not start" not in done.stderr
+        assert (after.st_mode, after.st_uid, after.st_gid) == (before.st_mode, before.st_uid, before.st_gid)
+        assert list(workdir.iterdir()) == []
+    finally:
+        workdir.chmod(0o755)
+
+
+@needs_non_root
+def test_the_printed_commands_take_the_directory_as_one_shell_word(tmp_path):
+    """A directory with a space and shell syntax is quoted (round 1 of #181's briefed
+    review, finding 2): each printed command splits back into the same words with the
+    directory whole, and nothing in it is run."""
+    from app import database
+
+    data = tmp_path / "with space;$(touch pwned) & 'q'"
+    data.mkdir()
+    data.chmod(0o555)
+    try:
+        with pytest.raises(SystemExit) as refused:
+            database.refuse_unwritable_storage(str(data / "ipam.db"))
+    finally:
+        data.chmod(0o755)
+    message = str(refused.value.code)
+    commands = re.findall(r"`(docker compose run [^`]*)`", message)
+    assert len(commands) == 2, message
+    uid, gid = os.getuid(), os.getgid()
+    give, close = (shlex.split(command) for command in commands)
+    run = ["docker", "compose", "run", "--rm", "--no-deps", "--user", "root", "--entrypoint"]
+    assert give == [*run, "chown", "ipam", "-R", f"{uid}:{gid}", str(data)]
+    assert close == [*run, "chmod", "ipam", "700", str(data)]
+    assert not (tmp_path / "pwned").exists()
+
+
+@needs_non_root
+def test_control_characters_in_the_path_are_shown_as_escapes(tmp_path):
+    from app import database
+
+    data = tmp_path / "a\x1b[2Jb\nc"
+    data.mkdir()
+    data.chmod(0o555)
+    try:
+        with pytest.raises(SystemExit) as refused:
+            database.refuse_unwritable_storage(str(data / "ipam.db"))
+    finally:
+        data.chmod(0o755)
+    message = str(refused.value.code)
+    assert "\x1b" not in message and "\n" not in message
+    # shown once, in the sentence; no command names the escaped spelling, which is
+    # another path (round 2 of #181's briefed review, finding 2)
+    assert message.count("a\\x1b[2Jb\\nc") == 1
+    assert "docker compose run --rm" not in message
+    assert "its path holds a control character" in message
+    assert "the commands must name the real directory" in message
+    assert database.volume_commands(str(data), os.getuid(), os.getgid()) is None
+
+
+# DB_PATH values the engine would not open as the path the storage check reads (round 2
+# of #181's briefed review, finding 1): a `file:` name, URI or not, and a URL query or
+# escape. `{data}` is a directory holding a database this process cannot write.
+NOT_A_PATH = {
+    "uri-rwc": "file:{data}/ipam.db?mode=rwc&uri=true",
+    "uri": "file:{data}/ipam.db?uri=true",
+    "literal-file-name": "file:plain.db",
+    "upper-case": "FILE:plain.db",
+    "shared-memory": "file::memory:?cache=shared",
+    "query-on-a-path": "{data}/ipam.db?mode=ro&uri=true",
+    "bare-query": "{data}/ipam.db?",
+    "percent-escape": "{data}/ipam%2Edb",
+}
+PATHS = {"absolute": "/data/ipam.db", "relative": "./ipam.db", "space": "/data/a b/ipam.db",
+         "hash": "/data/a#b.db", "memory": ":memory:", "empty": ""}
+
+
+@pytest.mark.parametrize("value", NOT_A_PATH.values(), ids=NOT_A_PATH.keys())
+def test_db_path_problem_refuses_what_is_not_a_filesystem_path(value):
+    assert config.db_path_problem(value.format(data="/data")) == "DB_PATH must be a filesystem path or :memory:."
+
+
+@pytest.mark.parametrize("value", PATHS.values(), ids=PATHS.keys())
+def test_db_path_problem_accepts_a_path_or_memory(value):
+    assert config.db_path_problem(value) is None
+
+
+def test_load_settings_refuses_a_db_path_that_is_not_a_path(monkeypatch):
+    for name in [n for n in os.environ if n.upper() == "DB_PATH"]:
+        monkeypatch.delenv(name)
+    monkeypatch.setenv("DB_PATH", "file:/data/ipam.db?mode=rwc&uri=true")
+    with pytest.raises(SystemExit) as refused:
+        config.load_settings()
+    assert str(refused.value.code) == "TLG-IPAM will not start: DB_PATH must be a filesystem path or :memory:."
+
+
+@needs_non_root
+@pytest.mark.parametrize("value", NOT_A_PATH.values(), ids=NOT_A_PATH.keys())
+def test_the_image_refuses_a_db_path_that_is_not_a_path_before_serving(tmp_path, value):
+    """Persistent storage this process cannot write (a 0555 directory holding a 0444
+    database, as root's volume is to uid 10001) named through a `file:` name or a URL
+    query: before round 2's fix these started, answered reads and failed every write.
+    The start stops before uvicorn serves anything, and the message repeats no value."""
+    data = tmp_path / "data"
+    data.mkdir()
+    sqlite3.connect(data / "ipam.db").close()
+    (data / "ipam.db").chmod(0o444)
+    data.chmod(0o555)
+    db_path = value.format(data=data)
+    workdir = tmp_path / "workdir"  # where a literal `file:` name would be opened
+    workdir.mkdir()
+    try:
+        proc = _image(tmp_path, REAL_KEY, {"DB_PATH": db_path}, cwd=workdir)
+        try:
+            _, stderr = proc.communicate(timeout=START_DEADLINE)
+        finally:
+            _stop(proc)
+    finally:
+        data.chmod(0o755)
+        (data / "ipam.db").chmod(0o644)
+    assert proc.returncode == 1, stderr
+    assert "TLG-IPAM will not start: DB_PATH must be a filesystem path or :memory:." in stderr
+    assert "Uvicorn running on" not in stderr and "Application startup complete" not in stderr
+    assert db_path not in stderr and str(data) not in stderr
+    assert list(workdir.iterdir()) == []
