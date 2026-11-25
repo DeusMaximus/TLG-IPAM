@@ -27,6 +27,20 @@ Template:
 
 ---
 
+## 2026-11-25 — Claude Code (Fable 5.2), worker — #25: the web-client spike's findings written into spec §6 (PR #182)
+- **Done:** [PR #182](https://github.com/DeusMaximus/TLG-IPAM/pull/182) closes #25. The spike's harness and raw log are in `.agents/spikes/25/`, written by the orchestrator (Opus 5.5) from the run on the owner's test deployment; the findings are the comment on #25. `docs/v0.2-spec.md` §6 and §9 carry them:
+  - §6.3: the link window opens before the URL is given to a client (ChatGPT and Gemini register on URL entry); a registration is not a link; registration accepts only `https` redirect URIs with a host, or `http` to loopback; a loopback-IP redirect authorises with any port, `localhost` by name only with its registered port; the redirect host is derived from the authorise request's validated `redirect_uri`, shown in ASCII form.
+  - §6.4: `oauth_clients` gains `token_endpoint_auth_method` and the hashed client secret, checked by the provider's own request-aware authenticator; `oauth_grants` gains `redirect_uri`; `last_used_at` is the client's last contact, not the owner's use.
+  - §6.5: a tool the caller lacks the scope for is hidden, and a direct call answers `Unknown tool`; no docstring tells an assistant to retry.
+  - §6.6: the cap of 50 counts every registration, and one with no unrevoked grant is reclaimable; the list shows the grant's host and **Last contact**.
+  - §6.7: unserved `/.well-known/` paths answer 404, never the SPA; `HEAD /mcp` answers as `GET` does.
+  - §6.8 is the record of the spike; §6.10 gains the acceptance lines; §9 has nothing open.
+- **Decisions:** PR Deliberate calls 1–18. RFC 8707 `resource` is checked at authorise only (`invalid_target`), absent is accepted. No CIMD: all four clients link by dynamic registration. The grant stores the whole `redirect_uri` as authorised. A client registered in one window can authorise in a later one. Hashing the client secret is kept.
+- **State:** no application code, no schema. Round 1 (GPT-6.1 Sol, `57030fb`) NO-GO with two P2s (a hash-only secret needs a request-aware authenticator; the SDK accepts any redirect scheme) and two P3s, fixed in `459625c`. Round 2 (`459625c`) GO with one P3 (the loopback-port exception), fixed in `a0b300e` and read by the orchestrator against the remedy. Codex clean on `a0b300e`, CI green. Greptile's free plan ran out of credits this billing period, so it no longer reviews.
+- **Merged:** `6da48bc`, 2026-11-25.
+- **Waiting on the owner:** approve the M3 issue edits below; remove the spike's public route and the four test connectors.
+- **Next:** edit the M3 issues from the PR's scope notes: #26 (the authenticator, the redirect policy and the loopback-port exception, the `resource` check), #27, #28, #29 (its 51st-registration line needs qualifying) and #30. Then M3 can start.
+
 ## 2026-11-25 — Claude Code (Opus 5.5), worker — #93: `ALLOWED_DNS_SERVERS`, a resolver allowlist on the agent's host (PR #177)
 - **Merged:** 2026-11-25, squash `2c54ef4`, at head `4352115`; branch deleted, #93 closed. Round 1 (GPT-6.1 Sol, `131349e`) NO-GO: P2 a scoped IPv6 entry let a server on another interface through, P3 no restart after the drop-in; both fixed in `1d73e4e`. Round 2 (GPT-6.1 Sol, `1d73e4e`) GO with one P3 (an unconditional kernel-refusal claim), fixed in wording in `4352115` and read by the orchestrator against the remedy; no third round. `main` (#178) merged in `4038143`: checked by the orchestrator as mechanical (every file but `AGENTS.md` equal to an automatic merge; both sides' sentence edits to the shared bullet carried over exactly). Codex clean on `4352115`, CI 9/9 green. Orchestrator's agent suite at the head: 1,908 passed, 14 skipped. Reviews at `.dev/93/review-1-sol.md` and `review-2-sol.md`. Follow-up filed with the owner's word: #179 (`install --allowed-dns-servers`).
 - **Done:** [PR #177](https://github.com/DeusMaximus/TLG-IPAM/pull/177) closes #93.
@@ -70,13 +84,3 @@ Template:
 - **State:** agent 1,812 passed, 4 skipped at the head (`main` 1,783). No schema change, no wire change, `PROTOCOL_VERSION` 2, `test_invariants.py` unchanged. Untested: the UI's layout of a long notice; a real forwarder (loopback responders stand in).
 - **Next:** #93 or #20, one at a time; both touch `probe.py`.
 
-## 2026-11-25 — Claude Code (Opus 5.5), worker — #165: enrolment refuses an agent on another protocol before its token is spent (PR #172)
-- **Merged:** 2026-11-25, squash `2afe2c0`, at head `01cd32c`; branch deleted, #165 closed. Codex clean and Greptile 5/5 on `01cd32c`; briefed round on GPT-6.1 Sol GO with no findings and every deliberate call standing (`.dev/165/review-1-sol.md`): both suites re-measured, seven mutations red, and the new agent's actual enrol request run in process against the actual server at `a8cb345` (enrolled `200`), which closes the PR's untested old-server line. The orchestrator re-ran the agent suite at the head (1,798 passed, 4 skipped) and the server's enrolment tests (78). Follow-up filed with the owner's word: #175 (show an enrolment protocol refusal on the Agents page).
-- **Done:** [PR #172](https://github.com/DeusMaximus/TLG-IPAM/pull/172) closes #165.
-  - `agent_protocol.py`: `EnrolRequest.protocol` (`StrictInt | None`); `ENROL_PROTOCOL_ABSENT = 2`; `ENROL_TOO_OLD`/`ENROL_TOO_NEW` (`AGENT_TOO_OLD`, `AGENT_TOO_NEW`); `enrol_protocol`, `enrol_protocol_refusal` (check-in's rule).
-  - `services/enrolment._exchange`: after the body is read and before validation, the write lock and `_claim`, a protocol mismatch is `409` with a fixed message naming no protocol. Nothing written, token unused, counts against the throttle. `protocol` is never stored.
-  - Agent: `enrol.enrol_body()` (the report plus `protocol`); `enrol.protocol_refusal` builds the operator message; `enrol_and_store` logs it and retries on the refusal wait; `install._not_enrolled` uses it and adds "run install again, with the same token". The two codes are copied into the agent's `protocol.py`, held by `test_contract.py`.
-  - Spec §5.6 has a new paragraph, "The agent's protocol, before the claim"; §5.7, brief §3.9 and §4.8, and the `AGENTS.md` "Enrolment tokens" and "wire contract" bullets are updated. #162's e2e test is replaced by `test_a_new_token_form_spends_an_old_agents_enrolment_only_if_the_protocol_is_not_raised`.
-- **Decisions:** PR Deliberate calls 1–11: a body field, not a header; checked after the token lookup and before the lock; check-in's rule; two `409` codes; absent or null means 2, a non-integer is `422`; it counts against the throttle; `PROTOCOL_VERSION` not raised; the agent keeps retrying; nothing recorded on the agent row.
-- **State:** agent 1,798 passed, 4 skipped; server 1,378; web 188 (untouched). No schema change; `PROTOCOL_VERSION` 2. In `install.py` only `_not_enrolled` changed.
-- **Next:** #169 (shares `install.py`) can start now.
