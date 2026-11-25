@@ -415,7 +415,7 @@ def env_assignments(text: str, env_path: str) -> list[tuple[str, str]]:
     """The assignments of an agent.env, in order, when the whole file is in the grammar
     `install` writes; otherwise InstallError, before any assignment is read (round 1
     of the briefed review of #179). systemd's `EnvironmentFile=` grammar is wider:
-    quoted values run across lines, a backslash continues a line (a comment's too),
+    quoted values run across lines, a backslash continues a value onto the next line,
     and `\r` ends one. Read line by line, a file using any of it can hold a line that
     looks like an assignment and is not one to systemd (`OTHER="a` … `b"`), or hide
     one systemd reads. So every line, unrelated ones included, is split at `\n`

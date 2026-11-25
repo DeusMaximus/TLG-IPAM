@@ -1120,12 +1120,14 @@ WIDENED = "ALLOWED_DNS_SERVERS=0.0.0.0/0"
         # value, and ALLOWED_DNS_SERVERS is 10.0.0.53; read line by line it was 0.0.0.0/0
         (f'ALLOWED_DNS_SERVERS=10.0.0.53\nOTHER="a\n{WIDENED}\nb"', "line 5 of"),
         (f"ALLOWED_DNS_SERVERS=10.0.0.53\nOTHER='a\n{WIDENED}\nb'", "line 5 of"),
-        # the same mismatch by the grammar's other ways: a comment continued with a
-        # backslash, a bare carriage return or a vertical tab
-        (f"ALLOWED_DNS_SERVERS=10.0.0.53\n# a note \\\n{WIDENED}", "line 5 of"),
+        # the same mismatch by the grammar's other ways: a bare carriage return, which
+        # ends a line to systemd, or a vertical tab, at which `splitlines` would cut one
         (f"ALLOWED_DNS_SERVERS=10.0.0.53\n# a note\r{WIDENED}", "line 5 of"),
         (f"ALLOWED_DNS_SERVERS=10.0.0.53\nOTHER=a\x0b{WIDENED}", "line 5 of"),
-        # lines that do not name it are held to the grammar too
+        # lines that do not name it are held to the grammar too. A comment ending in a
+        # backslash is outside it, though systemd 257 does not continue a comment onto
+        # the next line (round 2 of the briefed review): no backslash, anywhere
+        (f"ALLOWED_DNS_SERVERS=10.0.0.53\n# a note \\\n{WIDENED}", "line 5 of"),
         ('ALLOWED_DNS_SERVERS=10.0.0.53\nOTHER="a b"', "line 5 of"),
         ("OTHER=\nALLOWED_DNS_SERVERS=10.0.0.53", "line 4 of"),
         ("  # an indented comment\nALLOWED_DNS_SERVERS=10.0.0.53", "line 4 of"),
