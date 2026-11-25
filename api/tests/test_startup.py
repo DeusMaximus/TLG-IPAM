@@ -324,3 +324,129 @@ def test_a_start_that_exits_fails_at_once():
         assert time.monotonic() - started < 5
     finally:
         _stop(proc, reader)
+
+
+# --- Not root (#173) -----------------------------------------------------------------
+
+
+def _final_stage():
+    """The Dockerfile's last stage, one instruction per entry, continuation lines joined
+    and comments left out."""
+    text = (API_DIR.parent / "Dockerfile").read_text()
+    lines = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+    instructions = " ".join(line.strip() for line in "\n".join(lines).replace("\\\n", " ").splitlines() if line.strip())
+    joined = re.split(r" (?=(?:FROM|WORKDIR|COPY|RUN|ENV|EXPOSE|USER|CMD|ENTRYPOINT|ARG|VOLUME) )", " " + instructions)
+    stages = [i.strip() for i in joined if i.strip()]
+    last_from = max(n for n, i in enumerate(stages) if i.startswith("FROM "))
+    return stages[last_from:]
+
+
+def test_the_image_runs_as_uid_10001_and_gives_it_data():
+    """The server image runs as `ipam`, uid and gid 10001, written as literals (no build
+    argument can change them), and makes `/data` that user's, mode 0700, so a new volume
+    takes it. `USER` comes after the last `RUN`, so nothing after it runs as root, and
+    there is no `ENTRYPOINT`, so nothing runs before the `CMD`: CI's `server-image` job
+    (`.github/scripts/check-server-image.sh`) starts the image to see the process's ids."""
+    stage = _final_stage()
+    kinds = [i.split(" ", 1)[0] for i in stage]
+    assert kinds.count("USER") == 1
+    assert "USER 10001:10001" in stage
+    assert "ARG" not in kinds and "ENTRYPOINT" not in kinds and "VOLUME" not in kinds
+    assert max(n for n, k in enumerate(kinds) if k == "RUN") < kinds.index("USER") < kinds.index("CMD")
+    (account,) = [i for i in stage if "useradd" in i]
+    for part in [
+        "groupadd --system --gid 10001 ipam",
+        "useradd --system --uid 10001 --gid 10001 ",
+        "install -d -m 0700 -o 10001 -g 10001 /data",
+    ]:
+        assert part in account, part
+    assert any("DB_PATH=/data/ipam.db" in i for i in stage if i.startswith("ENV "))
+
+
+needs_non_root = pytest.mark.skipif(os.geteuid() == 0, reason="root passes every permission check")
+
+
+@needs_non_root
+def test_storage_is_usable_in_a_writable_directory_with_or_without_files(tmp_path):
+    from app import database
+
+    path = tmp_path / "ipam.db"
+    assert database.storage_problem(str(path)) is None
+    for name in ["ipam.db", "ipam.db-wal", "ipam.db-shm"]:
+        (tmp_path / name).write_bytes(b"")
+    assert database.storage_problem(str(path)) is None
+
+
+@needs_non_root
+def test_storage_problem_names_a_missing_or_unwritable_directory(tmp_path):
+    from app import database
+
+    missing = tmp_path / "missing"
+    assert database.storage_problem(str(missing / "ipam.db")) == (
+        f"the database's directory {missing} does not exist"
+    )
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o555)
+    try:
+        assert database.storage_problem(str(locked / "ipam.db")) == (
+            f"the database's directory {locked} is not writable by this process"
+        )
+    finally:
+        locked.chmod(0o755)
+
+
+@needs_non_root
+@pytest.mark.parametrize("name", ["ipam.db", "ipam.db-wal", "ipam.db-shm"])
+@pytest.mark.parametrize("mode", [0o444, 0o200, 0o000])
+def test_storage_problem_names_a_database_file_it_cannot_read_and_write(tmp_path, name, mode):
+    """A volume an image that ran as root made holds root's files in a directory that
+    may be writable (one given to uid 10001 by hand, say): each file is checked too."""
+    from app import database
+
+    for each in ["ipam.db", "ipam.db-wal", "ipam.db-shm"]:
+        (tmp_path / each).write_bytes(b"")
+    (tmp_path / name).chmod(mode)
+    try:
+        assert database.storage_problem(str(tmp_path / "ipam.db")) == (
+            f"{tmp_path / name} is not readable and writable by this process"
+        )
+    finally:
+        (tmp_path / name).chmod(0o644)
+
+
+@needs_non_root
+def test_the_image_refuses_to_start_on_storage_it_cannot_write(tmp_path):
+    """SQLite opens a database it cannot write read-only, so without the check the
+    server would start and refuse every write (#173). The start stops before uvicorn
+    serves anything, with the one-time command for this process's own ids."""
+    data = tmp_path / "data"
+    data.mkdir()
+    data.chmod(0o555)
+    try:
+        proc = _image(tmp_path, REAL_KEY, {"DB_PATH": str(data / "ipam.db")})
+        try:
+            _, stderr = proc.communicate(timeout=START_DEADLINE)
+        finally:
+            _stop(proc)
+    finally:
+        data.chmod(0o755)
+    assert proc.returncode == 1, stderr
+    assert f"TLG-IPAM will not start: the database's directory {data} is not writable" in stderr
+    assert f"--user root --entrypoint chown ipam -R {os.getuid()}:{os.getgid()} {data}`" in stderr
+    assert "Uvicorn running on" not in stderr
+    assert REAL_KEY not in stderr
+    assert not (data / "ipam.db").exists()
+
+
+@needs_non_root
+def test_a_missing_directory_is_refused_without_the_volume_command(tmp_path):
+    from app import database
+
+    missing = tmp_path / "missing"
+    with pytest.raises(SystemExit) as refused:
+        database.refuse_unwritable_storage(str(missing / "ipam.db"))
+    assert str(refused.value.code) == (
+        f"TLG-IPAM will not start: the database's directory {missing} does not exist (DB_PATH)."
+    )
+    assert database.refuse_unwritable_storage(str(tmp_path / "ipam.db")) is None

@@ -21,6 +21,19 @@ jobs:
       - run: python -m pip install --require-hashes -r requirements-dev.txt
       - run: python -m pytest
 
+  # The server's image (the root Dockerfile, #173): built, then started with no network,
+  # on a new volume and on one an image that ran as root left, which it refuses until the
+  # README's one-time chown. It runs as uid 10001, never root. The build fetches the
+  # locked packages; the checks need no credential and send nothing off the host.
+  server-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Image builds, runs as uid 10001, and starts on new and upgraded volumes
+        run: |
+          docker build -t tlg-ipam:ci .
+          bash .github/scripts/check-server-image.sh tlg-ipam:ci
+
   # The scan agent (agent/): its tests, the end-to-end ones against the server's
   # real routes included, and its image. The image is built and started with no
   # network at all, so CI sends no packet anywhere.

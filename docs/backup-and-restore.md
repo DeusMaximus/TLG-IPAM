@@ -147,7 +147,7 @@ The one rule behind the steps: **stop the app, remove the old database's `-wal` 
 
 Run this on the machine that runs the container (`ipam-host`), from the directory that holds `docker-compose.yml` and `.env`. If the pull host is a different machine, copy the snapshot over first (`scp backup-host:/var/backups/tlg-ipam/ipam-20261113T023000Z.db .`). It needs `sqlite3` there too.
 
-It is a script, not a block to paste, so that `set -eu` stops it at the first failed check: a bad snapshot is refused before the app is stopped, and nothing is moved until the snapshot has passed. Save it as `tlg-ipam-restore`:
+It is a script, not a block to paste, so that `set -eu` stops it at the first failed check: a bad snapshot is refused before the app is stopped, and nothing is moved until the snapshot has passed. Each step it runs in the volume runs as the server's user (uid 10001, README, "The container's user"), as the server does. The snapshot goes in through standard input, read on this host, so the restored file is that user's, mode 0600, whoever owns the snapshot here. On a volume that user cannot change, one an image that ran as root made, it stops before the app with nothing changed: run the README's one-time command, then the script again. Save it as `tlg-ipam-restore`:
 
 ```sh
 #!/bin/sh
@@ -159,6 +159,15 @@ mode="${1:-}"
 arg="${2:-}"
 [ -n "$arg" ] || { sed -n '2,3p' "$0" >&2; exit 2; }
 fail() { echo "tlg-ipam-restore: $*" >&2; exit 1; }
+
+# Every step in the volume runs as the server's user (#173), which must be able to change
+# /data and each directory given. Checked before the app is stopped.
+check_writable() {
+  docker compose run --rm --no-deps --entrypoint sh ipam -c '
+    for d in "$@"; do [ -w "$d" ] || { echo "$d is not writable by uid $(id -u)" >&2; exit 1; }; done
+  ' sh "$@" ||
+    fail "the server's user cannot change the volume; nothing changed (README: Upgrading from an image that ran as root)"
+}
 
 check_up() {
   docker compose up -d ipam
@@ -172,25 +181,31 @@ restore)
   [ -s "$arg" ] || fail "not found, or empty: $arg"
   snap="$(cd "$(dirname "$arg")" && pwd)/$(basename "$arg")"
 
-  # 1. The snapshot must pass before anything is touched.
+  # 1. The snapshot must pass, and the server's user be able to change the volume,
+  # before anything is touched.
   result=$(sqlite3 "file:$snap?immutable=1" 'PRAGMA integrity_check')
   [ "$result" = "ok" ] || fail "integrity_check said: $result"
+  check_writable /data
 
   # 2. Stop the app, so nothing writes while the file is replaced.
   docker compose stop ipam
 
   # 3. Move the current database (and its -wal and -shm) aside, then copy the snapshot in.
-  docker compose run --rm --no-deps -v "$snap:/restore/ipam.db:ro" --entrypoint sh ipam -c '
+  # The snapshot goes in on standard input, read by this shell, so the copy is written by
+  # the server's user, mode 0600, whoever owns the file on this host.
+  docker compose run --rm --no-deps -T --entrypoint sh ipam -c '
     set -eu
+    umask 077
     cd /data
     aside="before-restore-$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir "$aside"
     for f in ipam.db ipam.db-wal ipam.db-shm; do
       if [ -e "$f" ]; then mv "$f" "$aside/"; fi
     done
-    cp /restore/ipam.db /data/ipam.db
+    cat > .ipam.db.restoring
+    mv .ipam.db.restoring ipam.db
     echo "the replaced database is in /data/$aside"
-  '
+  ' < "$snap"
 
   # 4. Start the app and check it answers.
   check_up
@@ -205,6 +220,7 @@ undo)
   # Look for the saved database before stopping anything.
   docker compose run --rm --no-deps --entrypoint test ipam -f "/data/$arg/ipam.db" ||
     fail "no $arg/ipam.db in the volume; nothing changed"
+  check_writable /data "/data/$arg"
   docker compose stop ipam
   docker compose run --rm --no-deps --entrypoint sh ipam -c '
     set -eu

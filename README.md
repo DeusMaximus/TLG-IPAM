@@ -23,6 +23,25 @@ Open http://localhost:8080, paste your API key, done.
 
 The server will not start without a real key: with `API_KEY` unset, empty, still the `change-me` placeholder from `.env.example`, or with a space, tab or newline at either end, it exits with a message that names `API_KEY`. A padded key is refused rather than trimmed, so check a key pasted from a file or a secret store.
 
+## The container's user
+
+The server runs as `ipam`, uid and gid 10001, never root (`docker compose top` shows `10001`). The code in the image stays root's, so the server cannot change it. A new `ipam-data` volume takes the image's `/data`, which belongs to that user, mode 0700. Nothing in the image runs as root at start, so a volume made by an earlier image, which belongs to root, is given to the user once by hand (below). Until then the server refuses to start, and its log gives the command.
+
+### Upgrading from an image that ran as root
+
+Once, from the directory that holds `docker-compose.yml`:
+
+```sh
+docker compose build ipam
+docker compose stop ipam
+docker compose run --rm --no-deps --user root --entrypoint chown ipam -R 10001:10001 /data
+docker compose up -d ipam
+```
+
+`chown -R` covers `ipam.db`, its `-wal` and `-shm` files, and any `before-restore-` directory the restore script left. The command runs through the container runtime, so the ids come out right where the runtime maps them to others on the host (an unprivileged LXC, Docker's user-namespace remapping). To check: `docker compose run --rm --no-deps --entrypoint ls ipam -ln /data` lists only `10001 10001`.
+
+A bind mount in place of the named volume (`./data:/data`, say) needs its directory given to 10001:10001 too, and the same command does it.
+
 ## Backups and restore
 
 `GET /api/v1/backup` returns a consistent snapshot of the database (also the Settings → backup button). [docs/backup-and-restore.md](docs/backup-and-restore.md) sets up a scheduled pull of it from another host with dated files and retention, and walks through restoring from one. Try the restore once before you need it.
