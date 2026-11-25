@@ -120,19 +120,22 @@ class FakeResolver:
     A lookup here takes one slot and answers at once, or after `delay`: the name in
     `names`, None (no usable answer) for an address in `unanswered`, the
     `probe.UnreadReplies` given for an address in `unread` (no usable answer, its
-    server's reply refused unread, #164), and NO_NAME for any other, as a server's
+    server's reply refused unread, #164), the `probe.AnsweredPastRefusal` given for an
+    address in `later` (a later server's answer after such a refusal, #170), and
+    NO_NAME for any other, as a server's
     NXDOMAIN; a lookup whose slot left it no time is None. The real resolver's tests
     are in test_probe.py."""
 
     def __init__(
         self, names=None, clock: FakeClock | None = None, delay: float = 0.0, host=HOST_DNS, unanswered=(),
-        unread=None,
+        unread=None, later=None,
     ):
         self.names = {ipaddress.ip_address(k): v for k, v in (names or {}).items()}
         # addresses no server gives a usable answer for; any other address not in
         # `names` is answered "no name" (NO_NAME), as NXDOMAIN is
         self.unanswered = {ipaddress.ip_address(a) for a in unanswered}
         self.unread = {ipaddress.ip_address(k): v for k, v in (unread or {}).items()}
+        self.later = {ipaddress.ip_address(k): v for k, v in (later or {}).items()}
         self.asked: list = []
         self.timeouts: list[float] = []
         self.times: list[float] = []
@@ -161,6 +164,8 @@ class FakeResolver:
             return None
         if address in self.unread:
             return self.unread[address]
+        if address in self.later:
+            return self.later[address]
         return self.names.get(address, NO_NAME)
 
 

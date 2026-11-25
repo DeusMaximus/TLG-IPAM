@@ -16,7 +16,8 @@ out, did not run; one the deadline stops before its first attempt is the timeout
 record says what its own lookup found: a name, `rdns_no_name` when a server answered
 that there is none, or neither, and only `rdns_no_name` clears a stored name. The
 lookups that got no usable answer are counted in the job's error, and of them those
-that met a reply the agent refused unread, for its size or its header's counts (#164).
+that met a reply the agent refused unread, for its size or its header's counts (#164),
+and, as a notice, the lookups a later server answered after such a refusal (#170).
 """
 
 import asyncio
@@ -33,6 +34,7 @@ from .probe import (
     DNS_RECORDS_MAX,
     NO_DNS_SERVER,
     NO_NAME,
+    AnsweredPastRefusal,
     ArpLink,
     ArpSession,
     ProbeError,
@@ -397,21 +399,36 @@ def cut_short(too_large: int, too_many_records: int) -> str:
     return f"rdns: before the timeout, {refused_unread(too_large, too_many_records)}"
 
 
-def error_text(errors: list[str], optional: tuple[int, str | None] | None = None) -> str | None:
+def answered_later(too_large: int, too_many_records: int) -> str:
+    """The notice of a job some of whose PTR lookups a later server answered, with a
+    name or that there is none, after an earlier attempt of each met a reply from its
+    own server that the agent refused unread (#170): `too_large` and
+    `too_many_records` count those lookups by limit (`probe.AnsweredPastRefusal`), in
+    `refused_unread`'s words. Those lookups had their answer, so nothing was lost but
+    a query and a packet of the budget each; this says so, so that a first server
+    whose every reply is refused shows before the day the later one stops answering.
+    Counts and fixed words only, as #164's: nothing of a reply, a name, an address or
+    a server, which of the configured servers it was included."""
+    return f"rdns: a later server answered after {refused_unread(too_large, too_many_records)}"
+
+
+def error_text(errors: list[str], *optional: tuple[int, str | None]) -> str | None:
     """A job's error: its parts joined, made printable and capped as the server stores
-    it (`scan_error`). `optional` names the one part that carries the refusal counts,
-    at its place in `errors`, with the text that stands there without them (None:
-    nothing). When the whole would not fit SCAN_ERROR_MAX, the counts are left out
-    whole, never cut short of their number (round 1 of the briefed review, finding 2);
-    what is left is capped as before."""
+    it (`scan_error`). Each of `optional` names a part that carries counts, at its
+    place in `errors`, with the text that stands there without them (None: nothing),
+    in the order they are given up: `scan.run` gives the notice of lookups a later
+    server answered first (#170), then the refusal counts of the lookups without a
+    usable answer (#164). While the whole would not fit SCAN_ERROR_MAX, the next of
+    them is left out whole, never cut short of its number (round 1 of #164's briefed
+    review, finding 2); what is left is capped as before."""
     if not errors:
         return None
-    text = "; ".join(errors)
-    if optional is not None and not scan_error_fits(text):
-        at, without = optional
-        kept = errors[:at] + ([without] if without is not None else []) + errors[at + 1:]
-        text = "; ".join(kept)
-    return scan_error(text)
+    parts: list[str | None] = list(errors)
+    for at, without in optional:
+        if scan_error_fits("; ".join(p for p in parts if p is not None)):
+            break
+        parts[at] = without
+    return scan_error("; ".join(p for p in parts if p is not None))
 
 
 def refusal(ref: JobRef, reason: str, clock: Clock) -> dict:
@@ -526,10 +543,15 @@ async def run(
     # for its header's counts (a lookup a later server answered is in neither)
     too_large: set[Address] = set()
     too_many_records: set[Address] = set()
+    # the lookups a later server answered after such a refusal, by limit (#170)
+    later_too_large: set[Address] = set()
+    later_too_many_records: set[Address] = set()
     looked_up = 0  # lookups that returned, whatever they found
-    # the part of `errors` that carries the refusal counts, and what stands there
-    # without them: left out whole if the error would not fit (`error_text`)
-    optional: tuple[int, str | None] | None = None
+    # the parts of `errors` that carry counts, and what stands there without them:
+    # the notice, then the refusal counts, are left out whole if the error would not
+    # fit (`error_text`)
+    notice: tuple[int, str | None] | None = None
+    counts: tuple[int, str | None] | None = None
     servers: tuple[str, ...] = ()
     if "rdns" in job.methods and alive and not timed_out:
         # chosen once for the job: its own servers, else the host's resolvers as they
@@ -571,6 +593,14 @@ async def run(
 
             answer = await resolver.ptr(address, servers, slot)
             looked_up += 1
+            if isinstance(answer, AnsweredPastRefusal):
+                # a later server's answer decides the record as it would alone; that an
+                # earlier server's reply was refused is only counted (#170)
+                if answer.too_large:
+                    later_too_large.add(address)
+                if answer.too_many_records:
+                    later_too_many_records.add(address)
+                answer = answer.answer
             if answer is NO_NAME:
                 no_name.add(address)
             elif answer is None or isinstance(answer, UnreadReplies):
@@ -606,10 +636,15 @@ async def run(
         if unanswered and not timed_out:
             errors.append(no_answer(len(unanswered), looked_up, len(too_large), len(too_many_records)))
             if too_large or too_many_records:
-                optional = (len(errors) - 1, no_answer(len(unanswered), looked_up))
+                counts = (len(errors) - 1, no_answer(len(unanswered), looked_up))
         elif timed_out and (too_large or too_many_records):
             errors.append(cut_short(len(too_large), len(too_many_records)))
-            optional = (len(errors) - 1, None)
+            counts = (len(errors) - 1, None)
+        # the lookups that returned with a later server's answer, whatever ended the
+        # rest: last, and the first part given up should the error not fit (#170)
+        if later_too_large or later_too_many_records:
+            errors.append(answered_later(len(later_too_large), len(later_too_many_records)))
+            notice = (len(errors) - 1, None)
     if timed_out:
         complete = False
 
@@ -633,5 +668,5 @@ async def run(
         "liveness_complete": liveness_complete,
         "observations": observations,
         "fdns": [],
-        "error": error_text(errors, optional),
+        "error": error_text(errors, *(part for part in (notice, counts) if part is not None)),
     }
