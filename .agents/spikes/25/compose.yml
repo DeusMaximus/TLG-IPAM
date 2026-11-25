@@ -9,5 +9,7 @@ services:
     ports:
       - "8090:8090"
     volumes:
+      # Create ./logs writable by the container's non-root user before the first start (README): a
+      # directory Docker creates for this mount is root's, and the harness stops at its first log line.
       - ./logs:/logs
     restart: "no"

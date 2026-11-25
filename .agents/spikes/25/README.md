@@ -11,6 +11,9 @@ The harness for spec §6.8's spike. The findings are in the comment on #25. The 
 
 ```sh
 # from the repository root
+# The log directory is bind-mounted over the image's /logs, so the image's ownership of it does not
+# apply, and Docker creates a missing one owned by root. The container's user must be able to write it:
+mkdir -p .agents/spikes/25/logs && chmod a+rwx .agents/spikes/25/logs
 PUBLIC_BASE_URL=https://mcp-spike.example.com docker compose -f .agents/spikes/25/compose.yml up -d --build
 ```
 
