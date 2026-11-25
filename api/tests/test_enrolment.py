@@ -32,6 +32,7 @@ from app.database import SessionLocal, engine
 from app.main import app
 from app.models import Agent, Change, Token
 from app.services import agents as agents_svc
+from app.routers import agent as agent_router
 from app.services import enrolment, jobs
 from app.services.changes import WITHHELD
 
@@ -570,6 +571,396 @@ def test_enrolment_refuses_exactly_the_integer_protocols_check_in_refuses(monkey
         if refused is not None:
             assert refused == (ENROL_TOO_OLD if protocol < server else ENROL_TOO_NEW)
     assert enrol_protocol_refusal({}) == enrol_protocol_refusal({"protocol": 2})
+
+
+# --- What the owner is shown of a protocol refusal (#175) ---
+
+
+def _refusals() -> int:
+    return len(agents_svc.enrol_refusals)
+
+
+@pytest.fixture
+def during_the_body(monkeypatch):
+    """Run owner requests, and other agents' attempts, while one attempt's body arrives:
+    after its token was found usable, before the protocol is judged (round 1 of #184's
+    briefed review drove the same point through the real route)."""
+    steps = []
+    real = agent_router._json_body
+
+    async def body_after_steps(request):
+        while steps:
+            await steps.pop(0)()
+        return await real(request)
+
+    monkeypatch.setattr(agent_router, "_json_body", body_after_steps)
+    return steps
+
+
+@pytest.mark.parametrize("protocol", [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1], ids=["old", "new"])
+async def test_a_protocol_refusal_is_shown_to_the_owner_and_writes_nothing(
+    client, agent_api, protocol
+):
+    """Acceptance: the owner sees which way the agent was refused, and when, without the
+    agent's log; the code is the server's, and nothing is written for it."""
+    created = await create(client)
+    before = every_row()
+    asked = _now()
+    res = await enrol(agent_api, created["enrol_token"], protocol=protocol, **REPORT)
+    assert res.status_code == 409, res.text
+    assert every_row() == before
+    code = res.json()["error"]["code"]
+    agent = await get_agent(client, created["id"])
+    assert agent["state"] == "pending"
+    assert agent["enrol_refusal"]["code"] == code == _protocol_refusal(protocol)["error"]["code"]
+    refused_at = agent["enrol_refusal"]["refused_at"]
+    assert refused_at.endswith("+00:00")
+    assert asked <= datetime.fromisoformat(refused_at) <= _now()
+    [listed] = (await client.get("/api/v1/agents")).json()["data"]
+    assert listed["enrol_refusal"] == agent["enrol_refusal"]
+    # nothing the agent reported is taken from a refused body
+    assert (agent["version"], agent["hostname"], agent["platform"]) == (None, None, None)
+
+
+async def test_a_later_refusal_replaces_the_earlier(client, agent_api, monkeypatch):
+    created = await create(client)
+    first, second = _now(), _now() + timedelta(minutes=14)
+    times = iter([first, first, second, second])  # each attempt's lookup, then its refusal
+    monkeypatch.setattr(enrolment, "_now", lambda: next(times))
+    await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+    await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION + 1)
+    refusal = (await get_agent(client, created["id"]))["enrol_refusal"]
+    assert refusal == {"code": ENROL_TOO_NEW, "refused_at": second.isoformat()}
+
+
+async def test_the_enrolment_that_spends_the_token_ends_the_refusal(client, agent_api):
+    created = await create(client)
+    await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION + 1)
+    assert _refusals() == 1
+    assert (await enrol(agent_api, created["enrol_token"], **REPORT)).status_code == 200
+    agent = await get_agent(client, created["id"])
+    assert agent["state"] == "active" and agent["enrol_refusal"] is None
+    assert _refusals() == 0
+
+
+async def test_a_refusal_is_shown_only_while_its_token_is_current(client, agent_api):
+    """The refusal is judged on read against the agent's tokens, so a record that lands
+    after its token was spent (an exchange of the same token that finished first) is not
+    shown."""
+    created = await create(client)
+    [token] = await tokens_of(created["id"])
+    assert (await enrol(agent_api, created["enrol_token"])).status_code == 200
+    agents_svc.enrol_refusals.record(token.id, ENROL_TOO_OLD, _now())
+    assert (await get_agent(client, created["id"]))["enrol_refusal"] is None
+    assert _refusals() == 1  # one agent's read only reads the store
+    await client.get("/api/v1/agents")
+    assert _refusals() == 0  # the list, begun after it was recorded, drops it
+
+
+@pytest.mark.parametrize("action", ["re-enrol", "revoke"])
+async def test_re_enrol_or_revoke_ends_the_refusal(client, agent_api, action):
+    """Either revokes the token the agent was refused for: what the page shows is about
+    the enrolment in progress, and a refusal with the new token is shown again."""
+    created = await create(client)
+    await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+    res = await client.post(f"/api/v1/agents/{created['id']}/{action}")
+    assert res.status_code in (200, 201), res.text
+    assert (await get_agent(client, created["id"]))["enrol_refusal"] is None
+    if action == "re-enrol":
+        await enrol(agent_api, res.json()["data"]["enrol_token"], protocol=PROTOCOL_VERSION + 1)
+        refusal = (await get_agent(client, created["id"]))["enrol_refusal"]
+        assert refusal["code"] == ENROL_TOO_NEW
+
+
+async def test_an_expired_token_keeps_the_refusal_until_a_re_enrol_replaces_it(client, agent_api):
+    """It is still why a pending agent never arrived. Re-enrol revokes only a live token,
+    so the expired one stays unrevoked; the new token is what hides it (Codex on #184:
+    the page showed the old refusal beside a token not yet tried)."""
+    created = await create(client)
+    [token] = await tokens_of(created["id"])
+    await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+    await set_token(token.id, expires_at=_now() - timedelta(minutes=1))
+    agent = await get_agent(client, created["id"])
+    assert agent["enrol_refusal"]["code"] == ENROL_TOO_OLD
+    assert agent["tokens"][0]["expires_in_s"] is None
+    assert (await re_enrol(client, created["id"])).status_code == 201
+    old = next(t for t in await tokens_of(created["id"]) if t.id == token.id)
+    assert old.revoked_at is None  # expired, so not revoked: the newer token hides it
+    assert (await get_agent(client, created["id"]))["enrol_refusal"] is None
+
+
+@pytest.mark.parametrize("step", [timedelta(0), timedelta(seconds=-60)], ids=["equal", "backward"])
+@pytest.mark.parametrize("first", ["live", "expired"])
+async def test_which_token_is_current_never_depends_on_when_tokens_were_issued(
+    client, agent_api, monkeypatch, step, first
+):
+    """Round 1 of #184's briefed review, finding 2: with the replacement issued at the
+    same instant as the first token, or before it by a clock stepped back, the first
+    token's refusal is hidden and the replacement's own is shown. The first token is
+    live when re-enrolled (and so revoked) or expired (and so left unrevoked)."""
+    t0 = _now()
+    clock = {"now": t0}
+    monkeypatch.setattr(agents_svc, "_now", lambda: clock["now"])
+    monkeypatch.setattr(enrolment, "_now", lambda: clock["now"])
+    created = await create(client)
+    [a] = await tokens_of(created["id"])
+    await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+    if first == "expired":
+        await set_token(a.id, expires_at=t0 + step - timedelta(seconds=1))
+    clock["now"] = t0 + step
+    res = await re_enrol(client, created["id"])
+    assert res.status_code == 201, res.text
+    tokens = {t.id: t for t in await tokens_of(created["id"])}
+    assert len(tokens) == 2 and (tokens[a.id].revoked_at is None) == (first == "expired")
+    b = next(t for t in tokens.values() if t.id != a.id)
+    assert b.created_at.replace(tzinfo=timezone.utc) <= a.created_at.replace(tzinfo=timezone.utc)
+    assert (await get_agent(client, created["id"]))["enrol_refusal"] is None  # A's hidden
+    res = await enrol(agent_api, res.json()["data"]["enrol_token"], protocol=PROTOCOL_VERSION + 1)
+    assert res.status_code == 409, res.text
+    refusal = (await get_agent(client, created["id"]))["enrol_refusal"]
+    assert refusal is not None and refusal["code"] == ENROL_TOO_NEW  # B's shown
+
+
+async def test_a_late_attempt_with_a_replaced_token_leaves_the_current_refusal(
+    client, agent_api, during_the_body
+):
+    """Round 1 of #184's briefed review, finding 1: an attempt with token A, its body
+    still arriving, while the owner re-enrols (B, revoking A) and B is refused. A's
+    refusal, landing last, neither replaces nor clears B's."""
+    created = await create(client)
+    issued = {}
+
+    async def re_enrol_then_refuse_b():
+        res = await re_enrol(client, created["id"])
+        assert res.status_code == 201, res.text
+        issued["b"] = res.json()["data"]["enrol_token"]
+        res = await enrol(agent_api, issued["b"], protocol=PROTOCOL_VERSION + 1)
+        assert res.status_code == 409, res.text
+
+    during_the_body.append(re_enrol_then_refuse_b)
+    res = await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+    assert res.status_code == 409 and res.json()["error"]["code"] == ENROL_TOO_OLD
+    refusal = (await get_agent(client, created["id"]))["enrol_refusal"]
+    assert refusal is not None and refusal["code"] == ENROL_TOO_NEW
+    await client.get("/api/v1/agents")
+    assert _refusals() == 1  # A's, no token's current one, went with the list
+
+
+@pytest.mark.parametrize("late", [False, True], ids=["recorded-before", "recorded-after"])
+async def test_a_replaced_token_never_returns_once_the_replacement_enrols(
+    client, agent_api, during_the_body, late
+):
+    """Codex on #184 at 54a83c9: A, refused, expires; the owner re-enrols to B and B
+    enrols. A stays unused and unrevoked (re-enrol revokes only a live token), whether
+    its refusal was recorded before or lands after B's exchange, its body having arrived
+    late: it is not shown, since only a pending agent falls back to an expired token."""
+    created = await create(client)
+    [a] = await tokens_of(created["id"])
+    if not late:
+        await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+
+    async def expire_a_then_enrol_b():
+        await set_token(a.id, expires_at=_now() - timedelta(seconds=1))
+        res = await re_enrol(client, created["id"])
+        assert res.status_code == 201, res.text
+        res = await enrol(agent_api, res.json()["data"]["enrol_token"], **REPORT)
+        assert res.status_code == 200, res.text
+
+    if late:
+        during_the_body.append(expire_a_then_enrol_b)
+        res = await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+        assert res.status_code == 409, res.text
+    else:
+        await expire_a_then_enrol_b()
+    agent = await get_agent(client, created["id"])
+    assert agent["state"] == "active"
+    old = next(t for t in agent["tokens"] if t["id"] == a.id)
+    assert old["used_at"] is None and old["revoked_at"] is None
+    assert agent["enrol_refusal"] is None
+    await client.get("/api/v1/agents")
+    assert _refusals() == 0
+
+
+async def test_an_attempt_whose_agent_is_deleted_during_its_body_leaves_nothing_behind(
+    client, agent_api, during_the_body
+):
+    """Round 1 of #184's briefed review, finding 3: three agents, each deleted while an
+    attempt's body arrives. Each attempt still records after its delete; the agents list
+    drops them, and the store never holds more than its bound."""
+    for name in ("a", "b", "c"):
+        created = await create(client, name=name)
+
+        async def delete_it(agent_id=created["id"]):
+            res = await client.delete(f"/api/v1/agents/{agent_id}")
+            assert res.status_code == 204, res.text
+
+        during_the_body.append(delete_it)
+        res = await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION + 1)
+        assert res.status_code == 409, res.text
+    assert _refusals() == 3  # recorded after each delete committed
+    assert (await client.get("/api/v1/agents")).json()["data"] == []
+    assert _refusals() == 0
+
+
+@pytest.fixture
+def after_the_lists_rows(monkeypatch):
+    """Run steps after the agents list has read its rows and before it answers, as a
+    list whose fetch is slow would (round 2 of #184's briefed review held it in
+    aiosqlite's fetch; the list's generation is read before that await)."""
+    steps = []
+    real = agents_svc.list_agents
+
+    async def rows_then_steps(session):
+        rows = await real(session)
+        while steps:
+            await steps.pop(0)()
+        return rows
+
+    monkeypatch.setattr(agents_svc, "list_agents", rows_then_steps)
+    return steps
+
+
+@pytest.mark.parametrize("change", ["create", "re-enrol"])
+async def test_a_list_read_before_a_refusal_never_deletes_it(
+    client, agent_api, after_the_lists_rows, change
+):
+    """Round 2 of #184's briefed review, finding 1: while a list is between its rows
+    and its answer, an agent is created (the list's rows hold no agent) or re-enrolled
+    from A to B (they hold A alone), and the new token is refused. The list, whose rows
+    hold neither the agent nor B, keeps the newer refusal; a list begun afterwards
+    still does, since it is the current token's."""
+    existing = await create(client, name="existing") if change == "re-enrol" else None
+    made = {}
+
+    async def change_then_refuse():
+        if change == "create":
+            made["agent"] = await create(client, name="late")
+            token = made["agent"]["enrol_token"]
+        else:
+            made["agent"] = existing
+            res = await re_enrol(client, existing["id"])
+            assert res.status_code == 201, res.text
+            token = res.json()["data"]["enrol_token"]
+        res = await enrol(agent_api, token, protocol=PROTOCOL_VERSION + 1)
+        assert res.status_code == 409, res.text
+
+    after_the_lists_rows.append(change_then_refuse)
+    stale = (await client.get("/api/v1/agents")).json()["data"]
+    assert [a["name"] for a in stale] == ([] if change == "create" else ["existing"])
+    assert _refusals() == 1
+    refusal = (await get_agent(client, made["agent"]["id"]))["enrol_refusal"]
+    assert refusal is not None and refusal["code"] == ENROL_TOO_NEW
+    [fresh] = (await client.get("/api/v1/agents")).json()["data"]
+    assert fresh["enrol_refusal"]["code"] == ENROL_TOO_NEW and _refusals() == 1
+
+
+def test_a_prune_keeps_every_entry_newer_than_its_generation():
+    store = agents_svc.EnrolRefusals(limit=8)
+    store.record("token-a", ENROL_TOO_OLD, _now())
+    seen = store.generation()
+    store.record("token-b", ENROL_TOO_NEW, _now())  # recorded after the read began
+    store.record("token-a", ENROL_TOO_NEW, _now())  # replaced after it: kept too
+    store.keep_only([], seen)
+    assert len(store) == 2
+    store.keep_only([], store.generation())
+    assert len(store) == 0
+
+
+@pytest.mark.parametrize("step", [timedelta(0), timedelta(days=-1)], ids=["equal", "backward"])
+def test_a_replacement_alone_takes_a_newer_generation(step):
+    """Round 3 of #184's briefed review: with nothing else recorded between, replacing
+    a token's refusal after the generation was read still survives a prune at that
+    generation, whatever its `refused_at` (equal, or a day earlier)."""
+    store = agents_svc.EnrolRefusals(limit=8)
+    first = _now()
+    store.record("token-a", ENROL_TOO_OLD, first)
+    seen = store.generation()
+    store.record("token-a", ENROL_TOO_NEW, first + step)
+    store.keep_only([], seen)
+    kept = store.get("token-a")
+    assert kept is not None and kept.code == ENROL_TOO_NEW and kept.refused_at == first + step
+
+
+def test_the_store_holds_at_most_its_bound(monkeypatch):
+    store = agents_svc.EnrolRefusals(limit=3)
+    for i in range(5):
+        store.record(f"token-{i}", ENROL_TOO_OLD, _now())
+    assert len(store) == 3
+    assert store.get("token-0") is None and store.get("token-1") is None
+    store.record("token-2", ENROL_TOO_NEW, _now())  # refused again: the newest kept
+    store.record("token-5", ENROL_TOO_OLD, _now())
+    assert store.get("token-3") is None and store.get("token-2").code == ENROL_TOO_NEW
+    assert agents_svc.ENROL_REFUSALS_MAX == 1024
+
+
+async def test_a_disabled_agents_refusal_is_not_shown_until_it_is_enabled(client, agent_api):
+    """Round 1 of #184's briefed review, finding 4: a disabled agent's token is refused
+    whatever release it runs, so installing one is not the advice."""
+    created = await create(client)
+    await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+    res = await client.put(f"/api/v1/agents/{created['id']}", json={"enabled": False})
+    assert res.json()["data"]["enrol_refusal"] is None
+    assert (await get_agent(client, created["id"]))["enrol_refusal"] is None
+    res = await client.put(f"/api/v1/agents/{created['id']}", json={"enabled": True})
+    assert res.json()["data"]["enrol_refusal"]["code"] == ENROL_TOO_OLD
+
+
+async def test_disabling_a_never_enrolled_agent_keeps_its_expired_tokens_refusal(client, agent_api):
+    """Codex on #184 at c59ee62: the refusal of a pending agent whose token expired is
+    hidden while it is disabled, and reads of it (the disable's own answer, the list)
+    do not prune it, so enabling it shows it again."""
+    created = await create(client)
+    [token] = await tokens_of(created["id"])
+    await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+    await set_token(token.id, expires_at=_now() - timedelta(minutes=1))
+    res = await client.put(f"/api/v1/agents/{created['id']}", json={"enabled": False})
+    assert res.json()["data"]["state"] == "disabled" and res.json()["data"]["enrol_refusal"] is None
+    [listed] = (await client.get("/api/v1/agents")).json()["data"]
+    assert listed["enrol_refusal"] is None and _refusals() == 1
+    res = await client.put(f"/api/v1/agents/{created['id']}", json={"enabled": True})
+    assert res.json()["data"]["state"] == "pending"
+    assert res.json()["data"]["enrol_refusal"]["code"] == ENROL_TOO_OLD
+
+
+async def test_deleting_the_agent_forgets_its_refusal(client, agent_api):
+    created = await create(client)
+    await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+    assert _refusals() == 1
+    assert (await client.delete(f"/api/v1/agents/{created['id']}")).status_code == 204
+    assert _refusals() == 0
+
+
+@pytest.mark.parametrize("case", ["unknown", "used", "expired", "revoked", "disabled", "not-an-integer"])
+async def test_a_refusal_before_the_protocol_is_judged_records_none(
+    client, agent_api, monkeypatch, case
+):
+    """A token that is not usable keeps today's answer, and the body, its protocol
+    included, is never read; a protocol that is not an integer is the body's 422."""
+    created = await create(client)
+    [token] = await tokens_of(created["id"])
+    bearer, protocol, status = created["enrol_token"], PROTOCOL_VERSION + 1, 403
+    if case == "unknown":
+        bearer = ENROL_TOKEN_PREFIX + "x" * 43
+    elif case == "used":
+        assert (await enrol(agent_api, bearer)).status_code == 200
+    elif case == "expired":
+        await set_token(token.id, expires_at=_now() - timedelta(seconds=1))
+    elif case == "revoked":
+        await set_token(token.id, revoked_at=_now())
+    elif case == "disabled":
+        await client.put(f"/api/v1/agents/{created['id']}", json={"enabled": False})
+    else:
+        protocol, status = str(PROTOCOL_VERSION + 1), 422
+    res = await enrol(agent_api, bearer, protocol=protocol)
+    assert res.status_code == status, res.text
+    assert _refusals() == 0
+    assert (await get_agent(client, created["id"]))["enrol_refusal"] is None
+
+
+def test_a_refusal_is_recorded_only_as_one_of_the_servers_codes():
+    with pytest.raises(ValueError):
+        agents_svc.enrol_refusals.record("token-1", "PROTOCOL_MISMATCH", _now())
+    assert _refusals() == 0
 
 
 # --- Re-enrol (acceptance: the old agent token is refused, the scan targets unchanged) ---

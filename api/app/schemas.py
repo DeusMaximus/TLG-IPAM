@@ -3,7 +3,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, field_validator
 
-from .agent_protocol import ScanRange
+from .agent_protocol import ENROL_TOO_NEW, ENROL_TOO_OLD, ScanRange
 from .ipnet import normalise_domain, normalise_mac, parse_ip
 from .times import utc
 
@@ -394,6 +394,14 @@ class TokenOut(BaseModel):
     expires_in_s: int | None = None
 
 
+class EnrolRefusalOut(BaseModel):
+    """An enrolment refused for the agent's protocol (#175, `agents.enrol_refusal`):
+    the server's code for which way it was, and when."""
+
+    code: Literal[ENROL_TOO_OLD, ENROL_TOO_NEW]
+    refused_at: UtcDatetime
+
+
 class AgentOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -416,6 +424,11 @@ class AgentOut(BaseModel):
     # version), and whether its last check-in was refused for another protocol.
     update_available: bool | None = None
     protocol_mismatch: bool = False
+    # Computed on read too, from process memory (`agents.enrol_refusals`): the last
+    # enrolment refused for the agent's protocol, while the token it was refused for is
+    # neither used nor revoked; null otherwise, and after a restart until it is refused
+    # again.
+    enrol_refusal: EnrolRefusalOut | None = None
 
 
 class AgentEnrolment(AgentOut):

@@ -11,6 +11,7 @@ REST only: nothing over MCP creates, changes or lists them (spec §7.2, invarian
 
 import hashlib
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from packaging.version import InvalidVersion, Version
@@ -19,11 +20,17 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from ..agent_protocol import AGENT_TOKEN_PREFIX, ENROL_TOKEN_PREFIX, TOKEN_SECRET_BYTES
+from ..agent_protocol import (
+    AGENT_TOKEN_PREFIX,
+    ENROL_TOKEN_PREFIX,
+    ENROL_TOO_NEW,
+    ENROL_TOO_OLD,
+    TOKEN_SECRET_BYTES,
+)
 from ..config import settings
 from ..errors import ApiError, conflict, not_found
 from ..models import Agent, Token
-from ..schemas import AgentCreate, AgentOut, AgentUpdate
+from ..schemas import AgentCreate, AgentOut, AgentUpdate, EnrolRefusalOut
 from ..times import utc
 from . import changes, scans
 
@@ -89,6 +96,133 @@ def protocol_mismatch(agent: Agent) -> bool:
     return (agent.last_error or "").startswith(PROTOCOL_MISMATCH_PREFIX)
 
 
+@dataclass(frozen=True)
+class EnrolRefusal:
+    """An enrolment the exchange refused for the agent's protocol (#175): the server's
+    code for which way it was (ENROL_TOO_OLD, ENROL_TOO_NEW), and when, by the server's
+    clock."""
+
+    code: str
+    refused_at: datetime
+    # the store's generation when it was recorded (`EnrolRefusals.generation`)
+    generation: int
+
+
+# The most refusals kept at once. One entry per enrolment token, and an attempt is
+# recorded only once its token is found usable, so a token the owner issued; this caps
+# the few a deletion that races an attempt's body can leave behind (`EnrolRefusals`).
+ENROL_REFUSALS_MAX = 1024
+
+
+class EnrolRefusals:
+    """The last enrolment each enrolment token was refused for its protocol, in process
+    memory (#175), so the Agents page can say why an agent never arrived. The exchange
+    refuses another protocol before it locks or writes anything, and keeping the record
+    here keeps it so: it is no database write, so it takes no lock, adds no row, and
+    needs no audit entry. The server runs one process (`AGENTS.md`), as the enrolment
+    throttle, also in memory, relies on. A restart forgets it, and the agent's next
+    attempt, 13.5–15 minutes after a refusal (spec §5.7), records it again.
+
+    Keyed by the enrolment token, never by the agent, so an attempt made with one token
+    can replace only that token's record: a request with a token since revoked, whose
+    body arrives late, cannot change what is shown for the agent's current token
+    (`enrol_refusal`). The keys are ids of tokens found usable and the codes the
+    server's own constants: never a value the caller sent. Bounded: at most
+    ENROL_REFUSALS_MAX entries, the oldest recorded dropped first; a successful
+    exchange drops its agent's tokens', deleting an agent its tokens', and the agents
+    list every one recorded before the list began whose token it does not hold as
+    current (`keep_only`). An entry recorded for an agent deleted while the attempt's
+    body arrived goes at the next read of the list, or to the cap, whichever comes
+    first. No other read deletes an entry.
+
+    Every record takes the next generation, a counter in this process, never the wall
+    clock. The list reads its generation before its first database await and prunes
+    only entries of that generation or older: an entry recorded or replaced after the
+    list began was refused for a token the list's rows may not hold yet (an agent
+    created, or re-enrolled, meanwhile), so a list read before it never deletes it
+    (round 2 of #184's briefed review)."""
+
+    def __init__(self, limit: int = ENROL_REFUSALS_MAX) -> None:
+        self.limit = limit
+        self._last: dict[str, EnrolRefusal] = {}
+        self._generation = 0
+
+    def generation(self) -> int:
+        """The generation of the newest record: an entry with a higher one was
+        recorded after this was read."""
+        return self._generation
+
+    def record(self, token_id: str, code: str, refused_at: datetime) -> None:
+        if code not in (ENROL_TOO_OLD, ENROL_TOO_NEW):
+            raise ValueError("an enrolment refusal is one of the server's two codes")
+        self._generation += 1
+        self._last.pop(token_id, None)  # a token refused again is the newest recorded
+        self._last[token_id] = EnrolRefusal(code, refused_at, self._generation)
+        while len(self._last) > self.limit:
+            del self._last[next(iter(self._last))]
+
+    def get(self, token_id: str) -> EnrolRefusal | None:
+        return self._last.get(token_id)
+
+    def drop(self, token_ids) -> None:
+        for token_id in token_ids:
+            self._last.pop(token_id, None)
+
+    def keep_only(self, token_ids, seen: int) -> None:
+        """Drop every entry of generation `seen` or older whose token is not in
+        `token_ids`; keep every newer one, which the caller's read may not cover."""
+        keep = set(token_ids)
+        stale = [t for t, e in self._last.items() if t not in keep and e.generation <= seen]
+        for token_id in stale:
+            del self._last[token_id]
+
+    def __len__(self) -> int:
+        return len(self._last)
+
+    def reset(self) -> None:
+        self._last.clear()
+
+
+enrol_refusals = EnrolRefusals()
+
+
+def current_enrolment(agent: Agent, now: datetime) -> Token | None:
+    """The enrolment token an agent's refusal is shown for: its one live enrolment token
+    (`live`), or, for an agent that has never held an agent token (a `pending` one, or
+    one disabled before it ever enrolled) with none, its one enrolment token neither
+    used nor revoked (expired, with no re-enrol since: still why the agent never
+    arrived).
+    None when there are two or more of either, which is never to be guessed between.
+    Judged from the tokens and the agent's state alone, by identity, never by when the
+    tokens were issued: a re-enrol revokes a live token and adds one, so after it the
+    new token is the one live, or, once both have expired, there are two unused and none
+    is chosen. The expired fallback is a never-enrolled agent's alone, so once any
+    exchange has succeeded (the agent has held an agent token) an expired token it
+    replaced never becomes current again, whatever refusal lands for it later; and
+    disabling a never-enrolled agent keeps its expired token current, so the refusal is
+    hidden while it is disabled (`enrol_refusal`), not pruned (Codex on #184)."""
+    enrols = [t for t in agent.tokens if t.kind == "enrol"]
+    live_now = [t for t in enrols if live(t, now)]
+    if live_now:
+        return live_now[0] if len(live_now) == 1 else None
+    if any(t.kind == "agent" for t in agent.tokens):
+        return None
+    unspent = [t for t in enrols if t.used_at is None and t.revoked_at is None]
+    return unspent[0] if len(unspent) == 1 else None
+
+
+def enrol_refusal(agent: Agent, now: datetime) -> EnrolRefusalOut | None:
+    """The last refusal of the agent's current enrolment token (`current_enrolment`) for
+    the agent's protocol; None when it has none, when that token has no refusal, and
+    while the agent is disabled, since its token is then refused whatever it runs (the
+    record is kept, and shown again once it is enabled). It only reads the store."""
+    current = current_enrolment(agent, now)
+    last = enrol_refusals.get(current.id) if current is not None else None
+    if last is None or agent.state == "disabled":
+        return None
+    return EnrolRefusalOut(code=last.code, refused_at=last.refused_at)
+
+
 def expires_in_s(token: Token, now: datetime) -> int | None:
     """Whole seconds an enrolment token has left by the server's clock at `now`, rounded
     down, while it is live (`live`: unrevoked, unused, unexpired); None for one that is
@@ -102,13 +236,14 @@ def expires_in_s(token: Token, now: datetime) -> int | None:
 def agent_out(agent: Agent, now: datetime | None = None) -> dict:
     """An agent as the owner routes answer with it: its columns and tokens
     (`schemas.AgentOut`), the two flags the Agents page shows (`update_available`,
-    `protocol_mismatch`) and each token's `expires_in_s` at `now`, all computed on
-    read."""
+    `protocol_mismatch`), the last enrolment refused for its protocol (`enrol_refusal`)
+    and each token's `expires_in_s` at `now`, all computed on read."""
     now = _now() if now is None else now
     out = AgentOut.model_validate(agent)
     flags = {
         "update_available": update_available(agent.version),
         "protocol_mismatch": protocol_mismatch(agent),
+        "enrol_refusal": enrol_refusal(agent, now),
         "tokens": [
             out_token.model_copy(update={"expires_in_s": expires_in_s(token, now)})
             for out_token, token in zip(out.tokens, agent.tokens, strict=True)
@@ -120,6 +255,20 @@ def agent_out(agent: Agent, now: datetime | None = None) -> dict:
 async def list_agents(session: AsyncSession) -> list[Agent]:
     query = select(Agent).options(selectinload(Agent.tokens)).order_by(Agent.name)
     return list((await session.scalars(query)).all())
+
+
+async def list_agents_out(session: AsyncSession) -> list[dict]:
+    """The agents list as the owner route answers it (`agent_out` for each). The list
+    holds every agent, so it keeps only the refusals of their current enrolment tokens
+    (`EnrolRefusals.keep_only`), one recorded for an agent deleted meanwhile included;
+    fenced by the store's generation read before the list's first database await, so
+    a refusal recorded after the rows were read is kept."""
+    seen = enrol_refusals.generation()
+    agents = await list_agents(session)
+    now = _now()
+    current = [current_enrolment(agent, now) for agent in agents]
+    enrol_refusals.keep_only((t.id for t in current if t is not None), seen)
+    return [agent_out(agent, now) for agent in agents]
 
 
 async def get_agent(session: AsyncSession, agent_id: str) -> Agent:
@@ -394,8 +543,10 @@ async def delete_agent(session: AsyncSession, agent_id: str, source: str) -> Non
         source=source,
         before=changes.snapshot(agent),
     )
+    token_ids = [t.id for t in agent.tokens]
     await session.delete(agent)
     await session.commit()
+    enrol_refusals.drop(token_ids)
 
 
 # where `authenticate` leaves the id of the token it accepted, for the route's own

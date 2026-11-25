@@ -378,3 +378,4 @@ def test_no_mcp_tool_serves_suggestions_or_the_flags():
     assert "suggestions" not in source
     assert "agent_out" not in source and "update_available" not in source
     assert "expires_in_s" not in source
+    assert "enrol_refusal" not in source

@@ -23,7 +23,7 @@ from app.config import settings
 from app.database import SessionLocal, _configure_connection, engine, get_session
 from app.main import app
 from app.models import Base, Subnet
-from app.services import enrolment, jobs
+from app.services import agents, enrolment, jobs
 from app.services.device_types import seed_defaults
 
 
@@ -52,10 +52,13 @@ def unlimited_checkins(monkeypatch):
 @pytest.fixture(autouse=True)
 def fresh_enrol_throttle():
     """The enrolment throttle is process memory (`services/enrolment.throttle`): each test
-    starts with it empty, so one test's refused attempts never refuse another's."""
+    starts with it empty, so one test's refused attempts never refuse another's. So are
+    the enrolment refusals the Agents page is shown (`services/agents.enrol_refusals`)."""
     enrolment.throttle.reset()
+    agents.enrol_refusals.reset()
     yield
     enrolment.throttle.reset()
+    agents.enrol_refusals.reset()
 
 
 async def enrol(client, enrol_token: str, **body):
