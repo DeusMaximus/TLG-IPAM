@@ -404,6 +404,43 @@ def inherited_trust(environ, ca_file: str | None) -> str | None:
     return None
 
 
+# a line of agent.env `kept_allowed_dns` reads as an assignment: an unquoted name, `=`,
+# and a value of `_PLAIN` characters
+_ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(" + _PLAIN.pattern + r")")
+# what any line may hold: printable ASCII, no backslash
+_PRINTABLE = re.compile(r"[\x20-\x5b\x5d-\x7e]*")
+
+
+def env_assignments(text: str, env_path: str) -> list[tuple[str, str]]:
+    """The assignments of an agent.env, in order, when the whole file is in the grammar
+    `install` writes; otherwise InstallError, before any assignment is read (round 1
+    of the briefed review of #179). systemd's `EnvironmentFile=` grammar is wider:
+    quoted values run across lines, a backslash continues a line (a comment's too),
+    and `\r` ends one. Read line by line, a file using any of it can hold a line that
+    looks like an assignment and is not one to systemd (`OTHER="a` … `b"`), or hide
+    one systemd reads. So every line, unrelated ones included, is split at `\n`
+    alone, may end in one `\r` (a CRLF file), and must be printable ASCII with no
+    backslash, and then either empty, a comment (`#` or `;` first), or
+    `NAME=<plain value>` (`_PLAIN`, as `install` writes values). Everything `install`
+    writes is in it. The refusal names the line by its number, never its content."""
+    assignments = []
+    for number, line in enumerate(text.split("\n"), 1):
+        line = line.removesuffix("\r")
+        if _PRINTABLE.fullmatch(line):
+            if line == "" or line.startswith(("#", ";")):
+                continue
+            if found := _ASSIGNMENT.fullmatch(line):
+                assignments.append((found[1], found[2]))
+                continue
+        raise InstallError(
+            f"line {number} of {env_path} is in a form install does not read back (it reads "
+            "only unquoted NAME=value lines of plain characters, comments and empty lines), "
+            "so the ALLOWED_DNS_SERVERS in it could not be kept; give --allowed-dns-servers, "
+            "or rewrite or remove that line"
+        )
+    return assignments
+
+
 def kept_allowed_dns(env_path: str):
     """The `ALLOWED_DNS_SERVERS` agent.env holds, for a run without
     `--allowed-dns-servers` (#179), as `config.parse_allowed_dns` reads it: None when
@@ -414,12 +451,11 @@ def kept_allowed_dns(env_path: str):
     so dropping it on an update copied from the Agents page would widen what the agent
     may ask without a word. To remove it, delete its line from agent.env.
 
-    The file is read by `store.read_small`, as `install` wrote it: the last line that
-    sets the name decides, as in systemd. Any other line that names it (whitespace
-    around the name or the `=`, quotes, `export`, a value with a character `_plain`
-    refuses), a line continued with a backslash, or a file that cannot be read, is
-    refused rather than guessed at; giving the option skips the read. A bad item is
-    named by its place, never by its value (#140)."""
+    The file is read by `store.read_small`, and only when the whole of it is in the
+    grammar `install` writes (`env_assignments`); then the last assignment of the name
+    decides, as in systemd. A file outside that grammar, or one that cannot be read,
+    is refused rather than guessed at; giving the option skips the read. A bad item
+    is named by its place, never by its value (#140)."""
     name = "ALLOWED_DNS_SERVERS"
     where = f"the {name} in {env_path}"
     try:
@@ -432,19 +468,8 @@ def kept_allowed_dns(env_path: str):
         text = data.decode("ascii")
     except UnicodeDecodeError:
         raise InstallError(f"{env_path} is not ASCII, so {where} could not be kept; give --allowed-dns-servers") from None
-    value = None
-    for line in text.splitlines():
-        if line.lstrip().startswith(("#", ";")):
-            continue
-        key, _, rest = line.partition("=")
-        if key == name and _PLAIN.fullmatch(rest):
-            value = rest
-        elif name in line or line.endswith("\\"):
-            raise InstallError(
-                f"{env_path} sets {name} in a form install does not read back, so it could "
-                f"not be kept; give --allowed-dns-servers, or write the line as {name}=<networks>"
-            )
-    return None if value is None else config.parse_allowed_dns(value, where)
+    values = [value for key, value in env_assignments(text, env_path) if key == name]
+    return config.parse_allowed_dns(values[-1], where) if values else None
 
 
 def render_env(url: str, allowed, allowed_dns, max_pps: int | None, ca_file: str | None, token_path: str) -> str:

@@ -1098,34 +1098,95 @@ def test_an_update_keeps_a_line_added_by_hand_and_the_last_one_as_systemd_does(r
     assert settings_of(root)[-1] == "ALLOWED_DNS_SERVERS=192.168.1.53/32,192.168.2.0/24"
 
 
+FORM = "in a form install does not read back"
+# agent.env as the first install of these tests writes it holds three lines (two
+# comments and IPAM_URL), so what a test appends starts at line 4
+WIDENED = "ALLOWED_DNS_SERVERS=0.0.0.0/0"
+
+
 @pytest.mark.parametrize(
-    "line, message",
+    "lines, message",
     [
-        ('ALLOWED_DNS_SERVERS="10.0.0.53"', "in a form install does not read back"),
-        ("ALLOWED_DNS_SERVERS = 10.0.0.53", "in a form install does not read back"),
-        (" ALLOWED_DNS_SERVERS=10.0.0.53", "in a form install does not read back"),
-        ("export ALLOWED_DNS_SERVERS=10.0.0.53", "in a form install does not read back"),
-        ("ALLOWED_DNS_SERVERS=10.0.0.53 10.0.0.54", "in a form install does not read back"),
-        ("ALLOWED_DNS_SERVERS=", "in a form install does not read back"),
-        ("MAX_PPS=20 \\", "in a form install does not read back"),
+        ('ALLOWED_DNS_SERVERS="10.0.0.53"', FORM),
+        ("ALLOWED_DNS_SERVERS = 10.0.0.53", FORM),
+        (" ALLOWED_DNS_SERVERS=10.0.0.53", FORM),
+        ("export ALLOWED_DNS_SERVERS=10.0.0.53", FORM),
+        ("ALLOWED_DNS_SERVERS=10.0.0.53 10.0.0.54", FORM),
+        ("ALLOWED_DNS_SERVERS=", FORM),
+        ("MAX_PPS=20 \\", FORM),
         (f"ALLOWED_DNS_SERVERS=10.0.0.53,{ENROL_TOKEN}", "item 2 of 2 is not a network"),
-        (f"ALLOWED_DNS_SERVERS=fe80::53%{ENROL_TOKEN}", "in a form install does not read back"),  # `%` is not plain
+        (f"ALLOWED_DNS_SERVERS=fe80::53%{ENROL_TOKEN}", FORM),  # `%` is not plain
+        # round 1 of the briefed review: to systemd, the third line is inside OTHER's
+        # value, and ALLOWED_DNS_SERVERS is 10.0.0.53; read line by line it was 0.0.0.0/0
+        (f'ALLOWED_DNS_SERVERS=10.0.0.53\nOTHER="a\n{WIDENED}\nb"', "line 5 of"),
+        (f"ALLOWED_DNS_SERVERS=10.0.0.53\nOTHER='a\n{WIDENED}\nb'", "line 5 of"),
+        # the same mismatch by the grammar's other ways: a comment continued with a
+        # backslash, a bare carriage return or a vertical tab
+        (f"ALLOWED_DNS_SERVERS=10.0.0.53\n# a note \\\n{WIDENED}", "line 5 of"),
+        (f"ALLOWED_DNS_SERVERS=10.0.0.53\n# a note\r{WIDENED}", "line 5 of"),
+        (f"ALLOWED_DNS_SERVERS=10.0.0.53\nOTHER=a\x0b{WIDENED}", "line 5 of"),
+        # lines that do not name it are held to the grammar too
+        ('ALLOWED_DNS_SERVERS=10.0.0.53\nOTHER="a b"', "line 5 of"),
+        ("OTHER=\nALLOWED_DNS_SERVERS=10.0.0.53", "line 4 of"),
+        ("  # an indented comment\nALLOWED_DNS_SERVERS=10.0.0.53", "line 4 of"),
+        ("ALLOWED_DNS_SERVERS=10.0.0.53\n\tOTHER=1", "line 5 of"),
     ],
 )
-def test_an_update_refuses_a_value_it_cannot_keep_before_anything_changes(root, line, message):
-    """Refused, not guessed at nor dropped; the value is not repeated (#140). Giving the
-    option is the way past it, since then agent.env is not read."""
+def test_an_update_refuses_a_file_it_cannot_read_back_before_anything_changes(root, lines, message):
+    """Refused, not guessed at nor dropped, whichever line is outside the grammar
+    install writes, and before any line is read as an assignment; no line's content
+    is repeated (#140). Giving the option is the way past it, since then agent.env is
+    not read."""
     run_install(root, FakeHost())
     env = root / "etc/tlg-ipam-agent/agent.env"
-    env.write_text(env.read_text() + line + "\n")
-    before = {p: (root / p).read_bytes() for p in tree(root) if (root / p).is_file()}
+    env.write_bytes(env.read_bytes() + lines.encode("ascii") + b"\n")
+    files = [root / p for p in tree(root) if (root / p).is_file()]
+    before = {p: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode)) for p in files}
     host = FakeHost(user=True)
     code, said = run_install(root, host, Options(url=URL), exchange=lambda *a: pytest.fail("no exchange"))
     assert code == 1 and message in said[-1] and "agent.env" in said[-1], said
-    assert ENROL_TOKEN[5:] not in "".join(said)
-    assert host.commands == [] and host.run_checks == []
-    assert {p: (root / p).read_bytes() for p in tree(root) if (root / p).is_file()} == before
+    if message.startswith("line"):
+        assert FORM in said[-1] and "give --allowed-dns-servers" in said[-1]
+    shown = "".join(said)
+    assert ENROL_TOKEN[5:] not in shown and "0.0.0.0" not in shown and "10.0.0.53" not in shown
+    assert host.commands == [] and host.run_checks == [] and host.read_checks == []
+    assert {p: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode)) for p in files} == before
     code, said = update(root, allowed_dns_servers="10.0.0.53")
+    assert code == 0, said
+    assert settings_of(root)[-1] == "ALLOWED_DNS_SERVERS=10.0.0.53/32"
+
+
+@pytest.mark.parametrize("allowed_dns", [None, "10.0.0.53 192.168.1.0/24,2001:db8::53"])
+@pytest.mark.parametrize("ca", [False, True])
+def test_every_agent_env_install_writes_is_in_the_grammar_it_reads_back(root, allowed_dns, ca):
+    """What `install` writes, with every option it takes, is read back whole by
+    `env_assignments`, as the assignments it wrote."""
+    bundle = root / "ca.pem"
+    bundle.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
+    options = Options(
+        url="https://ipam.home.arpa:8443/a/b",
+        enrol_token="-",
+        allowed_cidrs="10.20.0.0/16 192.168.1.0/24 fd00::/8",
+        allowed_dns_servers=allowed_dns,
+        max_pps="1000",
+        ca_file=str(bundle) if ca else None,
+    )
+    code, said = run_install(root, FakeHost(), options)
+    assert code == 0, said
+    path = root / "etc/tlg-ipam-agent/agent.env"
+    assignments = install.env_assignments(path.read_text(), str(path))
+    assert ["=".join(pair) for pair in assignments] == settings_of(root)
+    assert [key for key, _ in assignments][:2] == ["IPAM_URL", "ALLOWED_CIDRS"]
+    code, said = update(root)
+    assert code == 0, said
+    assert any(line.startswith("ALLOWED_DNS_SERVERS") for line in settings_of(root)) == (allowed_dns is not None)
+
+
+def test_a_crlf_agent_env_is_read_as_its_lines(root):
+    run_install(root, FakeHost())
+    env = root / "etc/tlg-ipam-agent/agent.env"
+    env.write_bytes(env.read_bytes().replace(b"\n", b"\r\n") + b"ALLOWED_DNS_SERVERS=10.0.0.53\r\n")
+    code, said = update(root)
     assert code == 0, said
     assert settings_of(root)[-1] == "ALLOWED_DNS_SERVERS=10.0.0.53/32"
 
