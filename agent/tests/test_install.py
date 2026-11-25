@@ -6,12 +6,20 @@ be checked without root. The files are real, written by `store`, under a tempora
 root. The enrolment exchange is made against the server's real routes, in process.
 
 What this cannot show (a real `useradd`, a real systemd, the file's owner as another
-user) was shown in Linux containers; the PR records how."""
+user) was shown in Linux containers; the PR records how. The CA bundle's check
+(`install.read_as`) runs its real programs here, as the test's own user, since without
+root a process can take on no other user's ids or groups; the cases that need root (an
+ACL, a supplementary group, another user's ids) run only as root on Linux, which the
+PR of #136 records."""
 
 import asyncio
 import os
 import stat
+import struct
+import subprocess
+import sys
 from pathlib import Path
+from unittest import mock
 
 import httpx
 import pytest
@@ -32,6 +40,22 @@ URL = "https://ipam.home.arpa"
 ANSWER = Answer(Kind.OK, 200, None, "HTTP 200", {"agent_id": "0b6f3c1e-1111-4222-8333-444455556666", "agent_token": TOKEN})
 
 
+def as_the_test_user(asked: list):
+    """`subprocess.run` for `read_as`'s programs, run as the test's own user: what
+    `read_as` asked for is recorded, and its `user`, `group` and `extra_groups` taken
+    off, since without root a process can set none of them (setgroups needs
+    CAP_SETGID even for the groups it holds)."""
+    real = subprocess.run
+
+    def run(argv, **keywords):
+        asked.append((argv, dict(keywords)))
+        for name in ("user", "group", "extra_groups"):
+            keywords.pop(name)
+        return real(argv, **keywords)
+
+    return run
+
+
 class FakeHost(install.Host):
     def __init__(
         self, *, root=True, systemd=True, user=False, group_stays=False, fail=None, failed_unit=False, ids=None
@@ -47,6 +71,10 @@ class FakeHost(install.Host):
         self.fail = fail or {}
         self.hidden = None
         self.commands: list[tuple[str, ...]] = []
+        # what the CA bundle's check answers: None runs the real `read_as`, as the
+        # test's own user; a string is that answer
+        self.reads = None
+        self.read_checks: list[tuple] = []
 
     def euid(self):
         return 0 if self.root else 1000
@@ -63,6 +91,15 @@ class FakeHost(install.Host):
     def code_unreachable(self, interpreter):
         assert interpreter == PYTHON
         return self.hidden
+
+    def service_reads(self, path, uid, gid):
+        assert (uid, gid) == self.ids  # asked for the service user found or created
+        self.read_checks.append((path, uid, gid))
+        if self.reads is not None:
+            return self.reads
+        asked = []
+        with mock.patch.object(install.subprocess, "run", as_the_test_user(asked)):
+            return install.read_as(path, uid, gid, [gid])
 
     def run(self, *argv):
         self.commands.append(argv)
@@ -428,46 +465,73 @@ def test_install_learns_each_token_for_the_log_redaction(root):
     assert code == 0 and learnt == [ENROL_TOKEN, TOKEN]
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a file of mode 0000")
 def test_a_ca_file_the_service_user_cannot_read_stops_the_install_before_the_exchange(root):
     """The review of #130: root could read the bundle and the service user could not,
     and the install spent the token on a unit that could not verify the server. The
-    file is checked as the service user, after the account exists, before the
-    exchange, and the install is taken back."""
+    file is checked as the service user (here, the test's own user, through the real
+    programs), after the account exists, before the exchange, and the install is
+    taken back."""
     ca = root / "ca.pem"
     ca.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
-    ca.chmod(0o600)  # root's (here, the test's) alone
-    host = FakeHost(ids=(os.getuid() + 1000, os.getgid() + 1000))
+    ca.chmod(0o000)
+    host = FakeHost()
     before = tree(root)
     code, said = run_install(
         root, host, Options(url=URL, enrol_token="-", ca_file=str(ca)), exchange=lambda *a: pytest.fail("no exchange")
     )
-    assert code == 1 and "could not read the file" in said[-1], said
+    assert code == 1 and "could not read the file (stopped at the file itself)" in said[-1], said
     assert str(ca) not in said[-1] and ca.name not in said[-1]  # #140: no path is repeated
     assert tree(root) == before and host.commands == [USERADD, ("userdel", "tlg-ipam-agent")]
+    assert host.read_checks == [(str(ca), *host.ids)]
 
 
-@pytest.mark.parametrize(
-    "blocked, where",
-    [
-        ("{ca}", "the file itself"),
-        ("{real}", "the file itself"),  # the file a link leads to
-        ("{dir}", "a directory or link on the way to it"),
-        ("{dir} (more than 40 links)", "a directory or link on the way to it"),
-    ],
-)
-def test_a_ca_file_the_service_user_cannot_read_is_placed_without_its_path(root, monkeypatch, blocked, where):
-    """The refusal says where the walk stopped by its kind, never by the path (#140)."""
+def test_a_ca_file_is_checked_on_an_update_too(root):
+    """Run again without `--enrol-token`, the bundle is checked all the same, and a
+    refusal leaves the stored token and the files as they were."""
+    ca = root / "ca.pem"
+    ca.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
+    assert run_install(root, FakeHost(), Options(url=URL, enrol_token="-", ca_file=str(ca)))[0] == 0
+    before = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    host = FakeHost(user=True)
+    host.reads = install.AT_THE_FILE
+    code, said = run_install(root, host, Options(url=URL, ca_file=str(ca)), exchange=lambda *a: pytest.fail("no exchange"))
+    assert code == 1 and "could not read the file" in said[-1], said
+    assert {path: path.read_bytes() for path in root.rglob("*") if path.is_file()} == before
+    assert host.commands == []
+
+
+@pytest.mark.parametrize("where", [install.AT_THE_FILE, install.ON_THE_WAY])
+def test_a_ca_file_the_service_user_cannot_read_is_placed_without_its_path(root, where):
+    """The refusal says where the check stopped by its kind, never by the path (#140)."""
     real = root / "real.pem"
     real.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
     ca = root / "ca.pem"
     ca.symlink_to(real)
-    blocked = blocked.format(ca=ca, real=os.path.realpath(ca), dir=root)
-    monkeypatch.setattr(install, "blocked_for", lambda path, uid, gid: blocked)
+    host = FakeHost()
+    host.reads = where
     code, said = run_install(
-        root, FakeHost(), Options(url=URL, enrol_token="-", ca_file=str(ca)), exchange=lambda *a: pytest.fail("no exchange")
+        root, host, Options(url=URL, enrol_token="-", ca_file=str(ca)), exchange=lambda *a: pytest.fail("no exchange")
     )
     assert code == 1 and f"could not read the file (stopped at {where})" in said[-1], said
+    assert "getfacl" in said[-1] and "namei -l" in said[-1]
     assert str(root) not in said[-1] and "pem" not in said[-1]
+
+
+def test_a_ca_file_whose_check_could_not_be_made_stops_the_install_before_the_exchange(root):
+    """A program that could not be run as the service user, or that did not finish in
+    time, is not taken for a readable file: the install stops with the token unspent."""
+    ca = root / "ca.pem"
+    ca.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
+    host = FakeHost()
+    host.reads = install.NOT_CHECKED
+    before = tree(root)
+    code, said = run_install(
+        root, host, Options(url=URL, enrol_token="-", ca_file=str(ca)), exchange=lambda *a: pytest.fail("no exchange")
+    )
+    assert code == 1 and "could not check that tlg-ipam-agent" in said[-1] and "before the token was spent" in said[-1]
+    assert str(root) not in said[-1] and "pem" not in said[-1]
+    assert tree(root) == before
 
 
 def _misplaced(token):
@@ -507,46 +571,205 @@ def test_a_token_given_as_any_options_value_is_in_no_output(root, capsys, token,
         assert token[5:] not in shown, shown
 
 
-def test_a_ca_file_behind_a_directory_the_service_user_cannot_enter_is_refused(tmp_path):
-    """Every directory on the way is judged, and a link's directories too."""
+# --- the CA bundle's check, `read_as`, as the test's own user ---
+
+
+def _read_as_me(path, asked=None):
+    asked = [] if asked is None else asked
+    with mock.patch.object(install.subprocess, "run", as_the_test_user(asked)):
+        return install.read_as(str(path), os.getuid(), os.getgid(), [os.getgid(), 4242])
+
+
+def test_the_check_runs_its_fixed_programs_as_the_service_user_and_nothing_else(tmp_path):
+    """`read_as` asks for the service user's ids and every group it is given, the
+    install's fixed environment, `/` as the working directory, no input, its output
+    discarded (`head`'s errors name the path), a deadline and no shell; the arguments
+    are the fixed programs' and the path."""
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    asked = []
+    assert _read_as_me(hidden / "ca.pem", asked) == install.ON_THE_WAY
+    path = str(hidden / "ca.pem")
+    assert [argv for argv, _ in asked] == [["head", "-c", "1", "--", path], ["test", "-e", path]]
+    for _, keywords in asked:
+        assert keywords == {
+            "env": install.COMMAND_ENV,
+            "cwd": "/",
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "user": os.getuid(),
+            "group": os.getgid(),
+            "extra_groups": [os.getgid(), 4242],
+            "timeout": install.CA_CHECK_TIMEOUT_S,
+            "check": False,
+        }
+
+
+def test_a_readable_file_is_read_once_and_nothing_more_is_run(tmp_path):
+    ca = tmp_path / "ca.pem"
+    ca.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
+    asked = []
+    assert _read_as_me(ca, asked) is None
+    assert [argv[0] for argv, _ in asked] == ["head"]
+    # an empty file is readable too: what it holds is the TLS handshake's to judge
+    ca.write_bytes(b"")
+    assert _read_as_me(ca) is None
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads and enters whatever the mode bits say")
+def test_the_check_says_where_it_stopped_by_what_the_kernel_answered(tmp_path):
+    """The file itself when the user reaches it and cannot read it; on the way when it
+    cannot reach it (a directory it cannot enter, followed through a link too, or
+    nothing there)."""
     tmp_path.chmod(0o755)
     hidden = tmp_path / "private"
     hidden.mkdir()
     ca = hidden / "ca.pem"
     ca.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
-    ca.chmod(0o644)
-    hidden.chmod(0o700)  # the installer's alone: others cannot enter it
-    other = (os.getuid() + 1000, os.getgid() + 1000)
-    top = str(tmp_path)
-    assert install.blocked_for(str(ca), *other, top=top) == str(hidden)
-    # a link from a readable place into it is followed, and refused at the same place
     (tmp_path / "ca-link.pem").symlink_to(ca)
-    assert install.blocked_for(str(tmp_path / "ca-link.pem"), *other, top=top) == str(hidden)
-    hidden.chmod(0o711)
-    assert install.blocked_for(str(ca), *other, top=top) is None
-    assert install.blocked_for(str(tmp_path / "missing.pem"), *other, top=top) == str(tmp_path / "missing.pem")
+    ca.chmod(0o000)
+    assert _read_as_me(ca) == install.AT_THE_FILE
+    assert _read_as_me(tmp_path / "ca-link.pem") == install.AT_THE_FILE
+    ca.chmod(0o644)
+    hidden.chmod(0o600)  # listable, not enterable
+    try:
+        assert _read_as_me(ca) == install.ON_THE_WAY
+        assert _read_as_me(tmp_path / "ca-link.pem") == install.ON_THE_WAY
+    finally:
+        hidden.chmod(0o755)
+    assert _read_as_me(ca) is None
+    assert _read_as_me(tmp_path / "missing.pem") == install.ON_THE_WAY
+    (tmp_path / "dangling.pem").symlink_to(tmp_path / "missing.pem")
+    assert _read_as_me(tmp_path / "dangling.pem") == install.ON_THE_WAY
 
 
-@pytest.mark.parametrize(
-    "mode, uid, gid, readable",
-    [
-        (0o600, "me", "other", True),  # the owner's bits
-        (0o060, "other", "mine", True),  # the group's, for a file of the user's group
-        (0o604, "other", "other", True),  # others' bits
-        (0o640, "other", "other", False),  # group bits of a group it is not in
-        (0o600, "other", "mine", False),
-    ],
+def test_a_fifo_put_in_the_files_place_is_cut_off_and_not_taken_for_a_file(tmp_path, monkeypatch):
+    """A FIFO swapped in after `_ca_file` looked: `head` waits on a writer that never
+    comes, is killed at the deadline, and the check is not made."""
+    fifo = tmp_path / "ca.pem"
+    os.mkfifo(fifo)
+    monkeypatch.setattr(install, "CA_CHECK_TIMEOUT_S", 0.5)
+    assert _read_as_me(fifo) == install.NOT_CHECKED
+
+
+def test_programs_that_cannot_be_run_are_no_answer(tmp_path, monkeypatch):
+    """A PATH that holds neither program, and a start the kernel refuses (here, as
+    setgroups refuses one without root), give NOT_CHECKED, never a readable file."""
+    ca = tmp_path / "ca.pem"
+    ca.write_bytes(b"x")
+    monkeypatch.setattr(install, "COMMAND_ENV", {"PATH": str(tmp_path / "empty"), "LC_ALL": "C"})
+    assert _read_as_me(ca) == install.NOT_CHECKED
+
+    def refused(argv, **keywords):
+        raise PermissionError(1, "Operation not permitted")
+
+    with mock.patch.object(install.subprocess, "run", refused):
+        assert install.read_as(str(ca), 1, 1, [1]) == install.NOT_CHECKED
+
+
+@pytest.mark.parametrize("head, reach, answer", [
+    (0, None, None), (1, 0, install.AT_THE_FILE), (1, 1, install.ON_THE_WAY),
+    (1, 2, install.NOT_CHECKED),  # `test` itself failed
+    (-9, 0, install.AT_THE_FILE),  # head killed by a signal, the file there
+])
+def test_exit_statuses_are_read_as_listed(head, reach, answer):
+    codes = iter([head, reach])
+
+    def run(argv, **keywords):
+        return subprocess.CompletedProcess(argv, next(codes))
+
+    with mock.patch.object(install.subprocess, "run", run):
+        assert install.read_as("/ca.pem", 1, 1, [1]) == answer
+
+
+def test_the_real_host_checks_with_the_accounts_groups_and_prints_no_path(monkeypatch, capsys):
+    """`Host.service_reads` gives `read_as` the groups initgroups(3) would give the
+    unit's process, and says what it runs without the path (#140)."""
+    seen = []
+    monkeypatch.setattr(install.os, "getgrouplist", lambda name, gid: seen.append((name, gid)) or [gid, 27, 100])
+    monkeypatch.setattr(install, "read_as", lambda *a: seen.append(a) or None)
+    assert install.Host().service_reads("/etc/ssl/private-ca.pem", 999, 998) is None
+    assert seen == [("tlg-ipam-agent", 998), ("/etc/ssl/private-ca.pem", 999, 998, [998, 27, 100])]
+    out = capsys.readouterr().out
+    assert out == "+ head -c 1 -- <--ca-file>, as tlg-ipam-agent\n"
+
+
+# --- as root, on Linux: what only the kernel decides (#136) ---
+
+as_root = pytest.mark.skipif(
+    not sys.platform.startswith("linux") or os.geteuid() != 0, reason="takes on another user's ids: root on Linux"
 )
-def test_a_file_is_judged_by_the_bits_that_apply_to_the_service_user(tmp_path, mode, uid, gid, readable):
-    path = tmp_path / "ca.pem"
-    path.write_bytes(b"")
-    path.chmod(mode)
-    me, mine = os.getuid(), os.getgid()
-    as_uid = me if uid == "me" else me + 1000
-    as_gid = mine if gid == "mine" else mine + 1000
-    # the directories above are the test's own: judged from the test's user
-    blocked = install.blocked_for(str(path), as_uid, as_gid, top=str(path))
-    assert (blocked is None) is readable
+NOBODY = 65534
+
+
+@pytest.fixture
+def shared(tmp_path):
+    """A directory every user can enter, with a CA bundle in it, root's."""
+    for directory in (tmp_path, *tmp_path.parents):
+        assert os.stat(directory).st_mode & stat.S_IXOTH, "the test's directory must be reachable by others"
+    ca = tmp_path / "ca.pem"
+    ca.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
+    os.chown(ca, 0, 0)
+    return ca
+
+
+@as_root
+def test_as_root_the_mode_bits_the_service_user_gets_are_the_kernels(shared):
+    shared.chmod(0o644)
+    assert install.read_as(str(shared), NOBODY, NOBODY, [NOBODY]) is None
+    shared.chmod(0o600)
+    assert install.read_as(str(shared), NOBODY, NOBODY, [NOBODY]) == install.AT_THE_FILE
+    shared.parent.chmod(0o700)
+    try:
+        assert install.read_as(str(shared), NOBODY, NOBODY, [NOBODY]) == install.ON_THE_WAY
+    finally:
+        shared.parent.chmod(0o755)
+
+
+@as_root
+def test_as_root_a_supplementary_group_that_grants_the_file_is_honoured(shared):
+    """The reviewer's second reproduction: a bundle of mode 0640 whose group the
+    account holds as a supplementary group, not as its primary one."""
+    group = 4242
+    os.chown(shared, 0, group)
+    shared.chmod(0o640)
+    assert install.read_as(str(shared), NOBODY, NOBODY, [NOBODY, group]) is None
+    assert install.read_as(str(shared), NOBODY, NOBODY, [NOBODY]) == install.AT_THE_FILE
+
+
+def deny_by_acl(path, uid):
+    """What `setfacl -m u:<uid>:--- <path>` does to a file of mode 0644: it writes the
+    POSIX ACL as the `system.posix_acl_access` attribute (version 2, then each entry
+    as tag, permission and id, sorted by tag; the mask is the group's bits, so the mode
+    stays 0644). Written here so that no image needs the acl package."""
+    unset = 0xFFFFFFFF
+    entries = [(0x01, 6, unset), (0x02, 0, uid), (0x04, 4, unset), (0x10, 4, unset), (0x20, 4, unset)]
+    blob = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *entry) for entry in entries)
+    try:
+        os.setxattr(path, "system.posix_acl_access", blob)
+    except OSError as exc:
+        pytest.skip(f"the filesystem takes no POSIX ACL ({exc.strerror})")
+
+
+@as_root
+def test_as_root_an_acl_that_denies_the_account_is_honoured(shared):
+    """The reviewer's first reproduction: mode 0644, and an ACL entry for the account
+    with no permission."""
+    shared.chmod(0o644)
+    deny_by_acl(shared, NOBODY)
+    assert stat.S_IMODE(os.stat(shared).st_mode) == 0o644
+    assert install.read_as(str(shared), NOBODY, NOBODY, [NOBODY]) == install.AT_THE_FILE
+    assert install.read_as(str(shared), NOBODY - 1, NOBODY, [NOBODY]) is None  # another user: the bits
+
+
+@as_root
+def test_as_root_the_programs_hold_none_of_roots_groups(shared):
+    """A file only root's group may read: the check's programs keep none of the
+    installer's groups, whatever groups root holds."""
+    os.chown(shared, 0, 0)
+    shared.chmod(0o640)
+    assert install.read_as(str(shared), NOBODY, NOBODY, [NOBODY]) == install.AT_THE_FILE
 
 
 @pytest.mark.parametrize(

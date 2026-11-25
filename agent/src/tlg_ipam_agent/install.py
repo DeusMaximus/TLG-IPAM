@@ -18,10 +18,10 @@ input alone (`--enrol-token -`; with a prompt, and without echoing it, on a
 terminal), never taken as an argument: any local user can read a command line from
 `/proc/<pid>/cmdline` while the exchange waits, and sudo logs it, which on a host with
 a persistent journal puts it on disk (#22 measured both). A `--ca-file` must be
-readable by the service user (`blocked_for`), judged once the account exists and
-before the exchange. The token file exists, empty, with its owner and mode, before the
-exchange, so nothing that could fail locally is left until
-the token is spent; if the install fails before the exchange, or the exchange is
+readable by the service user, which the kernel is asked by running fixed programs as
+that user (`read_as`), once the account exists and before the exchange. The token
+file exists, empty, with its owner and mode, before the exchange, so nothing that
+could fail locally is left until the token is spent; if the install fails before the exchange, or the exchange is
 refused, what this run created is taken away again. Once the token is stored nothing
 is taken back.
 
@@ -43,8 +43,10 @@ operator made, and the agent's record on the server, which only the owner can re
 Neither command is reached until `cli` has had `trust.check` find that only root can
 change the code Python could load: this module is imported after that check.
 
-The programs this runs are fixed (`useradd`, `userdel`, `groupdel`, `systemctl`), with
-fixed arguments, a fixed PATH and no shell; nothing the server sends reaches them.
+The programs this runs are fixed: `useradd`, `userdel`, `groupdel` and `systemctl` as
+root, and `head` and `test` as the service user (`read_as`). Their arguments are fixed
+but for the operator's `--ca-file` path, with a fixed PATH and no shell; nothing the
+server sends reaches them.
 This module and `store.py` are the only modules allowed to start a process or write a
 file (`tests/test_invariants.py`, `WRITES_WHERE`).
 """
@@ -63,7 +65,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
-from . import config, enrol, store, trust
+from . import config, enrol, store
 from .client import Answer, Kind, make_http
 
 SERVICE_USER = "tlg-ipam-agent"
@@ -154,6 +156,14 @@ class Host:
     def code_unreachable(self, interpreter: str) -> str | None:
         return unreachable(interpreter)
 
+    def service_reads(self, path: str, uid: int, gid: int) -> str | None:
+        """`read_as` for the service user, with the groups systemd gives the unit's
+        process (initgroups(3): its primary group and every group the user database
+        lists the account in). The line printed names the `--ca-file` by its option,
+        not by its path (#140)."""
+        print(f"+ {' '.join(CA_READ)} <--ca-file>, as {SERVICE_USER}", flush=True)
+        return read_as(path, uid, gid, os.getgrouplist(SERVICE_USER, gid))
+
 
 def unreachable(
     interpreter: str,
@@ -227,37 +237,67 @@ def _plain(value: str, name: str) -> str:
     return value
 
 
-def _allowed(info: os.stat_result, uid: int, gid: int, bits: tuple[int, int, int]) -> bool:
-    """Whether a user `uid` whose only group is `gid` gets one of `bits` (user, group,
-    others) on the file `info` describes, as the kernel decides it."""
-    mine, group, others = bits
-    if info.st_uid == uid:
-        return bool(info.st_mode & mine)
-    if info.st_gid == gid:
-        return bool(info.st_mode & group)
-    return bool(info.st_mode & others)
+# How `install` asks the kernel whether the service user can read the `--ca-file`
+# (#136): it runs these fixed programs as that user, with the groups the unit's agent
+# gets, and judges by their exit status. `head` opens the file and reads one byte;
+# only when it fails, `test -e` says whether the user can reach the path at all (it
+# stats it, which needs every directory and link on the way and nothing of the file),
+# so the refusal can say where it stopped without naming the path. Their output and
+# their errors, which name the path, go to /dev/null.
+CA_READ = ("head", "-c", "1", "--")
+CA_REACH = ("test", "-e")
+# ample for a local file; a FIFO swapped in for the file, or a stuck network mount, is
+# killed at it, and the install refused
+CA_CHECK_TIMEOUT_S = 10
+# where the check stopped, by its kind (#140: never by the path)
+AT_THE_FILE = "the file itself"
+ON_THE_WAY = "a directory or link on the way to it"
+NOT_CHECKED = "not checked"
 
 
-def blocked_for(path: str, uid: int, gid: int, top: str = "/") -> str | None:
-    """The first path on the way to `path` that the user `uid` (in group `gid` alone, as
-    the service user is) could not pass through, or `path` itself if it could not read
-    it; None when it can read it. Every directory from `/` and every directory a link
-    passes through is looked at, as `trust.resolve` walks them (the review of #130: a
-    CA bundle root could read and the service user could not passed, and the install
-    spent the token on a unit that could not verify the server)."""
-    searchable = (stat.S_IXUSR, stat.S_IXGRP, stat.S_IXOTH)
-    readable = (stat.S_IRUSR, stat.S_IRGRP, stat.S_IROTH)
+def read_as(path: str, uid: int, gid: int, groups) -> str | None:
+    """None when the user `uid`, with primary group `gid` and supplementary `groups`,
+    can open `path` and read from it, as the kernel decides it: POSIX ACLs, every group
+    it is in, every directory and link on the way, and a security module that checks
+    an open. Otherwise where it stopped: AT_THE_FILE, ON_THE_WAY, or NOT_CHECKED when a
+    program could not be run as that user or did not finish in time (the review of
+    #130, round 2: a model of the mode bits passed a bundle an ACL denied the account,
+    and refused one it could read through a supplementary group).
 
-    def refuse(candidate: str, info: os.stat_result, last: bool) -> bool:
-        return not _allowed(info, uid, gid, readable if last else searchable)
+    The programs run as that user from the start: `subprocess`'s `user`, `group` and
+    `extra_groups` have the child call setgroups, setregid and setreuid before it
+    execs, so the program holds no root privilege and none of root's groups. They get
+    the fixed environment the install's other programs get, no shell, no input, and
+    `/` as the working directory. Their arguments are fixed but for `path`, the
+    operator's own `--ca-file`, already checked to be absolute and plain (`_ca_file`);
+    nothing the server sends reaches them, and the check is made before the exchange."""
+
+    def as_user(*argv: str) -> int:
+        return subprocess.run(
+            list(argv),
+            env=COMMAND_ENV,
+            cwd="/",
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            user=uid,
+            group=gid,
+            extra_groups=list(groups),
+            timeout=CA_CHECK_TIMEOUT_S,
+            check=False,
+        ).returncode
 
     try:
-        trust.resolve(path, refuse, top)
-    except trust.Untrusted as exc:
-        return str(exc)
-    except FileNotFoundError:
-        return path
-    return None
+        if as_user(*CA_READ, path) == 0:
+            return None
+        reached = as_user(*CA_REACH, path)
+    except (OSError, subprocess.SubprocessError):
+        return NOT_CHECKED
+    if reached == 0:
+        return AT_THE_FILE
+    if reached == 1:
+        return ON_THE_WAY
+    return NOT_CHECKED
 
 
 def _ca_file(value: str | None) -> str | None:
@@ -553,16 +593,23 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out, envir
             if user is None:
                 raise InstallError(f"useradd ran but there is no user {SERVICE_USER}")
         if ca_file is not None:
-            blocked = blocked_for(ca_file, *user)
-            if blocked is not None:
-                # neither path is repeated (#140): `namei -l` on the path shows them
-                itself = blocked in (ca_file, os.path.realpath(ca_file))
-                where = "the file itself" if itself else "a directory or link on the way to it"
+            # asked of the kernel, as the service user (#136). Neither path is
+            # repeated (#140): `namei -l` and `getfacl` on the path show them
+            where = host.service_reads(ca_file, *user)
+            if where == NOT_CHECKED:
+                raise InstallError(
+                    f"--ca-file: could not check that {SERVICE_USER}, which the unit runs as, "
+                    f"can read the file (`{CA_READ[0]}` or `{CA_REACH[0]}` could not be run as that "
+                    f"user, or did not finish within {CA_CHECK_TIMEOUT_S} s), so the install "
+                    "stopped before the token was spent"
+                )
+            if where is not None:
                 raise InstallError(
                     f"--ca-file: {SERVICE_USER}, which the unit runs as, could not read the "
                     f"file (stopped at {where}), so the agent could not verify the server. "
                     "Make the file and the directories above it readable by that user "
-                    "(`namei -l` on the path shows each one's owner and mode)"
+                    "(`namei -l` on the path shows each one's owner and mode, `getfacl` "
+                    "an ACL)"
                 )
         for directory in (paths.etc, paths.state):
             if store.make_dir(directory, DIR_MODE):
