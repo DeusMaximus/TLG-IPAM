@@ -13,6 +13,7 @@ import queue
 import re
 import secrets
 import shlex
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -127,14 +128,17 @@ def _uvicorn(tmp_path, api_key, *args):
     )
 
 
-def _image(tmp_path, api_key, env=None):
+def _image(tmp_path, api_key, env=None, cwd=API_DIR):
     """Start the server as the image's `CMD` does (`python -m app.serve`), on a loopback
-    port it picks; `env` is added to the child's environment as it is."""
+    port it picks; `env` is added to the child's environment as it is. Another `cwd`
+    finds `app` through `PYTHONPATH`, as the image's `/app` holds it."""
     child_env = _child_env(tmp_path, api_key)
     child_env.update(env or {})
+    if cwd != API_DIR:
+        child_env["PYTHONPATH"] = str(API_DIR)
     return subprocess.Popen(
         [sys.executable, "-m", "app.serve", "--host", "127.0.0.1", "--port", "0"],
-        cwd=API_DIR,
+        cwd=cwd,
         env=child_env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -454,10 +458,10 @@ def test_a_missing_directory_is_refused_without_the_volume_command(tmp_path):
     assert database.refuse_unwritable_storage(str(tmp_path / "ipam.db")) is None
 
 
-@pytest.mark.parametrize("target", ["", ":memory:", "file:ipam?mode=memory&cache=shared"])
+@pytest.mark.parametrize("target", ["", ":memory:"])
 def test_a_target_with_no_file_is_not_checked(tmp_path, monkeypatch, target):
-    """SQLite's in-memory and temporary databases, and a `file:` URI, have no directory
-    this process must write (round 1 of #181's briefed review, finding 1)."""
+    """`:memory:` and the empty name, which this engine opens in memory, have no
+    directory this process must write (round 1 of #181's briefed review, finding 1)."""
     from app import database
 
     locked = tmp_path / "locked"
@@ -550,4 +554,77 @@ def test_control_characters_in_the_path_are_shown_as_escapes(tmp_path):
         data.chmod(0o755)
     message = str(refused.value.code)
     assert "\x1b" not in message and "\n" not in message
-    assert message.count("a\\x1b[2Jb\\nc") == 3  # the sentence and both commands
+    # shown once, in the sentence; no command names the escaped spelling, which is
+    # another path (round 2 of #181's briefed review, finding 2)
+    assert message.count("a\\x1b[2Jb\\nc") == 1
+    assert "docker compose run --rm" not in message
+    assert "its path holds a control character" in message
+    assert "the commands must name the real directory" in message
+    assert database.volume_commands(str(data), os.getuid(), os.getgid()) is None
+
+
+# DB_PATH values the engine would not open as the path the storage check reads (round 2
+# of #181's briefed review, finding 1): a `file:` name, URI or not, and a URL query or
+# escape. `{data}` is a directory holding a database this process cannot write.
+NOT_A_PATH = {
+    "uri-rwc": "file:{data}/ipam.db?mode=rwc&uri=true",
+    "uri": "file:{data}/ipam.db?uri=true",
+    "literal-file-name": "file:plain.db",
+    "upper-case": "FILE:plain.db",
+    "shared-memory": "file::memory:?cache=shared",
+    "query-on-a-path": "{data}/ipam.db?mode=ro&uri=true",
+    "bare-query": "{data}/ipam.db?",
+    "percent-escape": "{data}/ipam%2Edb",
+}
+PATHS = {"absolute": "/data/ipam.db", "relative": "./ipam.db", "space": "/data/a b/ipam.db",
+         "hash": "/data/a#b.db", "memory": ":memory:", "empty": ""}
+
+
+@pytest.mark.parametrize("value", NOT_A_PATH.values(), ids=NOT_A_PATH.keys())
+def test_db_path_problem_refuses_what_is_not_a_filesystem_path(value):
+    assert config.db_path_problem(value.format(data="/data")) == "DB_PATH must be a filesystem path or :memory:."
+
+
+@pytest.mark.parametrize("value", PATHS.values(), ids=PATHS.keys())
+def test_db_path_problem_accepts_a_path_or_memory(value):
+    assert config.db_path_problem(value) is None
+
+
+def test_load_settings_refuses_a_db_path_that_is_not_a_path(monkeypatch):
+    for name in [n for n in os.environ if n.upper() == "DB_PATH"]:
+        monkeypatch.delenv(name)
+    monkeypatch.setenv("DB_PATH", "file:/data/ipam.db?mode=rwc&uri=true")
+    with pytest.raises(SystemExit) as refused:
+        config.load_settings()
+    assert str(refused.value.code) == "TLG-IPAM will not start: DB_PATH must be a filesystem path or :memory:."
+
+
+@needs_non_root
+@pytest.mark.parametrize("value", NOT_A_PATH.values(), ids=NOT_A_PATH.keys())
+def test_the_image_refuses_a_db_path_that_is_not_a_path_before_serving(tmp_path, value):
+    """Persistent storage this process cannot write (a 0555 directory holding a 0444
+    database, as root's volume is to uid 10001) named through a `file:` name or a URL
+    query: before round 2's fix these started, answered reads and failed every write.
+    The start stops before uvicorn serves anything, and the message repeats no value."""
+    data = tmp_path / "data"
+    data.mkdir()
+    sqlite3.connect(data / "ipam.db").close()
+    (data / "ipam.db").chmod(0o444)
+    data.chmod(0o555)
+    db_path = value.format(data=data)
+    workdir = tmp_path / "workdir"  # where a literal `file:` name would be opened
+    workdir.mkdir()
+    try:
+        proc = _image(tmp_path, REAL_KEY, {"DB_PATH": db_path}, cwd=workdir)
+        try:
+            _, stderr = proc.communicate(timeout=START_DEADLINE)
+        finally:
+            _stop(proc)
+    finally:
+        data.chmod(0o755)
+        (data / "ipam.db").chmod(0o644)
+    assert proc.returncode == 1, stderr
+    assert "TLG-IPAM will not start: DB_PATH must be a filesystem path or :memory:." in stderr
+    assert "Uvicorn running on" not in stderr and "Application startup complete" not in stderr
+    assert db_path not in stderr and str(data) not in stderr
+    assert list(workdir.iterdir()) == []

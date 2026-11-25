@@ -112,6 +112,15 @@ grep -qF -- '--user root --entrypoint chown ipam -R 10001:10001 /data`' <<<"$out
 grep -qF -- '--user root --entrypoint chmod ipam 700 /data`' <<<"$out" ||
   fail "the refusal does not give the chmod command: $out"
 echo "$image: refuses a root volume, naming the commands"
+# the same volume named through a URI is refused too, before the storage check could be
+# passed by: a file: name is not a path the check reads
+if out=$(docker run --rm --network none -e API_KEY="$key" -e 'DB_PATH=file:/data/ipam.db?mode=rwc&uri=true' \
+    --mount "$mount" "$image" 2>&1); then
+  fail "the server started on a root volume named by a file: URI"
+fi
+grep -qxF 'TLG-IPAM will not start: DB_PATH must be a filesystem path or :memory:.' <<<"$out" ||
+  fail "the refusal of a file: DB_PATH was not the expected message: $out"
+echo "$image: refuses a file: DB_PATH"
 # the README's one-time commands, as docker run in place of docker compose run
 docker run --rm --network none --user root --mount "$mount" --entrypoint chown "$image" -R 10001:10001 /data
 docker run --rm --network none --user root --mount "$mount" --entrypoint chmod "$image" 700 /data

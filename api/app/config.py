@@ -1,8 +1,15 @@
 from typing import ClassVar
 
 from pydantic_settings import BaseSettings
+from sqlalchemy.engine import make_url
 
 from .version import VERSION
+
+# How `app.database` names the database to SQLAlchemy: this, then `DB_PATH` as it is
+SQLITE_URL_PREFIX = "sqlite+aiosqlite:///"
+
+# The one refusal of DB_PATH; fixed, so it repeats no value
+DB_PATH_REFUSED = "DB_PATH must be a filesystem path or :memory:."
 
 # The value `.env.example` ships. Anyone who has read the repository knows it.
 PLACEHOLDER_API_KEY = "change-me"
@@ -41,8 +48,28 @@ def api_key_problem(value: str) -> str | None:
     return None
 
 
+def db_path_problem(value: str) -> str | None:
+    """Why `value` cannot be `DB_PATH`, or None when it can (#173, round 2 of #181's
+    briefed review).
+
+    `DB_PATH` is a filesystem path, or `:memory:` (the empty name is SQLite's in-memory
+    database too), so that `database.storage_problem` checks the file the server opens.
+    A `file:` name in any case is refused: with `uri=true` it is a URI naming any file,
+    and without it a file whose name starts `file:`. So is anything the engine's URL
+    would read otherwise than as that path, a query (`?mode=ro&uri=true`) or a `%`
+    escape (`make_url` decodes it), since the path checked would not be the one opened.
+    """
+    if value.lower().startswith("file:"):
+        return DB_PATH_REFUSED
+    url = make_url(SQLITE_URL_PREFIX + value)
+    if url.query or url.database != value:
+        return DB_PATH_REFUSED
+    return None
+
+
 def load_settings() -> Settings:
-    """Read the settings from the environment, refusing an unusable owner key.
+    """Read the settings from the environment, refusing an unusable owner key, and a
+    `DB_PATH` that is not a filesystem path or `:memory:` (`db_path_problem`).
 
     Runs when this module is imported, so uvicorn (by hand or as the container's
     CMD) exits before it serves anything. Under `--reload` the reloader stays up and
@@ -57,6 +84,8 @@ def load_settings() -> Settings:
             f"TLG-IPAM will not start: {problem} The owner key guards the REST API and /mcp. "
             f"{GENERATE_KEY_HINT}"
         )
+    if db_path_problem(loaded.db_path) is not None:
+        raise SystemExit(f"TLG-IPAM will not start: {DB_PATH_REFUSED}")
     return loaded
 
 

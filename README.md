@@ -25,7 +25,7 @@ The server will not start without a real key: with `API_KEY` unset, empty, still
 
 ## The container's user
 
-The server runs as `ipam`, uid and gid 10001, never root (`docker compose top` shows `10001`). The code in the image stays root's, so the server cannot change it. A new `ipam-data` volume takes the image's `/data`, which belongs to that user, mode 0700. Nothing in the image runs as root at start, so a volume made by an earlier image, which belongs to root, is given to the user once by hand (below). Until then the server refuses to start, and its log gives the commands. `DB_PATH=:memory:`, a database with no file, is not checked.
+The server runs as `ipam`, uid and gid 10001, never root (`docker compose top` shows `10001`). The code in the image stays root's, so the server cannot change it. A new `ipam-data` volume takes the image's `/data`, which belongs to that user, mode 0700. Nothing in the image runs as root at start, so a volume made by an earlier image, which belongs to root, is given to the user once by hand (below). Until then the server refuses to start, and its log gives the commands. `DB_PATH=:memory:`, a database with no file, is not checked. Any other `DB_PATH` must be a plain filesystem path: a `file:` URI, or a path with a `?` query or a `%` escape, is refused at start.
 
 ### Upgrading from an image that ran as root
 
