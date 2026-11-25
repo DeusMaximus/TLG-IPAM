@@ -27,6 +27,18 @@ Template:
 
 ---
 
+## 2026-11-25 — Claude Code (Opus 5.5), worker — #93: `ALLOWED_DNS_SERVERS`, a resolver allowlist on the agent's host (PR #177)
+- **Merged:** 2026-11-25, squash `2c54ef4`, at head `4352115`; branch deleted, #93 closed. Round 1 (GPT-6.1 Sol, `131349e`) NO-GO: P2 a scoped IPv6 entry let a server on another interface through, P3 no restart after the drop-in; both fixed in `1d73e4e`. Round 2 (GPT-6.1 Sol, `1d73e4e`) GO with one P3 (an unconditional kernel-refusal claim), fixed in wording in `4352115` and read by the orchestrator against the remedy; no third round. `main` (#178) merged in `4038143`: checked by the orchestrator as mechanical (every file but `AGENTS.md` equal to an automatic merge; both sides' sentence edits to the shared bullet carried over exactly). Codex clean on `4352115`, CI 9/9 green. Orchestrator's agent suite at the head: 1,908 passed, 14 skipped. Reviews at `.dev/93/review-1-sol.md` and `review-2-sol.md`. Follow-up filed with the owner's word: #179 (`install --allowed-dns-servers`).
+- **Done:** [PR #177](https://github.com/DeusMaximus/TLG-IPAM/pull/177) closes #93.
+  - `config.parse_allowed_dns`: unset is None. A value set but empty, a name, a URL, host bits, or an IPv6 item with a zone stops the agent at start, naming the item by its place.
+  - `guard.dns_servers` narrows the chosen servers after the cut to 3. It never keeps a zoned server while the setting is set; an unscoped address is compared by address alone, and the host's routing picks its link.
+  - `scan.run(…, allowed_dns=)`; `scan.outside_allowed` gives the notice, or the "rdns not run" error when no server is left (incomplete, names kept).
+  - `loop.py` passes the setting; `cli.py` shows it in `--help` and the start-up log line. Agents page: one hint sentence per tab.
+  - Docs: spec §5.2 and §5.6, both READMEs, brief §2.2, and the DNS sentences of the `AGENTS.md` agent bullet.
+- **Decisions:** PR Deliberate calls 1–13: drop the server, don't refuse the job; the list applies to `resolv.conf` too; no fallback to the host's resolvers; a partial drop leaves the scan complete, its notice given up last, after #164's counts; zones refused, not matched; for systemd, a drop-in followed by `systemctl restart`.
+- **State:** no schema change, no wire change, `install.py` untouched. Untested: a live systemd drop-in, real link-local traffic, the web hint text.
+- **Next:** #179. #20 (fdns) is next on `probe.py`.
+
 ## 2026-11-25 — Claude Code (Opus 5.5), worker — #169: the installer asks the kernel whether the service account can use the venv (PR #178)
 - **Merged:** 2026-11-25, squash `8d623c8`, at head `967bdf5`; branch deleted, #169 closed. Briefed round on GPT-6.1 Sol at `f144b11`: GO with one P3, every Deliberate call standing (`.dev/169/review-1-sol.md`); the owner accepted call 4 (`useradd` then `userdel` on a refused first install). The P3 (an exit 0 from a start-up hook read as usable) fixed by the worker in `967bdf5`, read by the orchestrator against the reviewer's remedy, Codex clean there, no second round (the owner's standing preference); Greptile 5/5 on `f144b11` only. All nine checks green at `967bdf5`. The orchestrator ran the agent suite on the head merged with `main` at `f7a9aa3`: 1,858 passed, 14 skipped (root-only). No follow-up filed.
 - **Done:** [PR #178](https://github.com/DeusMaximus/TLG-IPAM/pull/178) closes #169.
@@ -68,28 +80,3 @@ Template:
 - **Decisions:** PR Deliberate calls 1–11: a body field, not a header; checked after the token lookup and before the lock; check-in's rule; two `409` codes; absent or null means 2, a non-integer is `422`; it counts against the throttle; `PROTOCOL_VERSION` not raised; the agent keeps retrying; nothing recorded on the agent row.
 - **State:** agent 1,798 passed, 4 skipped; server 1,378; web 188 (untouched). No schema change; `PROTOCOL_VERSION` 2. In `install.py` only `_not_enrolled` changed.
 - **Next:** #169 (shares `install.py`) can start now.
-
-## 2026-11-25 — Claude Code (Fable 5.2), orchestrator — session closed: #136, #159 and #164 merged; nothing in flight
-- **Done:** three PRs verified, briefed, fixed and merged this session's last leg, each squash, branch deleted, worker's entry below or in the archive:
-  - [PR #167](https://github.com/DeusMaximus/TLG-IPAM/pull/167) (#136) `069af99`: the installer asks the kernel, as the service account, whether it can read the `--ca-file`.
-  - [PR #166](https://github.com/DeusMaximus/TLG-IPAM/pull/166) (#159) `bc3ba04`: `publish-release` stops when it cannot tell whether the tag has a release; only the two publish steps may be given a credential.
-  - [PR #168](https://github.com/DeusMaximus/TLG-IPAM/pull/168) (#164) `33ea51b`: a job's error counts the PTR lookups whose reply the agent refused unread, by limit.
-  - Each got one briefed round (GO with P3s: two, two and four), the P3s fixed in the same PR by its worker, and the fix read by the orchestrator against the reviewer's remedy with Codex clean on the new head. No second round, by the owner's standing preference.
-  - Filed, with the owner's word: **#169** (the installer's venv check still judges by mode bits, the model #136 removed for the CA bundle) and **#170** (decide whether to report a first DNS server whose replies are always refused while a later one answers).
-- **Decisions:**
-  - The owner (2026-11-25): a review round may be **started** on GPT-6 Sol with Daybreak Blue when the orchestrator judges a GPT-6.1 Sol refusal likely, said in the report; a judgment per round, not a rule (`.agents/orchestration.md`, "When a model refuses"). Used once: #164's round, which builds refused DNS replies. #136's and #159's rounds ran to the end on GPT-6.1 Sol.
-  - Merge order was #167, #166, #168: #167 and #168 edited the same `AGENTS.md` bullet, and #168's worker merged `main` and resolved it by hand. #166 was merged on a local run of the suite over its tree merged with `main` (its files are disjoint from #167's).
-- **State:** `main` is green. Agent 1,783 passed and 4 skipped (the root-only installer cases, which run in a container), server 1,357, web 188. No PR is open, no worker is running, no review round is running. No schema or protocol change this leg (`PROTOCOL_VERSION` 2).
-  - Nothing has ever been published by the release workflow; the first tag is the owner's. `.agents/releases.md` is the checklist: step 3 the base-image refresh (with the DNS-ceiling premise recheck when the image's Python changes), step 5 the cross-attempt artefact download, and on the first release a look at `publish-release`'s log to see the tag's release listed (#159's assumptions about draft listing).
-  - Never built or run by anyone: the server's Docker image with the `python -m app.serve` `CMD`; a proxy in front of the server against spec §8.
-  - Recorded, not filed: `publish-image`'s warning prints skopeo's stderr with its newlines (the pattern #159 tidied in `publish-release`); after exec, a process running as a reused service account can ptrace the CA check's program where the host allows it (#136's review, not rated).
-- **Waiting on the owner:**
-  - #5 and #25 (`owner` label), deferred until the deployment is rebuilt behind a tunnel; M3 (#26–#30, #32) waits on #25.
-  - The first release tag.
-  - No real-network test without asking again: the permission to send packets on the test host covered 2026-11-23 only.
-  - The owner is considering Claude Opus 5.5 as orchestrator for a session started before the weekly limit resets; the roster in `.agents/orchestration.md` is unchanged until they say so.
-- **Next:** ready and not started, all owing a briefed round but #31:
-  - `probe.py`, one at a time: #93 (resolver allowlist on the agent's host), #20 (forward-DNS check), #170.
-  - `install.py` / enrolment: #165 (refuse an agent the server cannot answer before its token is spent), then #169; they may share `install.py`, so not together unless #165 turns out to be server-side only.
-  - #31 (deployment document from spec §8): no code, can run beside any of the above.
-  - At most three workers, none sharing a code file. Review briefs and reviews of this session are in `.dev/<issue>/` (not committed).
