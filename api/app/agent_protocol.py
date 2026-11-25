@@ -113,8 +113,13 @@ ENROL_TOKEN_PREFIX = "tlge_"
 # `secrets.token_urlsafe(TOKEN_SECRET_BYTES)` the server issues (#140). An agent stores
 # only an enrol answer whose `agent_token` is exactly AGENT_TOKEN_FORM (its
 # `client.ISSUED_AGENT_TOKEN`), and takes any other answer as a malformed `200` after
-# the enrolment token is spent: a server that issues another form, longer or shorter,
-# raises PROTOCOL_VERSION.
+# the enrolment token is spent. A server that issues another form, longer or shorter,
+# raises PROTOCOL_VERSION, but that is not enough: the enrol body carries no protocol
+# and the version is checked only at check-in, so an existing agent's enrolment is
+# answered `200` at any protocol and its enrolment token spent on a token it refuses
+# (agent/tests/test_e2e.py, the briefed review of #140). The form of the enrol
+# answer's token is kept for existing agents until enrolment itself can choose an
+# answer they take, or refuse them before the token is spent.
 TOKEN_SECRET_BYTES = 32
 TOKEN_SECRET_LENGTH = 43
 TOKEN_SECRET_ALPHABET = "A-Za-z0-9_-"

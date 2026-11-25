@@ -307,7 +307,7 @@ def test_install_refuses_before_it_changes_anything(root, host, message):
         (Options(url=URL, enrol_token="-", allowed_cidrs="10.0.0.1/8"), "--allowed-cidrs"),
         (Options(url=URL, enrol_token="-", max_pps="0"), "--max-pps"),
         (Options(url=URL, enrol_token="-", ca_file="relative.pem"), "--ca-file must be an absolute path"),
-        (Options(url=URL, enrol_token="-", ca_file="/no/such/ca.pem"), "cannot be found"),
+        (Options(url=URL, enrol_token="-", ca_file="/no/such/ca.pem"), "--ca-file: there is no file at the path given"),
         (Options(url=URL, enrol_token="-", ca_file="/a b.pem"), "--ca-file has a character"),
         (Options(url="https://ipam.home.arpa/%61", enrol_token="-"), "--url has a character"),
     ],
@@ -441,8 +441,70 @@ def test_a_ca_file_the_service_user_cannot_read_stops_the_install_before_the_exc
     code, said = run_install(
         root, host, Options(url=URL, enrol_token="-", ca_file=str(ca)), exchange=lambda *a: pytest.fail("no exchange")
     )
-    assert code == 1 and "could not read" in said[-1] and str(ca) in said[-1], said
+    assert code == 1 and "could not read the file" in said[-1], said
+    assert str(ca) not in said[-1] and ca.name not in said[-1]  # #140: no path is repeated
     assert tree(root) == before and host.commands == [USERADD, ("userdel", "tlg-ipam-agent")]
+
+
+@pytest.mark.parametrize(
+    "blocked, where",
+    [
+        ("{ca}", "the file itself"),
+        ("{real}", "the file itself"),  # the file a link leads to
+        ("{dir}", "a directory or link on the way to it"),
+        ("{dir} (more than 40 links)", "a directory or link on the way to it"),
+    ],
+)
+def test_a_ca_file_the_service_user_cannot_read_is_placed_without_its_path(root, monkeypatch, blocked, where):
+    """The refusal says where the walk stopped by its kind, never by the path (#140)."""
+    real = root / "real.pem"
+    real.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
+    ca = root / "ca.pem"
+    ca.symlink_to(real)
+    blocked = blocked.format(ca=ca, real=os.path.realpath(ca), dir=root)
+    monkeypatch.setattr(install, "blocked_for", lambda path, uid, gid: blocked)
+    code, said = run_install(
+        root, FakeHost(), Options(url=URL, enrol_token="-", ca_file=str(ca)), exchange=lambda *a: pytest.fail("no exchange")
+    )
+    assert code == 1 and f"could not read the file (stopped at {where})" in said[-1], said
+    assert str(root) not in said[-1] and "pem" not in said[-1]
+
+
+def _misplaced(token):
+    """A token typed as the value of each of install's options that takes one, in each
+    form a slip of order or of paste would give it (#140)."""
+    return [
+        {"url": token},
+        {"url": f"https://{token}"},
+        {"url": f"{URL}/{token}"},
+        {"url": f"{URL}?{token}"},
+        {"url": f" {token}"},
+        {"allowed_cidrs": token},
+        {"allowed_cidrs": f"10.0.0.0/8,{token}"},
+        {"allowed_cidrs": f"10.0.0.0/8 192.168.0.0/16 {token} 100.64.0.0/10"},
+        {"max_pps": token},
+        {"ca_file": token},
+        {"ca_file": f"/{token}"},
+        {"ca_file": f"/etc/ssl/{token}"},
+        {"ca_file": f"/etc/ssl/{token}.pem"},
+        {"enrol_token": token},
+    ]
+
+
+@pytest.mark.parametrize("token", [ENROL_TOKEN, TOKEN])
+@pytest.mark.parametrize("place", range(len(_misplaced(TOKEN))))
+def test_a_token_given_as_any_options_value_is_in_no_output(root, capsys, token, place):
+    """Through install's real validation, a fake host and an exchange that does not
+    enrol: whatever the outcome, neither what install says nor what it prints holds
+    the token or its secret part. A `--url` with the token as its host gets as far as
+    the exchange, and is in agent.env as the URL given, which is no output."""
+    options = Options(**{"url": URL, "enrol_token": "-", **_misplaced(token)[place]})
+    refused = Answer(Kind.RETRY, None, None, "no answer (ConnectError)")
+    code, said = run_install(root, FakeHost(), options, exchange=lambda *a: refused)
+    out, err = capsys.readouterr()
+    assert code == 1 and said
+    for shown in (*said, out, err):
+        assert token[5:] not in shown, shown
 
 
 def test_a_ca_file_behind_a_directory_the_service_user_cannot_enter_is_refused(tmp_path):
@@ -1086,3 +1148,15 @@ def test_live_tls_with_no_trust_for_the_server_the_exchange_fails_before_any_req
     code, said = _live(root, tls_server, monkeypatch)
     assert code == 1 and "no answer" in said[-1], said
     assert tls_server.seen == [] and tree(root) == before
+
+
+@pytest.mark.parametrize("token", [ENROL_TOKEN, TOKEN])
+def test_a_ca_file_that_is_not_a_regular_file_is_refused_without_its_path(root, token):
+    """A directory named by the token, so the path is there but is no file (#140)."""
+    there = root / token
+    there.mkdir()
+    code, said = run_install(
+        root, FakeHost(), Options(url=URL, enrol_token="-", ca_file=str(there)), exchange=lambda *a: pytest.fail("no exchange")
+    )
+    assert code == 1 and "--ca-file: the path given is not a regular file" in said[-1], said
+    assert token[5:] not in said[-1]

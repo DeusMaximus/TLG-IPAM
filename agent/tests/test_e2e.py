@@ -908,3 +908,45 @@ async def test_a_delegated_reverse_zone_keeps_the_name_and_the_next_server_suppl
     finally:
         transport.close()
         ANSWERS.pop(key, None)
+
+
+@pytest.mark.parametrize("raised", [False, True])
+@pytest.mark.parametrize("secret_bytes", [32, 33])
+async def test_raising_the_protocol_does_not_keep_a_new_token_form_from_spending_an_old_agents_enrolment(
+    owner, monkeypatch, raised, secret_bytes
+):
+    """Why `agent_protocol` says raising PROTOCOL_VERSION is necessary but not enough
+    when the issued form changes (the briefed review of #140). The enrolment body
+    carries no protocol and the version is checked only at check-in, so a server that
+    issues a longer secret answers this release's agent `200` at any protocol: the
+    agent refuses the answer as not in the route's shape, and the enrolment token is
+    spent. The form must stay what existing agents take until enrolment itself can
+    tell them apart."""
+    from app.agent_protocol import AGENT_TOKEN_FORM
+    from app.models import Token
+    from app.services import agents as server_agents
+    from app.services import jobs as server_jobs
+
+    from tlg_ipam_agent.client import Kind
+
+    if raised:
+        monkeypatch.setattr(server_jobs, "PROTOCOL_VERSION", server_jobs.PROTOCOL_VERSION + 1)
+    monkeypatch.setattr(server_agents, "TOKEN_SECRET_BYTES", secret_bytes)
+    agent = await _ok(await owner.post("/api/v1/agents", json={"name": "vlan10"}), 201)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://test",
+        headers={"Authorization": f"Bearer {agent['enrol_token']}"},
+    ) as http:
+        answer = await AgentClient(http).enrol({})
+        again = await http.post("/api/v1/agent/enrol", json={})
+    async with SessionLocal() as session:
+        [spent] = (await session.scalars(select(Token).where(Token.kind == "enrol"))).all()
+        [issued] = (await session.scalars(select(Token).where(Token.kind == "agent"))).all()
+    # either way the exchange took place and the enrolment token is used up
+    assert answer.status == 200 and spent.used_at is not None and again.status_code == 403
+    if secret_bytes == 32:
+        assert answer.kind is Kind.OK and AGENT_TOKEN_FORM.fullmatch(answer.data["agent_token"])
+    else:
+        assert answer.kind is Kind.RETRY and answer.message == "HTTP 200 answer not in the expected shape"
+        assert issued.revoked_at is None  # the server holds a token the agent never stored

@@ -5,7 +5,7 @@ import ipaddress
 import pytest
 
 from conftest import ENROL_TOKEN, TOKEN
-from tlg_ipam_agent.config import DEFAULT_MAX_PPS, ConfigError, load
+from tlg_ipam_agent.config import DEFAULT_MAX_PPS, ConfigError, load, parse_allowed
 
 GOOD = {"IPAM_URL": "https://ipam.home.arpa", "IPAM_AGENT_TOKEN": TOKEN}
 
@@ -150,3 +150,24 @@ def test_max_pps(value, expected):
 def test_bad_max_pps(value):
     with pytest.raises(ConfigError, match="MAX_PPS"):
         load({**GOOD, "MAX_PPS": value})
+
+
+@pytest.mark.parametrize("name", ["ALLOWED_CIDRS", "--allowed-cidrs"])
+@pytest.mark.parametrize(
+    "value, place",
+    [
+        ("tlge_" + "y" * 43, "item 1 of 1"),
+        ("10.0.0.0/8,tlge_" + "y" * 43, "item 2 of 2"),
+        ("10.0.0.0/8 192.168.0.0/16 tlga_" + "x" * 43 + " 100.64.0.0/10", "item 3 of 4"),
+        ("10.0.0.1/8", "item 1 of 1"),
+    ],
+)
+def test_an_item_that_is_not_a_network_is_named_by_its_place(name, value, place):
+    """Never by its value (#140): a token pasted into the wrong option, on install's
+    command line or a container's `-e`, is not repeated. The running agent and the
+    installer share the rule."""
+    with pytest.raises(ConfigError) as refused:
+        parse_allowed(value, name)
+    message = str(refused.value)
+    assert message == f"{name}: {place} is not a network (host bits must be zero); it is not repeated here"
+    assert "y" * 43 not in message and "x" * 43 not in message and "10.0.0.1" not in message
