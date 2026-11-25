@@ -4,8 +4,9 @@ permissions, from pinned actions and images.
 
 What a pushed tag does can be seen only when one is pushed; these tests hold what the
 workflow is (`.github/workflows/release.yml`) and the checks it runs before it publishes
-(`.github/scripts/release_check.py`). `web/src/utils/install.test.js` holds the names it
-publishes under to the ones the Agents page renders."""
+(`.github/scripts/release_check.py`). `test_release_publish.py` runs its two publish
+steps against stand-ins for the registry and GitHub. `web/src/utils/install.test.js`
+holds the names it publishes under to the ones the Agents page renders."""
 
 import importlib.util
 import re
