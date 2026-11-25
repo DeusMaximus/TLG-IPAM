@@ -64,12 +64,15 @@ def dns_servers(
     server away: it never makes one asked that would not have been. An entry that is
     not an address is left out and counted, though `Resolver.servers` passes none.
 
-    An IPv6 server with a scope (`fe80::53%eth1`) is never kept, whatever the list
-    holds (round 1 of the briefed review, finding 1): `ipaddress` finds it inside a
-    network whatever its scope, but the query goes to the interface the scope names,
-    and the same link-local address is another host on each interface. The list holds
-    no scope (`config.parse_allowed_dns` refuses one), so it cannot say which interface
-    it means, and an unscoped network names no interface's link-local server."""
+    An IPv6 server written with a zone (`fe80::53%eth1`, `fe80::53%0`) is never kept,
+    whatever the list holds (round 1 of the briefed review, finding 1): `ipaddress`
+    finds it inside a network whatever its zone, but the query goes to the interface
+    the zone names, and the same link-local address is another host on each interface.
+    The list holds no zone (`config.parse_allowed_dns` refuses one), so it cannot say
+    which interface it means. A link-local server written without a zone is compared
+    by its address alone, like any other, and when it is kept its query is handed to
+    the socket with no interface named: the host's routing then picks the link it goes
+    out on (round 2, finding 1), which this does not decide."""
     if allowed is None:
         return servers, 0
     kept = []

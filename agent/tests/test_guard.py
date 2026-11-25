@@ -185,3 +185,13 @@ def test_a_server_with_a_scope_is_never_kept(server, allowed):
     out and counted. Unset, it is kept as before."""
     assert guard.dns_servers((server, "10.0.0.53"), nets(allowed, "10.0.0.0/8")) == (("10.0.0.53",), 1)
     assert guard.dns_servers((server,), None) == ((server,), 0)
+
+
+def test_a_link_local_server_without_a_zone_is_compared_by_address_alone():
+    """Round 2 of the briefed review, finding 1: the rule as it is, stated. A zone
+    suffix, `%0` included, is never inside the list; a link-local address written
+    without one is compared by its address like any other, and goes out on the link
+    the host's routing picks, which the list does not decide."""
+    assert guard.dns_servers(("fe80::53",), nets("fe80::/10")) == (("fe80::53",), 0)
+    assert guard.dns_servers(("fe80::53",), nets("fe80::54")) == ((), 1)
+    assert guard.dns_servers(("fe80::53%0",), nets("fe80::/10")) == ((), 1)
