@@ -23,6 +23,7 @@ import {
   activeToken,
   agentStatus,
   blockedEnrolment,
+  enrolRefusalText,
   liveEnrolment,
   monotonicNow,
   nextEnrolmentChange,
@@ -215,6 +216,11 @@ function AgentRow({
         {agent.last_error && (
           <div className="mt-1 max-w-64 text-red-400">Last check-in refused: {agent.last_error}</div>
         )}
+        {agent.enrol_refusal && (
+          <div className="mt-1 max-w-64 text-red-400" data-testid="enrol-refusal">
+            {enrolRefusalText(agent.enrol_refusal, now)}
+          </div>
+        )}
       </td>
       <td className="whitespace-nowrap px-3 py-2.5">
         <Version agent={agent} onUpdate={onUpdate} />
@@ -279,7 +285,7 @@ function AgentRow({
 // Every enrolment token still open (spec §5.8), listed until it is used or expires by
 // the server's clock (`expires_in_s`), never the browser's; a disabled agent's is not
 // open. The list and the time left refresh with the page.
-function PendingEnrolments({ agents, elapsed }) {
+function PendingEnrolments({ agents, elapsed, now }) {
   const pending = pendingEnrolments(agents, elapsed)
   if (!pending.length) return null
   return (
@@ -294,6 +300,11 @@ function PendingEnrolments({ agents, elapsed }) {
               {agent.state === 'pending' ? 'waiting for its first enrolment' : 'being re-enrolled'},
               expires {timeLeft(token, elapsed) ?? 'soon'}
             </span>
+            {agent.enrol_refusal && (
+              <span className="basis-full text-red-400" data-testid="pending-refusal">
+                {enrolRefusalText(agent.enrol_refusal, now)}
+              </span>
+            )}
           </li>
         ))}
       </ul>
@@ -529,7 +540,7 @@ export default function Agents() {
           onAccept={accept}
           onDismiss={(s) => setDismissed((d) => new Set(d).add(`${s.agent_id}:${s.subnet_id}`))}
         />
-        {list && <PendingEnrolments agents={list} elapsed={elapsed} />}
+        {list && <PendingEnrolments agents={list} elapsed={elapsed} now={now} />}
         {agents.error && !list && (
           <p className="text-sm text-red-400">Could not load agents: {agents.error.message}</p>
         )}

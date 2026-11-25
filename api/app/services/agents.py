@@ -11,6 +11,7 @@ REST only: nothing over MCP creates, changes or lists them (spec §7.2, invarian
 
 import hashlib
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from packaging.version import InvalidVersion, Version
@@ -19,11 +20,17 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from ..agent_protocol import AGENT_TOKEN_PREFIX, ENROL_TOKEN_PREFIX, TOKEN_SECRET_BYTES
+from ..agent_protocol import (
+    AGENT_TOKEN_PREFIX,
+    ENROL_TOKEN_PREFIX,
+    ENROL_TOO_NEW,
+    ENROL_TOO_OLD,
+    TOKEN_SECRET_BYTES,
+)
 from ..config import settings
 from ..errors import ApiError, conflict, not_found
 from ..models import Agent, Token
-from ..schemas import AgentCreate, AgentOut, AgentUpdate
+from ..schemas import AgentCreate, AgentOut, AgentUpdate, EnrolRefusalOut
 from ..times import utc
 from . import changes, scans
 
@@ -89,6 +96,67 @@ def protocol_mismatch(agent: Agent) -> bool:
     return (agent.last_error or "").startswith(PROTOCOL_MISMATCH_PREFIX)
 
 
+@dataclass(frozen=True)
+class EnrolRefusal:
+    """An enrolment the exchange refused for the agent's protocol (#175): the server's
+    code for which way it was (ENROL_TOO_OLD, ENROL_TOO_NEW), the enrolment token it was
+    refused for, and when, by the server's clock."""
+
+    token_id: str
+    code: str
+    refused_at: datetime
+
+
+class EnrolRefusals:
+    """The last enrolment each agent was refused for its protocol, in process memory
+    (#175), so the Agents page can say why an agent never arrived. The exchange refuses
+    another protocol before it locks or writes anything, and keeping the record here
+    keeps it so: it is no database write, so it takes no lock, adds no row, and needs no
+    audit entry. The server runs one process (`AGENTS.md`), as the enrolment throttle,
+    also in memory, relies on. A restart forgets it, and the agent's next attempt,
+    13.5–15 minutes after a refusal (spec §5.7), records it again.
+
+    One entry per agent, replaced by each refusal, and only after the token was found
+    usable, so the keys are agents' ids and the codes the server's own constants: never
+    a value the caller sent. A successful exchange and deleting the agent remove it."""
+
+    def __init__(self) -> None:
+        self._last: dict[str, EnrolRefusal] = {}
+
+    def record(self, agent_id: str, token_id: str, code: str, refused_at: datetime) -> None:
+        if code not in (ENROL_TOO_OLD, ENROL_TOO_NEW):
+            raise ValueError("an enrolment refusal is one of the server's two codes")
+        self._last[agent_id] = EnrolRefusal(token_id, code, refused_at)
+
+    def get(self, agent_id: str) -> EnrolRefusal | None:
+        return self._last.get(agent_id)
+
+    def clear(self, agent_id: str) -> None:
+        self._last.pop(agent_id, None)
+
+    def reset(self) -> None:
+        self._last.clear()
+
+
+enrol_refusals = EnrolRefusals()
+
+
+def enrol_refusal(agent: Agent) -> EnrolRefusalOut | None:
+    """The agent's last enrolment refused for its protocol, while the enrolment token it
+    was refused for is neither used nor revoked; None otherwise. An expired token keeps
+    it: a pending agent's refusal is still why the agent never arrived. Judged on read
+    from the agent's tokens, so an exchange that spent the token, or a re-enrol, revoke
+    or delete that revoked it, hides the refusal whatever the order in which the record
+    and that write happened."""
+    last = enrol_refusals.get(agent.id)
+    if last is None:
+        return None
+    token = next((t for t in agent.tokens if t.id == last.token_id), None)
+    if token is None or token.used_at is not None or token.revoked_at is not None:
+        return None
+    return EnrolRefusalOut(code=last.code, refused_at=last.refused_at)
+
+
 def expires_in_s(token: Token, now: datetime) -> int | None:
     """Whole seconds an enrolment token has left by the server's clock at `now`, rounded
     down, while it is live (`live`: unrevoked, unused, unexpired); None for one that is
@@ -102,13 +170,14 @@ def expires_in_s(token: Token, now: datetime) -> int | None:
 def agent_out(agent: Agent, now: datetime | None = None) -> dict:
     """An agent as the owner routes answer with it: its columns and tokens
     (`schemas.AgentOut`), the two flags the Agents page shows (`update_available`,
-    `protocol_mismatch`) and each token's `expires_in_s` at `now`, all computed on
-    read."""
+    `protocol_mismatch`), the last enrolment refused for its protocol (`enrol_refusal`)
+    and each token's `expires_in_s` at `now`, all computed on read."""
     now = _now() if now is None else now
     out = AgentOut.model_validate(agent)
     flags = {
         "update_available": update_available(agent.version),
         "protocol_mismatch": protocol_mismatch(agent),
+        "enrol_refusal": enrol_refusal(agent),
         "tokens": [
             out_token.model_copy(update={"expires_in_s": expires_in_s(token, now)})
             for out_token, token in zip(out.tokens, agent.tokens, strict=True)
@@ -396,6 +465,7 @@ async def delete_agent(session: AsyncSession, agent_id: str, source: str) -> Non
     )
     await session.delete(agent)
     await session.commit()
+    enrol_refusals.clear(agent_id)
 
 
 # where `authenticate` leaves the id of the token it accepted, for the route's own

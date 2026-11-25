@@ -572,6 +572,132 @@ def test_enrolment_refuses_exactly_the_integer_protocols_check_in_refuses(monkey
     assert enrol_protocol_refusal({}) == enrol_protocol_refusal({"protocol": 2})
 
 
+# --- What the owner is shown of a protocol refusal (#175) ---
+
+
+@pytest.mark.parametrize("protocol", [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1], ids=["old", "new"])
+async def test_a_protocol_refusal_is_shown_to_the_owner_and_writes_nothing(
+    client, agent_api, protocol
+):
+    """Acceptance: the owner sees which way the agent was refused, and when, without the
+    agent's log; the code is the server's, and nothing is written for it."""
+    created = await create(client)
+    before = every_row()
+    asked = _now()
+    res = await enrol(agent_api, created["enrol_token"], protocol=protocol, **REPORT)
+    assert res.status_code == 409, res.text
+    assert every_row() == before
+    code = res.json()["error"]["code"]
+    agent = await get_agent(client, created["id"])
+    assert agent["state"] == "pending"
+    assert agent["enrol_refusal"]["code"] == code == _protocol_refusal(protocol)["error"]["code"]
+    refused_at = agent["enrol_refusal"]["refused_at"]
+    assert refused_at.endswith("+00:00")
+    assert asked <= datetime.fromisoformat(refused_at) <= _now()
+    [listed] = (await client.get("/api/v1/agents")).json()["data"]
+    assert listed["enrol_refusal"] == agent["enrol_refusal"]
+    # nothing the agent reported is taken from a refused body
+    assert (agent["version"], agent["hostname"], agent["platform"]) == (None, None, None)
+
+
+async def test_a_later_refusal_replaces_the_earlier(client, agent_api, monkeypatch):
+    created = await create(client)
+    first, second = _now(), _now() + timedelta(minutes=14)
+    times = iter([first, first, second, second])  # each attempt's lookup, then its refusal
+    monkeypatch.setattr(enrolment, "_now", lambda: next(times))
+    await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+    await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION + 1)
+    refusal = (await get_agent(client, created["id"]))["enrol_refusal"]
+    assert refusal == {"code": ENROL_TOO_NEW, "refused_at": second.isoformat()}
+
+
+async def test_the_enrolment_that_spends_the_token_ends_the_refusal(client, agent_api):
+    created = await create(client)
+    await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION + 1)
+    assert (await enrol(agent_api, created["enrol_token"], **REPORT)).status_code == 200
+    agent = await get_agent(client, created["id"])
+    assert agent["state"] == "active" and agent["enrol_refusal"] is None
+    assert agents_svc.enrol_refusals.get(created["id"]) is None
+
+
+async def test_a_refusal_is_shown_only_while_its_token_is_unspent_and_unrevoked(client, agent_api):
+    """The refusal is judged on read against the token it was refused for, so a record
+    that lands after that token was spent (an exchange of the same token that finished
+    first) is not shown."""
+    created = await create(client)
+    [token] = await tokens_of(created["id"])
+    assert (await enrol(agent_api, created["enrol_token"])).status_code == 200
+    agents_svc.enrol_refusals.record(created["id"], token.id, ENROL_TOO_OLD, _now())
+    assert (await get_agent(client, created["id"]))["enrol_refusal"] is None
+
+
+@pytest.mark.parametrize("action", ["re-enrol", "revoke"])
+async def test_re_enrol_or_revoke_ends_the_refusal(client, agent_api, action):
+    """Either revokes the token the agent was refused for: what the page shows is about
+    the enrolment in progress, and a refusal with the new token is shown again."""
+    created = await create(client)
+    await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+    res = await client.post(f"/api/v1/agents/{created['id']}/{action}")
+    assert res.status_code in (200, 201), res.text
+    assert (await get_agent(client, created["id"]))["enrol_refusal"] is None
+    if action == "re-enrol":
+        await enrol(agent_api, res.json()["data"]["enrol_token"], protocol=PROTOCOL_VERSION + 1)
+        refusal = (await get_agent(client, created["id"]))["enrol_refusal"]
+        assert refusal["code"] == ENROL_TOO_NEW
+
+
+async def test_an_expired_token_keeps_the_refusal(client, agent_api):
+    """It is still why a pending agent never arrived."""
+    created = await create(client)
+    [token] = await tokens_of(created["id"])
+    await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+    await set_token(token.id, expires_at=_now() - timedelta(minutes=1))
+    agent = await get_agent(client, created["id"])
+    assert agent["enrol_refusal"]["code"] == ENROL_TOO_OLD
+    assert agent["tokens"][0]["expires_in_s"] is None
+
+
+async def test_deleting_the_agent_forgets_its_refusal(client, agent_api):
+    created = await create(client)
+    await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+    assert agents_svc.enrol_refusals.get(created["id"]) is not None
+    assert (await client.delete(f"/api/v1/agents/{created['id']}")).status_code == 204
+    assert agents_svc.enrol_refusals.get(created["id"]) is None
+
+
+@pytest.mark.parametrize("case", ["unknown", "used", "expired", "revoked", "disabled", "not-an-integer"])
+async def test_a_refusal_before_the_protocol_is_judged_records_none(
+    client, agent_api, monkeypatch, case
+):
+    """A token that is not usable keeps today's answer, and the body, its protocol
+    included, is never read; a protocol that is not an integer is the body's 422."""
+    created = await create(client)
+    [token] = await tokens_of(created["id"])
+    bearer, protocol, status = created["enrol_token"], PROTOCOL_VERSION + 1, 403
+    if case == "unknown":
+        bearer = ENROL_TOKEN_PREFIX + "x" * 43
+    elif case == "used":
+        assert (await enrol(agent_api, bearer)).status_code == 200
+    elif case == "expired":
+        await set_token(token.id, expires_at=_now() - timedelta(seconds=1))
+    elif case == "revoked":
+        await set_token(token.id, revoked_at=_now())
+    elif case == "disabled":
+        await client.put(f"/api/v1/agents/{created['id']}", json={"enabled": False})
+    else:
+        protocol, status = str(PROTOCOL_VERSION + 1), 422
+    res = await enrol(agent_api, bearer, protocol=protocol)
+    assert res.status_code == status, res.text
+    assert agents_svc.enrol_refusals.get(created["id"]) is None
+    assert (await get_agent(client, created["id"]))["enrol_refusal"] is None
+
+
+def test_a_refusal_is_recorded_only_as_one_of_the_servers_codes():
+    with pytest.raises(ValueError):
+        agents_svc.enrol_refusals.record("agent-1", "token-1", "PROTOCOL_MISMATCH", _now())
+    assert agents_svc.enrol_refusals.get("agent-1") is None
+
+
 # --- Re-enrol (acceptance: the old agent token is refused, the scan targets unchanged) ---
 
 
