@@ -28,9 +28,9 @@ import dns.reversename
 import dns.rrset
 import pytest
 
-from conftest import job
+from conftest import FakeProber, job
 from tlg_ipam_agent import guard, probe, scan
-from tlg_ipam_agent.config import parse_allowed
+from tlg_ipam_agent.config import parse_allowed, parse_allowed_dns
 from tlg_ipam_agent.probe import (
     MAX_DNS_SERVERS,
     NO_DNS_SERVER,
@@ -2719,3 +2719,72 @@ async def test_choosing_the_servers_ends_at_the_jobs_deadline(monkeypatch, tmp_p
     finally:
         release.set()
         await no_read_thread_left()
+
+
+# --- ALLOWED_DNS_SERVERS on loopback: no DNS packet to a server outside it (#93) ---
+
+
+async def allowlisted_scan(port, dns_servers, allowed, resolv_conf_path):
+    """One live address, 10.0.0.9, looked up through the real resolver on loopback, with
+    `allowed` as ALLOWED_DNS_SERVERS (None: unset)."""
+    raw = job(ranges=[{"start": "10.0.0.9", "end": "10.0.0.9"}], dns_servers=list(dns_servers))
+    parsed = parse_job(job_ref(raw), raw)
+    return await scan.run(
+        parsed,
+        guard.plan(parsed, parse_allowed(None)),
+        prober=FakeProber(alive=["10.0.0.9"]),
+        resolver=DnsResolver(port=port, resolv_conf=str(resolv_conf_path), read_timeout=PATIENT),
+        max_pps=1000,
+        clock=scan.Clock(),
+        allowed_dns=None if allowed is None else parse_allowed_dns(allowed),
+    )
+
+
+async def test_on_loopback_a_server_outside_the_list_gets_no_datagram(tmp_path):
+    """Acceptance 2, on IPv4 alone: the job's one server answers on 127.0.0.1, and with
+    the list naming only 127.0.0.2 it is sent nothing at all, and the lookup is not
+    made (acceptance 3). With the list naming it, or unset, it is asked as before."""
+    transport, proto, port = await responder()
+    missing = tmp_path / "missing"
+    try:
+        result = await allowlisted_scan(port, ["127.0.0.1"], "127.0.0.2", missing)
+        assert proto.arrivals == []
+        assert result["error"] == scan.outside_allowed(1, 1)
+        assert result["complete"] is False and result["liveness_complete"] is True
+        assert result["observations"] == [{"ip": "10.0.0.9"}]
+        for allowed in ("127.0.0.0/8", None):
+            result = await allowlisted_scan(port, ["127.0.0.1"], allowed, missing)
+            assert result["observations"] == [{"ip": "10.0.0.9", "rdns_name": "nas.home.arpa"}]
+            assert result["error"] is None and result["complete"] is True
+        assert proto.questions == [("9.0.0.10.in-addr.arpa.", "PTR")] * 2
+    finally:
+        transport.close()
+
+
+@pytest.mark.parametrize("source", ["job", "resolv.conf"])
+async def test_on_loopback_only_the_listed_server_of_two_is_asked(tmp_path, source):
+    """Acceptance 1 and 2: two servers on one port, ::1 first, both answering. Unset,
+    ::1 is asked and answers, as before #93; with the list naming 127.0.0.1 alone, ::1
+    gets no datagram and 127.0.0.1 answers. The same whether the job named them or the
+    host's resolv.conf lists them."""
+    if not _ipv6_loopback():
+        pytest.skip("no IPv6 loopback here")
+    (v4_t, v4), (v6_t, v6), port = await responders_on_one_port()
+    servers = ["::1", "127.0.0.1"]
+    if source == "job":
+        named, path = servers, tmp_path / "missing"
+    else:
+        named, path = [], resolv_conf(tmp_path, "".join(f"nameserver {s}\n" for s in servers))
+    try:
+        result = await allowlisted_scan(port, named, None, path)
+        assert result["observations"] == [{"ip": "10.0.0.9", "rdns_name": "nas.home.arpa"}]
+        assert result["error"] is None
+        assert len(v6.arrivals) == 1 and v4.arrivals == []
+
+        result = await allowlisted_scan(port, named, "127.0.0.1", path)
+        assert result["observations"] == [{"ip": "10.0.0.9", "rdns_name": "nas.home.arpa"}]
+        assert result["error"] == scan.outside_allowed(1, 2) and result["complete"] is True
+        assert len(v6.arrivals) == 1 and len(v4.arrivals) == 1  # nothing more to ::1
+    finally:
+        v4_t.close()
+        v6_t.close()

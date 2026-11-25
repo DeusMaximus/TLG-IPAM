@@ -139,3 +139,38 @@ def test_malformed_jobs_are_refused(overrides, reason):
         parse_job(job_ref(raw), raw)
     # the reason quotes nothing the agent did not parse
     assert "shell" not in err.value.reason and "home.arpa" not in err.value.reason
+
+
+# --- ALLOWED_DNS_SERVERS (#93): the DNS servers a job's lookups may ask ---
+
+
+def nets(*items):
+    return tuple(ipaddress.ip_network(i) for i in items)
+
+
+def test_unset_keeps_every_server():
+    servers = ("192.0.2.1", "198.51.100.1", "2001:db8::53")
+    assert guard.dns_servers(servers, None) == (servers, 0)
+    assert guard.dns_servers((), None) == ((), 0)
+
+
+@pytest.mark.parametrize(
+    "servers, allowed, kept",
+    [
+        (("10.0.0.53", "1.1.1.1", "10.0.1.53"), ("10.0.0.0/8",), ("10.0.0.53", "10.0.1.53")),
+        (("1.1.1.1", "10.0.0.53"), ("10.0.0.53",), ("10.0.0.53",)),
+        (("1.1.1.1", "8.8.8.8"), ("10.0.0.0/8",), ()),
+        (("fd00::53", "10.0.0.53"), ("fd00::/8",), ("fd00::53",)),
+        (("10.0.0.53", "fd00::53"), ("10.0.0.0/8", "fd00::/8"), ("10.0.0.53", "fd00::53")),
+        # an IPv4-mapped address is an IPv6 address, outside every IPv4 network
+        (("::ffff:10.0.0.53",), ("10.0.0.0/8",), ()),
+        (("10.0.0.53",), ("::/0",), ()),
+        (("1.1.1.1",), ("0.0.0.0/0",), ("1.1.1.1",)),
+    ],
+)
+def test_servers_outside_the_list_are_left_out_in_order(servers, allowed, kept):
+    assert guard.dns_servers(servers, nets(*allowed)) == (kept, len(servers) - len(kept))
+
+
+def test_an_entry_that_is_not_an_address_is_never_kept():
+    assert guard.dns_servers(("dns.home.arpa", "10.0.0.53"), nets("0.0.0.0/0")) == (("10.0.0.53",), 1)

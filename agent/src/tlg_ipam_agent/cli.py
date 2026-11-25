@@ -161,7 +161,7 @@ def _parser() -> argparse.ArgumentParser:
         prog="tlg-ipam-agent",
         description="TLG-IPAM scan agent. With no command it runs, configured from the "
         "environment: IPAM_URL, IPAM_ENROL_TOKEN (first start) or IPAM_AGENT_TOKEN, "
-        "ALLOWED_CIDRS, MAX_PPS.",
+        "ALLOWED_CIDRS, ALLOWED_DNS_SERVERS, MAX_PPS.",
     )
     parser.add_argument("--version", action="version", version=__version__)
     commands = parser.add_subparsers(dest="command", metavar="{install,uninstall}")
@@ -262,10 +262,11 @@ def _main_run() -> int:
         return 2
     configure_logging(settings.agent_token, settings.enrol_token)
     log.info(
-        "tlg-ipam-agent %s: server %s, ALLOWED_CIDRS %s, MAX_PPS %d",
+        "tlg-ipam-agent %s: server %s, ALLOWED_CIDRS %s, ALLOWED_DNS_SERVERS %s, MAX_PPS %d",
         __version__,
         settings.url,
         ",".join(str(n) for n in settings.allowed),
+        "unset" if settings.allowed_dns is None else ",".join(str(n) for n in settings.allowed_dns),
         settings.max_pps,
     )
     return asyncio.run(_run(settings))

@@ -6,7 +6,15 @@ that, set on the agent's host, so that a mistyped public CIDR in the IPAM cannot
 the agent into a scanner pointed at someone else's network. A job whose subnet is
 outside it, or whose ranges leave the subnet, is refused whole: nothing of it is
 scanned, and the refusal is reported to the server.
+
+`ALLOWED_DNS_SERVERS` is the same kind of limit on the PTR lookups' DNS servers (#93),
+which the job names, as the subnet's resolvers, or the host's resolv.conf lists when it
+names none: a server outside it is not asked (`dns_servers`). It is a narrowing of the
+servers the agent would ask, not a refusal of the job, since the liveness sweep owes
+nothing to the subnet's DNS settings.
 """
+
+import ipaddress
 
 from .protocol import OBSERVATIONS_MAX, Address, Job, JobRefused, Network
 
@@ -42,3 +50,27 @@ def plan(job: Job, allowed: tuple[Network, ...]) -> tuple[Address, ...]:
     # the network's own class: ip_address() would read a small IPv6 integer as IPv4
     cls = type(network.network_address)
     return tuple(cls(a) for a in sorted(addresses))
+
+
+def dns_servers(
+    servers: tuple[str, ...], allowed: tuple[Network, ...] | None
+) -> tuple[tuple[str, ...], int]:
+    """Of `servers`, the ones the PTR lookups may ask, in their order, and how many
+    were left out for lying outside `allowed` (`ALLOWED_DNS_SERVERS`). With `allowed`
+    None (the setting unset), every server is kept, as before #93.
+
+    `servers` are those the agent would ask without the setting (`Resolver.servers`:
+    addresses only, already cut to MAX_DNS_SERVERS), so the setting only ever takes a
+    server away: it never makes one asked that would not have been. An entry that is
+    not an address is left out and counted, though `Resolver.servers` passes none."""
+    if allowed is None:
+        return servers, 0
+    kept = []
+    for server in servers:
+        try:
+            address = ipaddress.ip_address(server)
+        except ValueError:
+            continue
+        if any(address.version == network.version and address in network for network in allowed):
+            kept.append(server)
+    return tuple(kept), len(servers) - len(kept)

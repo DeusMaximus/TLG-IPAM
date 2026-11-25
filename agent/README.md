@@ -2,8 +2,9 @@
 
 The TLG-IPAM scan agent: it checks in with a TLG-IPAM server, sweeps the subnets the
 server assigns it with ICMP echo, ARP and reverse DNS, and reports what answered. It
-never sends a packet outside `ALLOWED_CIDRS`, and never runs, downloads or installs
-anything the server sends.
+never sends a packet outside `ALLOWED_CIDRS` (and, when `ALLOWED_DNS_SERVERS` is set,
+no DNS query to a server outside it), and never runs, downloads or installs anything
+the server sends.
 
 Running it, and what each setting does: the "Scan agent" section of the
 [project README](../README.md#scan-agent). The design is in
@@ -25,6 +26,17 @@ that stopped answering, or that FIFO), every later scan of a subnet without DNS
 servers reports the same, and fixing the file is not enough: the stuck read must end,
 or the agent be restarted. A subnet that lists its own DNS servers is not affected, so
 setting them is the other way out.
+
+**Which DNS servers it may ask** (#93). Unset, `ALLOWED_DNS_SERVERS` limits nothing:
+the subnet's servers, or the host's, are asked as they are. Set, a server outside it
+is left out before any query (`guard.dns_servers`), whichever of the two named it,
+after the list is cut to three, so the setting only ever takes a server away. The
+others are asked, and the scan's error says how many were not, counts only; when none
+is left, no lookup is made and the scan is incomplete with "rdns not run: all N DNS
+servers to ask are outside ALLOWED_DNS_SERVERS", and the names already stored are
+kept. A subnet's DNS servers are not checked against anything else, so this is what
+stops a server that has been taken over from pointing the agent's queries at a
+resolver of its choosing.
 
 **What clears a stored name.** Only a DNS server's answer that an address has no name
 (`NXDOMAIN`, or a `NOERROR` without a PTR record that carries the SOA of a zone holding

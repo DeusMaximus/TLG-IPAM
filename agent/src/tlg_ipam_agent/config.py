@@ -1,5 +1,5 @@
 """Configuration from the environment (spec §5.6): `IPAM_URL`, `IPAM_AGENT_TOKEN` or
-`IPAM_ENROL_TOKEN`, `ALLOWED_CIDRS`, `MAX_PPS`. A bad value stops the agent before it
+`IPAM_ENROL_TOKEN`, `ALLOWED_CIDRS`, `ALLOWED_DNS_SERVERS`, `MAX_PPS`. A bad value stops the agent before it
 sends anything, with a message that names the variable and never contains the token.
 
 Where the agent token comes from, when `IPAM_AGENT_TOKEN` is not set, is `enrol`'s:
@@ -35,9 +35,14 @@ class Config:
     token: str
     allowed: tuple[Network, ...]
     max_pps: int
+    # the DNS servers the agent may ask (`guard.dns_servers`); None: any, as before #93
+    allowed_dns: tuple[Network, ...] | None = None
 
     def __repr__(self) -> str:  # never print the token
-        return f"Config(url={self.url!r}, allowed={self.allowed!r}, max_pps={self.max_pps})"
+        return (
+            f"Config(url={self.url!r}, allowed={self.allowed!r}, allowed_dns={self.allowed_dns!r}, "
+            f"max_pps={self.max_pps})"
+        )
 
 
 @dataclass(frozen=True)
@@ -50,12 +55,18 @@ class Settings:
     max_pps: int
     agent_token: str | None = None
     enrol_token: str | None = None
+    allowed_dns: tuple[Network, ...] | None = None
 
     def __repr__(self) -> str:  # never print a token
-        return f"Settings(url={self.url!r}, allowed={self.allowed!r}, max_pps={self.max_pps})"
+        return (
+            f"Settings(url={self.url!r}, allowed={self.allowed!r}, allowed_dns={self.allowed_dns!r}, "
+            f"max_pps={self.max_pps})"
+        )
 
     def config(self, token: str) -> Config:
-        return Config(url=self.url, token=token, allowed=self.allowed, max_pps=self.max_pps)
+        return Config(
+            url=self.url, token=token, allowed=self.allowed, max_pps=self.max_pps, allowed_dns=self.allowed_dns
+        )
 
 
 def _is_loopback(host: str) -> bool:
@@ -132,16 +143,14 @@ def _optional_token(env: Mapping[str, str], name: str, prefix: str) -> str | Non
     return parse_token(value, name, prefix) if value else None
 
 
-def parse_allowed(value: str | None, name: str = "ALLOWED_CIDRS") -> tuple[Network, ...]:
-    """Networks separated by commas or whitespace. Unset means the default; a value that
-    is set but empty is refused rather than read as "allow nothing" or "the default".
-    A network with host bits set is refused too, since it is most likely a typo."""
-    if value is None:
-        items = list(DEFAULT_ALLOWED_CIDRS)
-    else:
-        items = value.replace(",", " ").split()
-        if not items:
-            raise ConfigError(f"{name} is set but empty; unset it for the default")
+def _networks(value: str, name: str) -> tuple[Network, ...]:
+    """Networks separated by commas or whitespace. A value that is set but empty is
+    refused rather than read as "allow nothing" or "the default"; a network with host
+    bits set is refused too, since it is most likely a typo. An address alone is the
+    network of that one address."""
+    items = value.replace(",", " ").split()
+    if not items:
+        raise ConfigError(f"{name} is set but empty; unset it for the default")
     networks = []
     for place, item in enumerate(items, 1):
         try:
@@ -155,6 +164,24 @@ def parse_allowed(value: str | None, name: str = "ALLOWED_CIDRS") -> tuple[Netwo
                 "zero); it is not repeated here"
             ) from None
     return tuple(networks)
+
+
+def parse_allowed(value: str | None, name: str = "ALLOWED_CIDRS") -> tuple[Network, ...]:
+    """The networks a job's subnet must lie in (`guard.plan`). Unset means the default,
+    RFC 1918 and CGNAT; otherwise as `_networks` reads it."""
+    if value is None:
+        return tuple(ipaddress.ip_network(item) for item in DEFAULT_ALLOWED_CIDRS)
+    return _networks(value, name)
+
+
+def parse_allowed_dns(value: str | None, name: str = "ALLOWED_DNS_SERVERS") -> tuple[Network, ...] | None:
+    """The networks every DNS server the agent asks must lie in (#93,
+    `guard.dns_servers`), as `_networks` reads them: an address alone allows that one
+    server. Unset is None, which allows any, as before the setting existed; there is no
+    default list, since a subnet's resolvers may legitimately be public."""
+    if value is None:
+        return None
+    return _networks(value, name)
 
 
 def parse_max_pps(value: str | None, name: str = "MAX_PPS") -> int:
@@ -176,6 +203,7 @@ def load(env: Mapping[str, str]) -> Settings:
         max_pps=parse_max_pps(env.get("MAX_PPS")),
         agent_token=agent_token,
         enrol_token=enrol_token,
+        allowed_dns=parse_allowed_dns(env.get("ALLOWED_DNS_SERVERS")),
     )
     if agent_token and enrol_token:
         raise ConfigError(

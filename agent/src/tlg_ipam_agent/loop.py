@@ -201,6 +201,7 @@ class Agent:
                 max_pps=self.config.max_pps,
                 clock=self.clock,
                 pacer=self.pacer,
+                allowed_dns=self.config.allowed_dns,
             )
             try:
                 body = await asyncio.wait_for(scanning, job.timeout_s + SCAN_GRACE_S)
