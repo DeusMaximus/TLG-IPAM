@@ -68,15 +68,17 @@ ls -1 "$DIR"/ipam-*.db | sort -r | tail -n +"$((KEEP + 1))" |
 
 The names sort by date, so the newest snapshot is the last in `ls`. With the default of 30 and one pull a day, that is thirty days of history. Raise `TLG_IPAM_KEEP` for a longer one, or if you pull more often than daily.
 
+The script takes the server's URL from `TLG_IPAM_URL`. Its default, `https://ipam.home.arpa`, is a placeholder, so set your own in the command below and again in the systemd unit or the crontab that schedules the script. Use the address at which the backup host reaches the server, with no slash at the end. With no TLS proxy or tunnel in front of the container, that is plain HTTP on port 8080, such as `http://ipam-host:8080`, and the API key then crosses the network unencrypted.
+
 Run it once by hand before scheduling it:
 
 ```sh
-sudo -u backup /usr/local/bin/tlg-ipam-backup
+sudo -u backup env TLG_IPAM_URL=https://ipam.home.arpa /usr/local/bin/tlg-ipam-backup
 ```
 
 ### Schedule it: systemd timer
 
-`/etc/systemd/system/tlg-ipam-backup.service`:
+`/etc/systemd/system/tlg-ipam-backup.service`, with the URL on the `Environment=` line changed to yours:
 
 ```ini
 [Unit]
@@ -87,6 +89,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 User=backup
+Environment=TLG_IPAM_URL=https://ipam.home.arpa
 ExecStart=/usr/local/bin/tlg-ipam-backup
 ```
 
@@ -116,10 +119,11 @@ journalctl -u tlg-ipam-backup.service           # what the last run said
 
 ### Schedule it: cron
 
-If you prefer cron, put this in the `backup` user's crontab (`sudo -u backup crontab -e`):
+If you prefer cron, put this in the `backup` user's crontab (`sudo -u backup crontab -e`), with your own mail address and server URL. The `TLG_IPAM_URL=` line sets the variable for the job below it:
 
 ```cron
 MAILTO=you@example.com
+TLG_IPAM_URL=https://ipam.home.arpa
 30 2 * * * /usr/local/bin/tlg-ipam-backup >/dev/null
 ```
 
@@ -132,6 +136,8 @@ A backup job that fails silently is the usual way to find out you have no backup
 ### A second copy
 
 The `ipam-data` volume is also worth including in the hypervisor's own backup job, so that the database has a second copy that does not depend on this pull. A hypervisor snapshot of a running database is crash-consistent, and SQLite recovers from that on its next start. The pulled snapshot is the one to restore from first.
+
+Restoring such a copy has been tried once. A hypervisor's backup of the whole container that ran the app, taken while the app was running, was restored in place. The app started, `PRAGMA integrity_check` said `ok`, and the data was the backup's: a host written after the backup was gone. That was one run on a quiet database, so it is not a guarantee that every such copy will restore.
 
 ## Restore
 
@@ -223,6 +229,8 @@ esac
 chmod +x tlg-ipam-restore
 ./tlg-ipam-restore restore ipam-20261113T023000Z.db
 ```
+
+Both `restore` and `undo` end by asking the app for `/health`. While the app is still starting, `curl` can print an error such as `curl: (52) Empty reply from server`. That is expected. It waits a second and tries again, up to 10 more times, and can print a line for each try that fails. The check has passed when the app's answer, which contains `"status":"ok"`, follows and the script exits with status 0. If every try fails, the script exits with a non-zero status, and the last line is curl's error.
 
 If the script fails before it stops the app, nothing has changed. If it fails after that, the app is down: read the error and fix the cause. The old database is either still in place or in the `before-restore-` directory, and running the script again is safe.
 
