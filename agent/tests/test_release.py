@@ -446,7 +446,7 @@ def test_the_release_warns_when_the_base_tag_has_moved_on(workflow, tmp_path, an
     assert done.stdout == expected.format(pinned=pinned)
 
 
-def _run_with_docker(script, cwd, tmp_path, reply):
+def _run_with_docker(script, cwd, tmp_path, reply, *, options=("-eo", "pipefail")):
     """bash runs `script` with a stand-in `docker` that takes only the one registry
     read the workflow and AGENTS.md make, and answers it with `reply`, or fails."""
     bin_dir = tmp_path / "bin"
@@ -456,11 +456,11 @@ def _run_with_docker(script, cwd, tmp_path, reply):
         "#!/bin/sh\n"
         '[ "$*" = "buildx imagetools inspect python:3.13-slim --format {{.Manifest.Digest}}" ]'
         ' || { echo "unexpected: $*" >&2; exit 2; }\n'
-        + (f"printf %s {reply}\n" if reply else "echo 'ERROR: no answer' >&2; exit 1\n")
+        + (f"printf %s '{reply}'\n" if reply is not None else "echo 'ERROR: no answer' >&2; exit 1\n")
     )
     stub.chmod(0o755)
     return subprocess.run(
-        ["bash", "-eo", "pipefail", "-c", script],
+        ["bash", *options, "-c", script],
         cwd=cwd,
         env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
         capture_output=True,
@@ -468,25 +468,44 @@ def _run_with_docker(script, cwd, tmp_path, reply):
     )
 
 
-def _update_commands():
-    """The lines of AGENTS.md's procedure that change the pin: the digest read and the
-    `sed`. The other two only show the index and build the result."""
+def _update_command():
+    """The line of AGENTS.md's procedure that moves the pin: the digest read, its check
+    and the `sed`, as one chain. The other two only show the index and build the result."""
     section = (ROOT / "AGENTS.md").read_text().split("### The agent's base image\n", 1)[1]
     block = section.split("```sh\n", 1)[1].split("```", 1)[0]
-    return [line for line in block.splitlines() if line.startswith(("digest=", "sed "))]
+    (line,) = [line for line in block.splitlines() if line.startswith("digest=")]
+    assert not [line for line in block.splitlines() if line.startswith("sed ")]  # never a line of its own
+    return line
+
+
+def _update(tmp_path, reply):
+    work = tmp_path / "repo"
+    (work / "agent").mkdir(parents=True)
+    (work / "agent" / "Dockerfile").write_text(DOCKERFILE.read_text())
+    # no `set -e`: an interactive shell runs the next command whatever the last did
+    done = _run_with_docker(_update_command(), work, tmp_path, reply, options=())
+    return done, (work / "agent" / "Dockerfile").read_text(), sorted(p.name for p in (work / "agent").iterdir())
 
 
 def test_the_documented_update_moves_the_pin_and_nothing_else(tmp_path):
-    """AGENTS.md's commands, as written, on a copy of the Dockerfile: the pin becomes
+    """AGENTS.md's command, as written, on a copy of the Dockerfile: the pin becomes
     the digest the registry answers, and every other byte stays."""
-    commands = _update_commands()
-    assert len(commands) == 2
-    work = tmp_path / "repo"
-    (work / "agent").mkdir(parents=True)
     before = DOCKERFILE.read_text()
-    (work / "agent" / "Dockerfile").write_text(before)
-    done = _run_with_docker("\n".join(commands), work, tmp_path, DIGEST)
+    done, after, files = _update(tmp_path, DIGEST)
     assert done.returncode == 0, done.stderr
     (pinned,) = re.findall(r"@(sha256:[0-9a-f]{64})", before)
-    assert (work / "agent" / "Dockerfile").read_text() == before.replace(pinned, DIGEST)
-    assert sorted(p.name for p in (work / "agent").iterdir()) == ["Dockerfile"]  # no .bak left
+    assert after == before.replace(pinned, DIGEST)
+    assert files == ["Dockerfile"]  # no .bak left
+
+
+@pytest.mark.parametrize(
+    "reply", [None, "", "null", "sha256:" + "ab" * 31, f"{DIGEST}|x", "sha256:" + "AB" * 32],
+    ids=["no-answer", "empty", "null", "short", "sed-text", "upper-case"],
+)
+def test_a_failed_or_odd_registry_answer_leaves_the_pin(tmp_path, reply):
+    """A read that fails, or answers anything but a digest, stops the chain before the
+    Dockerfile is touched, without `set -e` (review of #94)."""
+    done, after, files = _update(tmp_path, reply)
+    assert done.returncode != 0
+    assert after == DOCKERFILE.read_text()
+    assert files == ["Dockerfile"]
