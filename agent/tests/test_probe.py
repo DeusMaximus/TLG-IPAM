@@ -1215,10 +1215,13 @@ def _comparisons(wire: bytes, **kwargs) -> tuple[dns.message.Message | Exception
     return message, compared
 
 
-# the most name comparisons dnspython's parse of a reply inside both limits can make
-# (spec §5.2; derived in the docstring below)
+# the most name comparisons dnspython's parse of a reply inside both limits can make,
+# on a 64-bit CPython whose dictionary probes as 3.13's does (spec §5.2; derived in the
+# docstring below): the keys a probe can compare more than once, and the ceiling with
+# no OPT record and with one (an OPT takes a record's place and costs one comparison)
 PROBE_EXTRA = 12
 CEILING = (probe.DNS_RECORDS_MAX - 1) * (probe.DNS_RECORDS_MAX + 2 * PROBE_EXTRA)
+CEILING_WITH_OPT = 1 + 2 * sum(PROBE_EXTRA + m for m in range(1, probe.DNS_RECORDS_MAX - 1))
 
 
 def _colliding_answers(count: int, h: int = 5237, tail: int = 125) -> bytes:
@@ -1255,14 +1258,26 @@ def test_the_parse_of_a_reply_the_agent_reads_is_bounded_by_its_counts():
     (`Name.fullcompare`, over at most 127 labels). A question is inserted once; a record
     of another section is looked up and, when new, inserted: at most two probes. A key
     is compared only with a stored key of the same hash, and a name only when the two
-    keys are of one section. CPython's probe visits slots i, then 5*i + perturb + 1,
-    shifting the 64-bit hash right by 5 each step, so from the 13th visit on perturb is
-    0 and the visits follow 5*i + 1, which visits no slot twice: the first 12 visits
-    compare at most 12 keys and the rest each stored key of the hash at most once, so a
-    probe compares at most PROBE_EXTRA (12) keys more than the m stored of its hash
-    (the next test holds that), and none when m is 0. With one question, which meets no key of its section, and at most
-    DNS_RECORDS_MAX = 32 records, the worst is every record new in one section:
-    sum over m < 32 of 2 * (12 + m), m > 0, which is (32 - 1) * (32 + 24) = 1,736.
+    keys are of one section. CPython's probe (3.13's `dictobject.c`) visits slot i,
+    then 5*i + perturb + 1, perturb starting as the 64-bit hash and shifted right by 5
+    before each step. The step to the 14th visit is the first with perturb 0 for every
+    hash (for 0x8000000000000000, perturb is still 8 at the step to the 13th), and
+    from there each visit is 5*i + 1 of the last, a recurrence whose one cycle passes
+    through every slot of the table. The 13th visit is the slot just before the 14th on
+    that cycle, so the 13th and every later visit are consecutive points of it, and
+    none repeats before the probe meets an empty slot, which it does within one turn.
+    Only the first 12 visits can repeat a slot: a probe compares each of the m stored
+    keys of its hash at least once and at most PROBE_EXTRA (12) keys more, and none
+    when m is 0 (the next test holds that, as a tripwire). With one question, which
+    meets no key of its section, and at most DNS_RECORDS_MAX = 32 records, the worst
+    is every record new in one section: 2 * (12 + m) summed over m from 1 to 31,
+    which is (32 - 1) * (32 + 24) = 1,736.
+
+    The index is not the parse's only comparison of an owner name: an OPT record's is
+    compared once with the root (`_parse_special_rr_header`; a second OPT is refused
+    before that comparison). An OPT takes a record's place, so a reply with one makes
+    at most 1 + 2 * (12 + m) summed over m from 1 to 30, 1,651 (CEILING_WITH_OPT). A
+    TSIG record adds none: the lookup passes no keyring, so dnspython refuses it.
 
     Before #160, a reply of DNS_PAYLOAD bytes could hold 244 root questions or 168
     questions at names of zero-byte labels; neither is parsed now. The reply built for
@@ -1280,7 +1295,10 @@ def test_the_parse_of_a_reply_the_agent_reads_is_bounded_by_its_counts():
     assert isinstance(probe.unread(_question_entries(names)), probe.ReplyTooManyRecords)
 
     assert sys.hash_info.width <= 64  # the premise of PROBE_EXTRA
-    assert CEILING == 1_736
+    assert (CEILING, CEILING_WITH_OPT) == (1_736, 1_651)
+    opt_alone = struct.pack("!HHHHHH", 0, 0x8180, 0, 0, 0, 1) + b"\x00" + struct.pack("!HHIH", 41, 1232, 0, 0)
+    message, compared = _comparisons(opt_alone)
+    assert message.edns == 0 and compared == 1  # the OPT's owner, with the root
     records = probe.DNS_RECORDS_MAX
     wire = _colliding_answers(records)
     assert len(wire) <= probe.DNS_PAYLOAD and probe.unread(wire) is None
@@ -1310,16 +1328,23 @@ class _Key:
 
 
 def test_one_probe_compares_at_most_twelve_keys_more_than_it_holds_of_one_hash():
-    """The premise of the ceiling above, held against the interpreter that runs the
-    agent: in a dictionary that also holds another key, as dnspython's index holds the
+    """The premise of the ceiling above, against the interpreter that runs the test:
+    in a dictionary that also holds another key, as dnspython's index holds the
     question's, each of DNS_RECORDS_MAX keys of one hash is looked up and then inserted,
-    for 3,000 hashes drawn at random (seeded). Each probe compares every stored key of
+    for the named hashes (0x8000000000000000, whose perturb is last to reach 0, among
+    them) and 3,000 drawn at random (seeded). Each probe compares every stored key of
     that hash at least once and at most PROBE_EXTRA more, so one record costs at most
-    2 * (12 + m), and all of them at most CEILING."""
+    2 * (12 + m), and all of them at most CEILING.
+
+    It is a tripwire, not a proof: a change to CPython's probe that affected only
+    hashes it does not try would pass it. The ceiling rests on the argument above, for
+    the probe as 3.13 has it; when the agent's interpreter changes (the image's base,
+    or the CPython a native install runs), this test is run on the new one and the
+    argument read against its `dictobject.c` (spec §5.2)."""
     draw = random.Random(160)
+    named = [-(2**63), 2**63 - 1, 2**60, 2**60 - 1, 1, 0, -2]  # as size_t: 0x8000000000000000, …
     worst = 0
-    for _ in range(3000):
-        hashed = draw.getrandbits(63) * draw.choice((1, -1))
+    for hashed in named + [draw.getrandbits(63) * draw.choice((1, -1)) for _ in range(3000)]:
         index = {("question", 0): None}
         total = 0
         for m in range(probe.DNS_RECORDS_MAX):
@@ -1331,6 +1356,36 @@ def test_one_probe_compares_at_most_twelve_keys_more_than_it_holds_of_one_hash()
                 total += _Key.compared
         worst = max(worst, total)
     assert worst <= CEILING
+
+
+def _probe_slots(hashed: int, size: int, visits: int) -> list[tuple[int, int]]:
+    """The slot and the perturb each of a probe's first `visits` visits uses, by the
+    rule of CPython 3.13's `dictobject.c` (a model of it, for the argument above)."""
+    perturb = hashed % 2**64  # Py_hash_t to size_t
+    slot = perturb & (size - 1)
+    seen = [(slot, perturb)]
+    for _ in range(visits - 1):
+        perturb >>= 5
+        slot = (slot * 5 + perturb + 1) & (size - 1)
+        seen.append((slot, perturb))
+    return seen
+
+
+@pytest.mark.parametrize("size", [8, 64, 1024])
+def test_from_the_13th_visit_a_probe_visits_no_slot_twice(size):
+    """The corrected count of round 1 of #163's briefed review, on the hash it names:
+    for 0x8000000000000000 perturb is still 8 at the 13th visit and first 0 at the
+    14th, yet the 13th is the slot just before the 14th on the cycle of 5*i + 1, so the
+    13th and every visit after it, for a whole turn of the table, are distinct."""
+    hashed = -(2**63)
+    slots = _probe_slots(hashed, size, PROBE_EXTRA + size)
+    assert [perturb for _, perturb in slots[12:14]] == [8, 0]
+    assert slots[13][0] == (5 * slots[12][0] + 1) % size
+    later = [slot for slot, _ in slots[PROBE_EXTRA:]]
+    assert len(later) == size and len(set(later)) == size
+    for hashed in (2**63 - 1, 2**60, 1, 0):
+        later = [slot for slot, _ in _probe_slots(hashed, size, PROBE_EXTRA + size)[PROBE_EXTRA:]]
+        assert len(set(later)) == size
 
 
 def test_two_answer_records_whose_owners_hash_alike_can_be_compared_more_than_once():

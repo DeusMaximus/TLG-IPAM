@@ -250,7 +250,9 @@ DNS_PAYLOAD = 1232
 # one name, and OPT); 32 is twice the larger. A reply that claims more is not parsed:
 # dnspython's parse of one whose owner names hash alike costs work that grows with
 # the square of its records, and holds the event loop while it runs. Under these
-# counts it makes at most (32 - 1) * (32 + 24) = 1,736 name comparisons (spec §5.2).
+# counts it makes at most (32 - 1) * (32 + 24) = 1,736 name comparisons on a 64-bit
+# CPython whose dictionary probes as 3.13's does (spec §5.2, which says when that is
+# rechecked).
 DNS_QUESTIONS_MAX = 1
 DNS_RECORDS_MAX = 32
 # a DNS message's header: id, flags, then the four section counts, 2 bytes each
