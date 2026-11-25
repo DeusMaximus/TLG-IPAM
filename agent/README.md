@@ -34,7 +34,13 @@ after the list is cut to three, so the setting only ever takes a server away. Th
 others are asked, and the scan's error says how many were not, counts only; when none
 is left, no lookup is made and the scan is incomplete with "rdns not run: all N DNS
 servers to ask are outside ALLOWED_DNS_SERVERS", and the names already stored are
-kept. A subnet's DNS servers are not checked against anything else, so this is what
+kept. An IPv6 item with a scope (`fe80::53%eth0`) is refused at start, and a server with
+a scope is never asked while the setting is set: `ipaddress` compares networks without
+the scope, but the query goes to the interface the scope names, so the list could not
+say which interface's link-local resolver it means. The agent reads the setting when it
+starts: after changing it (for the systemd unit, in a drop-in made with `systemctl edit
+tlg-ipam-agent`), restart the agent, and its start-up log line shows the value it
+took. A subnet's DNS servers are not checked against anything else, so this is what
 stops a server that has been taken over from pointing the agent's queries at a
 resolver of its choosing.
 

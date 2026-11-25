@@ -62,7 +62,14 @@ def dns_servers(
     `servers` are those the agent would ask without the setting (`Resolver.servers`:
     addresses only, already cut to MAX_DNS_SERVERS), so the setting only ever takes a
     server away: it never makes one asked that would not have been. An entry that is
-    not an address is left out and counted, though `Resolver.servers` passes none."""
+    not an address is left out and counted, though `Resolver.servers` passes none.
+
+    An IPv6 server with a scope (`fe80::53%eth1`) is never kept, whatever the list
+    holds (round 1 of the briefed review, finding 1): `ipaddress` finds it inside a
+    network whatever its scope, but the query goes to the interface the scope names,
+    and the same link-local address is another host on each interface. The list holds
+    no scope (`config.parse_allowed_dns` refuses one), so it cannot say which interface
+    it means, and an unscoped network names no interface's link-local server."""
     if allowed is None:
         return servers, 0
     kept = []
@@ -70,6 +77,8 @@ def dns_servers(
         try:
             address = ipaddress.ip_address(server)
         except ValueError:
+            continue
+        if address.version == 6 and address.scope_id is not None:
             continue
         if any(address.version == network.version and address in network for network in allowed):
             kept.append(server)

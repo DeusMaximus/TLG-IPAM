@@ -174,3 +174,14 @@ def test_servers_outside_the_list_are_left_out_in_order(servers, allowed, kept):
 
 def test_an_entry_that_is_not_an_address_is_never_kept():
     assert guard.dns_servers(("dns.home.arpa", "10.0.0.53"), nets("0.0.0.0/0")) == (("10.0.0.53",), 1)
+
+
+@pytest.mark.parametrize("server", ["fe80::53%2", "fe80::53%eth1", "fd00::53%1"])
+@pytest.mark.parametrize("allowed", ["fe80::/10", "fe80::53", "fd00::/8", "::/0"])
+def test_a_server_with_a_scope_is_never_kept(server, allowed):
+    """Round 1 of the briefed review, finding 1: `ipaddress` puts `fe80::53%2` inside
+    `fe80::/10` whatever its scope, but the query goes to the interface the scope
+    names. The list holds no scope, so it names no interface, and the server is left
+    out and counted. Unset, it is kept as before."""
+    assert guard.dns_servers((server, "10.0.0.53"), nets(allowed, "10.0.0.0/8")) == (("10.0.0.53",), 1)
+    assert guard.dns_servers((server,), None) == ((server,), 0)

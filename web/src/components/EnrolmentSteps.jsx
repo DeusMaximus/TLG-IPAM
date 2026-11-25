@@ -189,7 +189,9 @@ export default function EnrolmentSteps({ token, expires, serverVersion, location
                 to the last command to set them. To limit the DNS servers its reverse lookups may
                 ask, set <code>ALLOWED_DNS_SERVERS</code> in a drop-in (
                 <code>sudo systemctl edit tlg-ipam-agent</code>), since <code>install</code>{' '}
-                rewrites its settings file each time it runs.
+                rewrites its settings file each time it runs, then run{' '}
+                <code>sudo systemctl restart tlg-ipam-agent</code>: the agent reads it when it
+                starts, and logs the value it took.
               </p>
             </>
           )

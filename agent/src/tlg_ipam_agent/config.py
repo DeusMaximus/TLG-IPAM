@@ -178,10 +178,23 @@ def parse_allowed_dns(value: str | None, name: str = "ALLOWED_DNS_SERVERS") -> t
     """The networks every DNS server the agent asks must lie in (#93,
     `guard.dns_servers`), as `_networks` reads them: an address alone allows that one
     server. Unset is None, which allows any, as before the setting existed; there is no
-    default list, since a subnet's resolvers may legitimately be public."""
+    default list, since a subnet's resolvers may legitimately be public.
+
+    An IPv6 item with a scope (`fe80::53%eth0`, `fe80::%2/64`) is refused (round 1 of
+    the briefed review, finding 1): `ipaddress` compares networks without the scope,
+    while the query is sent to the scope the server names, so `fe80::53%1` would let
+    `fe80::53%2`, another interface's resolver, through. A server with a scope is never
+    inside the list instead (`guard.dns_servers`)."""
     if value is None:
         return None
-    return _networks(value, name)
+    networks = _networks(value, name)
+    for place, network in enumerate(networks, 1):
+        if network.version == 6 and network.network_address.scope_id is not None:
+            raise ConfigError(
+                f"{name}: item {place} of {len(networks)} names an IPv6 scope (%…), which is not "
+                "supported: a DNS server with a scope is never allowed; it is not repeated here"
+            )
+    return networks
 
 
 def parse_max_pps(value: str | None, name: str = "MAX_PPS") -> int:

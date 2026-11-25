@@ -2788,3 +2788,37 @@ async def test_on_loopback_only_the_listed_server_of_two_is_asked(tmp_path, sour
     finally:
         v4_t.close()
         v6_t.close()
+
+
+@pytest.mark.parametrize("source", ["job", "resolv.conf"])
+async def test_a_scoped_server_is_never_inside_the_list_as_its_query_would_be_sent(tmp_path, monkeypatch, source):
+    """Round 1 of the briefed review, finding 1: `ipaddress` finds `fe80::53%2` inside
+    a network whatever its scope, but dnspython sends the query to scope 2. Here the
+    socket's `sendto` records the destination dnspython hands it and refuses it, so no
+    packet leaves. Unset, the scoped server is handed its query exactly as on `main`
+    (`('fe80::53', 53, 0, 2)`); with any list, an unscoped link-local network or the
+    address itself included, it is outside and no destination at all is handed over.
+    The same whether the job named it or the host's resolv.conf lists it."""
+    if not _ipv6_loopback():
+        pytest.skip("no IPv6 here")
+    sent = []
+
+    async def sendto(self, what, destination, timeout):
+        sent.append(tuple(destination))
+        raise OSError("held by the test: nothing is sent")
+
+    monkeypatch.setattr(probe.QuerySocket, "sendto", sendto)
+    server = "fe80::53%2"
+    if source == "job":
+        named, path = [server], tmp_path / "missing"
+    else:
+        named, path = [], resolv_conf(tmp_path, f"nameserver {server}\n")
+    result = await allowlisted_scan(53, named, None, path)
+    assert sent == [("fe80::53", 53, 0, 2)]
+    assert result["error"] == no_query_sent("OSError") and result["complete"] is False
+    for allowed in ("fe80::/10", "fe80::53", "::/0", "fe80::/10 10.0.0.0/8"):
+        sent.clear()
+        result = await allowlisted_scan(53, named, allowed, path)
+        assert sent == []
+        assert result["error"] == scan.outside_allowed(1, 1)
+        assert result["complete"] is False and result["observations"] == [{"ip": "10.0.0.9"}]

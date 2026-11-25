@@ -209,3 +209,25 @@ def test_an_allowed_dns_item_that_is_not_a_network_is_named_by_its_place():
     assert str(refused.value) == (
         "ALLOWED_DNS_SERVERS: item 2 of 2 is not a network (host bits must be zero); it is not repeated here"
     )
+
+
+@pytest.mark.parametrize(
+    "value, place",
+    [
+        ("fe80::53%1", "item 1 of 1"),
+        ("fe80::53%eth0", "item 1 of 1"),
+        ("10.0.0.53, fe80::%2/64", "item 2 of 2"),
+        ("10.0.0.53 fd00::53 fe80::%eth1/64", "item 3 of 3"),
+    ],
+)
+def test_an_allowed_dns_item_with_a_scope_is_refused_by_its_place(value, place):
+    """Round 1 of the briefed review, finding 1: `ipaddress` compares networks without
+    the scope, so `fe80::53%1` would let `fe80::53%2`, another interface's resolver,
+    through. A scoped item stops the agent at start, named by its place."""
+    with pytest.raises(ConfigError) as refused:
+        load({**GOOD, "ALLOWED_DNS_SERVERS": value})
+    assert str(refused.value) == (
+        f"ALLOWED_DNS_SERVERS: {place} names an IPv6 scope (%…), which is not supported: a DNS server "
+        "with a scope is never allowed; it is not repeated here"
+    )
+    assert "eth" not in str(refused.value) and "fe80" not in str(refused.value)
