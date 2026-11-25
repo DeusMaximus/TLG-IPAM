@@ -96,8 +96,8 @@ SCAN_GRACE_S = 30
 
 
 def reported() -> dict:
-    """What the agent says about itself, at enrolment (the whole enrol body) and at
-    every check-in."""
+    """What the agent says about itself, at enrolment (with its protocol, the enrol
+    body: `enrol.enrol_body`) and at every check-in."""
     return {
         "version": printable(__version__, VERSION_MAX),
         "hostname": printable(socket.gethostname(), HOSTNAME_MAX),

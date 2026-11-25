@@ -833,6 +833,21 @@ def test_as_root_the_programs_hold_none_of_roots_groups(shared):
     "answer, message",
     [
         (Answer(Kind.REFUSED, 403, "FORBIDDEN", "HTTP 403 FORBIDDEN"), "refused the enrolment token (HTTP 403"),
+        # #165: the server speaks another protocol, and has not spent the token
+        (
+            Answer(Kind.REFUSED, 409, "AGENT_TOO_OLD", "HTTP 409 AGENT_TOO_OLD"),
+            "the server refused to enrol this agent (HTTP 409 AGENT_TOO_OLD): this agent release "
+            "is older than the server: install the agent release that matches the server. The "
+            "enrolment token was not spent: it enrols the agent once the releases match, until "
+            "it expires an hour after it was issued. Then run install again, with the same token",
+        ),
+        (
+            Answer(Kind.REFUSED, 409, "AGENT_TOO_NEW", "HTTP 409 AGENT_TOO_NEW"),
+            "this agent release is newer than the server: update the server, or install the "
+            "agent release that matches it. The enrolment token was not spent",
+        ),
+        # any other 409 is a refusal of the token, as before
+        (Answer(Kind.REFUSED, 409, "CONFLICT", "HTTP 409 CONFLICT"), "refused the enrolment token (HTTP 409"),
         (Answer(Kind.RETRY, 429, "RATE_LIMITED", "HTTP 429 RATE_LIMITED"), "the token is not spent"),
         (Answer(Kind.RETRY, 503, "UNAVAILABLE", "HTTP 503 UNAVAILABLE"), "the token is not spent"),
         (Answer(Kind.RETRY, None, None, "no answer (ConnectError)"), "If the server enrolled the agent"),

@@ -6,6 +6,12 @@ token used, revokes any agent token the agent held before (re-enrol), issues the
 one and makes the agent `active`, in one transaction. The agent keeps its id, its name
 and its scan targets.
 
+Before it claims the token, the exchange reads the protocol the body states
+(`agent_protocol.enrol_protocol_refusal`; none means protocol 2, every release before
+#165) and refuses one other than the server's, `409 AGENT_TOO_OLD` or `AGENT_TOO_NEW`,
+with the token still unused, so an agent that could not read the answer, or whose
+check-ins would all be refused, can be updated and enrol with the same token.
+
 It is the only agent route reachable without a long-lived token, so it is not behind
 `auth.require_agent` and it has its own guard: a small global throttle on attempts
 (`throttle`). It never uses `agents.authenticate` or the agent token's context in
@@ -29,7 +35,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from ..agent_protocol import EnrolRequest, EnrolResponse
+from ..agent_protocol import ENROL_TOO_OLD, EnrolRequest, EnrolResponse, enrol_protocol_refusal
 from ..errors import ApiError, database_unavailable, validation_error
 from ..models import Agent, Token
 from ..times import utc
@@ -110,6 +116,21 @@ def _refused() -> ApiError:
     )
 
 
+def _protocol_refused(code: str) -> ApiError:
+    # fixed text, naming neither protocol: the code alone says which way it is (#165)
+    if code == ENROL_TOO_OLD:
+        message = (
+            "This agent release is older than the server: install the agent release that "
+            "matches the server. The enrolment token was not used"
+        )
+    else:
+        message = (
+            "This agent release is newer than the server: update the server, or install "
+            "the agent release that matches it. The enrolment token was not used"
+        )
+    return ApiError(code, message, 409)
+
+
 def _usable(token: Token, agent: Agent, now: datetime) -> bool:
     return token.kind == "enrol" and agents.live(token, now) and agent.state != "disabled"
 
@@ -162,8 +183,16 @@ async def _exchange(
         raise _refused()
     token, agent = row
     # read only once the token is known to be usable
+    body = await read_body()
+    # The agent's protocol, before the rest of the body (which another protocol may
+    # shape differently) and before the claim, so an agent this server cannot answer
+    # is refused with its enrolment token unspent (#165). An attempt refused here
+    # counts against the throttle, as every refusal but its own does.
+    refusal = enrol_protocol_refusal(body)
+    if refusal is not None:
+        raise _protocol_refused(refusal)
     try:
-        report = EnrolRequest.model_validate(await read_body())
+        report = EnrolRequest.model_validate(body)
     except ValidationError as exc:
         raise validation_error(_validation_message(exc)) from None
     # the token as it was: the compare-and-set below proves it was unused and unrevoked
@@ -217,7 +246,8 @@ async def _exchange(
             actor=actor,
         )
         agent.state = "active"
-        for field, value in report.model_dump(exclude_none=True).items():
+        # what the agent reports; its protocol is judged above, not stored
+        for field, value in report.model_dump(exclude_none=True, exclude={"protocol"}).items():
             setattr(agent, field, value)
         changes.record(
             session,
@@ -251,8 +281,10 @@ async def enrol(
     Refusals: `429 RATE_LIMITED` while the throttle is full; `401` with no bearer; `403`
     for any bearer that is not a usable enrolment token (unknown, used, expired,
     revoked, another kind of token, the owner key, or one whose agent is disabled);
-    `422` for a body that is not JSON or not an `EnrolRequest`, which leaves the token
-    usable; `503 UNAVAILABLE` for a write the database refused, rolled back whole.
+    `409 AGENT_TOO_OLD` / `409 AGENT_TOO_NEW` for a body whose `protocol` is not the
+    server's (`agent_protocol.enrol_protocol_refusal`, absent meaning protocol 2), and
+    `422` for a body that is not JSON or not an `EnrolRequest`, both of which leave the
+    token usable; `503 UNAVAILABLE` for a write the database refused, rolled back whole.
     Every refusal but the throttle's own counts against it."""
     if agents.carries_agent_token(session):
         raise RuntimeError("the enrolment exchange runs on its own session, never an agent token's")

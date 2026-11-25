@@ -425,6 +425,9 @@ def exchange(url: str, token: str, ca_file: str | None) -> Answer:
 
 
 def _not_enrolled(answer: Answer) -> str:
+    refusal = enrol.protocol_refusal(answer)
+    if refusal is not None:
+        return f"{refusal}. Then run install again, with the same token"
     if answer.kind is Kind.REFUSED:
         return (
             f"the server refused the enrolment token ({answer.message}): it is used, expired "

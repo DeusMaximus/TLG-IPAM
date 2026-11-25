@@ -966,26 +966,39 @@ async def test_a_delegated_reverse_zone_keeps_the_name_and_the_next_server_suppl
         ANSWERS.pop(key, None)
 
 
+@pytest.mark.parametrize("body", ["this-release", "none"])
 @pytest.mark.parametrize("raised", [False, True])
 @pytest.mark.parametrize("secret_bytes", [32, 33])
-async def test_raising_the_protocol_does_not_keep_a_new_token_form_from_spending_an_old_agents_enrolment(
-    owner, monkeypatch, raised, secret_bytes
+async def test_a_new_token_form_spends_an_old_agents_enrolment_only_if_the_protocol_is_not_raised(
+    owner, monkeypatch, body, raised, secret_bytes
 ):
-    """Why `agent_protocol` says raising PROTOCOL_VERSION is necessary but not enough
-    when the issued form changes (the briefed review of #140). The enrolment body
-    carries no protocol and the version is checked only at check-in, so a server that
-    issues a longer secret answers this release's agent `200` at any protocol: the
-    agent refuses the answer as not in the route's shape, and the enrolment token is
-    spent. The form must stay what existing agents take until enrolment itself can
-    tell them apart."""
+    """What protects an agent of an earlier release when the issued form changes, and
+    what does not (the briefed review of #140; #165). The enrol body states the agent's
+    protocol, and none stated means protocol 2, so a server that raises
+    PROTOCOL_VERSION with its new form refuses this release's agent, and an exchange
+    that states none, `409 AGENT_TOO_OLD` before the claim: the enrolment token is
+    unused and works once the agent is updated. A server that changes the form without
+    raising PROTOCOL_VERSION still answers `200`: the agent refuses the answer as not in
+    the route's shape and the token is spent. That is why the form, like the rest of
+    the enrol answer, changes only with PROTOCOL_VERSION."""
+    from app import agent_protocol as server_protocol
     from app.agent_protocol import AGENT_TOKEN_FORM
     from app.models import Token
     from app.services import agents as server_agents
+    from app.services import enrolment as server_enrolment
     from app.services import jobs as server_jobs
 
+    from tlg_ipam_agent import enrol
     from tlg_ipam_agent.client import Kind
 
+    # two refusals a run: a throttle of its own, so no other test meets them
+    monkeypatch.setattr(
+        server_enrolment,
+        "throttle",
+        server_enrolment.AttemptThrottle(server_enrolment.THROTTLE_ATTEMPTS, server_enrolment.THROTTLE_WINDOW_S),
+    )
     if raised:
+        monkeypatch.setattr(server_protocol, "PROTOCOL_VERSION", server_protocol.PROTOCOL_VERSION + 1)
         monkeypatch.setattr(server_jobs, "PROTOCOL_VERSION", server_jobs.PROTOCOL_VERSION + 1)
     monkeypatch.setattr(server_agents, "TOKEN_SECRET_BYTES", secret_bytes)
     agent = await _ok(await owner.post("/api/v1/agents", json={"name": "vlan10"}), 201)
@@ -994,15 +1007,67 @@ async def test_raising_the_protocol_does_not_keep_a_new_token_form_from_spending
         base_url="https://test",
         headers={"Authorization": f"Bearer {agent['enrol_token']}"},
     ) as http:
-        answer = await AgentClient(http).enrol({})
+        answer = await AgentClient(http).enrol(enrol.enrol_body() if body == "this-release" else {})
         again = await http.post("/api/v1/agent/enrol", json={})
     async with SessionLocal() as session:
-        [spent] = (await session.scalars(select(Token).where(Token.kind == "enrol"))).all()
-        [issued] = (await session.scalars(select(Token).where(Token.kind == "agent"))).all()
-    # either way the exchange took place and the enrolment token is used up
-    assert answer.status == 200 and spent.used_at is not None and again.status_code == 403
+        [enrol_token] = (await session.scalars(select(Token).where(Token.kind == "enrol"))).all()
+        issued = (await session.scalars(select(Token).where(Token.kind == "agent"))).all()
+    if raised:
+        # refused before the claim, whatever form the server would have issued
+        assert (answer.kind, answer.status, answer.code) == (Kind.REFUSED, 409, "AGENT_TOO_OLD")
+        assert enrol.protocol_refusal(answer) is not None
+        assert enrol_token.used_at is None and issued == []
+        assert again.status_code == 409
+        return
+    # not raised: the exchange took place and the enrolment token is used up
+    assert answer.status == 200 and enrol_token.used_at is not None and again.status_code == 403
+    [issued] = issued
     if secret_bytes == 32:
         assert answer.kind is Kind.OK and AGENT_TOKEN_FORM.fullmatch(answer.data["agent_token"])
     else:
         assert answer.kind is Kind.RETRY and answer.message == "HTTP 200 answer not in the expected shape"
         assert issued.revoked_at is None  # the server holds a token the agent never stored
+
+
+async def test_a_server_before_165_enrols_an_agent_that_states_its_protocol(owner, monkeypatch):
+    """#165's acceptance: a server without the protocol check ignores the field and
+    enrols as it always did. The server before #165 is stood in for by its own parts as
+    they were: an `EnrolRequest` without `protocol` (pydantic ignores an unknown field,
+    as it did then) and no protocol check. What this release's agent reports is stored."""
+    from pydantic import BaseModel, field_validator
+
+    from app import agent_protocol as server_protocol
+    from app.models import Agent as AgentRow
+    from app.services import enrolment as server_enrolment
+
+    from tlg_ipam_agent import enrol
+    from tlg_ipam_agent.client import Kind
+    from tlg_ipam_agent.protocol import PROTOCOL_VERSION
+
+    class EnrolRequestBefore165(BaseModel):
+        version: str | None = None
+        hostname: str | None = None
+        platform: str | None = None
+
+        @field_validator("version", "hostname", "platform")
+        @classmethod
+        def _printable(cls, v):
+            return None if v is None else server_protocol.printable(v, 253)
+
+    assert set(EnrolRequestBefore165.model_fields) == set(server_protocol.EnrolRequest.model_fields) - {"protocol"}
+    monkeypatch.setattr(server_enrolment, "EnrolRequest", EnrolRequestBefore165)
+    monkeypatch.setattr(server_enrolment, "enrol_protocol_refusal", lambda body: None)
+    agent = await _ok(await owner.post("/api/v1/agents", json={"name": "vlan10"}), 201)
+    body = enrol.enrol_body()
+    assert body["protocol"] == PROTOCOL_VERSION
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://test",
+        headers={"Authorization": f"Bearer {agent['enrol_token']}"},
+    ) as http:
+        answer = await AgentClient(http).enrol(body)
+    assert answer.kind is Kind.OK
+    async with SessionLocal() as session:
+        row = await session.get(AgentRow, agent["id"])
+        assert row.state == "active"
+        assert (row.version, row.hostname, row.platform) == (body["version"], body["hostname"], body["platform"])
