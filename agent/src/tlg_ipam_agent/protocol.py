@@ -15,6 +15,10 @@ from dataclasses import dataclass
 from typing import Any
 
 PROTOCOL_VERSION = 2
+# The codes of the enrol route's refusal of an agent on another protocol, `409`
+# (agent_protocol.ENROL_TOO_OLD, ENROL_TOO_NEW; #165): the enrolment token is not spent.
+ENROL_TOO_OLD = "AGENT_TOO_OLD"
+ENROL_TOO_NEW = "AGENT_TOO_NEW"
 CHECKIN_INTERVAL_S = 60
 JOB_TIMEOUT_S = 600
 

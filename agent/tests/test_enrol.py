@@ -160,7 +160,7 @@ async def test_the_exchange_stores_the_token_then_returns_it(tmp_path):
     server.state_dir = directory
     assert await obtain(directory, server, enrol_token=ENROL_TOKEN) == TOKEN
     # the enrolment token was presented, the body is what the agent reports
-    assert server.requests == [(f"Bearer {ENROL_TOKEN}", reported())]
+    assert server.requests == [(f"Bearer {ENROL_TOKEN}", {**reported(), "protocol": PROTOCOL_VERSION})]
     # the file existed, empty, before the request
     assert server.files_seen == [["token.new"]]
     path = tmp_path / "state" / "token"
@@ -221,6 +221,35 @@ async def test_a_refused_exchange_waits_the_refusal_rule_and_never_loops(tmp_pat
     assert all(0.9 * CHECKIN_REFUSED_RETRY_S <= s <= CHECKIN_REFUSED_RETRY_S for s in clock.sleeps)
     assert os.listdir(directory) == []
     assert "HTTP 403 FORBIDDEN" in caplog.text
+    assert ENROL_TOKEN not in caplog.text and "echoing" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "code, release",
+    [
+        ("AGENT_TOO_OLD", "this agent release is older than the server: install the agent release that matches the server"),
+        ("AGENT_TOO_NEW", "this agent release is newer than the server: update the server, or install the agent release that matches it"),
+    ],
+)
+async def test_a_protocol_refusal_says_which_release_and_that_the_token_is_not_spent(
+    tmp_path, caplog, code, release
+):
+    """#165: the server refused the agent's protocol before it claimed the token. The
+    log says which side to update and that the token still works, from the status and
+    the code alone, and the agent tries again on the refusal rule's wait, so a server
+    updated meanwhile enrols it with the same token."""
+    directory = state(tmp_path)
+    refusal = (409, {"error": {"code": code, "message": f"echoing {ENROL_TOKEN}"}})
+    server = Scripted(refusal, ENROLLED)
+    clock = FakeClock()
+    with caplog.at_level(logging.INFO, logger="tlg_ipam_agent"):
+        assert await obtain(directory, server, clock=clock, enrol_token=ENROL_TOKEN) == TOKEN
+    assert len(server.requests) == 2 and server.requests[0] == server.requests[1]
+    assert len(clock.sleeps) == 1 and 0.9 * CHECKIN_REFUSED_RETRY_S <= clock.sleeps[0] <= CHECKIN_REFUSED_RETRY_S
+    [refused] = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert refused.startswith(f"the server refused to enrol this agent (HTTP 409 {code}): {release}. ")
+    assert "The enrolment token was not spent" in refused
+    assert "used, expired or revoked" not in refused  # not the message for a spent token
     assert ENROL_TOKEN not in caplog.text and "echoing" not in caplog.text
 
 
@@ -399,6 +428,54 @@ async def test_first_start_enrols_and_a_recreated_container_starts_on_the_stored
     assert second == first
     assert (await _checkin(second)).kind is Kind.OK
     assert len(enrolment.throttle._taken) == 0
+
+
+@pytest.mark.parametrize("newer", ["server", "agent"])
+async def test_an_agent_on_another_protocol_is_refused_with_its_token_unspent_and_enrols_once_they_match(
+    owner, tmp_path, monkeypatch, caplog, newer
+):
+    """#165's acceptance, through the real routes: an agent whose protocol the server
+    does not speak, older or newer, is refused before the claim; its enrolment token
+    is still unused afterwards, nothing is stored in its state directory, and an agent
+    of the server's protocol then enrols with the same token."""
+    from app import agent_protocol as server_protocol
+    from app.models import Token
+    from sqlalchemy import select
+
+    created = (await owner.post("/api/v1/agents", json={"name": "vlan10"})).json()["data"]
+    directory = state(tmp_path)
+    if newer == "server":
+        monkeypatch.setattr(server_protocol, "PROTOCOL_VERSION", PROTOCOL_VERSION + 1)
+        code = "AGENT_TOO_OLD"
+    else:
+        monkeypatch.setattr(enrol, "PROTOCOL_VERSION", PROTOCOL_VERSION + 1)
+        code = "AGENT_TOO_NEW"
+    clock, stop = FakeClock(), asyncio.Event()
+
+    async def stop_at_the_first_wait():
+        while not clock.sleeps:
+            await asyncio.sleep(0)
+        stop.set()
+
+    stopper = asyncio.ensure_future(stop_at_the_first_wait())
+    with caplog.at_level(logging.INFO, logger="tlg_ipam_agent"):
+        refused = await enrol.agent_token(
+            settings(enrol_token=created["enrol_token"]), directory, stop=stop, http=real_http, clock=clock
+        )
+    await stopper
+    assert refused is None and os.listdir(directory) == []
+    assert f"(HTTP 409 {code})" in caplog.text and "The enrolment token was not spent" in caplog.text
+    async with SessionLocal() as session:
+        [token] = (await session.scalars(select(Token).where(Token.agent_id == created["id"]))).all()
+        assert (token.kind, token.used_at, token.revoked_at) == ("enrol", None, None)
+        assert (await session.get(AgentRow, created["id"])).state == "pending"
+
+    monkeypatch.undo()  # the releases match
+    token = await enrol.agent_token(
+        settings(enrol_token=created["enrol_token"]), directory, stop=asyncio.Event(), http=real_http
+    )
+    assert token.startswith("tlga_") and (tmp_path / "state" / "token").read_bytes() == token.encode()
+    assert (await _checkin(token)).kind is Kind.OK
 
 
 async def test_a_re_enrol_token_replaces_a_lost_volumes_token(owner, tmp_path):

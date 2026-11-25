@@ -15,7 +15,18 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import event, select, update
 
-from app.agent_protocol import ENROL_TOKEN_FORM, ENROL_TOKEN_PREFIX, HOSTNAME_MAX, EnrolRequest
+from app import agent_protocol
+from app.agent_protocol import (
+    ENROL_PROTOCOL_ABSENT,
+    ENROL_TOKEN_FORM,
+    ENROL_TOKEN_PREFIX,
+    ENROL_TOO_NEW,
+    ENROL_TOO_OLD,
+    HOSTNAME_MAX,
+    PROTOCOL_VERSION,
+    EnrolRequest,
+    enrol_protocol_refusal,
+)
 from app.config import settings
 from app.database import SessionLocal, engine
 from app.main import app
@@ -433,6 +444,132 @@ def test_the_report_is_checked_as_check_in_checks_it():
     parsed = EnrolRequest.model_validate({"hostname": "  scanner  ", "unknown": 1})
     assert parsed.hostname == "scanner"
     assert parsed.model_dump(exclude_none=True) == {"hostname": "scanner"}
+
+
+# --- The agent's protocol (#165) ---
+
+TOO_OLD_MESSAGE = (
+    "This agent release is older than the server: install the agent release that "
+    "matches the server. The enrolment token was not used"
+)
+TOO_NEW_MESSAGE = (
+    "This agent release is newer than the server: update the server, or install "
+    "the agent release that matches it. The enrolment token was not used"
+)
+
+
+def _protocol_refusal(protocol) -> dict:
+    code = ENROL_TOO_OLD if protocol < PROTOCOL_VERSION else ENROL_TOO_NEW
+    message = TOO_OLD_MESSAGE if code == ENROL_TOO_OLD else TOO_NEW_MESSAGE
+    return {"error": {"code": code, "message": message}}
+
+
+@pytest.mark.parametrize(
+    "protocol", [PROTOCOL_VERSION - 1, 0, -7, PROTOCOL_VERSION + 1, 10**40],
+    ids=["previous", "zero", "negative", "next", "huge"],
+)
+async def test_an_agent_on_another_protocol_is_refused_before_the_claim(client, agent_api, protocol):
+    """Acceptance: refused `409` with a fixed code that says which way it is, a fixed
+    message that names no protocol, nothing written and the write lock never taken, so
+    the token is still unused; the same token then enrols an agent on the server's
+    protocol."""
+    created = await create(client)
+    before = every_row()
+    with every_statement() as sql:
+        res = await enrol(agent_api, created["enrol_token"], protocol=protocol, **REPORT)
+    assert res.status_code == 409, res.text
+    assert res.json() == _protocol_refusal(protocol)
+    assert not any(ch.isdigit() for ch in res.text)  # no value, the agent's or the server's
+    # only the token's lookup ran: no lock, no claim, no write
+    assert len(sql) == 1 and sql[0].lstrip().upper().startswith("SELECT"), sql
+    assert every_row() == before
+    [token] = await tokens_of(created["id"])
+    assert token.used_at is None and token.revoked_at is None
+
+    res = await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION, **REPORT)
+    assert res.status_code == 200, res.text
+    assert (await get_agent(client, created["id"]))["state"] == "active"
+
+
+async def test_the_protocol_is_judged_before_the_rest_of_the_body(client, agent_api):
+    """Another protocol may shape the other fields differently: what it is told is
+    that its protocol is not the server's, not that a field is wrong."""
+    created = await create(client)
+    res = await enrol(
+        agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION + 1, hostname="\x00", version=7
+    )
+    assert res.status_code == 409 and res.json()["error"]["code"] == ENROL_TOO_NEW
+
+
+async def test_the_token_is_judged_before_the_protocol(client, agent_api):
+    """The body is read only once the token is found usable, the protocol in it too: a
+    caller without a usable token learns nothing from it."""
+    created = await create(client)
+    assert (await enrol(agent_api, created["enrol_token"])).status_code == 200
+    for bearer in ("tlge_" + "x" * 43, created["enrol_token"]):
+        res = await enrol(agent_api, bearer, protocol=PROTOCOL_VERSION + 1)
+        assert res.status_code == 403 and res.json() == {"error": REFUSED}
+
+
+@pytest.mark.parametrize("body", [{}, {"protocol": None}, {"protocol": PROTOCOL_VERSION}],
+                         ids=["absent", "null", "stated"])
+async def test_a_body_without_a_protocol_enrols_as_before(client, agent_api, body):
+    """Acceptance: an agent that sends no protocol (every release before #165, or an
+    exchange by hand) enrols exactly as before, and the protocol is never stored."""
+    created = await create(client)
+    res = await enrol(agent_api, created["enrol_token"], **body, **REPORT)
+    assert res.status_code == 200, res.text
+    agent = await get_agent(client, created["id"])
+    assert agent["state"] == "active" and "protocol" not in agent
+    assert (agent["version"], agent["hostname"], agent["platform"]) == ("0.3.0", "scanner-20", "linux")
+    async with SessionLocal() as session:
+        entries = (await session.scalars(select(Change).where(Change.entity_type == "agent"))).all()
+    assert all("protocol" not in (e.after or {}) for e in entries)
+
+
+async def test_an_absent_protocol_stays_protocol_2_when_the_server_moves_on(
+    client, agent_api, monkeypatch
+):
+    """The rule `agent_protocol` states: a body without `protocol` is protocol 2's
+    whatever the server speaks, so a server of protocol 3 refuses it before the token is
+    spent, rather than enrol an agent that may not read its answer."""
+    assert ENROL_PROTOCOL_ABSENT == 2  # never to change while agents that send none exist
+    monkeypatch.setattr(agent_protocol, "PROTOCOL_VERSION", 3)
+    created = await create(client)
+    for body in ({}, {"protocol": None}, {"protocol": 2}):
+        res = await enrol(agent_api, created["enrol_token"], **body)
+        assert res.status_code == 409 and res.json()["error"]["code"] == ENROL_TOO_OLD
+    [token] = await tokens_of(created["id"])
+    assert token.used_at is None
+    assert (await enrol(agent_api, created["enrol_token"], protocol=3)).status_code == 200
+
+
+@pytest.mark.parametrize("protocol", ["2", 2.0, True, [2], {"v": 2}],
+                         ids=["string", "float", "bool", "list", "object"])
+async def test_a_protocol_that_is_not_an_integer_is_422_and_spends_nothing(
+    client, agent_api, protocol
+):
+    created = await create(client)
+    before = every_row()
+    res = await enrol(agent_api, created["enrol_token"], protocol=protocol)
+    assert res.status_code == 422, res.text
+    assert res.json()["error"]["message"].startswith("Enrolment refused: protocol: ")
+    assert every_row() == before
+    assert (await enrol(agent_api, created["enrol_token"])).status_code == 200
+
+
+@pytest.mark.parametrize("server", [1, 2, 3, 4])
+def test_enrolment_refuses_exactly_the_integer_protocols_check_in_refuses(monkeypatch, server):
+    """So that no enrolment spends a token on an agent whose every check-in is then
+    `409 PROTOCOL_MISMATCH`, and none refuses an agent check-in would serve."""
+    monkeypatch.setattr(agent_protocol, "PROTOCOL_VERSION", server)
+    monkeypatch.setattr(jobs, "PROTOCOL_VERSION", server)
+    for protocol in range(-2, 8):
+        refused = enrol_protocol_refusal({"protocol": protocol})
+        assert (refused is None) == (jobs._protocol_error({"protocol": protocol}) is None)
+        if refused is not None:
+            assert refused == (ENROL_TOO_OLD if protocol < server else ENROL_TOO_NEW)
+    assert enrol_protocol_refusal({}) == enrol_protocol_refusal({"protocol": 2})
 
 
 # --- Re-enrol (acceptance: the old agent token is refused, the scan targets unchanged) ---
@@ -895,7 +1032,7 @@ async def test_enrolments_give_their_place_back(client, agent_api, clock):
     assert (await enrol(agent_api, "tlge_" + "x" * 43)).status_code == 429
 
 
-@pytest.mark.parametrize("refusal", ["missing", "bad-body", "used"])
+@pytest.mark.parametrize("refusal", ["missing", "bad-body", "used", "protocol"])
 async def test_every_refusal_counts_against_the_throttle(client, agent_api, clock, refusal):
     created = await create(client)
     spent = await create(client, "spent")
@@ -905,9 +1042,11 @@ async def test_every_refusal_counts_against_the_throttle(client, agent_api, cloc
             res = await agent_api.post("/api/v1/agent/enrol", json={})
         elif refusal == "bad-body":
             res = await enrol(agent_api, created["enrol_token"], hostname="\x00")
+        elif refusal == "protocol":
+            res = await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION + 1)
         else:
             res = await enrol(agent_api, spent["enrol_token"])
-        assert res.status_code in (401, 403, 422), res.text
+        assert res.status_code in (401, 403, 409, 422), res.text
     assert (await enrol(agent_api, created["enrol_token"])).status_code == 429
 
 

@@ -14,7 +14,7 @@ from app.models import Agent as AgentRow
 from app.services import agents, jobs
 
 from conftest import FakeClock, FakeProber, FakeResolver, job
-from tlg_ipam_agent import client, config, guard, loop, probe, protocol, scan
+from tlg_ipam_agent import client, config, enrol, guard, loop, probe, protocol, scan
 from tlg_ipam_agent.config import parse_allowed
 
 AGENT = Path(__file__).resolve().parents[1]
@@ -37,6 +37,8 @@ AGENT = Path(__file__).resolve().parents[1]
         "OBSERVATIONS_MAX",
         "RDNS_NAME_MAX",
         "SCAN_ERROR_MAX",
+        "ENROL_TOO_OLD",
+        "ENROL_TOO_NEW",
     ],
 )
 def test_constants_match_the_server(name):
@@ -127,9 +129,30 @@ def test_the_tokens_the_tests_spell_by_hand_are_of_the_issued_form():
 
 
 def test_the_enrol_body_is_what_the_server_accepts_and_stores_unchanged():
-    body = loop.reported()
+    """The report as check-in sends it, and the protocol (#165), which is the field the
+    server judges and does not store."""
+    body = enrol.enrol_body()
     parsed = server.EnrolRequest.model_validate(body)
     assert parsed.model_dump() == body
+    assert {k: v for k, v in body.items() if k != "protocol"} == loop.reported()
+
+
+def test_the_enrol_body_states_the_protocol_the_server_answers():
+    """`agent_protocol` states the field and the rule (#165): the agent sends its
+    PROTOCOL_VERSION as `protocol`, an integer, which the server of the same protocol
+    takes and one of any other refuses with the code the agent reads."""
+    body = enrol.enrol_body()
+    assert "protocol" in server.EnrolRequest.model_fields
+    assert type(body["protocol"]) is int and body["protocol"] == server.PROTOCOL_VERSION
+    assert server.enrol_protocol_refusal(body) is None
+    assert server.enrol_protocol(body) == protocol.PROTOCOL_VERSION
+    newer = {**body, "protocol": protocol.PROTOCOL_VERSION + 1}
+    older = {**body, "protocol": protocol.PROTOCOL_VERSION - 1}
+    assert server.enrol_protocol_refusal(newer) == protocol.ENROL_TOO_NEW
+    assert server.enrol_protocol_refusal(older) == protocol.ENROL_TOO_OLD
+    # the codes are of the vocabulary shape the agent reads (`client._code`)
+    for code in (protocol.ENROL_TOO_OLD, protocol.ENROL_TOO_NEW):
+        assert client._CODE.fullmatch(code)
 
 
 def test_the_servers_enrol_answer_is_in_the_shape_the_agent_takes():

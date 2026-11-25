@@ -22,6 +22,12 @@ refusal rule's 13.5-15 minutes before it tries again, as a refused check-in does
 5xx or no answer waits the bounded back-off. The process keeps running throughout, so
 a container's restart policy does not turn a refusal into a restart loop.
 
+The enrol body states the agent's protocol (`enrol_body`, #165). A server that speaks
+another refuses the exchange `409 AGENT_TOO_OLD` or `AGENT_TOO_NEW` before it claims
+the token, and the agent says which release to install and that the token was not
+spent (`protocol_refusal`): it still enrols the agent, once the release matches, until
+it expires. A server before #165 ignores the field and enrols as it always did.
+
 `tlg-ipam-agent install` makes its exchange once, itself (`install.py`): the
 enrolment token there comes from the operator and never reaches the disk.
 """
@@ -38,6 +44,7 @@ from .backoff import Backoff, refused_wait
 from .client import AgentClient, Answer, Kind, make_http
 from .config import ConfigError, Settings, parse_token
 from .loop import reported
+from .protocol import ENROL_TOO_NEW, ENROL_TOO_OLD, PROTOCOL_VERSION
 from .scan import Clock
 
 log = logging.getLogger("tlg_ipam_agent")
@@ -76,10 +83,38 @@ def stored_token(state_dir: str) -> str | None:
     return parse_token(text, path)
 
 
+def enrol_body() -> dict:
+    """The enrol body: what the agent reports, and its protocol, which the server judges
+    before it spends the token (agent_protocol.EnrolRequest; #165)."""
+    return {**reported(), "protocol": PROTOCOL_VERSION}
+
+
 async def exchange(http: Any) -> Answer:
     """One enrolment exchange; `http` (an httpx client, `client.make_http`) presents
     the enrolment token."""
-    return await AgentClient(http).enrol(reported())
+    return await AgentClient(http).enrol(enrol_body())
+
+
+def protocol_refusal(answer: Answer) -> str | None:
+    """What the operator is told when the server refused this agent's protocol (#165):
+    which release to install, and that the token was not spent. None for any other
+    answer. Built from the status and the code alone, never the server's message."""
+    if answer.kind is not Kind.REFUSED or answer.status != 409:
+        return None
+    if answer.code == ENROL_TOO_OLD:
+        what = "this agent release is older than the server: install the agent release that matches the server"
+    elif answer.code == ENROL_TOO_NEW:
+        what = (
+            "this agent release is newer than the server: update the server, or install the "
+            "agent release that matches it"
+        )
+    else:
+        return None
+    return (
+        f"the server refused to enrol this agent ({answer.message}): {what}. The enrolment "
+        "token was not spent: it enrols the agent once the releases match, until it expires "
+        "an hour after it was issued"
+    )
 
 
 def _store(state_dir: str, token: str, pending: store.PendingFile) -> None:
@@ -165,6 +200,10 @@ async def enrol_and_store(
         if answer.kind is Kind.RETRY:
             wait = backoff.next()
             log.warning("enrolment not accepted (%s); retrying in %.0f s", answer.message, wait)
+        elif (refusal := protocol_refusal(answer)) is not None:
+            backoff.reset()
+            wait = refused_wait(rng)
+            log.error("%s; trying again in %.0f s", refusal, wait)
         else:
             backoff.reset()
             wait = refused_wait(rng)

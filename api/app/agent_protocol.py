@@ -24,7 +24,9 @@ from pydantic import (
 )
 
 # The protocol this server speaks. A check-in with any other value gets no jobs and
-# `409 PROTOCOL_MISMATCH`, and the error is recorded on the agent (spec §5.6).
+# `409 PROTOCOL_MISMATCH`, and the error is recorded on the agent (spec §5.6); an
+# enrolment with any other value is refused before its token is spent (#165,
+# `enrol_protocol_refusal`).
 # 2 (#100): a result set says whether its liveness sweep completed apart from
 # `complete`, and a record says when its PTR lookup was answered "no name".
 PROTOCOL_VERSION = 2
@@ -114,12 +116,12 @@ ENROL_TOKEN_PREFIX = "tlge_"
 # only an enrol answer whose `agent_token` is exactly AGENT_TOKEN_FORM (its
 # `client.ISSUED_AGENT_TOKEN`), and takes any other answer as a malformed `200` after
 # the enrolment token is spent. A server that issues another form, longer or shorter,
-# raises PROTOCOL_VERSION, but that is not enough: the enrol body carries no protocol
-# and the version is checked only at check-in, so an existing agent's enrolment is
-# answered `200` at any protocol and its enrolment token spent on a token it refuses
-# (agent/tests/test_e2e.py, the briefed review of #140). The form of the enrol
-# answer's token is kept for existing agents until enrolment itself can choose an
-# answer they take, or refuse them before the token is spent.
+# raises PROTOCOL_VERSION, and since #165 that is what keeps an existing agent's token
+# unspent: the enrol body states the agent's protocol (`EnrolRequest.protocol`, absent
+# meaning ENROL_PROTOCOL_ABSENT), and the exchange refuses one it does not speak before
+# the token is claimed (`enrol_protocol_refusal`). What still spends it is a change to
+# the enrol answer, the token's form included, made without raising PROTOCOL_VERSION
+# (agent/tests/test_e2e.py).
 TOKEN_SECRET_BYTES = 32
 TOKEN_SECRET_LENGTH = 43
 TOKEN_SECRET_ALPHABET = "A-Za-z0-9_-"
@@ -127,13 +129,55 @@ AGENT_TOKEN_FORM = re.compile(f"{re.escape(AGENT_TOKEN_PREFIX)}[{TOKEN_SECRET_AL
 ENROL_TOKEN_FORM = re.compile(f"{re.escape(ENROL_TOKEN_PREFIX)}[{TOKEN_SECRET_ALPHABET}]{{{TOKEN_SECRET_LENGTH}}}")
 
 
+# The protocol an enrol body that carries no `protocol` (or carries null) is taken to
+# speak (#165). Every agent release before #165 spoke protocol 2 and sent no
+# `protocol` on enrolment, and an exchange made by hand (`-d '{}'`) sends none either.
+# This stays 2 whatever PROTOCOL_VERSION becomes, for as long as such agents may exist:
+# a server of protocol 3 refuses a body without `protocol` as ENROL_TOO_OLD, before the
+# token is spent, which is the point. Changing it to any other value would make that
+# server enrol those agents and spend their tokens on an answer they may not read.
+ENROL_PROTOCOL_ABSENT = 2
+# The codes of the refusal (`409`), fixed, so that an agent can tell its operator what
+# to update without reading the server's message: the agent's protocol is older, or
+# newer, than the one this server speaks. Either leaves the enrolment token unspent.
+ENROL_TOO_OLD = "AGENT_TOO_OLD"
+ENROL_TOO_NEW = "AGENT_TOO_NEW"
+
+
+def enrol_protocol(body: Any) -> Any:
+    """The protocol a raw enrol body states, ENROL_PROTOCOL_ABSENT when it states none
+    (no `protocol`, or null). Not checked: `enrol_protocol_refusal` judges it."""
+    stated = body.get("protocol") if isinstance(body, dict) else None
+    return ENROL_PROTOCOL_ABSENT if stated is None else stated
+
+
+def enrol_protocol_refusal(body: Any) -> str | None:
+    """ENROL_TOO_OLD or ENROL_TOO_NEW when a raw enrol body states an integer protocol
+    other than PROTOCOL_VERSION; None otherwise. The exchange reads it before the rest
+    of the body, which another protocol may shape differently, and before it claims the
+    token, so a refused agent's enrolment token is still unused (#165). The rule is
+    check-in's (a check-in of any other protocol is `409 PROTOCOL_MISMATCH`): enrolment
+    never spends a token on an agent whose every check-in would then be refused. A
+    `protocol` that is not an integer is not judged here; `EnrolRequest` refuses it as
+    a field (`422`), which spends nothing either."""
+    protocol = enrol_protocol(body)
+    if type(protocol) is not int or protocol == PROTOCOL_VERSION:
+        return None
+    return ENROL_TOO_OLD if protocol < PROTOCOL_VERSION else ENROL_TOO_NEW
+
+
 class EnrolRequest(BaseModel):
     """`POST /api/v1/agent/enrol`, with the enrolment token as `Authorization: Bearer`.
-    Unknown fields are ignored. Each field is optional, so the exchange can be made by
-    hand (`-d '{}'`); a field that is sent is checked as check-in checks it and stored
-    on the agent. The body carries no `protocol`: the agent's first check-in, which
-    follows at once, is where a mismatch is refused."""
+    Unknown fields are ignored, as every server since enrolment shipped has ignored
+    them, so a server before #165 enrols an agent that sends `protocol`. Each field is
+    optional, so the exchange can be made by hand (`-d '{}'`); a report field that is
+    sent is checked as check-in checks it and stored on the agent. `protocol` (#165) is
+    the agent's PROTOCOL_VERSION, absent or null meaning ENROL_PROTOCOL_ABSENT; it is
+    judged first (`enrol_protocol_refusal`) and is not stored. Adding it did not raise
+    PROTOCOL_VERSION: a protocol-2 agent that sends it and one that does not are
+    enrolled alike by every server, this one and the ones before it."""
 
+    protocol: StrictInt | None = None
     version: str | None = None
     hostname: str | None = None
     platform: str | None = None
