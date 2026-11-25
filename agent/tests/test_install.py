@@ -14,6 +14,7 @@ PR of #136 records."""
 
 import asyncio
 import os
+import shutil
 import stat
 import struct
 import subprocess
@@ -705,21 +706,22 @@ NOBODY = 65534
 
 
 @pytest.fixture
-def shared(tmp_path):
-    """A directory every user can enter, with a CA bundle in it, root's. pytest makes
-    its directories 0700: they are opened to others up to the system's temporary
-    directory."""
-    top = Path(tempfile.gettempdir()).resolve()
-    for directory in (tmp_path, *tmp_path.parents):
-        if directory.resolve() == top:
-            break
+def shared():
+    """A directory every user can enter, with a CA bundle in it, root's. Made directly
+    under the system's temporary directory and opened to others there, never by
+    changing the mode of a directory above it (pytest's own are 0700, and a
+    `--basetemp` could sit under `/root`); removed afterwards."""
+    directory = Path(tempfile.mkdtemp(dir=tempfile.gettempdir()))
+    try:
         directory.chmod(0o755)
-    for directory in (tmp_path, *tmp_path.parents):
-        assert os.stat(directory).st_mode & stat.S_IXOTH, "the test's directory must be reachable by others"
-    ca = tmp_path / "ca.pem"
-    ca.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
-    os.chown(ca, 0, 0)
-    return ca
+        for above in (directory, *directory.parents):
+            assert os.stat(above).st_mode & stat.S_IXOTH, "the system's temporary directory must be reachable by others"
+        ca = directory / "ca.pem"
+        ca.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
+        os.chown(ca, 0, 0)
+        yield ca
+    finally:
+        shutil.rmtree(directory)
 
 
 @as_root
