@@ -38,7 +38,7 @@ from app.services import enrolment
 from app.services.device_types import seed_defaults
 
 from conftest import ENROL_TOKEN, TOKEN
-from tlg_ipam_agent import enrol, install, reach, store
+from tlg_ipam_agent import config, enrol, install, reach, store
 from tlg_ipam_agent.client import Answer, Kind
 from tlg_ipam_agent.install import USERADD, Options, Paths
 
@@ -353,6 +353,10 @@ def test_install_refuses_before_it_changes_anything(root, host, message):
         (Options(url=URL, enrol_token=TOKEN), "--enrol-token takes - alone"),
         (Options(url=URL), "--enrol-token is needed"),
         (Options(url=URL, enrol_token="-", allowed_cidrs="10.0.0.1/8"), "--allowed-cidrs"),
+        (Options(url=URL, enrol_token="-", allowed_dns_servers="10.0.0.1/8"), "--allowed-dns-servers: item 1 of 1"),
+        (Options(url=URL, enrol_token="-", allowed_dns_servers="10.0.0.53 dns.home.arpa"), "--allowed-dns-servers: item 2 of 2"),
+        (Options(url=URL, enrol_token="-", allowed_dns_servers="fe80::53%eth0"), "names an IPv6 scope"),
+        (Options(url=URL, enrol_token="-", allowed_dns_servers=" , "), "--allowed-dns-servers is set but empty"),
         (Options(url=URL, enrol_token="-", max_pps="0"), "--max-pps"),
         (Options(url=URL, enrol_token="-", ca_file="relative.pem"), "--ca-file must be an absolute path"),
         (Options(url=URL, enrol_token="-", ca_file="/no/such/ca.pem"), "--ca-file: there is no file at the path given"),
@@ -465,7 +469,7 @@ def test_the_exchange_is_made_with_exactly_the_trust_the_unit_is_given(root, mon
     monkeypatch.setattr(install.enrol, "exchange", exchange)
     for ca in (str(bundle), None):
         install.exchange(URL, ENROL_TOKEN, ca)
-        env = install.render_env(URL, None, None, ca, "/var/lib/tlg-ipam-agent/token")
+        env = install.render_env(URL, None, None, None, ca, "/var/lib/tlg-ipam-agent/token")
         given = dict(line.split("=", 1) for line in env.splitlines() if line.startswith("SSL_"))
         assert seen[-1] == {name: given.get(name) for name in install.TRUST_VARIABLES}
 
@@ -557,6 +561,9 @@ def _misplaced(token):
         {"allowed_cidrs": token},
         {"allowed_cidrs": f"10.0.0.0/8,{token}"},
         {"allowed_cidrs": f"10.0.0.0/8 192.168.0.0/16 {token} 100.64.0.0/10"},
+        {"allowed_dns_servers": token},
+        {"allowed_dns_servers": f"10.0.0.53,{token}"},
+        {"allowed_dns_servers": f"fe80::53%{token}"},
         {"max_pps": token},
         {"ca_file": token},
         {"ca_file": f"/{token}"},
@@ -1025,6 +1032,137 @@ def test_an_install_without_an_enrolment_token_keeps_the_stored_one_and_updates_
     assert host.commands == SYSTEMD_START
     assert "MAX_PPS=20" in (root / "etc/tlg-ipam-agent/agent.env").read_text()
     assert (root / "var/lib/tlg-ipam-agent/token").read_bytes() == TOKEN.encode()
+
+
+def settings_of(root: Path) -> list[str]:
+    env = (root / "etc/tlg-ipam-agent/agent.env").read_text()
+    return [line for line in env.splitlines() if not line.startswith("#")]
+
+
+def test_allowed_dns_servers_is_written_as_the_agent_then_reads_it(root):
+    """#179: the option goes to agent.env, in one spelling, and the agent's own
+    `config.load`, given the environment the unit gives it, reads the same networks."""
+    given = "10.0.0.53 192.168.1.0/24,2001:db8::53"
+    code, said = run_install(root, FakeHost(), Options(url=URL, enrol_token="-", allowed_dns_servers=given))
+    assert code == 0, said
+    assert "ALLOWED_DNS_SERVERS=10.0.0.53/32,192.168.1.0/24,2001:db8::53/128" in settings_of(root)
+    unit = (root / "etc/systemd/system/tlg-ipam-agent.service").read_text()
+    settings = config.load({**unit_environment(unit, {}), "IPAM_AGENT_TOKEN": TOKEN})
+    assert settings.allowed_dns == config.parse_allowed_dns(given)
+    # left out of a first install, the agent asks any server, as before
+    shutil.rmtree(root / "etc/tlg-ipam-agent")
+    shutil.rmtree(root / "var/lib/tlg-ipam-agent")
+    code, said = run_install(root, FakeHost(user=True))
+    assert code == 0, said
+    assert not any(line.startswith("ALLOWED_DNS_SERVERS") for line in settings_of(root))
+
+
+def update(root, **options):
+    return run_install(
+        root, FakeHost(user=True), Options(url=URL, **options), exchange=lambda *a: pytest.fail("no exchange")
+    )
+
+
+def test_an_update_without_the_option_keeps_allowed_dns_servers_and_one_with_it_replaces_it(root):
+    """#179, acceptance 2. Unlike `--allowed-cidrs`, whose absence is the private ranges,
+    this setting's absence is any server, so an update run as the Agents page renders it
+    (no options) keeps what agent.env holds rather than widen it."""
+    code, said = run_install(
+        root, FakeHost(), Options(url=URL, enrol_token="-", allowed_cidrs="10.20.0.0/16", allowed_dns_servers="10.0.0.53")
+    )
+    assert code == 0, said
+    code, said = update(root, max_pps="20")
+    assert code == 0, said
+    assert settings_of(root) == ["IPAM_URL=" + URL, "ALLOWED_DNS_SERVERS=10.0.0.53/32", "MAX_PPS=20"]
+    assert any("kept the 1 network(s)" in line for line in said)
+    code, said = update(root, allowed_dns_servers="10.0.0.54,10.0.0.55")
+    assert code == 0, said
+    assert settings_of(root) == ["IPAM_URL=" + URL, "ALLOWED_DNS_SERVERS=10.0.0.54/32,10.0.0.55/32"]
+    assert not any("kept" in line for line in said)
+    # the way to remove it: delete the line, and the next update has none to keep
+    env = root / "etc/tlg-ipam-agent/agent.env"
+    env.write_text("".join(line for line in env.read_text().splitlines(True) if "ALLOWED_DNS" not in line))
+    code, said = update(root)
+    assert code == 0, said
+    assert settings_of(root) == ["IPAM_URL=" + URL]
+
+
+def test_an_update_keeps_a_line_added_by_hand_and_the_last_one_as_systemd_does(root):
+    """Before #179 the docs had nothing for agent.env, but a line added there by hand
+    is the same setting: kept, in the install's spelling, the last line deciding."""
+    run_install(root, FakeHost())
+    env = root / "etc/tlg-ipam-agent/agent.env"
+    env.write_text(env.read_text() + "; a comment naming ALLOWED_DNS_SERVERS\nALLOWED_DNS_SERVERS=10.0.0.1\nALLOWED_DNS_SERVERS=192.168.1.53,192.168.2.0/24\n")
+    code, said = update(root)
+    assert code == 0, said
+    assert settings_of(root)[-1] == "ALLOWED_DNS_SERVERS=192.168.1.53/32,192.168.2.0/24"
+
+
+@pytest.mark.parametrize(
+    "line, message",
+    [
+        ('ALLOWED_DNS_SERVERS="10.0.0.53"', "in a form install does not read back"),
+        ("ALLOWED_DNS_SERVERS = 10.0.0.53", "in a form install does not read back"),
+        (" ALLOWED_DNS_SERVERS=10.0.0.53", "in a form install does not read back"),
+        ("export ALLOWED_DNS_SERVERS=10.0.0.53", "in a form install does not read back"),
+        ("ALLOWED_DNS_SERVERS=10.0.0.53 10.0.0.54", "in a form install does not read back"),
+        ("ALLOWED_DNS_SERVERS=", "in a form install does not read back"),
+        ("MAX_PPS=20 \\", "in a form install does not read back"),
+        (f"ALLOWED_DNS_SERVERS=10.0.0.53,{ENROL_TOKEN}", "item 2 of 2 is not a network"),
+        (f"ALLOWED_DNS_SERVERS=fe80::53%{ENROL_TOKEN}", "in a form install does not read back"),  # `%` is not plain
+    ],
+)
+def test_an_update_refuses_a_value_it_cannot_keep_before_anything_changes(root, line, message):
+    """Refused, not guessed at nor dropped; the value is not repeated (#140). Giving the
+    option is the way past it, since then agent.env is not read."""
+    run_install(root, FakeHost())
+    env = root / "etc/tlg-ipam-agent/agent.env"
+    env.write_text(env.read_text() + line + "\n")
+    before = {p: (root / p).read_bytes() for p in tree(root) if (root / p).is_file()}
+    host = FakeHost(user=True)
+    code, said = run_install(root, host, Options(url=URL), exchange=lambda *a: pytest.fail("no exchange"))
+    assert code == 1 and message in said[-1] and "agent.env" in said[-1], said
+    assert ENROL_TOKEN[5:] not in "".join(said)
+    assert host.commands == [] and host.run_checks == []
+    assert {p: (root / p).read_bytes() for p in tree(root) if (root / p).is_file()} == before
+    code, said = update(root, allowed_dns_servers="10.0.0.53")
+    assert code == 0, said
+    assert settings_of(root)[-1] == "ALLOWED_DNS_SERVERS=10.0.0.53/32"
+
+
+@pytest.mark.parametrize("kind", ["link", "directory", "large", "not-ascii"])
+def test_an_agent_env_that_cannot_be_read_back_stops_an_update_without_the_option(root, kind):
+    run_install(root, FakeHost())
+    env = root / "etc/tlg-ipam-agent/agent.env"
+    if kind == "link":
+        (root / "elsewhere.env").write_bytes(env.read_bytes())
+        env.unlink()
+        env.symlink_to(root / "elsewhere.env")
+    elif kind == "directory":
+        env.unlink()
+        env.mkdir()
+    elif kind == "large":
+        env.write_text(env.read_text() + "#" * store.READ_MAX + "\n")
+    else:
+        env.write_bytes(env.read_bytes() + "# caf\u00e9\n".encode())
+    host = FakeHost(user=True)
+    code, said = run_install(root, host, Options(url=URL), exchange=lambda *a: pytest.fail("no exchange"))
+    assert code == 1 and "could not be kept; give --allowed-dns-servers" in said[-1], said
+    assert host.commands == []
+
+
+def test_settings_a_later_install_could_not_read_back_are_refused_before_anything_changes(root):
+    """agent.env is read back through `store.read_small`, so the install never writes
+    one past `store.READ_MAX`."""
+    many = " ".join(f"10.{i // 256}.{i % 256}.0/24" for i in range(400))
+    host = FakeHost()
+    before = tree(root)
+    code, said = run_install(root, host, Options(url=URL, enrol_token="-", allowed_cidrs=many))
+    assert code == 1 and f"longer than {store.READ_MAX} bytes" in said[-1], said
+    assert host.commands == [] and tree(root) == before
+    fits = " ".join(f"10.0.{i}.0/24" for i in range(150))
+    code, said = run_install(root, FakeHost(), Options(url=URL, enrol_token="-", allowed_dns_servers=fits))
+    assert code == 0, said
 
 
 def test_an_update_gives_the_stored_token_to_the_service_user_again(root, monkeypatch):

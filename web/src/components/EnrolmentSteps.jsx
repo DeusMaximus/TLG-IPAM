@@ -184,14 +184,11 @@ export default function EnrolmentSteps({ token, expires, serverVersion, location
                 above. It is never given as an argument, which other users of the host could read
                 and sudo would log. <code>install</code> makes the exchange itself, keeps the
                 agent&apos;s token for the service, and starts the <code>tlg-ipam-agent</code>{' '}
-                unit. Add <code>--allowed-cidrs …</code>, <code>--max-pps …</code> or{' '}
-                <code>--ca-file …</code> (a CA bundle for a server certificate from a private CA)
-                to the last command to set them. To limit the DNS servers its reverse lookups may
-                ask, set <code>ALLOWED_DNS_SERVERS</code> in a drop-in (
-                <code>sudo systemctl edit tlg-ipam-agent</code>), since <code>install</code>{' '}
-                rewrites its settings file each time it runs, then run{' '}
-                <code>sudo systemctl restart tlg-ipam-agent</code>: the agent reads it when it
-                starts, and logs the value it took.
+                unit. Add <code>--allowed-cidrs …</code> to narrow what it may scan,{' '}
+                <code>--allowed-dns-servers …</code> to limit the DNS servers its reverse lookups
+                may ask (default: any), <code>--max-pps …</code> or <code>--ca-file …</code> (a CA
+                bundle for a server certificate from a private CA) to the last command to set
+                them.
               </p>
             </>
           )

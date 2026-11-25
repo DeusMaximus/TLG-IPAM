@@ -39,10 +39,13 @@ a scope is never asked while the setting is set: `ipaddress` compares networks w
 the scope, but the query goes to the interface the scope names, so the list could not
 say which interface's link-local resolver it means. A link-local server written without
 a scope is compared by its address alone, and its query goes out on the link the host's
-routing picks. The agent reads the setting when it
-starts: after changing it (for the systemd unit, in a drop-in made with `systemctl edit
-tlg-ipam-agent`), restart the agent, and its start-up log line shows the value it
-took. A subnet's DNS servers are not checked against anything else, so this is what
+routing picks. For the systemd unit, `install
+--allowed-dns-servers …` sets it (#179), and an update run without the option keeps the
+value `agent.env` holds, since its absence would mean any server; delete the line there
+to remove it. A drop-in's `Environment=ALLOWED_DNS_SERVERS=…`, which these docs used to
+suggest, is overridden by `agent.env`'s once that sets one. The agent reads the setting
+when it starts: after changing it by hand, restart the agent, and its start-up log line
+shows the value it took. A subnet's DNS servers are not checked against anything else, so this is what
 stops a server that has been taken over from pointing the agent's queries at a
 resolver of its choosing.
 

@@ -28,7 +28,9 @@ is taken back.
 
 Run again without `--enrol-token`, `install` keeps the stored token and rewrites the
 settings and the unit (an update: install the new release into the same environment,
-then run it). With a token already stored, `--enrol-token` is refused: `uninstall`
+then run it). Every setting is the run's own options but `ALLOWED_DNS_SERVERS`, which a
+run without `--allowed-dns-servers` keeps as agent.env holds it (`kept_allowed_dns`,
+#179). With a token already stored, `--enrol-token` is refused: `uninstall`
 first, then enrol again.
 
 `uninstall` stops and disables the unit and removes everything `install` created: the
@@ -125,6 +127,8 @@ class Options:
     # as given: "-" for standard input, or None; any other value is refused
     enrol_token: str | None = None
     allowed_cidrs: str | None = None
+    # None keeps the value agent.env holds (`kept_allowed_dns`, #179)
+    allowed_dns_servers: str | None = None
     max_pps: str | None = None
     ca_file: str | None = None
 
@@ -400,7 +404,50 @@ def inherited_trust(environ, ca_file: str | None) -> str | None:
     return None
 
 
-def render_env(url: str, allowed, max_pps: int | None, ca_file: str | None, token_path: str) -> str:
+def kept_allowed_dns(env_path: str):
+    """The `ALLOWED_DNS_SERVERS` agent.env holds, for a run without
+    `--allowed-dns-servers` (#179), as `config.parse_allowed_dns` reads it: None when
+    there is no agent.env or it sets none.
+
+    Kept, unlike `--allowed-cidrs`, which a run without it drops back to the default:
+    that default is the private ranges, while this setting's absence is "any server",
+    so dropping it on an update copied from the Agents page would widen what the agent
+    may ask without a word. To remove it, delete its line from agent.env.
+
+    The file is read by `store.read_small`, as `install` wrote it: the last line that
+    sets the name decides, as in systemd. Any other line that names it (whitespace
+    around the name or the `=`, quotes, `export`, a value with a character `_plain`
+    refuses), a line continued with a backslash, or a file that cannot be read, is
+    refused rather than guessed at; giving the option skips the read. A bad item is
+    named by its place, never by its value (#140)."""
+    name = "ALLOWED_DNS_SERVERS"
+    where = f"the {name} in {env_path}"
+    try:
+        data = store.read_small(env_path)
+    except store.StoreError as exc:
+        raise InstallError(f"{exc}, so {where} could not be kept; give --allowed-dns-servers") from None
+    if data is None:
+        return None
+    try:
+        text = data.decode("ascii")
+    except UnicodeDecodeError:
+        raise InstallError(f"{env_path} is not ASCII, so {where} could not be kept; give --allowed-dns-servers") from None
+    value = None
+    for line in text.splitlines():
+        if line.lstrip().startswith(("#", ";")):
+            continue
+        key, _, rest = line.partition("=")
+        if key == name and _PLAIN.fullmatch(rest):
+            value = rest
+        elif name in line or line.endswith("\\"):
+            raise InstallError(
+                f"{env_path} sets {name} in a form install does not read back, so it could "
+                f"not be kept; give --allowed-dns-servers, or write the line as {name}=<networks>"
+            )
+    return None if value is None else config.parse_allowed_dns(value, where)
+
+
+def render_env(url: str, allowed, allowed_dns, max_pps: int | None, ca_file: str | None, token_path: str) -> str:
     lines = [
         "# Written by `tlg-ipam-agent install`; `tlg-ipam-agent uninstall` removes it.",
         f"# No secrets: the agent token is in {token_path}, which only the service user can read.",
@@ -408,6 +455,10 @@ def render_env(url: str, allowed, max_pps: int | None, ca_file: str | None, toke
     ]
     if allowed is not None:
         lines.append("ALLOWED_CIDRS=" + _plain(",".join(str(n) for n in allowed), "--allowed-cidrs"))
+    if allowed_dns is not None:
+        lines.append(
+            "ALLOWED_DNS_SERVERS=" + _plain(",".join(str(n) for n in allowed_dns), "--allowed-dns-servers")
+        )
     if max_pps is not None:
         lines.append(f"MAX_PPS={max_pps}")
     lines += [f"{name}={value}" for name, value in service_trust(ca_file).items()]
@@ -577,6 +628,12 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out, envir
     _preflight(host)
     url = config.parse_url(options.url, "--url")
     allowed = None if options.allowed_cidrs is None else config.parse_allowed(options.allowed_cidrs, "--allowed-cidrs")
+    if options.allowed_dns_servers is None:
+        allowed_dns = kept_allowed_dns(paths.env)
+        kept = allowed_dns is not None
+    else:
+        kept = False
+        allowed_dns = config.parse_allowed_dns(options.allowed_dns_servers, "--allowed-dns-servers")
     max_pps = None if options.max_pps is None else config.parse_max_pps(options.max_pps, "--max-pps")
     ca_file = _ca_file(options.ca_file)
     inherited = inherited_trust(environ, ca_file)
@@ -603,7 +660,13 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out, envir
     if token is not None:
         token = config.parse_token(token, "--enrol-token", config.ENROL_TOKEN_PREFIX)
         secret(token)
-    env = render_env(url, allowed, max_pps, ca_file, paths.token)
+    env = render_env(url, allowed, allowed_dns, max_pps, ca_file, paths.token)
+    if len(env) > store.READ_MAX:
+        # a later run reads it back (`kept_allowed_dns`), through `store.read_small`
+        raise InstallError(
+            f"the settings given would make {paths.env} longer than {store.READ_MAX} bytes, "
+            "which a later install could not read back; give shorter lists"
+        )
     unit = render_unit(paths.env, interpreter, ca_file)
 
     stored = enrol.stored_token(paths.state)
@@ -619,6 +682,11 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out, envir
             "(--enrol-token - reads it from standard input)"
         )
 
+    if kept:
+        out(
+            f"ALLOWED_DNS_SERVERS: kept the {len(allowed_dns)} network(s) {paths.env} holds "
+            "(--allowed-dns-servers replaces them)"
+        )
     undo: list[Callable[[], object]] = []
     try:
         user = host.service_user()
