@@ -130,6 +130,24 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           driver-opts: image=docker.io/moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
+      - name: The base image's pin, against its tag
+        run: |
+          # agent/Dockerfile names its base by digest (#94) and the image is built from
+          # that pin whatever the tag names now. A tag that has moved on is a warning,
+          # not a failure: it says the pin is stale, so the next release should move it
+          # (AGENTS.md, Commands, "The agent's base image"). It reads one shape, the one
+          # test_release.py holds the Dockerfile to: a line `FROM <name>:<tag>@<digest>`,
+          # upper case, one space, nothing after it.
+          base=$(sed -n 's/^FROM \([^ ]*\).*/\1/p' agent/Dockerfile)
+          tag=${base%@*}
+          pinned=${base#*@}
+          if ! current=$(docker buildx imagetools inspect "$tag" --format '{{.Manifest.Digest}}'); then
+            echo "::warning::could not read the digest $tag names now, so whether agent/Dockerfile's pin is current is not known"
+          elif [ "$current" != "$pinned" ]; then
+            echo "::warning::agent/Dockerfile builds from $tag@$pinned, and $tag is now $current: move the pin forward before the next release (AGENTS.md, Commands)"
+          else
+            echo "$tag still names $pinned"
+          fi
       - name: Image, for both platforms, as one OCI archive
         id: image
         env:
