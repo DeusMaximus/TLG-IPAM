@@ -822,6 +822,58 @@ async def test_what_the_responder_answers_decides_the_names_and_never_the_dead(o
             ANSWERS.pop(key, None)
 
 
+async def test_the_owner_is_told_how_many_replies_the_agents_limits_refused(owner):
+    """#164 through the real routes, the real resolver and a DNS responder on loopback.
+    A first scan stores three names. In the second, the one server answers one address
+    with a reply over the payload the query advertised, another with one whose header
+    claims a record over the budget, and the third with its name. The target's error
+    counts both refusals, with no reply text, name or address, as the agent sent it;
+    the two names stay, the third is replaced, and the scan is complete."""
+    from test_probe import ANSWERS, responder
+
+    from tlg_ipam_agent.probe import DnsResolver
+
+    live = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+    keys = {ip: f"{ip[-1]}.0.0.10.in-addr.arpa." for ip in live}
+    for ip in live:
+        ANSWERS[keys[ip]] = f"kept{ip[-1]}.home.arpa."
+    transport, dns_responder, port = await responder()
+    try:
+        agent_row, subnet, target = await setup(owner, cidr="10.0.0.0/29", dns_servers=["127.0.0.1"])
+        agent = make_agent(
+            agent_row["token"],
+            prober=FakeProber(alive=live),
+            resolver=DnsResolver(port=port),
+            interfaces=[{"name": "eth0", "cidr": "10.0.0.5/29", "mac": None}],
+        )
+        await agent.checkin_once()
+        await run_queued(agent)
+        stored = {ip: f"kept{ip[-1]}.home.arpa" for ip in live}
+        assert await _names(subnet) == stored
+
+        await _ok(await owner.post(f"/api/v1/subnets/{subnet['id']}/scan"), 202)
+        await past_the_checkin_gap(agent_row["id"])
+        ANSWERS[keys["10.0.0.3"]] = "new3.home.arpa."
+        dns_responder.by_name = {keys["10.0.0.1"]: "oversize", keys["10.0.0.2"]: "over-budget"}
+        await agent.checkin_once()
+        await run_queued(agent)
+
+        assert len(dns_responder.arrivals) == 3 + 3
+        assert await _names(subnet) == {**stored, "10.0.0.3": "new3.home.arpa"}
+        shown = await target_of(owner, target["id"])
+        assert shown["last_scan_complete"] is True
+        assert shown["last_scan_error"] == (
+            "rdns: no DNS server gave a usable answer for 2 of 3 addresses; their stored names "
+            "are kept; the agent refused a reply over 1232 bytes for 1, over 32 records or 1 "
+            "question for 1"
+        )
+        assert not any(text in shown["last_scan_error"] for text in ("10.0.0", "in-addr", "home.arpa", "127.0.0.1"))
+    finally:
+        transport.close()
+        for key in keys.values():
+            ANSWERS.pop(key, None)
+
+
 async def test_a_scan_whose_lookups_had_no_server_still_marks_the_departed_dead(owner, tmp_path):
     """#100: a scan with no DNS server to ask is incomplete and keeps every name (#78),
     and its liveness sweep, which completed, still marks the address that left dead."""

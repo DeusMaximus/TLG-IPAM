@@ -14,7 +14,9 @@ lets the server mark the silent addresses dead, whatever the PTR lookups did (#1
 A PTR lookup with no server to ask, or whose every attempt failed before its query went
 out, did not run; one the deadline stops before its first attempt is the timeout. Each
 record says what its own lookup found: a name, `rdns_no_name` when a server answered
-that there is none, or neither, and only `rdns_no_name` clears a stored name.
+that there is none, or neither, and only `rdns_no_name` clears a stored name. The
+lookups that got no usable answer are counted in the job's error, and of them those
+that met a reply the agent refused unread, for its size or its header's counts (#164).
 """
 
 import asyncio
@@ -25,7 +27,19 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from . import arp
-from .probe import NO_DNS_SERVER, NO_NAME, ArpLink, ArpSession, ProbeError, Prober, Resolver
+from .probe import (
+    DNS_PAYLOAD,
+    DNS_QUESTIONS_MAX,
+    DNS_RECORDS_MAX,
+    NO_DNS_SERVER,
+    NO_NAME,
+    ArpLink,
+    ArpSession,
+    ProbeError,
+    Prober,
+    Resolver,
+    UnreadReplies,
+)
 from .protocol import (
     LIVENESS,
     PROTOCOL_VERSION,
@@ -327,13 +341,29 @@ async def _arp_sweep(
         await asyncio.gather(listener, return_exceptions=True)
 
 
-def no_answer(unanswered: int, asked: int) -> str:
+def no_answer(unanswered: int, asked: int, too_large: int = 0, too_many_records: int = 0) -> str:
     """The error of a job some of whose PTR lookups no DNS server gave a usable answer
-    to: counts only, since the server keeps those addresses' stored names (spec §5.2)."""
-    return (
+    to: counts only, since the server keeps those addresses' stored names (spec §5.2).
+
+    Of those lookups, `too_large` met a reply from a server longer than DNS_PAYLOAD
+    and `too_many_records` one whose header claimed more than DNS_RECORDS_MAX records
+    or DNS_QUESTIONS_MAX question, each refused unread (`probe.UnreadReplies`, #164).
+    One lookup can be in both counts, when its servers sent one of each. When neither
+    happened the text is what it was before #164, word for word; otherwise both counts
+    follow it, so the owner can tell the agent's own limits from a server that did
+    not answer. Counts and fixed words only: nothing of a reply, a name, an address or
+    a server. Its longest, with every other error a job can carry, fits the server's
+    SCAN_ERROR_MAX (`test_scan.py`'s `test_the_longest_error_a_job_can_carry_is_stored_whole`)."""
+    text = (
         f"rdns: no DNS server gave a usable answer for {unanswered} of {asked} "
         "addresses; their stored names are kept"
     )
+    if too_large or too_many_records:
+        text += (
+            f"; the agent refused a reply over {DNS_PAYLOAD} bytes for {too_large}, over "
+            f"{DNS_RECORDS_MAX} records or {DNS_QUESTIONS_MAX} question for {too_many_records}"
+        )
+    return text
 
 
 def refusal(ref: JobRef, reason: str, clock: Clock) -> dict:
@@ -444,6 +474,10 @@ async def run(
     # the addresses a server answered have no name, and those no server answered
     no_name: set[Address] = set()
     unanswered: set[Address] = set()
+    # of those, the ones a server sent a reply the agent refused unread: for its size,
+    # for its header's counts (a lookup a later server answered is in neither)
+    too_large: set[Address] = set()
+    too_many_records: set[Address] = set()
     looked_up = 0  # lookups that returned, whatever they found
     servers: tuple[str, ...] = ()
     if "rdns" in job.methods and alive and not timed_out:
@@ -488,9 +522,14 @@ async def run(
             looked_up += 1
             if answer is NO_NAME:
                 no_name.add(address)
-            elif answer is None:
+            elif answer is None or isinstance(answer, UnreadReplies):
                 # no usable answer, or none in time: says nothing about a name
                 unanswered.add(address)
+                if isinstance(answer, UnreadReplies):
+                    if answer.too_large:
+                        too_large.add(address)
+                    if answer.too_many_records:
+                        too_many_records.add(address)
             else:
                 # a name that is not a hostname is dropped, and is not "no name": the
                 # record carries neither, so the stored name stays
@@ -513,7 +552,7 @@ async def run(
             errors.append(str(exc))
         # a lookup the deadline cut off is in the timeout's error, not counted here
         if unanswered and not timed_out:
-            errors.append(no_answer(len(unanswered), looked_up))
+            errors.append(no_answer(len(unanswered), looked_up, len(too_large), len(too_many_records)))
     if timed_out:
         complete = False
 

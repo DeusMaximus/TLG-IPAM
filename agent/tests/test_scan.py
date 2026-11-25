@@ -1,15 +1,26 @@
 """One job's sweep: pacing, the timeout, PTR lookups (spec §5.2, §5.6)."""
 
 import asyncio
+import builtins
 import ipaddress
 
+import icmplib
 import pytest
+from app import agent_protocol as server
 
 from conftest import ETH0, FakeArp, FakeClock, FakeProber, FakeResolver, job
-from tlg_ipam_agent import guard, scan
+from tlg_ipam_agent import guard, probe, scan
 from tlg_ipam_agent.config import parse_allowed
-from tlg_ipam_agent.probe import NO_DNS_SERVER, ProbeError, no_query_sent
-from tlg_ipam_agent.protocol import PROTOCOL_VERSION, job_ref, parse_job
+from tlg_ipam_agent.probe import NO_DNS_SERVER, IcmpProber, ProbeError, UnreadReplies, no_query_sent
+from tlg_ipam_agent.protocol import (
+    INTERFACE_NAME_MAX,
+    JOB_TIMEOUT_S,
+    OBSERVATIONS_MAX,
+    PROTOCOL_VERSION,
+    SCAN_ERROR_MAX,
+    job_ref,
+    parse_job,
+)
 
 
 def planned(**overrides):
@@ -476,3 +487,261 @@ async def test_the_fake_resolver_keeps_the_real_ones_rules():
         await fake.ptr(ipaddress.ip_address("10.0.0.9"), (), slot)
     assert str(raised.value) == NO_DNS_SERVER
     assert taken == []
+
+
+# --- the job's error counts the replies the agent refused unread (#164) ---
+
+
+TOO_LARGE = UnreadReplies(too_large=True, too_many_records=False)
+TOO_MANY = UnreadReplies(too_large=False, too_many_records=True)
+BOTH = UnreadReplies(too_large=True, too_many_records=True)
+
+
+async def test_a_job_says_how_many_lookups_met_a_reply_refused_for_size_and_for_its_counts():
+    """Acceptance 1: one lookup's only reply was over the size limit, another's over
+    the record budget, a third had no usable answer for another reason and a fourth
+    was answered. The error counts the three without a usable answer, then the two
+    refusals, by count only, and the scan stays complete; the records are what they
+    were, so the server keeps those addresses' names."""
+    live = ["10.0.0.3", "10.0.0.4", "10.0.0.6", "10.0.0.7"]
+    prober = FakeProber(alive=live)
+    resolver = FakeResolver(
+        {"10.0.0.7": "seven.home.arpa"},
+        unanswered=["10.0.0.6"],
+        unread={"10.0.0.3": TOO_LARGE, "10.0.0.4": TOO_MANY},
+    )
+    parsed, addresses = planned()
+    result = await sweep(parsed, addresses, prober=prober, resolver=resolver)
+    assert result["error"] == (
+        "rdns: no DNS server gave a usable answer for 3 of 4 addresses; their stored names "
+        "are kept; the agent refused a reply over 1232 bytes for 1, over 32 records or 1 "
+        "question for 1"
+    )
+    assert result["error"] == scan.no_answer(3, 4, 1, 1)
+    assert "10.0." not in result["error"] and "home.arpa" not in result["error"]
+    assert result["observations"] == [
+        {"ip": "10.0.0.3"}, {"ip": "10.0.0.4"}, {"ip": "10.0.0.6"},
+        {"ip": "10.0.0.7", "rdns_name": "seven.home.arpa"},
+    ]
+    assert result["complete"] is True and result["liveness_complete"] is True
+
+
+async def test_a_lookup_whose_servers_sent_one_refusal_of_each_is_in_both_counts():
+    live = ["10.0.0.3", "10.0.0.4"]
+    resolver = FakeResolver(unread={"10.0.0.3": BOTH, "10.0.0.4": TOO_MANY})
+    parsed, addresses = planned()
+    result = await sweep(parsed, addresses, prober=FakeProber(alive=live), resolver=resolver)
+    assert result["error"] == scan.no_answer(2, 2, 1, 2)
+    assert result["error"].endswith("over 1232 bytes for 1, over 32 records or 1 question for 2")
+
+
+@pytest.mark.parametrize("unanswered, asked", [(1, 1), (2, 4), (4096, 4096)])
+def test_with_no_refused_reply_the_error_is_what_it_was(unanswered, asked):
+    """Acceptance 2: the text before #164, word for word, from the counts alone and
+    with both refusal counts zero."""
+    before = (
+        f"rdns: no DNS server gave a usable answer for {unanswered} of {asked} addresses; "
+        "their stored names are kept"
+    )
+    assert scan.no_answer(unanswered, asked) == before
+    assert scan.no_answer(unanswered, asked, 0, 0) == before
+
+
+async def test_a_job_with_no_refused_reply_reports_what_it_did():
+    """Acceptance 2, through a job: lookups without a usable answer that met no
+    refused reply give the text before #164; a job whose every lookup was answered
+    has no error, whatever a server's reply before the answer was (the resolver returns
+    the answer, `test_probe.py`'s `test_a_refused_reply_a_later_server_answered_past_is_not_reported`)."""
+    parsed, addresses = planned()
+    result = await sweep(
+        parsed, addresses, prober=FakeProber(alive=["10.0.0.3", "10.0.0.4"]),
+        resolver=FakeResolver(unanswered=["10.0.0.3"]),
+    )
+    assert result["error"] == "rdns: no DNS server gave a usable answer for 1 of 2 addresses; their stored names are kept"
+    result = await sweep(parsed, addresses, prober=FakeProber(alive=["10.0.0.3"]), resolver=FakeResolver())
+    assert result["error"] is None and result["complete"] is True
+
+
+async def test_a_lookup_the_deadline_cut_off_is_not_counted_as_refused():
+    """A job whose lookups the deadline cut short reports the timeout alone, as before:
+    no count of lookups without a usable answer, so none of refusals either."""
+    clock = FakeClock()
+    live = [f"10.0.0.{i}" for i in range(1, 41)]
+    resolver = FakeResolver(unread={a: BOTH for a in live}, clock=clock, delay=1.0)
+    parsed, addresses = planned(ranges=[{"start": "10.0.0.1", "end": "10.0.0.40"}], timeout_s=2)
+    result = await sweep(parsed, addresses, prober=FakeProber(alive=live, clock=clock), resolver=resolver, clock=clock)
+    assert result["error"] == "timed out after 2 s during the PTR lookups"
+    assert result["complete"] is False
+
+
+async def test_refusals_are_counted_beside_a_lookup_that_could_send_nothing():
+    """A lookup that sent its query to no server stops the lookups; those that had
+    ended before it are still counted, refusals included, after its error."""
+    live = ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"]
+
+    class Resolver(FakeResolver):
+        async def ptr(self, address, servers, slot):
+            if address == ipaddress.ip_address("10.0.0.4"):
+                for _ in range(20):
+                    await asyncio.sleep(0)  # the lookups before it end first
+                raise ProbeError(no_query_sent("OSError"))
+            return await super().ptr(address, servers, slot)
+
+    resolver = Resolver(unread={"10.0.0.1": TOO_LARGE, "10.0.0.2": TOO_MANY}, unanswered=["10.0.0.3"])
+    parsed, addresses = planned()
+    result = await sweep(parsed, addresses, prober=FakeProber(alive=live), resolver=resolver)
+    assert result["error"] == f"{no_query_sent('OSError')}; {scan.no_answer(3, 3, 1, 1)}"
+    assert result["complete"] is False
+
+
+# the longest name an exception type has that the agent names in an error: the
+# builtin OSError and ValueError subclasses (what a socket, the kernel and ipaddress
+# raise), and icmplib's socket errors
+LONGEST_EXCEPTION = max(
+    [c for c in vars(builtins).values() if isinstance(c, type) and issubclass(c, (OSError, ValueError))]
+    + [icmplib.SocketPermissionError, icmplib.SocketUnavailableError, ipaddress.AddressValueError],
+    key=lambda c: len(c.__name__),
+)
+LONGEST_INTERFACE = "x" * INTERFACE_NAME_MAX
+# the longest spelling of a network str() gives, and one of OBSERVATIONS_MAX addresses
+LONGEST_NETWORK = "ffff:ffff:ffff:ffff:ffff:ffff:ffff:f000/116"
+
+
+async def icmp_errors(monkeypatch) -> list[str]:
+    """Every error the ICMP sweep can add, at its longest."""
+    texts = []
+    for error in (icmplib.SocketPermissionError(False), icmplib.SocketUnavailableError()):
+        async def refused(*args, error=error, **kwargs):
+            raise error
+
+        monkeypatch.setattr(icmplib, "async_ping", refused)
+        with pytest.raises(ProbeError) as raised:
+            await IcmpProber().ping(ipaddress.ip_address("127.0.0.1"), 0.1)
+        texts.append(str(raised.value))
+    return texts + [f"timed out after {JOB_TIMEOUT_S} s during the ICMP sweep"]
+
+
+async def arp_errors(monkeypatch) -> list[str]:
+    """Every error the ARP sweep can add, at its longest: each failure of `PacketLink`,
+    made by a stand-in for its socket (none is opened), with the longest interface
+    name and exception name, then the sweep's own two."""
+    texts = []
+
+    def failing(error):
+        def make(*args):
+            raise error
+        return make
+
+    class Socket:
+        def __init__(self, bind=None, send=None):
+            self._bind, self._send = bind, send
+
+        def setblocking(self, flag):
+            pass
+
+        def bind(self, address):
+            if self._bind:
+                raise self._bind
+
+        def send(self, frame):
+            raise self._send
+
+        def close(self):
+            pass
+
+    # not every platform names it (macOS does not); the stand-in takes any value
+    monkeypatch.setattr(probe.socket, "AF_PACKET", 17, raising=False)
+    for make in (
+        failing(PermissionError()),
+        failing(LONGEST_EXCEPTION()),
+        lambda *args: Socket(bind=LONGEST_EXCEPTION()),
+    ):
+        monkeypatch.setattr(probe.socket, "socket", make)
+        with pytest.raises(ProbeError) as raised:
+            probe.PacketLink(LONGEST_INTERFACE)
+        texts.append(str(raised.value))
+    for error in (BlockingIOError(), LONGEST_EXCEPTION()):
+        monkeypatch.setattr(probe.socket, "socket", lambda *args, error=error: Socket(send=error))
+        with pytest.raises(ProbeError) as raised:
+            await probe.PacketLink(LONGEST_INTERFACE).send(b"")
+        texts.append(str(raised.value))
+    monkeypatch.setattr(probe.socket, "socket", lambda *args: Socket())
+    link = probe.PacketLink(LONGEST_INTERFACE)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "sock_recvfrom", failing(LONGEST_EXCEPTION()))
+    with pytest.raises(ProbeError) as raised:
+        await link.receive()
+    texts.append(str(raised.value))
+    monkeypatch.undo()
+    return texts + [
+        f"arp not run: no interface of this host with a MAC is on {LONGEST_NETWORK}",
+        f"timed out after {JOB_TIMEOUT_S} s during the ARP sweep",
+    ]
+
+
+async def test_the_longest_error_a_job_can_carry_is_stored_whole(monkeypatch):
+    """Acceptance 3. A job's error joins at most one text from each of its steps, in
+    order (`scan.run`): the methods this release does not run (`fdns`, the one); the
+    ICMP sweep's failure or its timeout; the ARP sweep's failure, its not running or
+    its timeout; and the PTR lookups' timeout, `NO_DNS_SERVER`, or a lookup that could
+    send nothing followed by the count of lookups without a usable answer, now with
+    its refusal counts. A timeout ends the job's later steps, and a count follows only
+    lookups the deadline did not cut short, so the longest error takes the longest
+    failure of each step that leaves the next to run. This test finds each step's
+    longest text (an exception named by its longest name, an interface by the longest
+    the agent reports, the network by the longest spelling, every count with as many
+    digits as OBSERVATIONS_MAX), then runs a job that carries all of them at once and
+    holds what it reports to the server's rule: within SCAN_ERROR_MAX, and stored as
+    sent."""
+    icmp, arp = await icmp_errors(monkeypatch), await arp_errors(monkeypatch)
+    longest_icmp, longest_arp = max(icmp, key=len), max(arp, key=len)
+    assert longest_icmp.startswith("ICMP needs CAP_NET_RAW") and longest_arp.startswith("arp not run")
+    digits = str(OBSERVATIONS_MAX)
+    lookups = f"{no_query_sent(LONGEST_EXCEPTION.__name__)}; {scan.no_answer(*[int(digits)] * 4)}"
+    assert len(lookups) > max(len(NO_DNS_SERVER), len(f"timed out after {JOB_TIMEOUT_S} s during the PTR lookups"))
+
+    raw = job(
+        cidr=LONGEST_NETWORK,
+        ranges=[{"start": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:f000", "end": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"}],
+        methods=["icmp", "arp", "rdns", "fdns"],
+        dns_servers=["127.0.0.1"],
+        timeout_s=JOB_TIMEOUT_S,
+    )
+    parsed = parse_job(job_ref(raw), raw)
+    addresses = guard.plan(parsed, parse_allowed(LONGEST_NETWORK))
+    assert len(addresses) == OBSERVATIONS_MAX and str(parsed.network) == LONGEST_NETWORK
+    last = addresses[-1]
+
+    class Prober(FakeProber):
+        async def ping(self, address, timeout):
+            if address == last:
+                raise ProbeError(longest_icmp)
+            return True
+
+    class Resolver(FakeResolver):
+        async def ptr(self, address, servers, slot):
+            await slot()
+            if address == addresses[-2]:
+                for _ in range(100):
+                    await asyncio.sleep(0)  # every lookup before it ends first
+                raise ProbeError(no_query_sent(LONGEST_EXCEPTION.__name__))
+            return BOTH
+
+    clock = FakeClock()
+    result = await sweep(
+        parsed, addresses, prober=Prober(), resolver=Resolver(), arp=FakeArp(), interfaces=(),
+        clock=clock, max_pps=1000,
+    )
+    error = result["error"]
+    counted = OBSERVATIONS_MAX - 2  # the address ICMP failed on is not alive; one lookup failed
+    assert len(str(counted)) == len(digits)
+    assert error == "; ".join([
+        "not run by this agent release: fdns",
+        longest_icmp,
+        longest_arp,
+        no_query_sent(LONGEST_EXCEPTION.__name__),
+        scan.no_answer(counted, counted, counted, counted),
+    ])
+    assert len(error) == len("; ".join(["not run by this agent release: fdns", longest_icmp, longest_arp, lookups]))
+    assert len(error) <= server.SCAN_ERROR_MAX == SCAN_ERROR_MAX
+    assert server.scan_error(error) == error

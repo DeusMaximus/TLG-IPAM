@@ -20,7 +20,7 @@ import os
 import socket
 import stat
 import threading
-from typing import Protocol
+from typing import NamedTuple, Protocol
 from collections.abc import Awaitable, Callable
 
 import dns.asyncquery
@@ -67,13 +67,38 @@ class NoName:
 NO_NAME = NoName()
 
 
+class UnreadReplies(NamedTuple):
+    """What `ptr` may return in place of None for a lookup no server gave a usable
+    answer to, when at least one of its attempts ended with a reply from the query's
+    own server that the agent refused unread (#164): `too_large` for one longer than
+    DNS_PAYLOAD (ReplyTooLarge), `too_many_records` for one whose header claims more
+    than a PTR answer needs (ReplyTooManyRecords), both when its attempts met both.
+    It is no usable answer, as None is, and the stored name stays: it only says which
+    of the agent's own limits refused a reply, so that the job's error can count them
+    (`scan.no_answer`). It holds nothing of the reply, its sender or the address. A
+    lookup a later server answered returns that answer, whatever an earlier server
+    sent."""
+
+    too_large: bool
+    too_many_records: bool
+
+
+def no_usable_answer(too_large: bool, too_many_records: bool) -> UnreadReplies | None:
+    """What `ptr` returns for a lookup no server gave a usable answer to: UnreadReplies
+    when any attempt's reply was refused unread, None otherwise."""
+    if too_large or too_many_records:
+        return UnreadReplies(too_large, too_many_records)
+    return None
+
+
 class Resolver(Protocol):
     # the servers one job's lookups ask, chosen once as the job's lookups start
     async def servers(self, job_servers: tuple[str, ...]) -> tuple[str, ...]: ...
-    # the name, NO_NAME when a server said there is none, or None when no server gave
-    # a usable answer; raises ProbeError when no query of the lookup could be sent:
-    # that is no lookup
-    async def ptr(self, address: Address, servers: tuple[str, ...], slot: Slot) -> str | NoName | None: ...
+    # the name, NO_NAME when a server said there is none, or, when no server gave a
+    # usable answer, None, or UnreadReplies when a server's reply was refused unread
+    # for the agent's own limits; raises ProbeError when no query of the lookup could
+    # be sent: that is no lookup
+    async def ptr(self, address: Address, servers: tuple[str, ...], slot: Slot) -> str | NoName | UnreadReplies | None: ...
 
 
 class IcmpProber:
@@ -564,7 +589,11 @@ class DnsResolver:
     None, so the scan reports itself incomplete and the server keeps the names it has
     (spec §5.7). Nor is a lookup that got no usable answer one that found no name:
     `ptr` returns NO_NAME only for a server's answer that there is none, and None for
-    the rest, and only the first lets the server clear a stored name (#100)."""
+    the rest, and only the first lets the server clear a stored name (#100). Of the
+    rest, a lookup one of whose attempts met a reply refused unread (ReplyTooLarge,
+    ReplyTooManyRecords) is UnreadReplies instead of None, saying which, so the job's
+    error can say the agent's own limit refused a server's reply (#164); it clears no
+    name either."""
 
     def __init__(
         self,
@@ -630,7 +659,7 @@ class DnsResolver:
         except TimeoutError:
             return ()
 
-    async def ptr(self, address: Address, servers: tuple[str, ...], slot: Slot) -> str | NoName | None:
+    async def ptr(self, address: Address, servers: tuple[str, ...], slot: Slot) -> str | NoName | UnreadReplies | None:
         """The PTR name of `address`, or NO_NAME when a server says there is none
         (NXDOMAIN, or NOERROR without a PTR record that `says_no_name`), as one reply
         is read by `read_reply`, or None when
@@ -640,13 +669,19 @@ class DnsResolver:
         truncated, malformed or mismatched reply, a reply longer than DNS_PAYLOAD or one
         claiming more questions or records than a PTR answer needs, neither of which is
         parsed), or when the lookup's time ran out after a query was sent (or before its first attempt, which only
-        the job's deadline does). Raises ProbeError when there is no server to ask, or
+        the job's deadline does). In place of None it returns UnreadReplies when any of
+        those attempts ended with a reply refused unread for its size or its header's
+        counts (`no_usable_answer`). Raises ProbeError when there is no server to ask, or
         when no query was sent before the servers or the lookup's time ran out."""
         if not servers:
             raise ProbeError(NO_DNS_SERVER)
         name = dns.reversename.from_address(str(address))
         asked = False
         unsent: str | None = None
+        # whether an attempt ended with a reply from its server refused unread: only
+        # the query's own server can end an attempt so (QuerySocket), so a datagram
+        # from anywhere else is never counted here
+        too_large = too_many_records = False
         for server in servers[:MAX_DNS_SERVERS]:
             # the query's socket is made before its slot is taken, so the query is
             # handed to the kernel in the step its slot is granted (QuerySocket). An
@@ -668,7 +703,7 @@ class DnsResolver:
                     # slot, capped by the deadline), and the scan reports that cut-off
                     if not asked and unsent is not None:
                         raise ProbeError(no_query_sent(unsent))
-                    return None
+                    return no_usable_answer(too_large, too_many_records)
                 # A fresh query, so a fresh id, for every datagram. It carries EDNS(0)
                 # advertising a DNS_PAYLOAD (1232-byte) UDP payload, so a resolver can
                 # send a PTR answer whole instead of truncating it (a truncated reply
@@ -699,12 +734,16 @@ class DnsResolver:
                         # dnspython's default, stated: trailing bytes make a reply bad
                         ignore_trailing=False,
                     )
-                except (dns.exception.DNSException, TimeoutError):
+                except (dns.exception.DNSException, TimeoutError) as exc:
                     # no answer in time, a truncated, broken or over-size one
                     # (ReplyTooLarge), or one claiming too many records
                     # (ReplyTooManyRecords): the query was sent, and the next server
-                    # is asked. (TimeoutError is an OSError: caught first.)
+                    # is asked. (TimeoutError is an OSError: caught first.) The two
+                    # refusals are remembered for the job's error, should no later
+                    # server answer
                     asked = True
+                    too_large = too_large or isinstance(exc, ReplyTooLarge)
+                    too_many_records = too_many_records or isinstance(exc, ReplyTooManyRecords)
                     continue
                 except (OSError, ValueError) as exc:
                     # the query was not sent: the kernel refused it (no route, a port
@@ -726,4 +765,4 @@ class DnsResolver:
         if not asked:
             # every server was tried, and none could be sent the query
             raise ProbeError(no_query_sent(unsent or "unknown"))
-        return None
+        return no_usable_answer(too_large, too_many_records)
