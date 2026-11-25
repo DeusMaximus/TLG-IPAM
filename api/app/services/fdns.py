@@ -15,9 +15,12 @@ subnet with more is covered over several jobs, whether or not the names asked we
 answered (Codex on #185).
 
 **What ingest keeps** (`store`). An answer is stored only for a host the job was sent
-(the target's `job_fdns`, kept with the lease), under the name that was sent, and only
-while the host is still in the subnet and in its scan scope, as ingest reads them under
-the write lock. An entry whose addresses are not all IPv4 addresses is not stored; a
+(the target's `job_fdns`, kept with the lease with the host's address then), under the
+name that was sent, and only while the host is still in the subnet, at that same
+address and in its scan scope, as ingest reads them under the write lock: a host
+whose address was edited while the job ran gets none (round 1 of #185's briefed
+review, finding 1). An edit of a host's address deletes its row
+(`hosts.update_host`), since the answer was judged against the old one. An entry whose addresses are not all IPv4 addresses is not stored; a
 second entry for one host is ignored. An empty list is a name a DNS server answered
 does not resolve. A name with no entry got no usable answer, and its stored answer
 stays. Every name the job sent whose host is still there and in scope has its
@@ -81,9 +84,10 @@ def sendable_fqdn(
 
 async def names_for_job(
     session: AsyncSession, subnet: Subnet, scope: list[tuple[int, int]]
-) -> list[tuple[str, str]]:
-    """The `(host_id, fqdn)` pairs a job for `subnet` sends, at most FDNS_JOB_MAX, in
-    address order. `scope` is the subnet's scan scope as the caller read it for the
+) -> list[tuple[str, str, int]]:
+    """The `(host_id, fqdn, ip_int)` of each host a job for `subnet` names, at most
+    FDNS_JOB_MAX, in address order: the job sends the first two, and the lease keeps all
+    three, so ingest can tell a host whose address changed since. `scope` is the subnet's scan scope as the caller read it for the
     job's ranges. One statement: the subnet's hosts with the time each was last asked
     (`asked_at`), never-asked first, then oldest. Asked, not answered: a name that
     never gets a usable answer must not hold its place ahead of the rest."""
@@ -105,7 +109,7 @@ async def names_for_job(
         candidates.append((asked is not None, asked or _NEVER, row.ip_int, row.id, fqdn))
     candidates.sort()
     chosen = sorted(candidates[:FDNS_JOB_MAX], key=lambda c: c[2])
-    return [(host_id, fqdn) for _, _, _, host_id, fqdn in chosen]
+    return [(host_id, fqdn, ip_int) for _, _, ip_int, host_id, fqdn in chosen]
 
 
 def _addresses(answer: FdnsAnswer) -> list[str] | None:
@@ -135,10 +139,11 @@ async def store(
     the rows of hosts that no longer exist.
     The caller holds the write lock, and `scope` is the subnet's scope read under it.
     Does not commit."""
-    names = {}
-    for pair in sent or []:
-        if isinstance(pair, list) and len(pair) == 2:
-            names[pair[0]] = pair[1]
+    # host id -> (the name sent, the host's address when it was sent)
+    names: dict[str, tuple[str, int]] = {}
+    for entry in sent or []:
+        if isinstance(entry, list) and len(entry) == 3:
+            names[entry[0]] = (entry[1], entry[2])
     kept: dict[str, list[str] | None] = {}
     for answer in answers:
         if answer.host_id not in names or answer.host_id in kept:
@@ -159,10 +164,14 @@ async def store(
             select(Host.id, Host.subnet_id, Host.ip_int).where(Host.id.in_(batch))
         )
         present.update(
-            r.id for r in rows.all() if r.subnet_id == subnet_id and in_scope(scope, r.ip_int)
+            r.id
+            for r in rows.all()
+            if r.subnet_id == subnet_id
+            and r.ip_int == names[r.id][1]
+            and in_scope(scope, r.ip_int)
         )
     answered = [
-        {"host_id": h, "fqdn": names[h], "addresses": kept[h], "checked_at": now, "asked_at": now}
+        {"host_id": h, "fqdn": names[h][0], "addresses": kept[h], "checked_at": now, "asked_at": now}
         for h in wanted
         if h in present and kept.get(h) is not None
     ]

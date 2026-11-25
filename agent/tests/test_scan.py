@@ -13,7 +13,7 @@ from tlg_ipam_agent import guard, probe, protocol, scan
 from tlg_ipam_agent.config import parse_allowed, parse_allowed_dns
 from tlg_ipam_agent.probe import NO_DNS_SERVER, IcmpProber, ProbeError, UnreadReplies, no_query_sent
 from tlg_ipam_agent.protocol import (
-    FDNS_MAX,
+    FDNS_JOB_MAX,
     INTERFACE_NAME_MAX,
     JOB_TIMEOUT_S,
     OBSERVATIONS_MAX,
@@ -910,7 +910,7 @@ async def longest_job(
     `narrowed`, two of the job's three DNS servers are outside ALLOWED_DNS_SERVERS
     (#93), the longest form of that notice.
 
-    `fdns` (#20) gives the job FDNS_MAX names to resolve as well, which ends one of
+    `fdns` (#20) gives the job FDNS_JOB_MAX names to resolve as well, the most it takes, which ends one of
     three ways: `after_rdns`, the PTR lookups stop as above and the forward lookups are
     not run; `stopped`, the PTR lookups all end, each with a reply of each limit
     refused, and the forward lookups end in one that could send nothing, every other
@@ -920,7 +920,7 @@ async def longest_job(
     longest_icmp, longest_arp = max(icmp, key=len), max(arp, key=len)
     assert longest_icmp.startswith("ICMP needs CAP_NET_RAW") and longest_arp.startswith("arp not run")
     names = (
-        [{"host_id": f"{i:036d}", "fqdn": f"h{i}.home.arpa"} for i in range(FDNS_MAX)] if fdns else []
+        [{"host_id": f"{i:036d}", "fqdn": f"h{i}.home.arpa"} for i in range(FDNS_JOB_MAX)] if fdns else []
     )
     raw = job(
         cidr=LONGEST_NETWORK,
@@ -994,7 +994,7 @@ async def longest_job(
     if fdns == "after_rdns" and not cut_off:
         assert resolver.resolved == []
         lookups.append(scan.FDNS_AFTER_RDNS_STOPPED)
-    resolved = FDNS_MAX - 1
+    resolved = FDNS_JOB_MAX - 1  # four digits, as the PTR lookups' counts
     if fdns == "stopped":
         lookups += [no_query_sent(exception_name, "fdns"), scan.fdns_no_answer(resolved, resolved, resolved, resolved)]
     elif fdns == "cut_off":
@@ -1045,7 +1045,7 @@ async def test_the_longest_error_with_forward_lookups_gives_up_their_counts_firs
     given up and the PTR lookups' kept."""
     result, parts, counted = await longest_job(monkeypatch, LONGEST_EXCEPTION.__name__, fdns="stopped")
     assert len("; ".join(parts)) > SCAN_ERROR_MAX
-    resolved = FDNS_MAX - 1
+    resolved = FDNS_JOB_MAX - 1  # four digits, as the PTR lookups' counts
     kept = parts[:2] + [scan.no_answer(counted, counted), parts[3], scan.fdns_no_answer(resolved, resolved)]
     error = result["error"]
     assert error == "; ".join(kept)

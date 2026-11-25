@@ -18,7 +18,7 @@ from test_scan import planned, sweep
 from tlg_ipam_agent import probe, scan
 from tlg_ipam_agent.config import parse_allowed_dns
 from tlg_ipam_agent.probe import NO_NAME, DnsResolver, ProbeError, UnreadReplies, no_query_sent
-from tlg_ipam_agent.protocol import FDNS_MAX, JobRefused, fdns_name, job_ref, parse_job
+from tlg_ipam_agent.protocol import FDNS_JOB_MAX, FDNS_MAX, JobRefused, fdns_name, job_ref, parse_job
 
 HOST_A = "00000000-0000-4000-8000-00000000000a"
 HOST_B = "00000000-0000-4000-8000-00000000000b"
@@ -77,13 +77,17 @@ def test_a_job_naming_anything_but_one_host_id_and_a_dns_hostname_is_refused(ent
     assert refused.value.reason.startswith("refused: ")
 
 
-def test_a_job_naming_more_hosts_than_a_result_set_carries_is_refused():
-    entries = [{"host_id": f"{i:036d}", "fqdn": f"h{i}.home.arpa"} for i in range(FDNS_MAX + 1)]
+def test_a_job_naming_more_hosts_than_the_server_sends_is_refused():
+    """Round 1 of #185's briefed review, finding 2: the server sends at most
+    FDNS_JOB_MAX names a job, so 1,025 distinct valid names are refused before a query,
+    though a result set may carry up to FDNS_MAX answers."""
+    assert FDNS_JOB_MAX == 1024 < FDNS_MAX
+    entries = [{"host_id": f"{i:036d}", "fqdn": f"h{i}.home.arpa"} for i in range(FDNS_JOB_MAX + 1)]
     raw = job(methods=["icmp", "fdns"], fdns=entries)
-    with pytest.raises(JobRefused, match=f"more than {FDNS_MAX}"):
+    with pytest.raises(JobRefused, match=f"more than {FDNS_JOB_MAX}"):
         parse_job(job_ref(raw), raw)
-    raw["fdns"] = entries[:FDNS_MAX]
-    assert len(parse_job(job_ref(raw), raw).fdns) == FDNS_MAX
+    raw["fdns"] = entries[:FDNS_JOB_MAX]
+    assert len(parse_job(job_ref(raw), raw).fdns) == FDNS_JOB_MAX
 
 
 def test_the_longest_dns_name_is_a_name_a_job_may_carry():

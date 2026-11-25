@@ -102,7 +102,8 @@ async def test_a_job_names_only_in_scope_hosts_whose_fqdn_is_under_the_subnets_d
     ]
     assert job["methods"] == ["icmp", "fdns"] and job["fdns"] == expected
     row = await target_row(target["id"])
-    assert row.job_fdns == [[e["host_id"], e["fqdn"]] for e in expected]
+    addresses = {host_id: int(ipaddress.ip_address(ip)) for ip, host_id in sent.items()}
+    assert row.job_fdns == [[e["host_id"], e["fqdn"], addresses[e["host_id"]]] for e in expected]
 
 
 @pytest.mark.parametrize("subnet", [{}, {"domain": "home.arpa"}])
@@ -477,7 +478,7 @@ async def test_a_target_row_written_by_the_lease_alone_holds_the_names(client, a
     [job] = await jobs_for(agent_api, token)
     async with SessionLocal() as session:
         row = await session.get(ScanTarget, target["id"])
-        assert row.current_job_id == job["job_id"] and row.job_fdns == [[host["id"], "nas.home.arpa"]]
+        assert row.current_job_id == job["job_id"] and row.job_fdns == [[host["id"], "nas.home.arpa", int(ipaddress.ip_address("10.0.0.10"))]]
 
 
 # --- Over MCP ---
@@ -556,3 +557,63 @@ async def test_the_largest_result_set_with_answers_fits_the_body_cap(client, age
     )
     assert res.status_code == 200, res.text
     assert res.json()["data"]["accepted"] == 4094
+
+
+# --- An address edit (round 1 of #185's briefed review, finding 1) ---
+
+
+async def test_a_host_whose_address_changed_while_the_job_ran_gets_no_answer(client, agent_api):
+    """Sol's first replay: the job names `nas.home.arpa` at 10.0.0.10, the owner moves
+    the host to 10.0.0.20, in scope, and the old job's answer (10.0.0.10) arrives. It
+    was about the host at its old address, so it is not stored, and no finding is
+    raised at the new one. The lease keeps each host's address with its name."""
+    agent, token, subnet, target = await named(client, agent_api)
+    nas = await make_host(client, subnet["id"], "10.0.0.10", hostname="nas")
+    [job] = await jobs_for(agent_api, token)
+    assert (await target_row(target["id"])).job_fdns == [[nas["id"], "nas.home.arpa", int(ipaddress.ip_address("10.0.0.10"))]]
+    res = await client.put(f"/api/v1/hosts/{nas['id']}", json={"ip": "10.0.0.20"})
+    assert res.status_code == 200, res.text
+    await accepted(agent_api, token, job, fdns=[{"host_id": nas["id"], "addresses": ["10.0.0.10"]}])
+    assert nas["id"] not in await rows(answered_only=False)
+    assert [f for f in await findings(client, subnet["id"]) if f["type"] == "fdns_mismatch"] == []
+    # the next job asks for it at its new address, and that answer is kept
+    job = await next_job(agent_api, token, target["id"])
+    assert [e["host_id"] for e in job["fdns"]] == [nas["id"]]
+    await accepted(agent_api, token, job, fdns=[{"host_id": nas["id"], "addresses": ["10.0.0.20"]}])
+    assert (await rows())[nas["id"]].addresses == ["10.0.0.20"]
+
+
+async def test_an_address_edit_deletes_the_hosts_answer_in_its_own_transaction(client, agent_api):
+    """Sol's second replay: a stored answer at 10.0.0.10, then 10.0.0.20 excluded from
+    the scan and the host moved there. The row goes with the edit, and a later result
+    set brings nothing back for a host outside the scope. An edit within scope drops
+    the answer too: it was judged against the old address. A write that leaves the
+    address as it was keeps it."""
+    agent, token, subnet, target = await named(client, agent_api)
+    nas = await make_host(client, subnet["id"], "10.0.0.10", hostname="nas")
+    tv = await make_host(client, subnet["id"], "10.0.0.11", hostname="tv")
+    [job] = await jobs_for(agent_api, token)
+    await accepted(
+        agent_api, token, job,
+        fdns=[{"host_id": nas["id"], "addresses": ["10.0.0.99"]}, {"host_id": tv["id"], "addresses": []}],
+    )
+    assert set(await rows()) == {nas["id"], tv["id"]}
+    res = await client.post(
+        f"/api/v1/subnets/{subnet['id']}/reserved",
+        json={"start_ip": "10.0.0.20", "end_ip": "10.0.0.20", "scan_excluded": True},
+    )
+    assert res.status_code == 201, res.text
+    res = await client.put(f"/api/v1/hosts/{nas['id']}", json={"ip": "10.0.0.20"})
+    assert res.status_code == 200, res.text
+    assert nas["id"] not in await rows(answered_only=False)
+    job = await next_job(agent_api, token, target["id"])
+    assert nas["id"] not in {e["host_id"] for e in job["fdns"]}
+    await accepted(agent_api, token, job, fdns=[{"host_id": nas["id"], "addresses": ["10.0.0.20"]}])
+    assert nas["id"] not in await rows(answered_only=False)
+    # within scope, the answer goes too; an edit that keeps the address keeps it
+    res = await client.put(f"/api/v1/hosts/{tv['id']}", json={"ip": "10.0.0.11", "notes": "x"})
+    assert res.status_code == 200, res.text
+    assert tv["id"] in await rows()
+    res = await client.put(f"/api/v1/hosts/{tv['id']}", json={"ip": "10.0.0.30"})
+    assert res.status_code == 200, res.text
+    assert tv["id"] not in await rows(answered_only=False)

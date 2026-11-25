@@ -34,9 +34,13 @@ HOSTNAME_MAX = 253
 INTERFACE_NAME_MAX = 15
 INTERFACES_MAX = 64
 OBSERVATIONS_MAX = 4096
-# names in a job, answers in a result set, and addresses in one answer (`fdns`, #20)
+# answers in a result set, and addresses in one answer (`fdns`, #20): the wire's bounds
 FDNS_MAX = 4096
 FDNS_ADDRESSES_MAX = 32
+# names in one job: the most the server sends (`services/fdns.FDNS_JOB_MAX`, which
+# `test_contract.py` holds equal), so a job naming more is refused rather than asked
+# (round 1 of #185's briefed review, finding 2). The result set's FDNS_MAX stays apart.
+FDNS_JOB_MAX = 1024
 RDNS_NAME_MAX = 253
 SCAN_ERROR_MAX = 500
 # the job and subnet ids the server sends are UUIDs
@@ -139,7 +143,7 @@ class Job:
     dns_servers: tuple[str, ...]
     timeout_s: int
     # (host_id, fqdn) pairs to resolve for `fdns`, each a hostname (`fdns_name`), each
-    # host once; empty unless `methods` holds fdns
+    # host once, at most FDNS_JOB_MAX; empty unless `methods` holds fdns
     fdns: tuple[tuple[str, str], ...] = ()
 
 
@@ -215,8 +219,8 @@ def parse_job(ref: JobRef, raw: dict) -> Job:
     names = raw.get("fdns", [])
     if not isinstance(names, list):
         raise JobRefused("refused: the job's fdns is not a list")
-    if len(names) > FDNS_MAX:
-        raise JobRefused(f"refused: the job names more than {FDNS_MAX} hosts to resolve")
+    if len(names) > FDNS_JOB_MAX:
+        raise JobRefused(f"refused: the job names more than {FDNS_JOB_MAX} hosts to resolve")
     fdns = []
     hosts = set()
     for item in names:

@@ -172,6 +172,15 @@ def test_the_lease_matches_the_server():
     assert protocol.JOB_TIMEOUT_S < protocol.LEASE_S
 
 
+def test_a_job_names_no_more_hosts_than_the_agent_takes():
+    """Round 1 of #185's briefed review, finding 2: the agent refuses a job naming more
+    hosts than the server ever sends, and the result set's bound stays the wire's."""
+    from app.services import fdns as server_fdns
+
+    assert protocol.FDNS_JOB_MAX == server_fdns.FDNS_JOB_MAX
+    assert protocol.FDNS_JOB_MAX < protocol.FDNS_MAX == server.FDNS_MAX
+
+
 def test_a_job_carries_no_more_dns_servers_than_the_agent_asks():
     """The server cuts a job's servers to what the agent asks per lookup (#75): more
     would be bytes of the check-in answer the agent never uses."""

@@ -169,16 +169,17 @@ async def _lease(
     target: ScanTarget,
     agent: Agent,
     methods: list[str],
-    names: list[tuple[str, str]],
+    names: list[tuple[str, str, int]],
     now: datetime,
 ) -> str | None:
     """Lease the target to a new job. The update only applies if the lease is still the
     one this check-in read, so two check-ins can never both issue the same target.
     The lease keeps the methods issued: results ingest judges a result by what
     the server sent (liveness, `arp` and so MACs), never by what the agent claims. It
-    keeps the names sent for `fdns` too, as `[host_id, fqdn]` pairs: ingest stores an
-    answer only for a host named there, under the name asked (`fdns.store`)."""
-    sent = [[host_id, fqdn] for host_id, fqdn in names] if "fdns" in methods else None
+    keeps the names sent for `fdns` too, as `[host_id, fqdn, ip_int]`: ingest stores an
+    answer only for a host named there, under the name asked, while the host is still at
+    that address (`fdns.store`)."""
+    sent = [[host_id, fqdn, ip_int] for host_id, fqdn, ip_int in names] if "fdns" in methods else None
     job_id = str(uuid4())
     result = await session.execute(
         update(ScanTarget)
@@ -243,7 +244,7 @@ async def _next_job(session: AsyncSession, agent: Agent, now: datetime) -> Job |
             # longer list stored before the owner API bounded it (spec §5.7)
             dns_servers=list(subnet.dns_servers or [])[:DNS_SERVERS_MAX],
             timeout_s=JOB_TIMEOUT_S,
-            fdns=[FdnsName(host_id=host_id, fqdn=fqdn) for host_id, fqdn in names],
+            fdns=[FdnsName(host_id=host_id, fqdn=fqdn) for host_id, fqdn, _ in names],
         )
     return None
 

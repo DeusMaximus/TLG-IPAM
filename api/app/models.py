@@ -243,10 +243,10 @@ class ScanTarget(Base):
     # the methods the leased job was issued with (`arp` only when L2-local): results
     # ingest trusts these, not what the agent says it ran
     job_methods: Mapped[list | None] = mapped_column(JSON)
-    # The names the leased job was sent to resolve (`fdns`), as `[host_id, fqdn]` pairs
+    # The names the leased job was sent to resolve (`fdns`), as `[host_id, fqdn, ip_int]`
     # (`services/fdns.names_for_job`): results ingest stores an answer only for a host
     # named here, under the name that was asked, never under the host's name as it is
-    # by then. Scheduling state, like the rest of the lease: kept out of audit
+    # by then, and only while the host is still at `ip_int`. Scheduling state, like the rest of the lease: kept out of audit
     # snapshots (`changes._SNAPSHOT_EXCLUDE`), cleared with it.
     job_fdns: Mapped[list | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
