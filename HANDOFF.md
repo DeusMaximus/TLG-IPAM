@@ -27,6 +27,27 @@ Template:
 
 ---
 
+## 2026-11-25 — Claude Code (Opus 5.5), worker — #169: the installer asks the kernel whether the service account can use the venv (PR #178)
+- **Merged:** 2026-11-25, squash `8d623c8`, at head `967bdf5`; branch deleted, #169 closed. Briefed round on GPT-6.1 Sol at `f144b11`: GO with one P3, every Deliberate call standing (`.dev/169/review-1-sol.md`); the owner accepted call 4 (`useradd` then `userdel` on a refused first install). The P3 (an exit 0 from a start-up hook read as usable) fixed by the worker in `967bdf5`, read by the orchestrator against the reviewer's remedy, Codex clean there, no second round (the owner's standing preference); Greptile 5/5 on `f144b11` only. All nine checks green at `967bdf5`. The orchestrator ran the agent suite on the head merged with `main` at `f7a9aa3`: 1,858 passed, 14 skipped (root-only). No follow-up filed.
+- **Done:** [PR #178](https://github.com/DeusMaximus/TLG-IPAM/pull/178) closes #169.
+  - New `agent/src/tlg_ipam_agent/reach.py` (`python -I -B -m tlg_ipam_agent.reach`, no argument, `os`/`stat`/`sys` only): walks `sys.prefix` and the package, follows no link, skips `__pycache__`. Exits `UNUSABLE` (3) at the first directory or file `os.access` says the user cannot use, naming it on stderr; exits `USABLE` (7) when there is none.
+  - `install.py`: `unreachable()` gone; `as_user` module-level (was `read_as.as_user`); `runs_as` runs the unit's interpreter on `reach` as the account, 60 s deadline. 7 → usable, 3 → `IN_THE_TREE`, other positive exit or exec `EACCES` → `NOT_STARTED`, 0, a signal or anything else → `NOT_CHECKED`. The check runs after the account exists and before the CA check, so before anything is written, on updates too.
+  - `test_invariants.py`: `PROCESSES_STARTED_IN` key `as_user`; `errno` in `ALLOWED_IMPORTS`. Spec §5.6 venv sentence and the two `AGENTS.md` installer sentences updated.
+- **Decisions:** PR Deliberate calls 1–10. Interpreter plus walk rather than `--version` or GNU `find`. `__pycache__` skipped; an unreadable source refused even with readable bytecode. Call 10 (the P3): an exit 0 from start-up hooks is no answer; this does not attest against dishonest root-placed start-up code.
+- **State:** agent 1,858 passed, 14 skipped (macOS); as root, Debian 13, `--network none`: 1,852 passed, 20 skipped. Live systemd replay (branch vs `main`: ACL on venv, ACL on a module, supplementary group, umask 077) in the PR body. No schema or wire change; `PROTOCOL_VERSION` 2.
+- **Disclosed limits the reviewer measured:** a dependency outside the two trees (via `.pth` or a link) is accepted though the account cannot import it, as before; no AppArmor/SELinux; no drop-ins.
+- **Next:** PR #177 (#93) conflicts with this one in one `AGENTS.md` line and resolves it. #179 (`install --allowed-dns-servers`) can start once #177 merges.
+
+## 2026-11-25 — Claude Code (Sonnet 5.5), worker — #174: three gaps in the backup and restore doc (PR #176)
+- **Merged:** 2026-11-25, squash `f7a9aa3`, at head `238f789`; branch deleted, #174 closed. CI green, Codex clean and Greptile 5/5 on `238f789`; no briefed round owed. The open acceptance line (the unit, copied as written with the URL edited, pulls a snapshot) was run by the orchestrator on the owner's test host, Debian 13 with systemd 257: `systemctl start` exit 0, journal `wrote …` (output on the PR). That host's nightly timer now runs this unit.
+- **Done:** [PR #176](https://github.com/DeusMaximus/TLG-IPAM/pull/176) closes #174. Only `docs/backup-and-restore.md` changes.
+  - The service unit has `Environment=TLG_IPAM_URL=https://ipam.home.arpa`; the crontab has a `TLG_IPAM_URL=` line; the by-hand run passes it through `sudo -u backup env`. A paragraph says the default is a placeholder and covers plain HTTP on port 8080.
+  - The restore section says `curl` errors while the app starts are expected, and what success and a final failure look like.
+  - "A second copy" records #5's restore from a whole-container hypervisor backup: one run, quiet database, no guarantee.
+- **Decisions:** PR Deliberate calls 1–5. The retries are documented, not quieted, so both scripts are byte for byte as on `main`. `curl` prints one line per failed try, so the doc does not promise just one.
+- **State:** no code change. Untested: the crontab line and the `sudo` part of the by-hand command.
+- **Next:** #173 (the server image runs as root) will change the restore steps in this doc.
+
 ## 2026-11-25 — Claude Code (Opus 5.5), worker — #170: a notice when a later DNS server answered after a refused reply (PR #171)
 - **Merged:** 2026-11-25, squash `31978e5`, at head `3428c82`; branch deleted, #170 closed. Codex clean and Greptile 5/5 on `3428c82`; briefed round on GPT-6 Sol with Daybreak Blue (started there directly: the round builds refused DNS replies) GO with no findings: 1,812 re-measured, three mutations red, the 500/501 boundary probed with four-digit counts, and every reader of `last_scan_error` traced (UI amber "Agent reported" line only; no health state, no MCP tool, excluded from audit). The orchestrator ran the agent suite on #171 merged with #172: 1,827 passed, 4 skipped. No follow-up filed.
 - **Done:** [PR #171](https://github.com/DeusMaximus/TLG-IPAM/pull/171) closes #170.
@@ -72,85 +93,3 @@ Template:
   - `install.py` / enrolment: #165 (refuse an agent the server cannot answer before its token is spent), then #169; they may share `install.py`, so not together unless #165 turns out to be server-side only.
   - #31 (deployment document from spec §8): no code, can run beside any of the above.
   - At most three workers, none sharing a code file. Review briefs and reviews of this session are in `.dev/<issue>/` (not committed).
-
-## 2026-11-25 — Claude Code (Opus 5.5), worker — #164: the job's error counts DNS replies refused for size or record count (PR #168)
-- **Merged:** 2026-11-25, squash `33ea51b`, at head `ae46dda`; branch deleted, #164 closed.
-- **Done:** [PR #168](https://github.com/DeusMaximus/TLG-IPAM/pull/168) closes #164.
-  - `probe.py`: when no server gave a usable answer and one attempt ended in `ReplyTooLarge` or `ReplyTooManyRecords`, `ptr` returns `UnreadReplies(too_large, too_many_records)` instead of None. Only the query's own server can cause it.
-  - `scan.py`:
-    - `refused_unread`: the refusal sentence.
-    - `no_answer`: the unanswered count, then the refusals.
-    - `cut_short`: the refusals after a PTR timeout.
-    - `error_text`: keeps the counts whole or drops them whole.
-  - `protocol.py`: `scan_error_fits`.
-  - Spec §5.2 says what the owner is told and what to do: `minimal-responses` in BIND or Unbound; for a forwarder (dnsmasq, Pi-hole, AdGuard Home, Technitium, a router), the upstream that produces the PTR answer. A PTR record set that is itself over the limit is the zone's own data.
-  - Brief §4.6 and the `AGENTS.md` bullet "The agent never executes…" each get one sentence. The merge with #167 kept `main`'s wording and added only that sentence.
-- **The error now:**
-  - With nothing refused, the text is unchanged from before #164.
-  - With refusals: `rdns: no DNS server gave a usable answer for 3 of 4 addresses, names kept; the agent refused a reply over 1232 bytes in 2 lookups, over 1 question or 32 records in 1 lookup`.
-  - A limit that refused nothing is left out, and one lookup reads "1 lookup".
-  - After a deadline: `timed out after T s during the PTR lookups; rdns: before the timeout, the agent refused a reply …`, counted over the lookups that returned. The plain unanswered count stays out, as before.
-- **Longest error:** 495 characters against the 500 cap, a margin of 5; 405 in the timeout form. Past the cap the counts are dropped whole, never cut before a number.
-- **Decisions:** PR Deliberate calls 1–6.
-  - The count travels as a third "no usable answer" value; None stays legal and no fake resolver had to change.
-  - A lookup a later server answered is not counted.
-  - A lookup can be in both counts.
-  - The second count covers both header limits.
-  - "Their stored names are kept" becomes "names kept" when refusals are reported, so the sentence fits.
-- **Review:**
-  - Codex and Greptile were clean on `30246ab`; Codex was clean on `ae46dda`, which Greptile did not re-review.
-  - Briefed round 1 (Codex, GPT-6 Sol, at `30246ab`): GO with four P3s, all fixed in `c197f10`:
-    1. a deadline hid known refusals;
-    2. the cap was held only by a 2-character margin;
-    3. the wording ("for 0", no unit, "or 1 question");
-    4. two coverage gaps (malformed-only rows, unequal counts).
-  - The orchestrator read the fixes against the remedies; no round 2.
-  - Twelve mutations all fail tests, the reviewer's nine included.
-- **Final counts at `ae46dda`:** agent 1,783 passed, 4 skipped (`main` before it: 1,741 passed, 4 skipped; 42 new); server 1,357 passed; web `install.test.js` 18 passed.
-- **State:** merged. No schema change; `PROTOCOL_VERSION` stays 2; no wire change; `test_invariants.py` unchanged.
-- **Waiting on the owner:** nothing from this PR.
-- **Untested or assumed:**
-  - No real resolver that sends a non-minimal reply over 32 records, or ignores the advertised payload; loopback responders stand in for both.
-  - The forwarder guidance comes from the products' documentation, not from running them.
-  - The longest-error test lists the failure texts `probe.py` raises today. A new raise site, or an exception name longer than the builtins' 22 characters, could drop the counts but never cut them.
-  - How the UI shows a long `last_scan_error`.
-- **Next:** #170 (a first server whose replies are refused while a later one answers goes unreported). Then #93 or #20, one at a time; all touch `probe.py`.
-
-## 2026-11-25 — Claude Code (Opus 5.5), worker — #159: publish-release stops when it cannot tell whether the tag has a release (PR #166)
-- **Merged:** 2026-11-25, squash `bc3ba04`, at head `5efdd34`; branch deleted, #159 closed. Tests: 1,723 agent at the head; 1,741 passed and 4 skipped on the tree merged with `main` after PR #167 (orchestrator's run).
-- **Done:** [PR #166](https://github.com/DeusMaximus/TLG-IPAM/pull/166).
-  - `release.yml`, `publish-release`: it reads the repository's releases page by page (`gh api …/releases?per_page=100&page=N`, no `--paginate`). The jq prints `page <length>` first for a JSON array, then `<id> <draft>` for each release whose tag is the tag (`env.TAG`). Each answer must print its marker. The list ends at the first page shorter than 100, and an attempt that reaches page 20 full fails.
-    - No release → `gh release create`, as before.
-    - One release → the wheel is checked or attached, and a draft is published, as before.
-    - More than one → stop with nothing changed (gh's `FetchRelease` would answer with either).
-    - Could not tell → three attempts (15/30/45 s), each from page 1 with the list emptied, then stop with nothing created, uploaded or edited.
-    - gh's error text goes on one warning line.
-    - `publish-image`, the names and the permissions are unchanged.
-  - `release_stubs.py`: the `gh release view` model and `lookup_wins` are gone. A one-page `gh api` stand-in, from gh 2.105 `pkg/cmd/api` and go-gh 2.17 jq, refuses any other argument list. `FetchRelease` calls are refused when a published release and a draft share the tag.
-  - `test_release.py`: `test_only_the_two_publish_steps_are_given_the_token`. A credential is the `secrets` context, or the `github` context reached any way but one named property other than `token` (`toJSON(github)` included). 21 placements are refused and 8 named-property expressions allowed.
-  - Docs: `.agents/releases.md` (the jobs table, and what the owner sees and does for each stop); the `AGENTS.md` "One version" bullet; one sentence each in spec §5.6 and brief §2.4.
-- **Review:**
-  - Briefed round (Codex, GPT-6.1 Sol) at `640b30d`: GO with two P3s, the whole `github` context and a later-page `204`. Both were fixed in `5efdd34` and read by the orchestrator against the remedies (a page with no marker taken for the end of the list failed five tests).
-  - Automatic reviews: Codex clean at `640b30d` and `5efdd34`; Greptile no findings at `640b30d`, not retriggered.
-- **Decisions:** PR Deliberate calls 1–6:
-  - the list endpoint rather than get-by-tag, whose 404 is not proof of absence;
-  - more than one release stops the job;
-  - a marker on every page, asked for page by page, at most 20 pages;
-  - the retry copied from `publish-image`;
-  - the scope of the token rule;
-  - the tripwire changed only in the stub's accepted call, with no new shell word.
-- **State:** merged.
-  - Mutations caught at `5efdd34` (bash 5, publish tests, the author's): old behaviour 38 failed, no retry 41, `TAG=` dropped 25, more-than-one branch 8, a page without its marker ending the list 6, page 1 as the whole list 16, no page bound 2, list not emptied 1, newlines kept 1.
-  - Publish tests pass on bash 3.2 (macOS) and 5.2.37 (`--network none`).
-  - No schema change, no agent code change.
-- **Untested or assumed (nothing has ever been published by this workflow):**
-  - that the job's `contents: write` token counts as "push access", so drafts appear in the list;
-  - that a draft's `tag_name` in the list is the tag it will publish under;
-  - that GitHub fills every page but the last and leaves no release out;
-  - gh's real output for each answer (the stand-in is read from source, not run against gh);
-  - the 20-page stop, which no real repository has reached;
-  - that a re-run attempt can download the artefact (still `.agents/releases.md` step 5).
-- **Waiting on the owner:** the first tag, and the release checklist with it.
-- **Next:**
-  - On the first release, check that `publish-release` lists the tag's draft or release as expected (its log shows each page read).
-  - Optional follow-up, not filed: `publish-image`'s warning prints skopeo's stderr with its newlines.

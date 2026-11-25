@@ -18,8 +18,9 @@ input alone (`--enrol-token -`; with a prompt, and without echoing it, on a
 terminal), never taken as an argument: any local user can read a command line from
 `/proc/<pid>/cmdline` while the exchange waits, and sudo logs it, which on a host with
 a persistent journal puts it on disk (#22 measured both). A `--ca-file` must be
-readable by the service user, which the kernel is asked by running fixed programs as
-that user (`read_as`), once the account exists and before the exchange. The token
+readable by the service user, and the agent's code usable by it, which the kernel is
+asked by running fixed programs as that user (`read_as`, `runs_as`), once the account
+exists and before anything is written or the exchange is made. The token
 file exists, empty, with its owner and mode, before the exchange, so nothing that
 could fail locally is left until the token is spent; if the install fails before the exchange, or the exchange is
 refused, what this run created is taken away again. Once the token is stored nothing
@@ -44,14 +45,17 @@ Neither command is reached until `cli` has had `trust.check` find that only root
 change the code Python could load: this module is imported after that check.
 
 The programs this runs are fixed: `useradd`, `userdel`, `groupdel` and `systemctl` as
-root, and `head` and `test` as the service user (`read_as`). Their arguments are fixed
-but for the operator's `--ca-file` path, with a fixed PATH and no shell; nothing the
-server sends reaches them.
+root; and as the service user, `head` and `test` (`read_as`) and the interpreter the
+unit names, on the agent's own `reach` module (`runs_as`). Their arguments are fixed
+but for the operator's `--ca-file` path and that interpreter's path (this process's
+own, `sys.executable`), with a fixed PATH and no shell; nothing the server sends
+reaches them.
 This module and `store.py` are the only modules allowed to start a process or write a
 file (`tests/test_invariants.py`, `WRITES_WHERE`).
 """
 
 import asyncio
+import errno
 import grp
 import os
 import pwd
@@ -65,7 +69,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
-from . import config, enrol, store
+from . import config, enrol, reach, store
 from .client import Answer, Kind, make_http
 
 SERVICE_USER = "tlg-ipam-agent"
@@ -153,8 +157,10 @@ class Host:
         print("+ " + " ".join(argv), flush=True)
         return subprocess.run(list(argv), env=COMMAND_ENV, stdin=subprocess.DEVNULL, check=False).returncode
 
-    def code_unreachable(self, interpreter: str) -> str | None:
-        return unreachable(interpreter)
+    def service_runs(self, interpreter: str, uid: int, gid: int) -> str | None:
+        """`runs_as` for the service user, with the groups `service_reads` gives it."""
+        print(f"+ {interpreter} {' '.join(CODE_CHECK)}, as {SERVICE_USER}", flush=True)
+        return runs_as(interpreter, uid, gid, os.getgrouplist(SERVICE_USER, gid))
 
     def service_reads(self, path: str, uid: int, gid: int) -> str | None:
         """`read_as` for the service user, with the groups systemd gives the unit's
@@ -163,43 +169,6 @@ class Host:
         not by its path (#140)."""
         print(f"+ {' '.join(CA_READ)} <--ca-file>, as {SERVICE_USER}", flush=True)
         return read_as(path, uid, gid, os.getgrouplist(SERVICE_USER, gid))
-
-
-def unreachable(
-    interpreter: str,
-    *,
-    prefix: str = sys.prefix,
-    package: str = str(Path(__file__).resolve().parent),
-    top: str = "/",
-) -> str | None:
-    """The first path the service user could not use, or None. It is no member of any
-    group these paths have, so their bits for others are what it gets: every directory
-    above the interpreter (as the unit names it and as resolved) must let others
-    through (`x`) and the interpreter run (`x`); every directory of the virtual
-    environment and the package must let others list and enter it (`r`, `x`: the
-    import system lists them), and every file in them must be readable (`r`). A virtual
-    environment made under a umask such as 077 fails here, before the install changes
-    anything or spends the token (Codex on #130)."""
-    resolved = Path(interpreter).resolve()
-    if not os.stat(resolved).st_mode & stat.S_IXOTH:
-        return str(resolved)
-    stop = Path(top)
-    for start in (Path(interpreter).parent, resolved.parent):
-        for directory in (start, *start.parents):
-            if not os.stat(directory).st_mode & stat.S_IXOTH:
-                return str(directory)
-            if directory == stop:
-                break
-    for tree in (Path(prefix), Path(package)):
-        for directory, _dirs, names in os.walk(tree):
-            if os.stat(directory).st_mode & (stat.S_IROTH | stat.S_IXOTH) != stat.S_IROTH | stat.S_IXOTH:
-                return directory
-            for name in names:
-                path = os.path.join(directory, name)
-                info = os.lstat(path)
-                if stat.S_ISREG(info.st_mode) and not info.st_mode & stat.S_IROTH:
-                    return path
-    return None
 
 
 def read_token_line() -> str:
@@ -237,6 +206,32 @@ def _plain(value: str, name: str) -> str:
     return value
 
 
+def as_user(argv: tuple[str, ...], uid: int, gid: int, groups, timeout: float) -> int:
+    """The exit status of `argv`, run as the user `uid` with primary group `gid` and
+    supplementary `groups`: the one place `install` starts a process as anyone but
+    root (`read_as`, `runs_as`). `subprocess`'s `user`, `group` and `extra_groups`
+    have the child call setgroups, setregid and setreuid before it execs, so the
+    program holds no root privilege and none of root's groups. It gets the fixed
+    environment the install's other programs get, no shell, no input, no output (what
+    it writes goes to /dev/null, so an error naming a path is not shown), and `/` as
+    its working directory. Raises what `subprocess.run` raises: OSError when the
+    program cannot be started as that user (the errno says why), TimeoutExpired past
+    `timeout`, once the child is killed and reaped."""
+    return subprocess.run(
+        list(argv),
+        env=COMMAND_ENV,
+        cwd="/",
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        user=uid,
+        group=gid,
+        extra_groups=list(groups),
+        timeout=timeout,
+        check=False,
+    ).returncode
+
+
 # How `install` asks the kernel whether the service user can read the `--ca-file`
 # (#136): it runs these fixed programs as that user, with the groups the unit's agent
 # gets, and judges by their exit status. `head` opens the file and reads one byte;
@@ -268,33 +263,14 @@ def read_as(path: str, uid: int, gid: int, groups) -> str | None:
     #130, round 2: a model of the mode bits passed a bundle an ACL denied the account,
     and refused one it could read through a supplementary group).
 
-    The programs run as that user from the start: `subprocess`'s `user`, `group` and
-    `extra_groups` have the child call setgroups, setregid and setreuid before it
-    execs, so the program holds no root privilege and none of root's groups. They get
-    the fixed environment the install's other programs get, no shell, no input, and
-    `/` as the working directory. Their arguments are fixed but for `path`, the
-    operator's own `--ca-file`, already checked to be absolute and plain (`_ca_file`);
-    nothing the server sends reaches them, and the check is made before the exchange."""
-
-    def as_user(*argv: str) -> int:
-        return subprocess.run(
-            list(argv),
-            env=COMMAND_ENV,
-            cwd="/",
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            user=uid,
-            group=gid,
-            extra_groups=list(groups),
-            timeout=CA_CHECK_TIMEOUT_S,
-            check=False,
-        ).returncode
-
+    The programs run as that user from the start (`as_user`). Their arguments are
+    fixed but for `path`, the operator's own `--ca-file`, already checked to be
+    absolute and plain (`_ca_file`); nothing the server sends reaches them, and the
+    check is made before the exchange."""
     try:
-        if as_user(*CA_READ, path) == 0:
+        if as_user((*CA_READ, path), uid, gid, groups, CA_CHECK_TIMEOUT_S) == 0:
             return None
-        reached = as_user(*CA_REACH, path)
+        reached = as_user((*CA_REACH, path), uid, gid, groups, CA_CHECK_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
         return NOT_CHECKED
     if reached == 0:
@@ -302,6 +278,68 @@ def read_as(path: str, uid: int, gid: int, groups) -> str | None:
     if reached == 1:
         return ON_THE_WAY
     return NOT_CHECKED
+
+
+# How `install` asks the kernel whether the service user can use the agent's code
+# (#169): it runs the interpreter the unit names, as that user with the groups the
+# unit's agent gets, on the agent's own `reach` module, and judges by how that ends.
+# The start itself is half the answer (the user could execute the interpreter, and
+# Python's start-up read the standard library, the environment and the package's
+# first modules); `reach` walks the environment and the package for the rest, and
+# exits `reach.UNUSABLE` at the first directory or file the user cannot use, or
+# `reach.USABLE` when it found none. Only that status is taken as usable: an exit 0 is
+# an interpreter that ended before `reach` answered (the briefed review of PR #178: a
+# `.pth` line ending it early). `-I` keeps the working directory, the user's site
+# directory and the environment's PYTHON* variables out of it, but not the venv's
+# `.pth` files or a `sitecustomize`, and `-B` has Python write no bytecode. It takes no
+# argument: `reach` finds both trees from where it was loaded.
+CODE_CHECK = ("-I", "-B", "-m", "tlg_ipam_agent.reach")
+# ample: the start and the walk took 12 ms as the service user on a venv of the
+# agent and its dependencies (442 paths, Debian 13), and 0.5 s on one of 10,000 (the
+# PR of #169); a host with a cold, slow disk gets the margin. It bounds an
+# interruptible wait only, as CA_CHECK_TIMEOUT_S does
+CODE_CHECK_TIMEOUT_S = 60
+# where the check stopped, by its kind: never by the path
+NOT_STARTED = "the interpreter or the start of the agent's package"
+IN_THE_TREE = "a directory or file of the virtual environment or of the agent's package"
+
+
+def runs_as(interpreter: str, uid: int, gid: int, groups) -> str | None:
+    """None when the user `uid`, with primary group `gid` and supplementary `groups`,
+    can start `interpreter` on the agent's `reach` module and that finds every
+    directory of the virtual environment and of the package listable and enterable,
+    and every regular file in them readable, as the kernel decides it (#169: a model
+    of the mode bits for others passed an environment an ACL denied the account, and
+    refused one it could use through a supplementary group). Otherwise where it
+    stopped: NOT_STARTED (the kernel refused the exec with EACCES, or Python exited
+    with a status of its own), IN_THE_TREE (`reach.UNUSABLE`), or NOT_CHECKED when the
+    process could not be started as that user for another reason, ended with status 0
+    (before `reach` gave its answer, which is `reach.USABLE`), was killed by a signal,
+    or did not finish in time. Exit 0 is not counted as either answer: it says the
+    kernel let the start through and nothing of the walk. This tells an early end of an
+    honest start-up apart from the walk's answer; it does not attest against start-up
+    code (a `.pth` line, `sitecustomize`) written to exit with `reach.USABLE`, which only
+    root can put in the environment.
+
+    `interpreter` is the path the unit's `ExecStart=` names (`sys.executable`, this
+    process's own), not anything the server sends, and it runs as that user from the
+    start (`as_user`): the venv's code that the unit itself runs as that user, which
+    `trust.check` found only root can change, with no argument from outside."""
+    try:
+        code = as_user((interpreter, *CODE_CHECK), uid, gid, groups, CODE_CHECK_TIMEOUT_S)
+    except PermissionError as exc:
+        # EACCES is the exec's answer (a directory on the way, the file, a noexec
+        # mount); EPERM is a credential change refused, which says nothing of the code
+        return NOT_STARTED if exc.errno == errno.EACCES else NOT_CHECKED
+    except (OSError, subprocess.SubprocessError):
+        return NOT_CHECKED
+    if code == reach.USABLE:
+        return None
+    if code == reach.UNUSABLE:
+        return IN_THE_TREE
+    if code > 0:
+        return NOT_STARTED
+    return NOT_CHECKED  # 0: ended before the walk answered; or a signal
 
 
 def _ca_file(value: str | None) -> str | None:
@@ -537,14 +575,6 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out, envir
     # that only root can change the code was checked by `cli`, before it imported this
     # module (`trust.check`)
     _preflight(host)
-    hidden = host.code_unreachable(interpreter)
-    if hidden is not None:
-        raise InstallError(
-            f"{hidden} is not readable by other users, so the unit's user, {SERVICE_USER}, "
-            "could not run the agent (a virtual environment made under a restrictive "
-            "umask, say). Make the environment readable, as with `chmod -R o+rX "
-            f"{sys.prefix}`, and run install again"
-        )
     url = config.parse_url(options.url, "--url")
     allowed = None if options.allowed_cidrs is None else config.parse_allowed(options.allowed_cidrs, "--allowed-cidrs")
     max_pps = None if options.max_pps is None else config.parse_max_pps(options.max_pps, "--max-pps")
@@ -599,6 +629,26 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out, envir
             user = host.service_user()
             if user is None:
                 raise InstallError(f"useradd ran but there is no user {SERVICE_USER}")
+        # asked of the kernel, as the service user (#169), before anything is
+        # written: on a first install the account was made for it, and goes again
+        where = host.service_runs(interpreter, *user)
+        if where == NOT_CHECKED:
+            raise InstallError(
+                f"could not check that {SERVICE_USER}, which the unit runs as, can use the "
+                f"agent's code (the interpreter could not be started as that user, ended "
+                f"before the check answered, or did not finish within {CODE_CHECK_TIMEOUT_S} s), "
+                "so the install "
+                "stopped before the token was spent"
+            )
+        if where is not None:
+            raise InstallError(
+                f"{SERVICE_USER}, which the unit runs as, could not use the agent's code "
+                f"(stopped at {where}), so the unit could not run the agent (a virtual "
+                "environment made under a restrictive umask, say). Make the environment "
+                f"usable by that user, as with `chmod -R o+rX {sys.prefix}`, or through a "
+                f"group or ACL it holds, and run install again; `runuser -u {SERVICE_USER} "
+                f"-- {interpreter} {' '.join(CODE_CHECK)}` names the path it stopped at"
+            )
         if ca_file is not None:
             # asked of the kernel, as the service user (#136). Neither path is
             # repeated (#140): `namei -l` and `getfacl` on the path show them
