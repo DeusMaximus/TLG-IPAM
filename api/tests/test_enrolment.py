@@ -822,6 +822,23 @@ async def test_a_disabled_agents_refusal_is_not_shown_until_it_is_enabled(client
     assert res.json()["data"]["enrol_refusal"]["code"] == ENROL_TOO_OLD
 
 
+async def test_disabling_a_never_enrolled_agent_keeps_its_expired_tokens_refusal(client, agent_api):
+    """Codex on #184 at c59ee62: the refusal of a pending agent whose token expired is
+    hidden while it is disabled, and reads of it (the disable's own answer, the list)
+    do not prune it, so enabling it shows it again."""
+    created = await create(client)
+    [token] = await tokens_of(created["id"])
+    await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+    await set_token(token.id, expires_at=_now() - timedelta(minutes=1))
+    res = await client.put(f"/api/v1/agents/{created['id']}", json={"enabled": False})
+    assert res.json()["data"]["state"] == "disabled" and res.json()["data"]["enrol_refusal"] is None
+    [listed] = (await client.get("/api/v1/agents")).json()["data"]
+    assert listed["enrol_refusal"] is None and _refusals() == 1
+    res = await client.put(f"/api/v1/agents/{created['id']}", json={"enabled": True})
+    assert res.json()["data"]["state"] == "pending"
+    assert res.json()["data"]["enrol_refusal"]["code"] == ENROL_TOO_OLD
+
+
 async def test_deleting_the_agent_forgets_its_refusal(client, agent_api):
     created = await create(client)
     await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)

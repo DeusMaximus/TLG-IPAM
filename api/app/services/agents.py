@@ -169,20 +169,24 @@ enrol_refusals = EnrolRefusals()
 
 def current_enrolment(agent: Agent, now: datetime) -> Token | None:
     """The enrolment token an agent's refusal is shown for: its one live enrolment token
-    (`live`), or, for a `pending` agent with none, its one enrolment token neither used
-    nor revoked (expired, with no re-enrol since: still why the agent never arrived).
+    (`live`), or, for an agent that has never held an agent token (a `pending` one, or
+    one disabled before it ever enrolled) with none, its one enrolment token neither
+    used nor revoked (expired, with no re-enrol since: still why the agent never
+    arrived).
     None when there are two or more of either, which is never to be guessed between.
     Judged from the tokens and the agent's state alone, by identity, never by when the
     tokens were issued: a re-enrol revokes a live token and adds one, so after it the
     new token is the one live, or, once both have expired, there are two unused and none
-    is chosen. The expired fallback is a `pending` agent's alone, so once any exchange
-    has succeeded (the agent has held an agent token) an expired token it replaced never
-    becomes current again, whatever refusal lands for it later (Codex on #184)."""
+    is chosen. The expired fallback is a never-enrolled agent's alone, so once any
+    exchange has succeeded (the agent has held an agent token) an expired token it
+    replaced never becomes current again, whatever refusal lands for it later; and
+    disabling a never-enrolled agent keeps its expired token current, so the refusal is
+    hidden while it is disabled (`enrol_refusal`), not pruned (Codex on #184)."""
     enrols = [t for t in agent.tokens if t.kind == "enrol"]
     live_now = [t for t in enrols if live(t, now)]
     if live_now:
         return live_now[0] if len(live_now) == 1 else None
-    if agent.state != "pending":
+    if any(t.kind == "agent" for t in agent.tokens):
         return None
     unspent = [t for t in enrols if t.used_at is None and t.revoked_at is None]
     return unspent[0] if len(unspent) == 1 else None
