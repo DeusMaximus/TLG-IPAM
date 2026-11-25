@@ -1095,7 +1095,8 @@ def test_code_whose_check_could_not_be_made_stops_the_install_before_anything_is
     before = tree(root)
     code, said = run_install(root, host, exchange=lambda *a: pytest.fail("no exchange"))
     assert code == 1 and "could not check that tlg-ipam-agent, which the unit runs as, can use" in said[-1]
-    assert "within 60 s" in said[-1] and "stopped before the token was spent" in said[-1]
+    assert "ended before the check answered" in said[-1] and "within 60 s" in said[-1]
+    assert "stopped before the token was spent" in said[-1]
     assert tree(root) == before and host.commands == []
 
 
@@ -1239,11 +1240,42 @@ def test_a_package_loaded_from_outside_the_environment_is_walked_too(venv, tmp_p
         blocked.chmod(0o644)
 
 
+@pytest.mark.parametrize("hook", ["early.pth", "sitecustomize.py"])
+def test_a_start_up_hook_that_ends_the_interpreter_early_is_no_answer(venv, hook):
+    """The briefed review of PR #178: `-I` does not stop the environment's `.pth`
+    files or `sitecustomize`, and one that ends the interpreter with status 0 before
+    `reach` runs left an environment with a file the user cannot read looking usable.
+    Only `reach.USABLE` is taken as usable, so it is not checked, and refused."""
+    if os.geteuid() != 0:
+        (venv["package"] / "scan.py").chmod(0o200)  # what the walk would have found
+    line = "import os; os._exit(0)\n"
+    (venv["site"] / hook).write_text(line)
+    (venv["site"] / hook).chmod(0o644)
+    assert _runs_as_me(venv) == install.NOT_CHECKED
+    (venv["site"] / hook).unlink()
+    assert _runs_as_me(venv) == (None if os.geteuid() == 0 else install.IN_THE_TREE)
+
+
+@as_root
+def test_as_root_a_pth_line_that_ends_the_accounts_start_early_is_no_answer(shared_venv):
+    """The reviewer's reproduction, as root: a module the account cannot read, and a
+    root-owned `.pth` line that ends the account's interpreter with status 0."""
+    (shared_venv["package"] / "scan.py").chmod(0o600)
+    assert install.runs_as(shared_venv["python"], NOBODY, NOBODY, [NOBODY, 4242]) == install.IN_THE_TREE
+    early = shared_venv["site"] / "early.pth"
+    early.write_text(f"import os; os.getuid() == {NOBODY} and os._exit(0)\n")
+    early.chmod(0o644)
+    assert install.runs_as(shared_venv["python"], NOBODY, NOBODY, [NOBODY, 4242]) == install.NOT_CHECKED
+
+
 @pytest.mark.parametrize(
     "outcome, answer",
     [
-        (0, None),
+        (reach.USABLE, None),
         (reach.UNUSABLE, install.IN_THE_TREE),
+        # the briefed review of PR #178: an interpreter that ended normally before
+        # `reach` answered is no answer
+        (0, install.NOT_CHECKED),
         (1, install.NOT_STARTED),  # Python could not start the module
         (2, install.NOT_STARTED),
         (-9, install.NOT_CHECKED),  # killed by a signal
@@ -1359,7 +1391,7 @@ def test_the_check_module_run_by_hand_names_where_it_stopped(venv):
     with a file it cannot read it exits UNUSABLE and names it on stderr, which the
     install discards and the refusal tells the operator how to see."""
     argv = [venv["python"], *install.CODE_CHECK]
-    assert subprocess.run(argv, env=install.COMMAND_ENV, cwd="/", capture_output=True).returncode == 0
+    assert subprocess.run(argv, env=install.COMMAND_ENV, cwd="/", capture_output=True).returncode == reach.USABLE
     if os.geteuid() == 0:
         return  # root reads it all the same
     blocked = venv["package"] / "scan.py"

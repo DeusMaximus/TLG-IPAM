@@ -39,16 +39,26 @@ the unit gets the same user, groups and view of the filesystem (spec §5.6 says 
 drop-in can change).
 
 It takes no argument, reads no environment, imports nothing of the agent's and nothing
-but `os`, `stat` and `sys`, and writes nothing (`-I` keeps the working directory and
-the user's site directory off the import path). Its exit status is its whole answer.
+but `os`, `stat` and `sys`, and writes nothing (`-I` keeps the working directory, the
+user's site directory and `PYTHON*` variables out of it; it does not stop the
+environment's `.pth` files or a `sitecustomize`, which run before it). Its exit status
+is its whole answer, and a walk that finished with nothing to report exits USABLE (7),
+never 0: a start-up hook that ends the interpreter early, with status 0, before this
+module has run would otherwise be read as an answer (the briefed review of PR #178).
+That tells an ordinary early end apart from the walk's answer; it does not attest
+against start-up code written to lie, which only root can put in the environment
+(`trust.check`) and which runs as this user with no more than its rights.
 """
 
 import os
 import stat
 import sys
 
-# the exit status for "a directory or file of the two trees is not usable"; Python
-# itself exits 1 when it cannot start the module and 2 on a command-line error
+# the exit statuses of the walk's two answers: "every directory and file of the two
+# trees is usable" and "one is not". Python itself exits 0 when the interpreter ends
+# normally (a start-up hook's `os._exit(0)`, say), 1 when it cannot start the module
+# and 2 on a command-line error, so neither answer is one of those
+USABLE = 7
 UNUSABLE = 3
 
 PACKAGE = os.path.dirname(os.path.realpath(__file__))
@@ -91,7 +101,7 @@ def first_unusable(trees) -> str | None:
 def main() -> int:
     stopped = first_unusable((sys.prefix, PACKAGE))
     if stopped is None:
-        return 0
+        return USABLE
     print(f"not usable by this user: {stopped!r}", file=sys.stderr)
     return UNUSABLE
 

@@ -286,9 +286,12 @@ def read_as(path: str, uid: int, gid: int, groups) -> str | None:
 # The start itself is half the answer (the user could execute the interpreter, and
 # Python's start-up read the standard library, the environment and the package's
 # first modules); `reach` walks the environment and the package for the rest, and
-# exits `reach.UNUSABLE` at the first directory or file the user cannot use. `-I`
-# keeps the working directory, the user's site directory and the environment's
-# PYTHON* variables out of it, and `-B` has Python write no bytecode. It takes no
+# exits `reach.UNUSABLE` at the first directory or file the user cannot use, or
+# `reach.USABLE` when it found none. Only that status is taken as usable: an exit 0 is
+# an interpreter that ended before `reach` answered (the briefed review of PR #178: a
+# `.pth` line ending it early). `-I` keeps the working directory, the user's site
+# directory and the environment's PYTHON* variables out of it, but not the venv's
+# `.pth` files or a `sitecustomize`, and `-B` has Python write no bytecode. It takes no
 # argument: `reach` finds both trees from where it was loaded.
 CODE_CHECK = ("-I", "-B", "-m", "tlg_ipam_agent.reach")
 # ample: the start and the walk took 12 ms as the service user on a venv of the
@@ -310,8 +313,13 @@ def runs_as(interpreter: str, uid: int, gid: int, groups) -> str | None:
     refused one it could use through a supplementary group). Otherwise where it
     stopped: NOT_STARTED (the kernel refused the exec with EACCES, or Python exited
     with a status of its own), IN_THE_TREE (`reach.UNUSABLE`), or NOT_CHECKED when the
-    process could not be started as that user for another reason, was killed by a
-    signal, or did not finish in time.
+    process could not be started as that user for another reason, ended with status 0
+    (before `reach` gave its answer, which is `reach.USABLE`), was killed by a signal,
+    or did not finish in time. Exit 0 is not counted as either answer: it says the
+    kernel let the start through and nothing of the walk. This tells an early end of an
+    honest start-up apart from the walk's answer; it does not attest against start-up
+    code (a `.pth` line, `sitecustomize`) written to exit with `reach.USABLE`, which only
+    root can put in the environment.
 
     `interpreter` is the path the unit's `ExecStart=` names (`sys.executable`, this
     process's own), not anything the server sends, and it runs as that user from the
@@ -325,13 +333,13 @@ def runs_as(interpreter: str, uid: int, gid: int, groups) -> str | None:
         return NOT_STARTED if exc.errno == errno.EACCES else NOT_CHECKED
     except (OSError, subprocess.SubprocessError):
         return NOT_CHECKED
-    if code == 0:
+    if code == reach.USABLE:
         return None
     if code == reach.UNUSABLE:
         return IN_THE_TREE
     if code > 0:
         return NOT_STARTED
-    return NOT_CHECKED
+    return NOT_CHECKED  # 0: ended before the walk answered; or a signal
 
 
 def _ca_file(value: str | None) -> str | None:
@@ -627,8 +635,9 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out, envir
         if where == NOT_CHECKED:
             raise InstallError(
                 f"could not check that {SERVICE_USER}, which the unit runs as, can use the "
-                f"agent's code (the interpreter could not be started as that user, or the "
-                f"check did not finish within {CODE_CHECK_TIMEOUT_S} s), so the install "
+                f"agent's code (the interpreter could not be started as that user, ended "
+                f"before the check answered, or did not finish within {CODE_CHECK_TIMEOUT_S} s), "
+                "so the install "
                 "stopped before the token was spent"
             )
         if where is not None:
