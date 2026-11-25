@@ -4,8 +4,8 @@
 #   2. on a new volume it starts and takes writes, and the database is that user's;
 #   3. on a volume left as an image that ran as root left it (root's directory, root's
 #      files, mode 0600, a before-restore directory), it refuses to start with the
-#      one-time command, and after that command (README, "Upgrading from an image that
-#      ran as root") it starts, keeps the data and takes writes.
+#      one-time commands, and after them (README, "Upgrading from an image that ran as
+#      root") /data is 10001's and 0700, and it starts, keeps the data and takes writes.
 # Every container runs with no network: requests go to the server's loopback from inside
 # its own container, so nothing leaves the host.
 #
@@ -107,12 +107,17 @@ if out=$(docker run --rm --network none -e API_KEY="$key" --mount "$mount" "$ima
 fi
 grep -qF 'TLG-IPAM will not start: the database'"'"'s directory /data is not writable by this process (uid 10001, gid 10001)' <<<"$out" ||
   fail "the refusal on a root volume was not the expected message: $out"
-grep -qF -- '--user root --entrypoint chown ipam -R 10001:10001 /data' <<<"$out" ||
-  fail "the refusal does not give the one-time command: $out"
-echo "$image: refuses a root volume, naming the command"
-# the README's one-time command, as docker run in place of docker compose run
+grep -qF -- '--user root --entrypoint chown ipam -R 10001:10001 /data`' <<<"$out" ||
+  fail "the refusal does not give the chown command: $out"
+grep -qF -- '--user root --entrypoint chmod ipam 700 /data`' <<<"$out" ||
+  fail "the refusal does not give the chmod command: $out"
+echo "$image: refuses a root volume, naming the commands"
+# the README's one-time commands, as docker run in place of docker compose run
 docker run --rm --network none --user root --mount "$mount" --entrypoint chown "$image" -R 10001:10001 /data
+docker run --rm --network none --user root --mount "$mount" --entrypoint chmod "$image" 700 /data
 start --mount "$mount"
+mode=$(docker exec "$name" stat -c '%u:%g %a' /data)
+[ "$mode" = "10001:10001 700" ] || fail "/data after the one-time commands is $mode, not 10001:10001 700"
 not_root
 expect 200 GET /api/v1/sections | grep -qF '"made as root"' || fail "the data made as root is gone"
 expect 201 POST /api/v1/sections '{"name":"after the chown"}' >/dev/null

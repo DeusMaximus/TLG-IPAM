@@ -25,7 +25,7 @@ The server will not start without a real key: with `API_KEY` unset, empty, still
 
 ## The container's user
 
-The server runs as `ipam`, uid and gid 10001, never root (`docker compose top` shows `10001`). The code in the image stays root's, so the server cannot change it. A new `ipam-data` volume takes the image's `/data`, which belongs to that user, mode 0700. Nothing in the image runs as root at start, so a volume made by an earlier image, which belongs to root, is given to the user once by hand (below). Until then the server refuses to start, and its log gives the command.
+The server runs as `ipam`, uid and gid 10001, never root (`docker compose top` shows `10001`). The code in the image stays root's, so the server cannot change it. A new `ipam-data` volume takes the image's `/data`, which belongs to that user, mode 0700. Nothing in the image runs as root at start, so a volume made by an earlier image, which belongs to root, is given to the user once by hand (below). Until then the server refuses to start, and its log gives the commands. `DB_PATH=:memory:`, a database with no file, is not checked.
 
 ### Upgrading from an image that ran as root
 
@@ -35,12 +35,13 @@ Once, from the directory that holds `docker-compose.yml`:
 docker compose build ipam
 docker compose stop ipam
 docker compose run --rm --no-deps --user root --entrypoint chown ipam -R 10001:10001 /data
+docker compose run --rm --no-deps --user root --entrypoint chmod ipam 700 /data
 docker compose up -d ipam
 ```
 
-`chown -R` covers `ipam.db`, its `-wal` and `-shm` files, and any `before-restore-` directory the restore script left. The command runs through the container runtime, so the ids come out right where the runtime maps them to others on the host (an unprivileged LXC, Docker's user-namespace remapping). To check: `docker compose run --rm --no-deps --entrypoint ls ipam -ln /data` lists only `10001 10001`.
+`chown -R` covers `ipam.db`, its `-wal` and `-shm` files, and any `before-restore-` directory the restore script left. `chmod 700` gives `/data` the mode a new volume has: an earlier image left it `755`, and its database files often `644`, readable by any user in the container. The command runs through the container runtime, so the ids come out right where the runtime maps them to others on the host (an unprivileged LXC, Docker's user-namespace remapping). To check: `docker compose run --rm --no-deps --entrypoint ls ipam -lan /data` lists only `10001 10001` as owner, and `drwx------` for `.`.
 
-A bind mount in place of the named volume (`./data:/data`, say) needs its directory given to 10001:10001 too, and the same command does it.
+A bind mount in place of the named volume (`./data:/data`, say) needs its directory given to 10001:10001 too, and the same two commands do it.
 
 ## Backups and restore
 

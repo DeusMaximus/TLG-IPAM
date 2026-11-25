@@ -147,7 +147,7 @@ The one rule behind the steps: **stop the app, remove the old database's `-wal` 
 
 Run this on the machine that runs the container (`ipam-host`), from the directory that holds `docker-compose.yml` and `.env`. If the pull host is a different machine, copy the snapshot over first (`scp backup-host:/var/backups/tlg-ipam/ipam-20261113T023000Z.db .`). It needs `sqlite3` there too.
 
-It is a script, not a block to paste, so that `set -eu` stops it at the first failed check: a bad snapshot is refused before the app is stopped, and nothing is moved until the snapshot has passed. Each step it runs in the volume runs as the server's user (uid 10001, README, "The container's user"), as the server does. The snapshot goes in through standard input, read on this host, so the restored file is that user's, mode 0600, whoever owns the snapshot here. On a volume that user cannot change, one an image that ran as root made, it stops before the app with nothing changed: run the README's one-time command, then the script again. Save it as `tlg-ipam-restore`:
+It is a script, not a block to paste, so that `set -eu` stops it at the first failed check: a bad snapshot is refused before the app is stopped, and nothing is moved until the snapshot has passed. Each step it runs in the volume runs as the server's user (uid 10001, README, "The container's user"), as the server does. The snapshot goes in through standard input, read on this host, so the restored file is that user's, mode 0600, whoever owns the snapshot here. On a volume that user cannot change, one an image that ran as root made, it stops before the app with nothing changed: run the README's one-time commands, then the script again. Save it as `tlg-ipam-restore`:
 
 ```sh
 #!/bin/sh

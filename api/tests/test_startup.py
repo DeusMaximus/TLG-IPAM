@@ -12,6 +12,7 @@ import os
 import queue
 import re
 import secrets
+import shlex
 import subprocess
 import sys
 import threading
@@ -434,6 +435,7 @@ def test_the_image_refuses_to_start_on_storage_it_cannot_write(tmp_path):
     assert proc.returncode == 1, stderr
     assert f"TLG-IPAM will not start: the database's directory {data} is not writable" in stderr
     assert f"--user root --entrypoint chown ipam -R {os.getuid()}:{os.getgid()} {data}`" in stderr
+    assert f"--user root --entrypoint chmod ipam 700 {data}`" in stderr
     assert "Uvicorn running on" not in stderr
     assert REAL_KEY not in stderr
     assert not (data / "ipam.db").exists()
@@ -450,3 +452,102 @@ def test_a_missing_directory_is_refused_without_the_volume_command(tmp_path):
         f"TLG-IPAM will not start: the database's directory {missing} does not exist (DB_PATH)."
     )
     assert database.refuse_unwritable_storage(str(tmp_path / "ipam.db")) is None
+
+
+@pytest.mark.parametrize("target", ["", ":memory:", "file:ipam?mode=memory&cache=shared"])
+def test_a_target_with_no_file_is_not_checked(tmp_path, monkeypatch, target):
+    """SQLite's in-memory and temporary databases, and a `file:` URI, have no directory
+    this process must write (round 1 of #181's briefed review, finding 1)."""
+    from app import database
+
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o555)
+    monkeypatch.chdir(locked)
+    try:
+        assert not database.on_filesystem(target)
+        assert database.storage_problem(target) is None
+        assert database.refuse_unwritable_storage(target) is None
+    finally:
+        locked.chmod(0o755)
+
+
+@needs_non_root
+def test_an_in_memory_database_starts_writes_and_reads_in_a_directory_it_cannot_write(tmp_path):
+    """`DB_PATH=:memory:` with a working directory this process cannot write (the image's
+    `/app`, root's) initialises, takes a write and reads it back, in a fresh interpreter
+    as the server imports the module, and changes nothing about the directory."""
+    workdir = tmp_path / "app"
+    workdir.mkdir()
+    workdir.chmod(0o555)
+    before = os.stat(workdir)
+    script = (
+        "from fastapi.testclient import TestClient\n"
+        "from app.main import app\n"
+        "with TestClient(app) as client:\n"
+        "    headers = {'X-API-Key': %r}\n"
+        "    made = client.post('/api/v1/sections', json={'name': 'in memory'}, headers=headers)\n"
+        "    assert made.status_code == 201, made.text\n"
+        "    listed = client.get('/api/v1/sections', headers=headers).json()['data']\n"
+        "    assert [s['name'] for s in listed] == ['in memory'], listed\n"
+        "print('wrote and read')\n"
+    ) % REAL_KEY
+    env = _child_env(tmp_path, REAL_KEY)
+    env["DB_PATH"] = ":memory:"
+    env["PYTHONPATH"] = str(API_DIR)
+    try:
+        done = subprocess.run(
+            [sys.executable, "-c", script], cwd=workdir, env=env, capture_output=True, text=True,
+            timeout=START_DEADLINE,
+        )
+        after = os.stat(workdir)
+        assert done.returncode == 0, done.stderr
+        assert done.stdout.strip().endswith("wrote and read")
+        assert "will not start" not in done.stderr
+        assert (after.st_mode, after.st_uid, after.st_gid) == (before.st_mode, before.st_uid, before.st_gid)
+        assert list(workdir.iterdir()) == []
+    finally:
+        workdir.chmod(0o755)
+
+
+@needs_non_root
+def test_the_printed_commands_take_the_directory_as_one_shell_word(tmp_path):
+    """A directory with a space and shell syntax is quoted (round 1 of #181's briefed
+    review, finding 2): each printed command splits back into the same words with the
+    directory whole, and nothing in it is run."""
+    from app import database
+
+    data = tmp_path / "with space;$(touch pwned) & 'q'"
+    data.mkdir()
+    data.chmod(0o555)
+    try:
+        with pytest.raises(SystemExit) as refused:
+            database.refuse_unwritable_storage(str(data / "ipam.db"))
+    finally:
+        data.chmod(0o755)
+    message = str(refused.value.code)
+    commands = re.findall(r"`(docker compose run [^`]*)`", message)
+    assert len(commands) == 2, message
+    uid, gid = os.getuid(), os.getgid()
+    give, close = (shlex.split(command) for command in commands)
+    run = ["docker", "compose", "run", "--rm", "--no-deps", "--user", "root", "--entrypoint"]
+    assert give == [*run, "chown", "ipam", "-R", f"{uid}:{gid}", str(data)]
+    assert close == [*run, "chmod", "ipam", "700", str(data)]
+    assert not (tmp_path / "pwned").exists()
+
+
+@needs_non_root
+def test_control_characters_in_the_path_are_shown_as_escapes(tmp_path):
+    from app import database
+
+    data = tmp_path / "a\x1b[2Jb\nc"
+    data.mkdir()
+    data.chmod(0o555)
+    try:
+        with pytest.raises(SystemExit) as refused:
+            database.refuse_unwritable_storage(str(data / "ipam.db"))
+    finally:
+        data.chmod(0o755)
+    message = str(refused.value.code)
+    assert "\x1b" not in message and "\n" not in message
+    assert message.count("a\\x1b[2Jb\\nc") == 3  # the sentence and both commands
