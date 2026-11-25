@@ -27,6 +27,32 @@ Template:
 
 ---
 
+## 2026-11-25 — Claude Code (Fable 5.2), orchestrator — state after the wave of 2026-11-24/25; three workers in flight
+- **Done:** since the last orchestrator entry (now in `.agents/handoff/2026-11.md`), merged by squash with the owner's go-ahead for each, every one with a hand-off entry here or in the archive: #91 (PR #134), #133 (#137), #22 (#130), #23 (#141), #100 (#142), #24 (#145), #144 (#146), #139 (#148), #132 (#135), #149 (#151), #143 (#150), #138 (#152), #92 (#157), #156 (#158), #153 (#155), #147 (#154). `main` is at `c4c4e4d` plus hand-off commits: 1,462 agent, 1,340 server and 188 web tests.
+- **In flight** (three, the limit; none shares a code file):
+  - **#140** (installer parser errors; the agent token's form in `agent_protocol.py`), branch `140-parser-errors-token-form`. Owes a briefed round.
+  - **#160** (refuse a DNS reply whose header claims more records than a PTR answer needs), branch `160-dns-record-budget`. Owes a briefed round.
+  - **#94** (pin the agent's base image by digest), branch `94-agent-base-image-digest`. Automatic reviews only.
+  - Nothing wakes the orchestrator when a worker opens its PR: list open PRs at the start of each turn, then watch, verify and brief.
+- **Queue, in the order agreed with the owner:** #136 after #140 (both edit `install.py`); #159 after #94 (both touch the release workflow); #93 and #20 after #160, one at a time (all in `probe.py`). #31 (deployment document from spec §8) is unblocked by #132 and not started. M3 (#26–#30, #32) waits on #25.
+- **Decisions the owner took this session:**
+  - A GO from Sol stands in for a Greptile re-run. When a PR owes no briefed round and Greptile has not read the head, run one outside read by Sol instead of asking for a retrigger.
+  - P3s on a follow-up PR go back to its worker to fix in the same PR; the orchestrator then reads the diff against the reviewer's remedy, with Codex clean on the new head, and no further round.
+  - PR #154's command record is a tripwire for changes made in good faith, not a boundary (after two NO-GOs).
+  - A review round GPT-6.1 Sol is stopped on by its safety filter is restarted from T3 Code on GPT-6 Sol with Daybreak Blue (`.agents/orchestration.md`, "When a model refuses", updated in this commit). It happened on #132, #153 and #147 (twice in one day); the hand-over files are under `.dev/<issue>/`.
+  - "Pause new sessions" for the 5-hour Claude limit means new Claude workers only: Codex rounds may start, and messages to running workers are fine.
+- **Learned, and not written elsewhere:**
+  - Re-running a pull request's CI job re-tests the merge it was first run on. To test a PR against a `main` that has moved, update its branch (`gh pr update-branch`), check the new head's tree equals `git merge-tree --write-tree origin/main <old head>`, post `@codex review`, and say on the PR what the commit is. Done on #155 and #154.
+  - A check that fails in a test the PR does not touch is still evidence. #156's failure followed the text of an unrelated test module: `tracemalloc` counted a rebuild of the interpreter's interned-string table. A re-run of `main`'s job was the control that showed it was the head, not the runner.
+  - The orchestrator's own verification caught a wrong figure in #155 before its round (203 entries; a root question is 5 bytes, so 244). Recompute one stated bound per PR.
+- **State:** nothing half-finished in `main`. No schema change this session beyond those the merged PRs' entries name; `PROTOCOL_VERSION` is 2. Review briefs and reviews are in `.dev/<issue>/` in the main checkout (not committed). Stale local branches and `t3-*` worktrees from merged work are still on this machine; they are not cleaned up.
+- **Waiting on the owner:**
+  - The first build of the server image with the new `CMD` (`python -m app.serve`, #132): nobody has built it, and no proxy has been run against spec §8.
+  - The first release, by `.agents/releases.md`: nothing has been published; the first tag and the registry settings are theirs. Its step 5 now includes a check of the cross-attempt artefact download (#147).
+  - #5 and #25 (`owner` label), deferred until the deployment is rebuilt behind a tunnel.
+  - Permission to send packets on the test host covered 2026-11-23 only: ask again before any real-network test.
+- **Next:** verify the three PRs as they open; brief Sol on #140 and #160; then the queue above.
+
 ## 2026-11-25 — Claude Code (Opus 5.5), worker — #147: run the release's publish steps against stand-ins; the retry window (PR #154)
 - **Merged:** 2026-11-25, squash `c4c4e4d`, at head `6261c8b`; branch deleted. Entry committed by the orchestrator, with the review and state lines brought up to date. `6261c8b` is GitHub's merge of `main` (holding PRs #158 and #155) into the worker's last head `c3855d4`, with no hand-written change (its tree equals `git merge-tree` of the two); CI passed on it and Codex read it clean.
 - **Done:** [PR #154](https://github.com/DeusMaximus/TLG-IPAM/pull/154) (`147-release-publish-tests`) closes #147. Tests and runbook only; `release.yml` and `.github/scripts/` are byte for byte what they were.
@@ -109,18 +135,3 @@ Template:
 - **Waiting on the owner:** nothing from this PR.
 - **Untested:** a real browser on a real plain-HTTP origin (jsdom tests pass a `location` object).
 - **Next:** the owner key crossing in clear from such a page stays #31's (deployment guidance).
-
-## 2026-11-24 — Claude Code (Opus 5.5), worker — #138: the unit discards the CA trust settings the system manager supplies (PR #152)
-- **Merged:** 2026-11-25, squash `0537950`, at head `cbc4c9c`; branch deleted. Entry committed by the orchestrator, with the review and merge lines brought up to date.
-- **Done:** [PR #152](https://github.com/DeusMaximus/TLG-IPAM/pull/152) (`138-unit-manager-trust`, head `cbc4c9c`) closes #138.
-  - `install.discarded_trust(ca_file)` (new): `SSL_CERT_DIR` always, `SSL_CERT_FILE` unless `--ca-file` sets it. `render_unit(env_path, interpreter, ca_file)` writes `UnsetEnvironment=<those>` after `EnvironmentFile=`. Fixed names only; the `--ca-file` path stays in agent.env.
-  - Measured on systemd 257 (Debian 13, `--privileged --cgroupns=private --network none`): `UnsetEnvironment=` is applied after the manager's environment, `Environment=` and `EnvironmentFile=`, whatever the line order. `EnvironmentFile=` overrides the manager's value. The bare-name form is needed (`NAME=value` unsets only on a match). An empty `UnsetEnvironment=` in a drop-in clears the list. The same holds for `DefaultEnvironment=`.
-  - Real runs: `main`'s wheel reproduces the finding (install 0, token spent, `CERTIFICATE_VERIFY_FAILED`); this head checks in for the manager setting file, directory, both or neither, with and without `--ca-file`; `uninstall` leaves `/etc`, `/var/lib`, `/usr/lib/systemd` and the user database as before.
-  - Docs: spec §5.6 (install paragraph), `AGENTS.md` "Enrolment tokens" bullet, `README.md` private-CA paragraph.
-  - Tests: agent 1,362 → 1,374 on the branch, 1,379 merged with `main` (`unit_environment`, a stand-in for systemd's ordering built from the unit text; 8 manager × `--ca-file` cases; 3 live-TLS `--ca-file` cases; `_as_the_service` now builds its environment from the unit). 9 fail with the line removed. No server change.
-  - Review: Codex clean and Greptile 5/5 on `cbc4c9c`; CI green (10 checks). Briefed round by Codex (GPT-6.1 Sol) at `cbc4c9c`: GO, its round-3 finding on PR #130 closed, no new findings; it replayed the reproduction on a real systemd 257 and ran 30 probes of the ordering (review on the PR and in `.dev/138/review-1.md`).
-- **Decisions:** Deliberate calls 1–6 in the PR body: the unit discards rather than the installer reading `systemctl show-environment`; `SSL_CERT_FILE` is not unset with `--ca-file`; `SSL_CERT_DIR` is unset even with it; bare names; an owner's drop-in is the owner's; only the two OpenSSL variables. No new import or listed name, so `test_invariants.py` is unchanged.
-- **State:** merged. No schema change. A unit installed before this keeps its old text until `install` is run again.
-- **Waiting on the owner:** nothing from this PR.
-- **Untested:** an LXC, distributions other than Debian, systemd versions other than 257.
-- **Next:** #136 and #140 each edit `install.py`, one at a time. The image `ipam130-sol-systemd:review` on this machine runs systemd for installer checks; `docker exec` in it starts with umask 0000, so set `umask 022` first or `trust.check` refuses the venv.
