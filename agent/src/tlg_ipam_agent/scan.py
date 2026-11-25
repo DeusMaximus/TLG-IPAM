@@ -1,7 +1,8 @@
 """Running one job: the ICMP sweep of its addresses, then the ARP sweep, then PTR
-lookups for the addresses either found, inside the job's timeout (spec §5.2, §5.6).
+lookups for the addresses either found, then the forward-DNS check's A lookups for the
+names the job sent (#20), inside the job's timeout (spec §5.2, §5.6).
 
-Every packet goes to an address `guard.plan` returned, or, for a PTR lookup, to one of
+Every packet goes to an address `guard.plan` returned, or, for a DNS lookup, to one of
 the job's DNS servers (the host's own resolvers when the job names none) that
 `guard.dns_servers` keeps: with `ALLOWED_DNS_SERVERS` set, none outside it (#93), which
 the job's error says, and when it leaves none the lookups are not made. Every packet
@@ -20,6 +21,12 @@ that there is none, or neither, and only `rdns_no_name` clears a stored name. Th
 lookups that got no usable answer are counted in the job's error, and of them those
 that met a reply the agent refused unread, for its size or its header's counts (#164),
 and, as a notice, the lookups a later server answered after such a refusal (#170).
+A forward lookup is judged the same way: a name a server answered has an entry in the
+result set's `fdns`, its addresses or an empty list when the name does not resolve, and
+a name no server gave a usable answer for has none, so the server keeps its stored
+answer; the job's error counts them in their own words. The forward lookups run after
+the PTR lookups and only when those neither timed out nor stopped for a query that
+could not be sent, so no query is handed to a socket after such a failure.
 """
 
 import asyncio
@@ -34,7 +41,6 @@ from .probe import (
     DNS_PAYLOAD,
     DNS_QUESTIONS_MAX,
     DNS_RECORDS_MAX,
-    NO_DNS_SERVER,
     NO_NAME,
     AnsweredPastRefusal,
     ArpLink,
@@ -43,8 +49,10 @@ from .probe import (
     Prober,
     Resolver,
     UnreadReplies,
+    no_dns_server,
 )
 from .protocol import (
+    FDNS_ADDRESSES_MAX,
     LIVENESS,
     PROTOCOL_VERSION,
     SUPPORTED,
@@ -390,7 +398,24 @@ def no_answer(unanswered: int, asked: int, too_large: int = 0, too_many_records:
     )
 
 
-def cut_short(too_large: int, too_many_records: int) -> str:
+def fdns_no_answer(unanswered: int, asked: int, too_large: int = 0, too_many_records: int = 0) -> str:
+    """`no_answer` for the forward-DNS check's lookups (#20): of the `asked` names a job
+    sent, no DNS server gave a usable answer for `unanswered`, so the result set has no
+    entry for them and the server keeps their stored answers. The refusals follow as
+    they do for the PTR lookups, and `error_text` leaves them out whole should the
+    whole not fit."""
+    if not (too_large or too_many_records):
+        return (
+            f"fdns: no DNS server gave a usable answer for {unanswered} of {asked} "
+            "names; their stored answers are kept"
+        )
+    return (
+        f"fdns: no DNS server gave a usable answer for {unanswered} of {asked} names, "
+        f"answers kept; {refused_unread(too_large, too_many_records)}"
+    )
+
+
+def cut_short(too_large: int, too_many_records: int, what: str = "rdns") -> str:
     """The refusals of a job whose PTR lookups the deadline cut short, after the
     timeout's own error (#164, round 1 of the briefed review, finding 1): counted over
     the lookups that returned, each refusal having ended an attempt before the
@@ -398,10 +423,10 @@ def cut_short(too_large: int, too_many_records: int) -> str:
     counted whatever its earlier attempts met. The count of lookups without a usable
     answer stays out of such a job's error, as before #164: the timeout's error already
     says the lookups did not all run."""
-    return f"rdns: before the timeout, {refused_unread(too_large, too_many_records)}"
+    return f"{what}: before the timeout, {refused_unread(too_large, too_many_records)}"
 
 
-def answered_later(too_large: int, too_many_records: int) -> str:
+def answered_later(too_large: int, too_many_records: int, what: str = "rdns") -> str:
     """The notice of a job some of whose PTR lookups a later server answered, with a
     name or that there is none, after an earlier attempt of each met a reply from its
     own server that the agent refused unread (#170): `too_large` and
@@ -411,10 +436,10 @@ def answered_later(too_large: int, too_many_records: int) -> str:
     whose every reply is refused shows before the day the later one stops answering.
     Counts and fixed words only, as #164's: nothing of a reply, a name, an address or
     a server, which of the configured servers it was included."""
-    return f"rdns: a later server answered after {refused_unread(too_large, too_many_records)}"
+    return f"{what}: a later server answered after {refused_unread(too_large, too_many_records)}"
 
 
-def outside_allowed(outside: int, chosen: int) -> str:
+def outside_allowed(outside: int, chosen: int, what: str = "rdns") -> str:
     """What `ALLOWED_DNS_SERVERS` took away (#93): of the `chosen` servers the agent
     would have asked (`Resolver.servers`), `outside` lie outside it and were not asked.
     When that is all of them the lookups were not made, which this says as NO_DNS_SERVER
@@ -424,23 +449,36 @@ def outside_allowed(outside: int, chosen: int) -> str:
     holds, as #164's counts name none."""
     if outside == chosen:
         if chosen == 1:
-            return "rdns not run: the 1 DNS server to ask is outside ALLOWED_DNS_SERVERS"
-        return f"rdns not run: all {chosen} DNS servers to ask are outside ALLOWED_DNS_SERVERS"
+            return f"{what} not run: the 1 DNS server to ask is outside ALLOWED_DNS_SERVERS"
+        return f"{what} not run: all {chosen} DNS servers to ask are outside ALLOWED_DNS_SERVERS"
     verb, passive = ("is", "was") if outside == 1 else ("are", "were")
     return (
-        f"rdns: {outside} of the {chosen} DNS servers to ask {verb} outside ALLOWED_DNS_SERVERS "
+        f"{what}: {outside} of the {chosen} DNS servers to ask {verb} outside ALLOWED_DNS_SERVERS "
         f"and {passive} not asked"
     )
+
+
+# The error of a job whose forward-DNS lookups were not made because its PTR lookups
+# stopped with no query sent, which the error says just before it: none is handed to a
+# socket after that failure (#20). Short, so that with it the longest error of such a
+# job still keeps #93's notice (`test_scan.py`)
+FDNS_AFTER_RDNS_STOPPED = "fdns not run"
+
+
+def lookups_named(rdns: bool, fdns: bool) -> str:
+    """Which lookups a job's DNS error is about: `rdns`, `fdns`, or both."""
+    return "rdns and fdns" if rdns and fdns else ("fdns" if fdns else "rdns")
 
 
 def error_text(errors: list[str], *optional: tuple[int, str | None]) -> str | None:
     """A job's error: its parts joined, made printable and capped as the server stores
     it (`scan_error`). Each of `optional` names a part that carries counts, at its
     place in `errors`, with the text that stands there without them (None: nothing),
-    in the order they are given up: `scan.run` gives the notice of lookups a later
-    server answered first (#170), then the refusal counts of the lookups without a
-    usable answer (#164), then the notice of servers `ALLOWED_DNS_SERVERS` left out
-    (#93), which is short and says a cause no count does. While the whole would not
+    in the order they are given up: `scan.run` gives the notices of lookups a later
+    server answered first (#170), the forward lookups' before the PTR lookups' (#20),
+    then the refusal counts of the lookups without a usable answer (#164), in the same
+    order, then the notice of servers `ALLOWED_DNS_SERVERS` left out (#93), which is
+    short and says a cause no count does. While the whole would not
     fit SCAN_ERROR_MAX, the next of them is left out whole, never cut short of its
     number (round 1 of #164's briefed review, finding 2); what is left is capped as
     before."""
@@ -503,8 +541,9 @@ async def run(
 
     unsupported = sorted(job.methods - SUPPORTED)
     if unsupported:
-        # e.g. `fdns` before #20: the rest runs, but a sweep that skipped an issued
-        # liveness method must not let the server mark the silent addresses dead
+        # none since #20 (this release runs every method the protocol names), kept for
+        # a method a later protocol adds: the rest runs, but a sweep that skipped an
+        # issued liveness method must not let the server mark the silent addresses dead
         complete = False
         liveness_complete = not (LIVENESS & set(unsupported))
         errors.append(f"not run by this agent release: {', '.join(unsupported)}")
@@ -572,19 +611,26 @@ async def run(
     later_too_large: set[Address] = set()
     later_too_many_records: set[Address] = set()
     looked_up = 0  # lookups that returned, whatever they found
-    # the parts of `errors` that carry counts, and what stands there without them:
-    # the notice, then the refusal counts, are left out whole if the error would not
-    # fit (`error_text`)
-    notice: tuple[int, str | None] | None = None
-    counts: tuple[int, str | None] | None = None
+    # the parts of `errors` that carry counts, and what stands there without them, by
+    # the order they are given up should the error not fit (`error_text`): each
+    # lookup's notice, then each lookup's refusal counts, the forward lookups' first
+    rdns_notice: tuple[int, str | None] | None = None
+    rdns_counts: tuple[int, str | None] | None = None
+    fdns_notice: tuple[int, str | None] | None = None
+    fdns_counts: tuple[int, str | None] | None = None
     # the notice of servers ALLOWED_DNS_SERVERS left out, while some are still asked
     narrowed: tuple[int, str | None] | None = None
+    # which lookups the job needs a DNS server for: PTR for its live addresses, A for
+    # the names it was sent (#20), chosen once for both
+    wants_rdns = "rdns" in job.methods and bool(alive)
+    wants_fdns = bool(job.fdns)
+    lookups = lookups_named(wants_rdns, wants_fdns)
     servers: tuple[str, ...] = ()
-    if "rdns" in job.methods and alive and not timed_out:
+    if (wants_rdns or wants_fdns) and not timed_out:
         # chosen once for the job: its own servers, else the host's resolvers as they
         # are now. With none, no lookup can be made, and a lookup not made is not one
         # that found no name: the result set is incomplete, so the server keeps the
-        # names it has (spec §5.7), and no query is sent
+        # names and answers it has (spec §5.7), and no query is sent
         left = deadline - clock.monotonic()
         try:
             if left <= 0:
@@ -595,7 +641,8 @@ async def run(
             servers = await asyncio.wait_for(resolver.servers(job.dns_servers), left)
         except TimeoutError:
             timed_out = True
-            errors.append(f"timed out after {job.timeout_s} s during the PTR lookups")
+            step = "PTR" if wants_rdns else "forward"
+            errors.append(f"timed out after {job.timeout_s} s during the {step} lookups")
         else:
             # the host's limit, before any query: a server outside it is never asked,
             # whether the job named it or resolv.conf lists it (#93)
@@ -605,30 +652,35 @@ async def run(
                 # no lookup is made: so the result set is incomplete, and the server
                 # keeps the names it has, as with no server at all
                 complete = False
-                errors.append(outside_allowed(outside, chosen) if outside else NO_DNS_SERVER)
+                errors.append(outside_allowed(outside, chosen, lookups) if outside else no_dns_server(lookups))
             elif outside:
                 # the rest are asked, as they would be were the others silent
-                errors.append(outside_allowed(outside, chosen))
+                errors.append(outside_allowed(outside, chosen, lookups))
                 narrowed = (len(errors) - 1, None)
-    if servers:
+
+    def lookup_slot() -> Callable[[], Awaitable[float]]:
+        """One lookup's `slot`: a packet from the budget the sweeps drew on, before each
+        query, and the seconds the lookup has left."""
+        end: float | None = None
+
+        async def slot() -> float:
+            nonlocal end
+            await pacer.wait()
+            now = clock.monotonic()
+            if end is None:
+                # the lookup's own time starts once its first query may go, not while
+                # it queues behind other lookups for a slot; the job's deadline holds
+                end = min(now + RDNS_TIMEOUT_S, deadline)
+            return end - now
+
+        return slot
+
+    rdns_stopped = False
+    if servers and wants_rdns:
 
         async def lookup(address: Address, _timeout: float) -> None:
             nonlocal looked_up
-            end: float | None = None
-
-            async def slot() -> float:
-                # one packet from the budget the ICMP sweep drew on, before each query
-                nonlocal end
-                await pacer.wait()
-                now = clock.monotonic()
-                if end is None:
-                    # the lookup's own time starts once its first query may go, not
-                    # while it queues behind other lookups for a slot; the job's
-                    # deadline still holds
-                    end = min(now + RDNS_TIMEOUT_S, deadline)
-                return end - now
-
-            answer = await resolver.ptr(address, servers, slot)
+            answer = await resolver.ptr(address, servers, lookup_slot())
             looked_up += 1
             if isinstance(answer, AnsweredPastRefusal):
                 # a later server's answer decides the record as it would alone; that an
@@ -667,21 +719,85 @@ async def run(
         except ProbeError as exc:
             # the names the lookups that finished found are still reported
             complete = False
+            rdns_stopped = True
             errors.append(str(exc))
         # a lookup the deadline cut off is in the timeout's error, not counted here;
         # the refusals of the lookups that ended in time are (#164)
         if unanswered and not timed_out:
             errors.append(no_answer(len(unanswered), looked_up, len(too_large), len(too_many_records)))
             if too_large or too_many_records:
-                counts = (len(errors) - 1, no_answer(len(unanswered), looked_up))
+                rdns_counts = (len(errors) - 1, no_answer(len(unanswered), looked_up))
         elif timed_out and (too_large or too_many_records):
             errors.append(cut_short(len(too_large), len(too_many_records)))
-            counts = (len(errors) - 1, None)
+            rdns_counts = (len(errors) - 1, None)
         # the lookups that returned with a later server's answer, whatever ended the
         # rest: last, and the first part given up should the error not fit (#170)
         if later_too_large or later_too_many_records:
             errors.append(answered_later(len(later_too_large), len(later_too_many_records)))
-            notice = (len(errors) - 1, None)
+            rdns_notice = (len(errors) - 1, None)
+
+    # The forward-DNS check (#20): the A records of each name the job sent, after the
+    # PTR lookups, through the same resolver, servers and budget. A name a server
+    # answered has an entry (an empty address list when it does not resolve); one no
+    # server gave a usable answer for has none, so the server keeps its stored answer.
+    resolved: dict[str, tuple[str, ...]] = {}
+    if servers and wants_fdns and not timed_out:
+        if rdns_stopped:
+            # no query is handed to a socket after a lookup that could send none
+            complete = False
+            errors.append(FDNS_AFTER_RDNS_STOPPED)
+        else:
+            f_unanswered: set[str] = set()
+            f_too_large: set[str] = set()
+            f_too_many_records: set[str] = set()
+            f_later_too_large: set[str] = set()
+            f_later_too_many_records: set[str] = set()
+            f_looked_up = 0
+
+            async def resolve(item: tuple[str, str], _timeout: float) -> None:
+                nonlocal f_looked_up
+                host_id, fqdn = item
+                answer = await resolver.a(fqdn, servers, lookup_slot())
+                f_looked_up += 1
+                if isinstance(answer, AnsweredPastRefusal):
+                    if answer.too_large:
+                        f_later_too_large.add(host_id)
+                    if answer.too_many_records:
+                        f_later_too_many_records.add(host_id)
+                    answer = answer.answer
+                if answer is NO_NAME:
+                    resolved[host_id] = ()
+                elif answer is None or isinstance(answer, UnreadReplies):
+                    f_unanswered.add(host_id)
+                    if isinstance(answer, UnreadReplies):
+                        if answer.too_large:
+                            f_too_large.add(host_id)
+                        if answer.too_many_records:
+                            f_too_many_records.add(host_id)
+                else:
+                    resolved[host_id] = tuple(answer)[:FDNS_ADDRESSES_MAX]
+
+            pool = _Pool(RDNS_CONCURRENCY, RDNS_TIMEOUT_S, None, clock, deadline, cancel_on_failure=True)
+            try:
+                if not await pool.run(list(job.fdns), resolve):
+                    timed_out = True
+                    errors.append(f"timed out after {job.timeout_s} s during the forward lookups")
+            except ProbeError as exc:
+                # the answers the lookups that finished found are still reported
+                complete = False
+                errors.append(str(exc))
+            if f_unanswered and not timed_out:
+                errors.append(
+                    fdns_no_answer(len(f_unanswered), f_looked_up, len(f_too_large), len(f_too_many_records))
+                )
+                if f_too_large or f_too_many_records:
+                    fdns_counts = (len(errors) - 1, fdns_no_answer(len(f_unanswered), f_looked_up))
+            elif timed_out and (f_too_large or f_too_many_records):
+                errors.append(cut_short(len(f_too_large), len(f_too_many_records), "fdns"))
+                fdns_counts = (len(errors) - 1, None)
+            if f_later_too_large or f_later_too_many_records:
+                errors.append(answered_later(len(f_later_too_large), len(f_later_too_many_records), "fdns"))
+                fdns_notice = (len(errors) - 1, None)
     if timed_out:
         complete = False
 
@@ -704,6 +820,17 @@ async def run(
         "complete": complete,
         "liveness_complete": liveness_complete,
         "observations": observations,
-        "fdns": [],
-        "error": error_text(errors, *(part for part in (notice, counts, narrowed) if part is not None)),
+        "fdns": [
+            {"host_id": host_id, "addresses": list(resolved[host_id])}
+            for host_id, _ in job.fdns
+            if host_id in resolved
+        ],
+        "error": error_text(
+            errors,
+            *(
+                part
+                for part in (fdns_notice, rdns_notice, fdns_counts, rdns_counts, narrowed)
+                if part is not None
+            ),
+        ),
     }

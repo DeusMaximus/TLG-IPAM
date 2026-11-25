@@ -44,12 +44,13 @@ from ..agent_protocol import (
     PROTOCOL_VERSION,
     CheckinRequest,
     CheckinResponse,
+    FdnsName,
     Job,
 )
 from ..errors import ApiError, database_unavailable, validation_error
 from ..ipnet import canonical_cidr, on_link, parse_cidr
 from ..models import Agent, Change, ScanTarget, Subnet, Token
-from . import agents, changes, scans
+from . import agents, changes, fdns, scans
 from .scans import utc
 
 # spec §5.1: the per-job timeout plus a margin
@@ -111,12 +112,12 @@ def l2_local(subnet: Subnet, interfaces: list[dict] | None) -> bool:
 def job_methods(target: ScanTarget, subnet: Subnet, interfaces: list[dict] | None) -> list[str]:
     """The methods a job for this target runs on this agent, or [] when it cannot run.
 
-    `arp` is dropped when the subnet is not on the agent's link (spec §5.2), and `fdns`
-    until the forward-DNS check exists (#20), so no name is ever sent. When no liveness
-    method is left, the target cannot be scanned by this agent and no job is issued.
+    `arp` is dropped when the subnet is not on the agent's link (spec §5.2). When no
+    liveness method is left, the target cannot be scanned by this agent and no job is
+    issued. `fdns` is kept as the target has it, whether or not any host's name can be
+    sent (`fdns.names_for_job`): a job with none sends an empty list.
     """
     chosen = set(target.methods or ())
-    chosen.discard("fdns")
     if "arp" in chosen and not l2_local(subnet, interfaces):
         chosen.discard("arp")
     if not chosen & scans.LIVENESS_METHODS:
@@ -164,12 +165,21 @@ def _priority(target: ScanTarget):
 
 
 async def _lease(
-    session: AsyncSession, target: ScanTarget, agent: Agent, methods: list[str], now: datetime
+    session: AsyncSession,
+    target: ScanTarget,
+    agent: Agent,
+    methods: list[str],
+    names: list[tuple[str, str, int]],
+    now: datetime,
 ) -> str | None:
     """Lease the target to a new job. The update only applies if the lease is still the
     one this check-in read, so two check-ins can never both issue the same target.
     The lease keeps the methods issued: results ingest judges a result by what
-    the server sent (liveness, `arp` and so MACs), never by what the agent claims."""
+    the server sent (liveness, `arp` and so MACs), never by what the agent claims. It
+    keeps the names sent for `fdns` too, as `[host_id, fqdn, ip_int]`: ingest stores an
+    answer only for a host named there, under the name asked, while the host is still at
+    that address (`fdns.store`)."""
+    sent = [[host_id, fqdn, ip_int] for host_id, fqdn, ip_int in names] if "fdns" in methods else None
     job_id = str(uuid4())
     result = await session.execute(
         update(ScanTarget)
@@ -177,12 +187,13 @@ async def _lease(
             ScanTarget.id == target.id,
             ScanTarget.current_job_id.is_not_distinct_from(target.current_job_id),
         )
-        .values(current_job_id=job_id, job_issued_at=now, job_methods=methods)
+        .values(current_job_id=job_id, job_issued_at=now, job_methods=methods, job_fdns=sent)
         .execution_options(synchronize_session=False)
     )
     if result.rowcount != 1:
         return None
     target.current_job_id, target.job_issued_at, target.job_methods = job_id, now, methods
+    target.job_fdns = sent
     # the agent's own record: it is busy until this lease is cleared or expires
     agent.current_job_id, agent.job_issued_at = job_id, now
     return job_id
@@ -213,10 +224,12 @@ async def _next_job(session: AsyncSession, agent: Agent, now: datetime) -> Job |
         methods = job_methods(target, subnet, agent.interfaces)
         if not methods:
             continue
-        ranges = await scans.scan_scope_ranges(session, subnet)
+        ranges, scope = await scans.scan_scope_with_ranges(session, subnet)
         if not ranges:
             continue
-        job_id = await _lease(session, target, agent, methods, now)
+        # spec §7.2, invariant 5: only names under the subnet's domain, of hosts in scope
+        names = await fdns.names_for_job(session, subnet, scope) if "fdns" in methods else []
+        job_id = await _lease(session, target, agent, methods, names, now)
         if job_id is None:
             continue
         return Job(
@@ -231,7 +244,7 @@ async def _next_job(session: AsyncSession, agent: Agent, now: datetime) -> Job |
             # longer list stored before the owner API bounded it (spec §5.7)
             dns_servers=list(subnet.dns_servers or [])[:DNS_SERVERS_MAX],
             timeout_s=JOB_TIMEOUT_S,
-            fdns=[],
+            fdns=[FdnsName(host_id=host_id, fqdn=fqdn) for host_id, fqdn, _ in names],
         )
     return None
 

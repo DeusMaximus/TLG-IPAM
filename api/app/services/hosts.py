@@ -2,13 +2,13 @@ from collections import Counter
 from datetime import datetime
 
 from pydantic import ValidationError
-from sqlalchemy import or_, select, tuple_
+from sqlalchemy import delete, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..errors import ApiError, conflict, not_found, validation_error
 from ..ipnet import ip_in_subnet, iter_free, parse_cidr
-from ..models import Host, Observation, Subnet
+from ..models import FdnsResult, Host, Observation, Subnet
 from ..schemas import (
     HOST_NOTES_MAX,
     AllocateRequest,
@@ -230,6 +230,15 @@ async def update_host(
         subnet = await get_subnet(session, host.subnet_id)
         addr = ip_in_subnet(data["ip"], subnet.cidr)
         _check_not_reserved(int(addr), subnet)
+        if int(addr) != host.ip_int:
+            # The host's forward-DNS answer was judged against the address it had: it
+            # goes with this edit, as scan state, and the next job asks again (#20; round
+            # 1 of #185's briefed review, finding 1). A job in flight stores none for it.
+            await session.execute(
+                delete(FdnsResult)
+                .where(FdnsResult.host_id == host.id)
+                .execution_options(synchronize_session=False)
+            )
         host.ip_int = int(addr)
     if "last_seen" in data and utc(data["last_seen"]) == utc(host.last_seen):
         # The same instant is not a change. SQLite reads the stored value back without

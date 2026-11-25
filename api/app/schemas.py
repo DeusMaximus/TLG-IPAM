@@ -527,9 +527,15 @@ class ScanTargetOut(BaseModel):
 
 # --- Findings ---
 
-# v0.2 spec §5.5. `fdns_mismatch` joins these with the forward-DNS check (#20).
+# v0.2 spec §5.5, in the order findings at one address are listed
 FindingType = Literal[
-    "unknown_host", "mac_missing", "mac_mismatch", "name_missing", "name_mismatch", "stale"
+    "unknown_host",
+    "mac_missing",
+    "mac_mismatch",
+    "name_missing",
+    "name_mismatch",
+    "fdns_mismatch",
+    "stale",
 ]
 
 
@@ -541,7 +547,8 @@ class FindingKey(BaseModel):
     subnet_id: str = Field(max_length=36)
     ip: str = Field(max_length=39)
     type: FindingType
-    # a MAC, a PTR name, a last-seen timestamp, `never`, or empty
+    # a MAC, a PTR name, forward-DNS addresses or `unresolved`, a last-seen timestamp,
+    # `never`, or empty
     observed: str = Field(max_length=253)
     # the finding's fingerprint as listed: required to accept, checked if sent to dismiss
     fingerprint: str | None = Field(default=None, max_length=64)

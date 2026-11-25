@@ -8,9 +8,9 @@ Scan targets and scan scope are configured by the owner over REST only. No MCP t
 creates, changes or lists a scan target, and no MCP call can widen the scope
 (spec §7.2, invariant 2); `list_changes` still shows their audit entries.
 
-Observations and finding dismissals exist only inside the scope. Every write that can
-narrow it calls `drop_out_of_scope` in its own transaction (spec §5.3, "leaving scope
-deletes data").
+Observations, finding dismissals and forward-DNS answers exist only inside the scope.
+Every write that can narrow it calls `drop_out_of_scope` in its own transaction (spec
+§5.3, "leaving scope deletes data").
 
 This module reads subnets and reserved ranges straight from the models rather than
 through `services/subnets`, which imports it.
@@ -33,7 +33,16 @@ from ..ipnet import (
     subtract_intervals,
     usable_bounds,
 )
-from ..models import Agent, FindingDismissal, Observation, ReservedRange, ScanTarget, Subnet
+from ..models import (
+    Agent,
+    FdnsResult,
+    FindingDismissal,
+    Host,
+    Observation,
+    ReservedRange,
+    ScanTarget,
+    Subnet,
+)
 from ..schemas import ScanSuggestionOut, ScanTargetCreate, ScanTargetOut, ScanTargetUpdate
 from ..times import utc
 from . import changes
@@ -177,11 +186,20 @@ async def scan_scope(session: AsyncSession, subnet: Subnet | str) -> list[tuple[
 
 async def scan_scope_ranges(session: AsyncSession, subnet: Subnet) -> list[dict]:
     """`scan_scope` as `[{start, end}]` address strings, the shape of a job's ranges."""
+    return (await scan_scope_with_ranges(session, subnet))[0]
+
+
+async def scan_scope_with_ranges(
+    session: AsyncSession, subnet: Subnet
+) -> tuple[list[dict], list[tuple[int, int]]]:
+    """`scan_scope_ranges` and `scan_scope` of one read: a job's ranges, and the integer
+    ranges its forward-DNS names are chosen by (`fdns.names_for_job`), so both are the
+    same scope."""
     found = await _scope_as_committed(session, subnet.id)
     if found is None:
-        return []
+        return [], []
     cidr, scope = found
-    return format_intervals(parse_cidr(cidr), scope)
+    return format_intervals(parse_cidr(cidr), scope), scope
 
 
 async def take_write_lock(session: AsyncSession) -> None:
@@ -201,10 +219,11 @@ def in_scope(scope: list[tuple[int, int]], ip_int: int) -> bool:
 
 
 async def drop_out_of_scope(session: AsyncSession, subnet: Subnet) -> None:
-    """Delete the subnet's observations and finding dismissals outside its scan scope as
-    it now stands: the "leaving scope" rule (spec §5.3). Every write that can narrow the scope calls this
-    in its own transaction, after its change (pool scanning turned off or the target
-    deleted, a range excluded, the pool or the CIDR edited). Does not commit.
+    """Delete the subnet's observations, finding dismissals and its hosts' forward-DNS
+    answers outside its scan scope as it now stands: the "leaving scope" rule (spec
+    §5.3). Every write that can narrow the scope calls this in its own transaction,
+    after its change (pool scanning turned off or the target deleted, a range excluded,
+    the pool or the CIDR edited). Does not commit.
 
     The caller read the subnet, and validated its change, before its transaction took
     SQLite's write lock: the driver begins the transaction at the first write, so
@@ -214,7 +233,7 @@ async def drop_out_of_scope(session: AsyncSession, subnet: Subnet) -> None:
     as committed. The caller's own change is flushed first and is part of it.
 
     The rows deleted are not audit-logged; the write that narrowed the scope is.
-    Observations are scan state. A dismissal is the owner's, but it only ever hides a
+    Observations and forward-DNS answers are scan state. A dismissal is the owner's, but it only ever hides a
     finding, and an address out of scope raises none (spec §5.5).
     """
     await session.flush()
@@ -223,10 +242,18 @@ async def drop_out_of_scope(session: AsyncSession, subnet: Subnet) -> None:
     # Membership is decided here with `in_scope`, not in SQL: a scope can hold more
     # ranges than SQLite's expression-depth limit allows as OR branches, and a statement
     # that failed would roll back the owner's edit.
-    for model in (Observation, FindingDismissal):
-        rows = await session.execute(
-            select(model.id, model.ip_int).where(model.subnet_id == subnet.id)
-        )
+    # A forward-DNS answer is a host's, placed by the host's address (#20).
+    fdns_rows = (
+        select(FdnsResult.id, Host.ip_int)
+        .join(Host, Host.id == FdnsResult.host_id)
+        .where(Host.subnet_id == subnet.id)
+    )
+    by_address = [
+        (model, select(model.id, model.ip_int).where(model.subnet_id == subnet.id))
+        for model in (Observation, FindingDismissal)
+    ]
+    for model, query in (*by_address, (FdnsResult, fdns_rows)):
+        rows = await session.execute(query)
         gone = [row_id for row_id, ip_int in rows.all() if not in_scope(scope, ip_int)]
         for i in range(0, len(gone), _DELETE_BATCH):
             await session.execute(

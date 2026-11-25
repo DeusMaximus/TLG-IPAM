@@ -23,7 +23,8 @@ each record's own lookup (`rdns_no_name`) the second. A protocol-1 result set, f
 agent that carried a job leased before the server was upgraded, is judged by
 `complete` for both, as it was when it was sent.
 
-Ingest writes observations and the target's last-scan columns. It never writes
+Ingest writes observations, forward-DNS answers (`fdns.store`, which keeps an answer
+only for a host the job was sent) and the target's last-scan columns. It never writes
 `hosts` (spec §7.2, invariant 3) and writes nothing to the change log: an agent
 reports every few minutes, and nothing here is owner data. Agent text is sanitised
 at ingest by the wire contract (`agent_protocol.rdns_name`, `scan_error`) and never
@@ -54,7 +55,7 @@ from ..agent_protocol import (
 from ..errors import ApiError, database_unavailable, internal_error, validation_error
 from ..ipnet import parse_cidr
 from ..models import Agent, Observation, ScanTarget, Subnet, Token
-from . import scans
+from . import fdns, scans
 from .agents import record_token_use, token_in_use, token_refused
 from .scans import utc
 
@@ -130,6 +131,7 @@ async def _release(
             current_job_id=None,
             job_issued_at=None,
             job_methods=None,
+            job_fdns=None,
             # when this job was issued, by the server's clock (spec §5.1): it keeps the
             # attempt time that `jobs._priority` orders by, and a request made while the
             # job ran is still later than it, so still due. `scan_requested_at` stays.
@@ -205,6 +207,8 @@ async def _accept(session: AsyncSession, agent: Agent, report: ResultsRequest) -
     # what the server issued, read with the lease that `_release` checks is still this
     # job's: liveness, `arp` and so MACs, `rdns` and so names
     methods = set(target.job_methods or ())
+    # the names the job was sent, read with the lease too: only their answers are kept
+    sent = target.job_fdns if "fdns" in methods else None
     subnet = await session.get(Subnet, target.subnet_id)
     await _release(session, agent, target, report)
     await record_token_use(session, _now())
@@ -269,6 +273,10 @@ async def _accept(session: AsyncSession, agent: Agent, report: ResultsRequest) -
         for ip_int, row in existing.items():
             if ip_int not in named and scans.in_scope(scope, ip_int):
                 row.alive = False
+
+    # Forward-DNS answers, only for the hosts the job named, under the names it sent,
+    # while still in this subnet's scope; and the rows of hosts that are gone (#20)
+    await fdns.store(session, subnet.id, scope, sent, report.fdns, now)
 
     # spec §5.4: unseen for 90 days, in any subnet
     await session.execute(

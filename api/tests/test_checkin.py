@@ -766,7 +766,7 @@ async def test_lease_is_compare_and_set(client, agent_api, monkeypatch):
     agent, token = await make_agent(client)
     subnet = await lab(client)
     target = await make_target(client, subnet["id"], agent["id"])
-    real = scans.scan_scope_ranges
+    real = scans.scan_scope_with_ranges
 
     async def leased_meanwhile(session, subnet):
         # another check-in leased the target after this one read it
@@ -778,7 +778,7 @@ async def test_lease_is_compare_and_set(client, agent_api, monkeypatch):
         )
         return await real(session, subnet)
 
-    monkeypatch.setattr(scans, "scan_scope_ranges", leased_meanwhile)
+    monkeypatch.setattr(scans, "scan_scope_with_ranges", leased_meanwhile)
     assert await jobs_for(agent_api, token) == []
     assert (await target_row(target["id"])).current_job_id == "someone-else"
 
@@ -830,13 +830,14 @@ async def test_unscannable_target_does_not_block_the_next(client, agent_api):
     assert job["subnet_id"] == second["id"]
 
 
-async def test_fdns_is_not_issued_yet(client, agent_api):
-    # #20 builds the name list; until then no name is sent and the method is dropped
+async def test_fdns_is_issued_with_an_empty_list_when_no_name_can_be_sent(client, agent_api):
+    # #20: the method stays as the target has it; with no host whose FQDN is under the
+    # subnet's domain (here the subnet has none), no name is sent
     agent, token = await make_agent(client)
     subnet = await lab(client)
     await make_target(client, subnet["id"], agent["id"], methods=["icmp", "fdns"])
     [job] = await jobs_for(agent_api, token)
-    assert job["methods"] == ["icmp"]
+    assert job["methods"] == ["icmp", "fdns"]
     assert job["fdns"] == []
 
 

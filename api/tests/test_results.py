@@ -25,7 +25,7 @@ from app.agent_protocol import (
 )
 from app.body_limit import BODY_MAX
 from app.database import SessionLocal
-from app.models import Agent, Change, Host, Observation, ReservedRange, ScanTarget, Token
+from app.models import Agent, Change, FdnsResult, Host, Observation, ReservedRange, ScanTarget, Token
 from app.schemas import ScanTargetUpdate, SubnetUpdate
 from app.errors import ApiError
 from app.services import agents as agents_svc
@@ -1562,13 +1562,17 @@ async def test_a_malformed_result_set_is_refused_whole(client, agent_api, fields
     assert (await target_row(target["id"])).current_job_id == job["job_id"]
 
 
-async def test_fdns_answers_are_not_stored_yet(client, agent_api):
-    """No job names a host until #20, so no answer can be for one it sent."""
+async def test_fdns_answers_for_a_job_that_sent_no_name_are_not_stored(client, agent_api):
+    """An answer is kept only for a host the job named (#20; `test_fdns.py` holds the
+    rest): this job was not issued `fdns`, so it named none."""
     agent, token, subnet, target, job = await setup(client, agent_api)
+    host = await make_host(client, subnet["id"], "10.0.0.10", hostname="nas")
     data = await accepted(
-        agent_api, token, job, [obs("10.0.0.10")], fdns=[{"host_id": "h", "addresses": []}]
+        agent_api, token, job, [obs("10.0.0.10")], fdns=[{"host_id": host["id"], "addresses": []}]
     )
     assert data["accepted"] == 1
+    async with SessionLocal() as session:
+        assert await session.scalar(select(func.count(FdnsResult.id))) == 0
 
 
 def test_in_scope():

@@ -10,7 +10,10 @@ excluded), every method a target can hold, a stored `dns_servers` list longer th
 the owner API now accepts, as a subnet saved before the bound keeps, and a stored CIDR
 spelled as long as the owner API once took, as a subnet saved before #97 keeps. A job
 carries the CIDR's canonical spelling (`ipnet.canonical_cidr`), so the longest CIDR the
-server can send is the longest canonical one, whatever the subnet stores."""
+server can send is the longest canonical one, whatever the subnet stores. Since #20 it
+also carries the forward-DNS names: a host at every scanned address, each with an FQDN
+of the longest a DNS name can be, more than a job sends (`fdns.FDNS_JOB_MAX`), and the
+bound counts as many as it sends, each with the longest host id and FQDN."""
 
 import ipaddress
 import json
@@ -22,9 +25,9 @@ from app.agent_protocol import DNS_SERVERS_MAX
 from app.database import SessionLocal
 from app.ipnet import canonical_cidr, usable_bounds
 from app.main import app
-from app.models import ReservedRange, Subnet
+from app.models import Host, ReservedRange, Subnet
 from app.schemas import SUBNET_DNS_SERVERS_MAX
-from app.services import scans
+from app.services import fdns, scans
 from sqlalchemy import update
 
 from conftest import FakeArp, FakeClock, FakeProber, FakeResolver, make_config
@@ -43,6 +46,12 @@ _LONGEST_CIDR = "255.255.255.255/32"
 # 109,276 bytes here, past the bound below, and the agent refused the job (its `cidr`
 # over 64 characters).
 _PADDED_CIDR = "192.168.240.0/" + "0" * 4298 + "20"
+# A hostname that makes, with the subnet's domain, an FQDN of 253 characters, the
+# longest a DNS name can be written (`agent_protocol.fdns_name`); and the longest host id
+_DOMAIN = "home.arpa"
+_LONGEST_HOSTNAME = ".".join(["a" * 63] * 3 + ["b" * (253 - len(_DOMAIN) - 1 - 3 * 64)])
+_LONGEST_FQDN = f"{_LONGEST_HOSTNAME}.{_DOMAIN}"
+_LONGEST_HOST_ID = "f" * 36
 
 
 class Recording(httpx.AsyncBaseTransport):
@@ -85,12 +94,20 @@ async def test_the_largest_checkin_answer_is_inside_the_agents_limit(owner):  # 
                     start_int=ip_int, end_int=ip_int, scan_excluded=True,
                 )
             )
+        # a host at every scanned address, each named at the longest (#20)
+        for ip_int in scanned:
+            session.add(
+                Host(
+                    subnet_id=subnet["id"], ip=str(ipaddress.ip_address(ip_int)), ip_int=ip_int,
+                    hostname=_LONGEST_HOSTNAME,
+                )
+            )
         # stored before the owner API bounded the list (#75) and canonicalised the
         # CIDR (#97), and kept by it
         await session.execute(
             update(Subnet)
             .where(Subnet.id == subnet["id"])
-            .values(dns_servers=legacy, cidr=_PADDED_CIDR)
+            .values(dns_servers=legacy, cidr=_PADDED_CIDR, domain=_DOMAIN)
         )
         await session.commit()
 
@@ -120,17 +137,20 @@ async def test_the_largest_checkin_answer_is_inside_the_agents_limit(owner):  # 
     # server issues for a target that holds them all, and as many servers as a job carries
     assert len(raw["ranges"]) == len(scanned)
     assert [r["start"] for r in raw["ranges"]] == [str(ipaddress.ip_address(i)) for i in scanned]
-    assert raw["methods"] == ["icmp", "arp", "rdns"]
+    assert raw["methods"] == ["icmp", "arp", "rdns", "fdns"]
     assert raw["dns_servers"] == legacy[:DNS_SERVERS_MAX]
     # the CIDR in its canonical spelling, whatever the subnet stores
     assert canonical_cidr(_PADDED_CIDR) == str(net)
     assert raw["cidr"] == str(net)
-    # until #20, which must add its names to the bound below
-    assert raw["fdns"] == []
+    # as many names as a job sends, each at the longest: more hosts than that are named
+    assert len(_LONGEST_FQDN) == 253
+    assert len(raw["fdns"]) == fdns.FDNS_JOB_MAX < len(scanned)
+    assert {entry["fqdn"] for entry in raw["fdns"]} == {_LONGEST_FQDN}
 
     # and the agent runs it
     parsed = protocol.parse_job(protocol.job_ref(raw), raw)
     assert len(guard.plan(parsed, make_config().allowed)) == len(scanned)
+    assert len(parsed.fdns) == fdns.FDNS_JOB_MAX
 
     # The same answer with every address in it, and the CIDR, written at its longest,
     # and every method a target can hold, bounds what any subnet of this size can
@@ -147,6 +167,8 @@ async def test_the_largest_checkin_answer_is_inside_the_agents_limit(owner):  # 
                     "ranges": [{"start": _LONGEST_IP, "end": _LONGEST_IP}] * len(raw["ranges"]),
                     "methods": list(scans.SCAN_METHODS),
                     "dns_servers": [_LONGEST_IP] * DNS_SERVERS_MAX,
+                    # as many names as a job may send, of any scope, each at the longest
+                    "fdns": [{"host_id": _LONGEST_HOST_ID, "fqdn": _LONGEST_FQDN}] * fdns.FDNS_JOB_MAX,
                 }
             ],
         }

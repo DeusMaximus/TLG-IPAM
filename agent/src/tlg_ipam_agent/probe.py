@@ -1,5 +1,5 @@
-"""What sends packets: the ICMP echo prober, the ARP session and the PTR resolver
-(spec §5.2).
+"""What sends packets: the ICMP echo prober, the ARP session and the DNS resolver, for
+PTR lookups and the forward-DNS check's A lookups (spec §5.2).
 
 These are the only places in the agent that put anything on the network apart from
 its requests to the server, and each is handed one address at a time by `scan.run`,
@@ -83,6 +83,11 @@ class UnreadReplies(NamedTuple):
     too_many_records: bool
 
 
+# What an A lookup (`DnsResolver.a`) found: the IPv4 addresses at the name the answer
+# is about, sorted and each once, as text
+Addresses = tuple[str, ...]
+
+
 class AnsweredPastRefusal(NamedTuple):
     """What `ptr` returns in place of its answer for a lookup a later server answered
     (`answer`: a name, or NO_NAME) after an earlier attempt ended with a reply from
@@ -92,7 +97,7 @@ class AnsweredPastRefusal(NamedTuple):
     replies cost a query more (`scan.answered_later`). It holds nothing of the reply,
     its sender or the address."""
 
-    answer: str | NoName
+    answer: "str | NoName | Addresses"
     too_large: bool
     too_many_records: bool
 
@@ -105,7 +110,9 @@ def no_usable_answer(too_large: bool, too_many_records: bool) -> UnreadReplies |
     return None
 
 
-def answered(answer: str | NoName, too_large: bool, too_many_records: bool) -> str | NoName | AnsweredPastRefusal:
+def answered(
+    answer: "str | NoName | Addresses", too_large: bool, too_many_records: bool
+) -> "str | NoName | Addresses | AnsweredPastRefusal":
     """What `ptr` returns for a lookup a server answered: the answer itself, as before
     #170, when no earlier attempt's reply was refused unread, and AnsweredPastRefusal
     otherwise."""
@@ -125,6 +132,11 @@ class Resolver(Protocol):
     async def ptr(
         self, address: Address, servers: tuple[str, ...], slot: Slot
     ) -> str | NoName | AnsweredPastRefusal | UnreadReplies | None: ...
+    # the forward-DNS check (#20): `name`'s IPv4 addresses, or NO_NAME when a server
+    # said it has none, and otherwise as `ptr` answers, the errors saying fdns
+    async def a(
+        self, name: str, servers: tuple[str, ...], slot: Slot
+    ) -> Addresses | NoName | AnsweredPastRefusal | UnreadReplies | None: ...
 
 
 class IcmpProber:
@@ -283,8 +295,16 @@ RESOLV_CONF = "/etc/resolv.conf"
 # has not finished by then, or a file larger when it is looked at, gives no server
 RESOLV_CONF_TIMEOUT_S = 1.0
 RESOLV_CONF_MAX = 64 * 1024
-# the error of a job whose PTR lookups had no server to ask (spec §5.2): fixed text
-NO_DNS_SERVER = "rdns not run: the agent has no DNS server to ask (the job names none, and the host's resolv.conf lists none it can use)"
+def no_dns_server(what: str = "rdns") -> str:
+    """The error of a job whose lookups had no server to ask (spec §5.2): fixed text,
+    naming the lookups that were not run (`rdns`, `fdns`, or `rdns and fdns`)."""
+    return (
+        f"{what} not run: the agent has no DNS server to ask (the job names none, and the "
+        "host's resolv.conf lists none it can use)"
+    )
+
+
+NO_DNS_SERVER = no_dns_server()
 # the UDP payload a PTR query advertises (EDNS(0), RFC 6891 §6.2.5), and the largest
 # reply the agent reads (#153). 1232 bytes is the size DNS Flag Day 2020 settled on to
 # keep a reply out of IP fragments; the largest ordinary PTR answer measured (a
@@ -545,9 +565,45 @@ def read_reply(reply: dns.message.Message, question: "dns.name.Name") -> str | N
     return NO_NAME if says_no_name(reply, name) else None
 
 
-def no_query_sent(cause: str) -> str:
+def read_a_reply(reply: dns.message.Message, question: "dns.name.Name") -> Addresses | NoName | None:
+    """What a reply to the A query for `question` says (the forward-DNS check, #20): the
+    addresses, NO_NAME when it says the name has none, or None when it gives no usable
+    answer and the next configured server is asked. Read as `read_reply` reads a PTR
+    reply, by the same rules:
+
+    - NXDOMAIN: NO_NAME. Any rcode but NOERROR: None.
+    - The A records are read only at the name the answer is about (`answered_name`: the
+      question's name, or the last target of its CNAME chain in this reply), and all of
+      them there are the answer, whatever else the reply holds.
+    - A records at any other owner and none there: None, never NO_NAME.
+    - No A record at all: NO_NAME if `says_no_name` for that name (NODATA: an SOA of a
+      zone that holds it, or nothing at all), else None (a referral, an alias left
+      unresolved, an SOA of another zone).
+
+    Only A records are asked for and read: v1 is IPv4-only, and a host's address is an
+    IPv4 address, so an AAAA record could only ever say "not this host". A name with
+    only AAAA records answers NODATA here, and is a name that does not resolve to an
+    IPv4 address."""
+    rcode = reply.rcode()
+    if rcode == dns.rcode.NXDOMAIN:
+        return NO_NAME
+    if rcode != dns.rcode.NOERROR:
+        return None
+    name = answered_name(reply, question)
+    if name is None:
+        return None  # a CNAME chain that loops
+    records = [rrset for rrset in reply.answer if rrset.rdtype == dns.rdatatype.A and len(rrset)]
+    found = {ipaddress.IPv4Address(rd.address) for rrset in records if rrset.name == name for rd in rrset}
+    if found:
+        return tuple(str(a) for a in sorted(found))
+    if records:
+        return None  # A records at an owner the question does not reach
+    return NO_NAME if says_no_name(reply, name) else None
+
+
+def no_query_sent(cause: str, what: str = "rdns") -> str:
     """The error of a lookup that could send its query to none of its servers."""
-    return f"rdns stopped: no DNS query could be sent to any server ({cause})"
+    return f"{what} stopped: no DNS query could be sent to any server ({cause})"
 
 
 def usable_servers(chosen: tuple[str, ...]) -> tuple[str, ...]:
@@ -704,9 +760,31 @@ class DnsResolver:
         AnsweredPastRefusal when an attempt before the answer ended so (`answered`,
         #170). Raises ProbeError when there is no server to ask, or when no query was
         sent before the servers or the lookup's time ran out."""
+        return await self._ask(
+            dns.reversename.from_address(str(address)), dns.rdatatype.PTR, servers, slot, read_reply, "rdns"
+        )
+
+    async def a(
+        self, name: str, servers: tuple[str, ...], slot: Slot
+    ) -> Addresses | NoName | AnsweredPastRefusal | UnreadReplies | None:
+        """The IPv4 addresses of `name` (the forward-DNS check, #20), or NO_NAME when a
+        server says it has none (NXDOMAIN, or NOERROR without an A record that
+        `says_no_name`), as one reply is read by `read_a_reply`; otherwise exactly as
+        `ptr`: the same queries (one per server, paced, EDNS at DNS_PAYLOAD, no
+        retransmission or TCP), the same replies refused unread, None or UnreadReplies
+        for no usable answer, AnsweredPastRefusal for a later server's answer, and
+        ProbeError when no query could be sent, its error saying fdns. `name` is a
+        hostname (`protocol.fdns_name`), asked as an absolute name for its A records
+        only."""
+        # dnspython makes the text an absolute name (`make_query`); the question it holds
+        # is what the reply is read against
+        return await self._ask(name, dns.rdatatype.A, servers, slot, read_a_reply, "fdns")
+
+    async def _ask(self, name, rdtype, servers: tuple[str, ...], slot: Slot, read, what: str):
+        """One lookup: the query for `name` and `rdtype` to each of `servers` in turn,
+        until a reply `read` finds usable (`ptr` says how each attempt ends)."""
         if not servers:
-            raise ProbeError(NO_DNS_SERVER)
-        name = dns.reversename.from_address(str(address))
+            raise ProbeError(no_dns_server(what))
         asked = False
         unsent: str | None = None
         # whether an attempt ended with a reply from its server refused unread: only
@@ -733,7 +811,7 @@ class DnsResolver:
                     # job's deadline has passed (a lookup's own time starts at its first
                     # slot, capped by the deadline), and the scan reports that cut-off
                     if not asked and unsent is not None:
-                        raise ProbeError(no_query_sent(unsent))
+                        raise ProbeError(no_query_sent(unsent, what))
                     return no_usable_answer(too_large, too_many_records)
                 # A fresh query, so a fresh id, for every datagram. It carries EDNS(0)
                 # advertising a DNS_PAYLOAD (1232-byte) UDP payload, so a resolver can
@@ -744,7 +822,7 @@ class DnsResolver:
                 # (QuerySocket, #153), nor one whose header claims more than a PTR
                 # answer needs (#160), and the next server is asked.
                 query = dns.message.make_query(
-                    name, dns.rdatatype.PTR, use_edns=0, payload=DNS_PAYLOAD, want_dnssec=False,
+                    name, rdtype, use_edns=0, payload=DNS_PAYLOAD, want_dnssec=False,
                     flags=dns.flags.RD,
                 )
                 try:
@@ -787,7 +865,7 @@ class DnsResolver:
             finally:
                 sock.close()
             asked = True
-            answer = read_reply(reply, name)
+            answer = read(reply, query.question[0].name)
             if answer is None:
                 # SERVFAIL, REFUSED, a referral, an alias left unresolved, or records
                 # that do not answer the question: the next server
@@ -795,5 +873,5 @@ class DnsResolver:
             return answered(answer, too_large, too_many_records)
         if not asked:
             # every server was tried, and none could be sent the query
-            raise ProbeError(no_query_sent(unsent or "unknown"))
+            raise ProbeError(no_query_sent(unsent or "unknown", what))
         return no_usable_answer(too_large, too_many_records)

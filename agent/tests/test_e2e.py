@@ -23,6 +23,7 @@ from tlg_ipam_agent import scan
 from tlg_ipam_agent.backoff import Backoff
 from tlg_ipam_agent.client import AgentClient
 from tlg_ipam_agent.loop import Agent
+from tlg_ipam_agent.probe import NO_NAME
 from tlg_ipam_agent.protocol import (
     CHECKIN_REFUSED_RETRY_S,
     CHECKIN_RETRY_MAX_S,
@@ -1071,3 +1072,65 @@ async def test_a_server_before_165_enrols_an_agent_that_states_its_protocol(owne
         row = await session.get(AgentRow, agent["id"])
         assert row.state == "active"
         assert (row.version, row.hostname, row.platform) == (body["version"], body["hostname"], body["platform"])
+
+
+# --- The forward-DNS check (#20) ---
+
+
+async def test_only_names_under_the_subnets_domain_are_sent_and_one_that_does_not_resolve_is_a_finding(owner):
+    """#20's acceptance through the real routes. The subnet's domain is home.arpa, and
+    its hosts are named every way the hosts service lets them be: under the domain,
+    under a sub-domain of it by their own override, outside it by their own override,
+    with a hostname that is no DNS hostname, with no hostname, and under the domain but
+    inside a range excluded from the scan. Only the two under the domain and in scope
+    are sent, and the agent asks only those. One resolves to its own address, the other
+    does not resolve: that host has an `fdns_mismatch` finding whose observed value is
+    `unresolved`, and nothing else does. Accepting it writes nothing; dismissing it
+    hides it."""
+    agent_row, subnet, target = await setup(
+        owner, cidr="10.0.0.0/28", methods=("icmp", "fdns"), domain="home.arpa", dns_servers=["10.0.0.1"]
+    )
+    await _ok(
+        await owner.post(
+            f"/api/v1/subnets/{subnet['id']}/reserved",
+            json={"start_ip": "10.0.0.12", "end_ip": "10.0.0.14", "scan_excluded": True},
+        ),
+        201,
+    )
+    made = {}
+    for ip, fields in {
+        "10.0.0.2": {"hostname": "nas"},
+        "10.0.0.3": {"hostname": "printer", "domain": "lab.home.arpa"},
+        "10.0.0.4": {"hostname": "outside", "domain": "example.com"},
+        "10.0.0.5": {"hostname": "not a name"},
+        "10.0.0.6": {},
+        "10.0.0.13": {"hostname": "excluded"},
+    }.items():
+        host = await _ok(await owner.post("/api/v1/hosts", json={"subnet_id": subnet["id"], "ip": ip, **fields}), 201)
+        made[ip] = host["id"]
+    resolver = FakeResolver(addresses={"nas.home.arpa": ("10.0.0.2",), "printer.lab.home.arpa": NO_NAME})
+    agent = make_agent(agent_row["token"], prober=FakeProber(alive=["10.0.0.2"]), resolver=resolver)
+
+    await agent.checkin_once()
+    raw = agent.queue.get_nowait()
+    assert raw["methods"] == ["icmp", "fdns"]
+    assert raw["fdns"] == [
+        {"host_id": made["10.0.0.2"], "fqdn": "nas.home.arpa"},
+        {"host_id": made["10.0.0.3"], "fqdn": "printer.lab.home.arpa"},
+    ]
+    await agent.run_job(raw)
+    assert sorted(name for name, _ in resolver.resolved) == ["nas.home.arpa", "printer.lab.home.arpa"]
+
+    shown = await target_of(owner, target["id"])
+    assert shown["last_scan_complete"] is True and shown["last_scan_error"] is None
+    found = await _ok(await owner.get(f"/api/v1/subnets/{subnet['id']}/findings"))
+    mismatches = [f for f in found if f["type"] == "fdns_mismatch"]
+    assert [(f["ip"], f["observed"], f["proposed"]) for f in mismatches] == [("10.0.0.3", "unresolved", {})]
+    [finding] = mismatches
+    key = {k: finding[k] for k in ("subnet_id", "ip", "type", "observed", "fingerprint")}
+    accepted = await _ok(await owner.post("/api/v1/findings/accept", json={"findings": [key]}))
+    assert accepted["accepted"] == 0 and accepted["results"][0]["status"] == "error"
+    dismissed = await _ok(await owner.post("/api/v1/findings/dismiss", json={"findings": [key]}))
+    assert dismissed["dismissed"] == 1
+    found = await _ok(await owner.get(f"/api/v1/subnets/{subnet['id']}/findings"))
+    assert not [f for f in found if f["type"] == "fdns_mismatch"]

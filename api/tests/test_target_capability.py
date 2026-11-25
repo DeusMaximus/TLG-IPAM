@@ -80,7 +80,7 @@ async def test_an_arp_only_target_cannot_be_scanned_by_a_routed_agent(client, ag
     assert answer["current_job_id"] is None
 
 
-async def test_an_agent_on_the_link_can_run_every_method_but_fdns(client, agent_api):
+async def test_an_agent_on_the_link_can_run_every_method(client, agent_api):
     agent, token = await make_agent(client)
     subnet = await lab(client)
     target = await make_target(
@@ -89,7 +89,7 @@ async def test_an_agent_on_the_link_can_run_every_method_but_fdns(client, agent_
     [job] = await jobs_for(agent_api, token)
     answer = await target_answer(client, target["id"])
     # the issued job's methods and the answer's agree: one rule
-    assert answer["runnable_methods"] == job["methods"] == ["icmp", "arp", "rdns"]
+    assert answer["runnable_methods"] == job["methods"] == ["icmp", "arp", "rdns", "fdns"]
 
 
 async def test_not_known_without_an_agent_or_before_its_first_check_in(client, agent_api):

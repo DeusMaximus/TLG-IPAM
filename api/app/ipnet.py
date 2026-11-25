@@ -64,6 +64,18 @@ def normalise_domain(domain: str) -> str:
     return cleaned
 
 
+def within_domain(name: str, domain: str | None) -> bool:
+    """Whether `name` is a name under `domain`, compared case-insensitively: it ends with
+    `.` + `domain` and has at least one label before it. The bare domain is not under
+    itself, and no name is under no domain. One rule for the name findings
+    (`findings._name_proposal`) and the names a forward-DNS job may send
+    (`fdns.names_for_job`, spec §7.2 invariant 5)."""
+    if not domain:
+        return False
+    suffix = "." + domain.casefold()
+    return name.casefold().endswith(suffix) and len(name) > len(suffix)
+
+
 def normalise_mac(mac: str) -> str:
     stripped = re.sub(r"[^0-9a-fA-F]", "", mac).lower()
     if not _MAC_RE.match(stripped):

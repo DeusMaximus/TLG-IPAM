@@ -343,6 +343,40 @@ describe('acceptance: a skipped accept shows its reason', () => {
   })
 })
 
+describe('forward DNS findings (#20)', () => {
+  it('lists an fdns_mismatch as informational: what the name resolves to, nothing to accept, and dismiss', async () => {
+    const user = userEvent.setup()
+    seed({
+      findings: [
+        finding('fdns_mismatch', '10.20.0.5', 'unresolved', { host_id: 'h1' }),
+        finding('fdns_mismatch', '10.20.0.6', '10.20.0.99, 10.20.0.100', { host_id: 'h2' }),
+      ],
+    })
+    ipam.dismissFindings.mockResolvedValue({
+      data: { dismissed: 1, skipped: 0, errors: 0, results: [{ index: 0, status: 'dismissed' }] },
+    })
+    renderView()
+    const group = await within(await findPanel()).findByRole('group', { name: 'Forward DNS mismatch' })
+    expect(within(group).getByText('does not resolve')).toBeInTheDocument()
+    expect(within(group).getByText('resolves to 10.20.0.99, 10.20.0.100')).toBeInTheDocument()
+    expect(within(group).getByText('host-h1.home.arpa at 10.20.0.5')).toBeInTheDocument()
+    // the server refuses an accept: there is no accept button, single or bulk
+    expect(within(group).queryByRole('button', { name: /Accept/ })).toBeNull()
+    expect(within(group).getAllByRole('button')).toHaveLength(2)
+    await user.click(within(group).getByRole('button', { name: 'Dismiss 10.20.0.5' }))
+    expect(ipam.dismissFindings).toHaveBeenCalledWith([
+      {
+        subnet_id: 'sub-1',
+        ip: '10.20.0.5',
+        type: 'fdns_mismatch',
+        observed: 'unresolved',
+        fingerprint: 'fp-fdns_mismatch-10.20.0.5',
+      },
+    ])
+    expect(ipam.acceptFindings).not.toHaveBeenCalled()
+  })
+})
+
 describe('findings panel', () => {
   it('shows a count badge and groups findings by type, in a fixed order', async () => {
     renderView()

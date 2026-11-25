@@ -34,6 +34,13 @@ HOSTNAME_MAX = 253
 INTERFACE_NAME_MAX = 15
 INTERFACES_MAX = 64
 OBSERVATIONS_MAX = 4096
+# answers in a result set, and addresses in one answer (`fdns`, #20): the wire's bounds
+FDNS_MAX = 4096
+FDNS_ADDRESSES_MAX = 32
+# names in one job: the most the server sends (`services/fdns.FDNS_JOB_MAX`, which
+# `test_contract.py` holds equal), so a job naming more is refused rather than asked
+# (round 1 of #185's briefed review, finding 2). The result set's FDNS_MAX stays apart.
+FDNS_JOB_MAX = 1024
 RDNS_NAME_MAX = 253
 SCAN_ERROR_MAX = 500
 # the job and subnet ids the server sends are UUIDs
@@ -44,8 +51,8 @@ LEASE_S = 15 * 60
 
 METHODS = frozenset({"icmp", "arp", "rdns", "fdns"})
 LIVENESS = frozenset({"icmp", "arp"})
-# what this release can run; `fdns` is #20
-SUPPORTED = frozenset({"icmp", "arp", "rdns"})
+# what this release can run: every method (`fdns` since #20)
+SUPPORTED = frozenset({"icmp", "arp", "rdns", "fdns"})
 
 _HOST_LABEL = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 
@@ -65,6 +72,16 @@ def rdns_name(value: Any) -> str | None:
     if all(_HOST_LABEL.fullmatch(label) for label in name.split(".")):
         return name
     return None
+
+
+def fdns_name(value: Any) -> str | None:
+    """A name a forward-DNS job may ask, or None: agent_protocol.fdns_name, copied. A
+    DNS hostname already in the form `rdns_name` keeps (lowercase, no trailing dot).
+    The agent cannot tell whether a name is under the subnet's domain (the server
+    decides that, spec §7.2 invariant 5); what it can hold is that every name it asks
+    is a hostname, so a job naming anything else is refused (`parse_job`)."""
+    name = rdns_name(value)
+    return name if name is not None and name == value else None
 
 
 def _scan_error_uncut(value: str) -> str:
@@ -125,6 +142,9 @@ class Job:
     methods: frozenset[str]
     dns_servers: tuple[str, ...]
     timeout_s: int
+    # (host_id, fqdn) pairs to resolve for `fdns`, each a hostname (`fdns_name`), each
+    # host once, at most FDNS_JOB_MAX; empty unless `methods` holds fdns
+    fdns: tuple[tuple[str, str], ...] = ()
 
 
 def _id(value: Any) -> str | None:
@@ -196,6 +216,21 @@ def parse_job(ref: JobRef, raw: dict) -> Job:
     if type(timeout_s) is not int or timeout_s < 1:
         raise JobRefused("refused: the job's timeout_s is not a positive whole number")
 
+    names = raw.get("fdns", [])
+    if not isinstance(names, list):
+        raise JobRefused("refused: the job's fdns is not a list")
+    if len(names) > FDNS_JOB_MAX:
+        raise JobRefused(f"refused: the job names more than {FDNS_JOB_MAX} hosts to resolve")
+    fdns = []
+    hosts = set()
+    for item in names:
+        host_id = _id(item.get("host_id")) if isinstance(item, dict) else None
+        fqdn = fdns_name(item.get("fqdn")) if isinstance(item, dict) else None
+        if host_id is None or fqdn is None or host_id in hosts:
+            raise JobRefused("refused: an fdns entry of the job is not one host id and a DNS hostname")
+        hosts.add(host_id)
+        fdns.append((host_id, fqdn))
+
     return Job(
         ref=ref,
         network=network,
@@ -205,4 +240,6 @@ def parse_job(ref: JobRef, raw: dict) -> Job:
         # the agent's own ceiling holds whatever the server asks for, so a scan always
         # ends while its lease is live
         timeout_s=min(timeout_s, JOB_TIMEOUT_S),
+        # names are resolved only for a job issued fdns; without it they are not asked
+        fdns=tuple(fdns) if "fdns" in methods else (),
     )

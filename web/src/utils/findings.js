@@ -10,7 +10,8 @@ import { parseServerTime } from './time'
 
 // The finding types the server raises, in the order the panel lists them. `action` is
 // what accepting one does; `stale` is informational, and accepting it sets the host
-// offline.
+// offline. `fdns_mismatch` is informational with nothing to accept (`action` null): the
+// server refuses an accept, so the panel offers only Dismiss.
 export const FINDING_TYPES = [
   {
     id: 'unknown_host',
@@ -43,6 +44,12 @@ export const FINDING_TYPES = [
     action: 'Replace hostname',
   },
   {
+    id: 'fdns_mismatch',
+    label: 'Forward DNS mismatch',
+    hint: 'the host’s FQDN does not resolve to its address',
+    action: null,
+  },
+  {
     id: 'stale',
     label: 'Stale',
     hint: 'active, not seen for 30 days',
@@ -52,7 +59,7 @@ export const FINDING_TYPES = [
 
 const TYPE_BY_ID = Object.fromEntries(FINDING_TYPES.map((t) => [t.id, t]))
 
-// A type the server adds later (#20's `fdns_mismatch`) still lists, under its own name
+// A type the server adds later still lists, under its own name
 export const findingType = (id) =>
   TYPE_BY_ID[id] || { id, label: String(id), hint: '', action: 'Accept' }
 
@@ -89,9 +96,12 @@ export function chunk(list, size = KEYS_PER_REQUEST) {
   return out
 }
 
-// The observed value as text: a MAC, a PTR name, a time (`stale`), `never`, or empty
-// (an `unknown_host` that gave no MAC)
+// The observed value as text: a MAC, a PTR name, a time (`stale`), `never`, what the
+// host's FQDN resolved to (`fdns_mismatch`), or empty (an `unknown_host` that gave no MAC)
 export function observedText(f) {
+  if (f.type === 'fdns_mismatch') {
+    return f.observed === 'unresolved' ? 'does not resolve' : `resolves to ${f.observed}`
+  }
   if (f.type === 'stale') {
     if (f.observed === 'never') return 'never seen'
     const date = parseServerTime(f.observed)
@@ -141,6 +151,8 @@ export function recordedText(f, host) {
       return host.fqdn || host.hostname || 'no hostname'
     case 'stale':
       return `status ${host.status}`
+    case 'fdns_mismatch':
+      return `${host.fqdn || host.hostname || 'no hostname'} at ${host.ip}`
     default:
       return host.hostname || host.ip
   }

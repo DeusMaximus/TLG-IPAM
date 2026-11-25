@@ -243,6 +243,12 @@ class ScanTarget(Base):
     # the methods the leased job was issued with (`arp` only when L2-local): results
     # ingest trusts these, not what the agent says it ran
     job_methods: Mapped[list | None] = mapped_column(JSON)
+    # The names the leased job was sent to resolve (`fdns`), as `[host_id, fqdn, ip_int]`
+    # (`services/fdns.names_for_job`): results ingest stores an answer only for a host
+    # named here, under the name that was asked, never under the host's name as it is
+    # by then, and only while the host is still at `ip_int`. Scheduling state, like the rest of the lease: kept out of audit
+    # snapshots (`changes._SNAPSHOT_EXCLUDE`), cleared with it.
+    job_fdns: Mapped[list | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     # the `job_issued_at` of the last completed job, by the server's clock
     last_scan_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -316,3 +322,36 @@ class FindingDismissal(Base):
     # timestamp, `never`, or empty
     observed: Mapped[str] = mapped_column(String(253))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class FdnsResult(Base):
+    """The latest forward-DNS answer for one host (v0.2 spec §5.4), upserted by results
+    ingest (`services/fdns.store`). `fqdn` is the name the job asked, which the
+    `fdns_mismatch` finding compares with the host's FQDN as it is now, so an answer for
+    a name the host no longer has raises nothing. `addresses` are the IPv4 addresses a
+    DNS server gave, sorted; an empty list means a server answered that the name does
+    not resolve. No history.
+
+    `asked_at` is when a job last asked for the host's name and its result set was
+    accepted, answered or not; the next job's names are chosen by it (`fdns.names_for_job`),
+    so names that never get a usable answer still rotate with the rest. A host asked and
+    never answered has a row with `asked_at` alone: no `fqdn`, `addresses` or
+    `checked_at`, and no finding.
+
+    No foreign key, as on observations: a row whose host is gone is pruned at ingest,
+    and rows for hosts that leave the scan scope go with the change that narrowed it
+    (`scans.drop_out_of_scope`). Ingest never writes `hosts` (spec §7.2, invariant 3).
+    """
+
+    __tablename__ = "fdns_results"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # the host's id; unique, which also indexes the join from `hosts` the findings read
+    host_id: Mapped[str] = mapped_column(String(36), unique=True)
+    # the last answer: the name asked, its addresses, when it was stored; null until a
+    # DNS server first answers for the host
+    fqdn: Mapped[str | None] = mapped_column(String(253))
+    addresses: Mapped[list | None] = mapped_column(JSON)
+    checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # when an accepted result set last came back for a job that asked for the name
+    asked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
