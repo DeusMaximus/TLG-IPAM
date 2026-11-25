@@ -143,13 +143,16 @@ def parse_allowed(value: str | None, name: str = "ALLOWED_CIDRS") -> tuple[Netwo
         if not items:
             raise ConfigError(f"{name} is set but empty; unset it for the default")
     networks = []
-    for item in items:
+    for place, item in enumerate(items, 1):
         try:
             networks.append(ipaddress.ip_network(item, strict=True))
         except ValueError:
-            shown = item if len(item) <= 64 and item.isprintable() else "a value"
+            # named by its place, never by its value: a token pasted into the wrong
+            # option (`install --allowed-cidrs tlge_…`, `docker run -e …`) would be
+            # repeated on the terminal (#140)
             raise ConfigError(
-                f"{name}: {shown} is not a network (host bits must be zero)"
+                f"{name}: item {place} of {len(items)} is not a network (host bits must be "
+                "zero); it is not repeated here"
             ) from None
     return tuple(networks)
 

@@ -15,7 +15,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import event, select, update
 
-from app.agent_protocol import ENROL_TOKEN_PREFIX, HOSTNAME_MAX, EnrolRequest
+from app.agent_protocol import ENROL_TOKEN_FORM, ENROL_TOKEN_PREFIX, HOSTNAME_MAX, EnrolRequest
 from app.config import settings
 from app.database import SessionLocal, engine
 from app.main import app
@@ -107,7 +107,7 @@ async def test_add_agent_issues_a_single_use_enrolment_token_for_an_hour(client)
     created = await create(client)
     assert created["state"] == "pending"
     plain = created["enrol_token"]
-    assert plain.startswith(ENROL_TOKEN_PREFIX) and len(plain) == len("tlge_") + 43
+    assert plain.startswith(ENROL_TOKEN_PREFIX) and ENROL_TOKEN_FORM.fullmatch(plain)
     [token] = await tokens_of(created["id"])
     assert (token.kind, token.used_at, token.revoked_at) == ("enrol", None, None)
     assert token.expires_at - token.created_at == timedelta(hours=1)

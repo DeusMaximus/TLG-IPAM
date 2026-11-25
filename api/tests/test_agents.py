@@ -5,7 +5,9 @@
 tested in `test_checkin.py`.
 """
 
+import base64
 import hashlib
+import secrets
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -18,6 +20,7 @@ from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app import agent_protocol
 from app.agent_protocol import PROTOCOL_VERSION
 from app.config import settings
 from app.database import SessionLocal, init_models
@@ -139,13 +142,72 @@ async def test_create_returns_a_pending_agent_and_its_enrolment_token(client):
 async def test_an_enrolled_agent_holds_its_agent_token(client):
     agent, token = await make_agent(client)
     assert agent["state"] == "active"
-    assert token.startswith("tlga_") and len(token) == len("tlga_") + 43
+    assert token.startswith("tlga_") and agent_protocol.AGENT_TOKEN_FORM.fullmatch(token)
     # newest first: the agent token, then the enrolment token it was exchanged for
     issued, spent = agent["tokens"]
     assert (issued["kind"], spent["kind"]) == ("agent", "enrol")
     assert issued["token_prefix"] == token[:13]
     assert issued["revoked_at"] is issued["last_used_at"] is issued["expires_at"] is None
     assert spent["used_at"] is not None and spent["revoked_at"] is None
+
+
+class _Session:
+    def add(self, row):
+        pass
+
+
+def _issue(kind: str) -> str:
+    _row, plain = agents_svc.issue_token(_Session(), Agent(name="x"), kind, datetime.now(timezone.utc))
+    return plain
+
+
+_FORMS = [("agent", agent_protocol.AGENT_TOKEN_FORM), ("enrol", agent_protocol.ENROL_TOKEN_FORM)]
+
+
+@pytest.mark.parametrize("kind, form", _FORMS)
+def test_every_token_the_server_issues_is_of_the_form_the_wire_contract_states(kind, form):
+    """`agent_protocol` states a token's form, and an agent of this protocol stores only
+    an agent token of exactly that form (#140): a token outside it fails here before it
+    fails an enrolment."""
+    for _ in range(500):
+        assert form.fullmatch(_issue(kind))
+
+
+@pytest.mark.parametrize("kind, form", _FORMS)
+@pytest.mark.parametrize("byte", [0x00, 0xFF, 0xFB, 0xBE, 0xEF, 0x7E])
+def test_each_end_of_the_alphabet_is_of_the_form(kind, form, byte, monkeypatch):
+    """The random bytes at their edges: all `A`, all `_` and `-`, so the form takes
+    every character the generator can write, and the length whatever the bytes."""
+    monkeypatch.setattr(secrets, "token_bytes", lambda n: bytes([byte]) * n)
+    plain = _issue(kind)
+    assert form.fullmatch(plain)
+    assert len(plain) == 5 + agent_protocol.TOKEN_SECRET_LENGTH
+
+
+def test_the_stated_length_is_what_the_stated_bytes_encode_to():
+    encoded = base64.urlsafe_b64encode(bytes(agent_protocol.TOKEN_SECRET_BYTES)).rstrip(b"=")
+    assert len(encoded) == agent_protocol.TOKEN_SECRET_LENGTH == 43
+    assert len(agent_protocol.AGENT_TOKEN_PREFIX) == len(agent_protocol.ENROL_TOKEN_PREFIX) == 5
+
+
+@pytest.mark.parametrize("kind, form", _FORMS)
+def test_the_form_is_exact(kind, form):
+    """What a later server might issue instead is outside the form: another length, the
+    standard base64 alphabet, padding, the other kind's prefix."""
+    plain = _issue(kind)
+    other = (agent_protocol.ENROL_TOKEN_PREFIX if kind == "agent" else agent_protocol.AGENT_TOKEN_PREFIX)
+    for outside in (
+        plain[:-1],
+        plain + "A",
+        plain[:5] + secrets.token_urlsafe(33),
+        plain[:-1] + "=",
+        plain[:-1] + "+",
+        plain[:-1] + "/",
+        other + plain[5:],
+        plain.upper()[:5] + plain[5:],
+        plain + "\n",
+    ):
+        assert not form.fullmatch(outside)
 
 
 async def test_two_agents_get_different_tokens(client):

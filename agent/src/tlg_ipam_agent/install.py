@@ -261,6 +261,8 @@ def blocked_for(path: str, uid: int, gid: int, top: str = "/") -> str | None:
 
 
 def _ca_file(value: str | None) -> str | None:
+    """The CA bundle's path, checked. No refusal repeats it: a token pasted into the
+    wrong option would be shown on the terminal (#140)."""
     if value is None:
         return None
     _plain(value, "--ca-file")
@@ -269,9 +271,9 @@ def _ca_file(value: str | None) -> str | None:
     try:
         info = os.stat(value)
     except OSError:
-        raise InstallError(f"--ca-file: {value} cannot be found") from None
+        raise InstallError("--ca-file: there is no file at the path given (not repeated here)") from None
     if not stat.S_ISREG(info.st_mode):
-        raise InstallError(f"--ca-file: {value} is not a regular file")
+        raise InstallError("--ca-file: the path given is not a regular file (not repeated here)")
     return value
 
 
@@ -553,10 +555,14 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out, envir
         if ca_file is not None:
             blocked = blocked_for(ca_file, *user)
             if blocked is not None:
+                # neither path is repeated (#140): `namei -l` on the path shows them
+                itself = blocked in (ca_file, os.path.realpath(ca_file))
+                where = "the file itself" if itself else "a directory or link on the way to it"
                 raise InstallError(
-                    f"--ca-file: {SERVICE_USER}, which the unit runs as, could not read "
-                    f"{ca_file} (stopped at {blocked}), so the agent could not verify the "
-                    "server. Make the file and the directories above it readable by that user"
+                    f"--ca-file: {SERVICE_USER}, which the unit runs as, could not read the "
+                    f"file (stopped at {where}), so the agent could not verify the server. "
+                    "Make the file and the directories above it readable by that user "
+                    "(`namei -l` on the path shows each one's owner and mode)"
                 )
         for directory in (paths.etc, paths.state):
             if store.make_dir(directory, DIR_MODE):

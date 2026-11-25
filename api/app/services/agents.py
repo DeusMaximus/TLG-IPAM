@@ -19,7 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from ..agent_protocol import AGENT_TOKEN_PREFIX, ENROL_TOKEN_PREFIX
+from ..agent_protocol import AGENT_TOKEN_PREFIX, ENROL_TOKEN_PREFIX, TOKEN_SECRET_BYTES
 from ..config import settings
 from ..errors import ApiError, conflict, not_found
 from ..models import Agent, Token
@@ -156,8 +156,10 @@ def issue_token(
 ) -> tuple[Token, str]:
     """A new token of `kind` for the agent, added to the session; does not flush. An
     enrolment token expires ENROL_TOKEN_LIFETIME from `now`. Returns the token and the
-    plain value, which the caller shows once and must not store."""
-    plain = _PREFIXES[kind] + secrets.token_urlsafe(32)
+    plain value, which the caller shows once and must not store. The value is of the
+    form agent_protocol states (AGENT_TOKEN_FORM, ENROL_TOKEN_FORM), which an agent
+    holds an enrol answer to."""
+    plain = _PREFIXES[kind] + secrets.token_urlsafe(TOKEN_SECRET_BYTES)
     token = Token(
         kind=kind,
         agent=agent,
