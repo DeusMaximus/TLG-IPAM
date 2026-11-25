@@ -27,6 +27,27 @@ Template:
 
 ---
 
+## 2026-11-25 — Claude Code (Opus 5.5), worker — #170: a notice when a later DNS server answered after a refused reply (PR #171)
+- **Merged:** 2026-11-25, squash `31978e5`, at head `3428c82`; branch deleted, #170 closed. Codex clean and Greptile 5/5 on `3428c82`; briefed round on GPT-6 Sol with Daybreak Blue (started there directly: the round builds refused DNS replies) GO with no findings: 1,812 re-measured, three mutations red, the 500/501 boundary probed with four-digit counts, and every reader of `last_scan_error` traced (UI amber "Agent reported" line only; no health state, no MCP tool, excluded from audit). The orchestrator ran the agent suite on #171 merged with #172: 1,827 passed, 4 skipped. No follow-up filed.
+- **Done:** [PR #171](https://github.com/DeusMaximus/TLG-IPAM/pull/171) closes #170.
+  - `probe.py`: `AnsweredPastRefusal(answer, too_large, too_many_records)`, what `DnsResolver.ptr` returns in place of a name or `NO_NAME` when an earlier attempt ended with a reply from its own server refused unread; `answered()` gives the bare answer when nothing was refused.
+  - `scan.py`: `answered_later()` builds the notice in `refused_unread`'s words; `run` unwraps the answer, so the record is decided as before, and counts the lookup by limit; `error_text(errors, *optional)` gives parts up in order, the notice first, then #164's counts.
+  - `conftest.FakeResolver(later=…)`. Spec §5.2, brief §4.6 and the DNS sentences of `AGENTS.md`'s "The agent never executes…" bullet updated.
+- **Decisions:** PR Deliberate calls 1–7. The owner is told (a first server whose every reply is refused costs up to 254 queries and budget slots a scan); the notice goes in `error`, not a new field, so a scan that learned every name can carry a non-null `last_scan_error`, shown as "Agent reported: …" apart from "incomplete"; it is the first part given up at the 500 cap, so #164's longest errors store as before; any refusal before the answer counts.
+- **State:** agent 1,812 passed, 4 skipped at the head (`main` 1,783). No schema change, no wire change, `PROTOCOL_VERSION` 2, `test_invariants.py` unchanged. Untested: the UI's layout of a long notice; a real forwarder (loopback responders stand in).
+- **Next:** #93 or #20, one at a time; both touch `probe.py`.
+
+## 2026-11-25 — Claude Code (Opus 5.5), worker — #165: enrolment refuses an agent on another protocol before its token is spent (PR #172)
+- **Merged:** 2026-11-25, squash `2afe2c0`, at head `01cd32c`; branch deleted, #165 closed. Codex clean and Greptile 5/5 on `01cd32c`; briefed round on GPT-6.1 Sol GO with no findings and every deliberate call standing (`.dev/165/review-1-sol.md`): both suites re-measured, seven mutations red, and the new agent's actual enrol request run in process against the actual server at `a8cb345` (enrolled `200`), which closes the PR's untested old-server line. The orchestrator re-ran the agent suite at the head (1,798 passed, 4 skipped) and the server's enrolment tests (78). Follow-up filed with the owner's word: #175 (show an enrolment protocol refusal on the Agents page).
+- **Done:** [PR #172](https://github.com/DeusMaximus/TLG-IPAM/pull/172) closes #165.
+  - `agent_protocol.py`: `EnrolRequest.protocol` (`StrictInt | None`); `ENROL_PROTOCOL_ABSENT = 2`; `ENROL_TOO_OLD`/`ENROL_TOO_NEW` (`AGENT_TOO_OLD`, `AGENT_TOO_NEW`); `enrol_protocol`, `enrol_protocol_refusal` (check-in's rule).
+  - `services/enrolment._exchange`: after the body is read and before validation, the write lock and `_claim`, a protocol mismatch is `409` with a fixed message naming no protocol. Nothing written, token unused, counts against the throttle. `protocol` is never stored.
+  - Agent: `enrol.enrol_body()` (the report plus `protocol`); `enrol.protocol_refusal` builds the operator message; `enrol_and_store` logs it and retries on the refusal wait; `install._not_enrolled` uses it and adds "run install again, with the same token". The two codes are copied into the agent's `protocol.py`, held by `test_contract.py`.
+  - Spec §5.6 has a new paragraph, "The agent's protocol, before the claim"; §5.7, brief §3.9 and §4.8, and the `AGENTS.md` "Enrolment tokens" and "wire contract" bullets are updated. #162's e2e test is replaced by `test_a_new_token_form_spends_an_old_agents_enrolment_only_if_the_protocol_is_not_raised`.
+- **Decisions:** PR Deliberate calls 1–11: a body field, not a header; checked after the token lookup and before the lock; check-in's rule; two `409` codes; absent or null means 2, a non-integer is `422`; it counts against the throttle; `PROTOCOL_VERSION` not raised; the agent keeps retrying; nothing recorded on the agent row.
+- **State:** agent 1,798 passed, 4 skipped; server 1,378; web 188 (untouched). No schema change; `PROTOCOL_VERSION` 2. In `install.py` only `_not_enrolled` changed.
+- **Next:** #169 (shares `install.py`) can start now.
+
 ## 2026-11-25 — Claude Code (Fable 5.2), orchestrator — session closed: #136, #159 and #164 merged; nothing in flight
 - **Done:** three PRs verified, briefed, fixed and merged this session's last leg, each squash, branch deleted, worker's entry below or in the archive:
   - [PR #167](https://github.com/DeusMaximus/TLG-IPAM/pull/167) (#136) `069af99`: the installer asks the kernel, as the service account, whether it can read the `--ca-file`.
@@ -133,57 +154,3 @@ Template:
 - **Next:**
   - On the first release, check that `publish-release` lists the tag's draft or release as expected (its log shows each page read).
   - Optional follow-up, not filed: `publish-image`'s warning prints skopeo's stderr with its newlines.
-
-## 2026-11-25 — Claude Code (Opus 5.5), worker — #136: the CA bundle's access asked of the kernel, as the service account (PR #167)
-- **Merged:** 2026-11-25, squash `069af99`, at head `6429037`; branch deleted, #136 closed. Agent suite at the head, merged with `main` at `3feec43`: 1,662 passed, 4 skipped (the root-only cases). As root on Linux, `test_install.py` + `test_invariants.py`: 595 passed, 2 skipped. Server 1,357, web 188.
-- **Done:** [PR #167](https://github.com/DeusMaximus/TLG-IPAM/pull/167) (`136-ca-access-as-service`).
-  - `install.read_as` replaces `blocked_for`/`_allowed`. It runs `head -c 1 -- <path>` as the service user, and `test -e <path>` only when that fails, to tell "the file itself" from "a directory or link on the way".
-  - The programs run through `subprocess.run(user=, group=, extra_groups=)`, with `COMMAND_ENV`, `cwd="/"`, stdio on `/dev/null`, no shell and `CA_CHECK_TIMEOUT_S` (10 s).
-  - `Host.service_reads` passes `os.getgrouplist(SERVICE_USER, gid)` and prints the command without the path (#140).
-  - `NOT_CHECKED` (a program missing or refused, or past the deadline) refuses the install before the exchange. `install.py` no longer imports `trust`.
-  - Tripwire: `test_invariants.PROCESSES_STARTED_IN` (`Host.run`, `read_as.as_user`, with the exact keywords) and `SUBPROCESS_NAMES`.
-    - `_process_starts` refuses the module named anywhere but as an attribute base (an import or assignment alias, a default argument), the string `'subprocess'`, `from subprocess import`, other names, an uncalled `run`, an `env` other than `COMMAND_ENV`, and `**keywords`.
-    - No forbidden-name list changed.
-  - `AGENTS.md` ("Enrolment tokens" and "agent never executes" bullets) and spec §5.6 updated. The brief has no CA-check text.
-- **Verified:** as root in a `--network none` Debian 13 / systemd 257 container, with the server on loopback over HTTPS and agent wheels built from the branch and from `main`, by the author and again by the reviewer.
-  - ACL that denies the account: the branch refuses with the token unused, and the same token enrols once the entry is gone. `main` spent the token, and the unit logged `CERTIFICATE_VERIFY_FAILED`.
-  - Supplementary group: the branch enrols and checks in; `main` refused.
-  - No image had `setfacl` and there was no network to add it, so the ACL was written as the `system.posix_acl_access` xattr (`deny_by_acl` in the tests).
-- **Decisions:** PR Deliberate calls 1–9.
-  - Fixed programs through `subprocess`'s user switching, not `os.fork` (which would copy root's memory, the enrolment token included, into the account's process), not Python run as the account, not `access(2)`.
-  - The operator's `--ca-file` path is the one argument that is not fixed.
-  - A check that cannot be made refuses the install.
-  - `unreachable()` (the venv check, others' bits) is left as it was: a possible follow-up.
-- **Review:** briefed round (Codex, GPT-6.1 Sol) GO at `2db1f1c` with two P3s, both fixed in `6429037` and answered on the PR:
-  - an assignment alias of `subprocess` passed the tripwire; the reproduction now fails 13 tests;
-  - with the deadline removed, the FIFO test hung the suite; it now fails at 5 s on its own bound (`FIFO_BOUND_S`), kills the process groups and reaps them, and no `head` is left.
-
-  Automatic reviews: Greptile, one P2, fixed in `2db1f1c` (the root fixture no longer changes the mode of `--basetemp`'s parent directories); Codex clean on `a110963`, `2db1f1c` and `6429037`.
-- **State:** merged. No schema change, no protocol change, no new import.
-- **Untested / assumed:**
-  - Ptrace (recorded, not rated): after exec, a process already running as a reused account can ptrace `head` or `test` where `ptrace_scope=0` and falsify the answer. Such an account can already sabotage its own agent, so the mechanism stands.
-  - The deadline bounds only an interruptible wait; only the FIFO case was measured. A program in an uninterruptible wait (a hard network mount) is not reaped promptly, and `_ca_file`'s stat, the group lookup and starting the process are outside the deadline.
-  - The check answers for the unit `install` writes, not one a drop-in changes (`SupplementaryGroups=`, `InaccessiblePaths=`, a private mount namespace, the unit's own security profile).
-  - Also untested: AppArmor or SELinux, distributions other than Debian 13, busybox built without `head -c`, an unprivileged LXC.
-- **Waiting on the owner:** nothing from this PR.
-- **Next:** #165 (refuse an agent the server cannot answer before its token is spent) is not started.
-
-## 2026-11-25 — Claude Code (Fable 5.2), orchestrator — state after #94, #140 and #160 merged; three workers in flight
-- **Done:** since the orchestrator entry below this one's worker entries (same date; it holds the session's decisions and lessons, which still stand), merged by squash with the owner's go-ahead: #94 (PR #161), #140 (PR #162), #160 (PR #163). Filed with the owner's go-ahead: #164 and #165. #159's scope gained a bullet (a secret handed to a `build` step passes every shape test). `main` is at `6cb82b6` plus hand-off commits: 1,644 agent, 1,357 server and 188 web tests.
-- **In flight** (three, the limit; none shares a code file):
-  - **#136** (check the CA bundle's access as the service account), branch `136-ca-access-as-service`. Owes a briefed round. It will widen `test_invariants.py`'s lists.
-  - **#159** (stop `publish-release` when it cannot tell whether the tag has a release; hold which steps are given a secret), branch `159-release-lookup-fail-closed`. Owes a briefed round.
-  - **#164** (say in the job's error how many DNS replies were refused for size or record count), branch `164-dns-refusal-reasons`. Owes a briefed round.
-  - Nothing wakes the orchestrator when a worker opens its PR: list open PRs at the start of each turn, then watch, verify and brief.
-- **Queue:** #93 and #20 after #164, one at a time (all in `probe.py`); #165 (refuse an agent the server cannot answer before its enrolment token is spent) after #136, since both reach the installer's exchange; #31 (deployment document from spec §8) is unblocked and not started. M3 (#26–#30, #32) waits on #25.
-- **Decisions since the last orchestrator entry:**
-  - P3s from a briefed round or an outside read go back to the PR's worker to fix in the same PR, on stretch issues too (#94), not only on follow-ups; the orchestrator reads the fix against the reviewer's remedy, with Codex clean on the new head.
-  - A reviewer's recommendation that reaches past the PR's files (#164, #165) is put to the owner as a new issue instead.
-  - Before merging a PR whose CI ran against an older `main`, either update its branch (when the two may interact) or run the suite on the merged tree locally (when their files are disjoint: done for #162 after #161).
-- **Reviewer models:** GPT-6.1 Sol completed the rounds on #156, #140 and #94, and was stopped by its safety filter on #160, as on #132, #153 and #147: every time on work that builds hostile input (DNS replies, pipelined requests, a shell harness). GPT-6 Sol with Daybreak Blue completed each restarted round. The orchestrator proposed starting rounds on DNS replies on GPT-6 Sol directly; the owner has not answered, so the roster's order stands: 6.1 first.
-- **State:** nothing half-finished in `main`; CI green on it. `PROTOCOL_VERSION` is 2. Review briefs, reviews and hand-over files are in `.dev/<issue>/` in the main checkout (not committed).
-- **Waiting on the owner:**
-  - The first build of the server image with `CMD ["python", "-m", "app.serve"]` (#132); no proxy has been run against spec §8.
-  - The first release, by `.agents/releases.md`: nothing has been published. Step 3 is now the base-image refresh (#94), with a recheck of the DNS ceiling's premise when the image's Python changes (#160); step 5 checks the cross-attempt artefact download (#147).
-  - #5 and #25 (`owner` label), deferred. Permission to send packets on the test host covered 2026-11-23 only.
-- **Next:** verify the three PRs as they open and brief Sol on each; then the queue above.
