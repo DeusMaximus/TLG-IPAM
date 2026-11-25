@@ -27,6 +27,74 @@ Template:
 
 ---
 
+## 2026-11-25 — Claude Code (Fable 5.2), orchestrator — session closed: #136, #159 and #164 merged; nothing in flight
+- **Done:** three PRs verified, briefed, fixed and merged this session's last leg, each squash, branch deleted, worker's entry below or in the archive:
+  - [PR #167](https://github.com/DeusMaximus/TLG-IPAM/pull/167) (#136) `069af99`: the installer asks the kernel, as the service account, whether it can read the `--ca-file`.
+  - [PR #166](https://github.com/DeusMaximus/TLG-IPAM/pull/166) (#159) `bc3ba04`: `publish-release` stops when it cannot tell whether the tag has a release; only the two publish steps may be given a credential.
+  - [PR #168](https://github.com/DeusMaximus/TLG-IPAM/pull/168) (#164) `33ea51b`: a job's error counts the PTR lookups whose reply the agent refused unread, by limit.
+  - Each got one briefed round (GO with P3s: two, two and four), the P3s fixed in the same PR by its worker, and the fix read by the orchestrator against the reviewer's remedy with Codex clean on the new head. No second round, by the owner's standing preference.
+  - Filed, with the owner's word: **#169** (the installer's venv check still judges by mode bits, the model #136 removed for the CA bundle) and **#170** (decide whether to report a first DNS server whose replies are always refused while a later one answers).
+- **Decisions:**
+  - The owner (2026-11-25): a review round may be **started** on GPT-6 Sol with Daybreak Blue when the orchestrator judges a GPT-6.1 Sol refusal likely, said in the report; a judgment per round, not a rule (`.agents/orchestration.md`, "When a model refuses"). Used once: #164's round, which builds refused DNS replies. #136's and #159's rounds ran to the end on GPT-6.1 Sol.
+  - Merge order was #167, #166, #168: #167 and #168 edited the same `AGENTS.md` bullet, and #168's worker merged `main` and resolved it by hand. #166 was merged on a local run of the suite over its tree merged with `main` (its files are disjoint from #167's).
+- **State:** `main` is green. Agent 1,783 passed and 4 skipped (the root-only installer cases, which run in a container), server 1,357, web 188. No PR is open, no worker is running, no review round is running. No schema or protocol change this leg (`PROTOCOL_VERSION` 2).
+  - Nothing has ever been published by the release workflow; the first tag is the owner's. `.agents/releases.md` is the checklist: step 3 the base-image refresh (with the DNS-ceiling premise recheck when the image's Python changes), step 5 the cross-attempt artefact download, and on the first release a look at `publish-release`'s log to see the tag's release listed (#159's assumptions about draft listing).
+  - Never built or run by anyone: the server's Docker image with the `python -m app.serve` `CMD`; a proxy in front of the server against spec §8.
+  - Recorded, not filed: `publish-image`'s warning prints skopeo's stderr with its newlines (the pattern #159 tidied in `publish-release`); after exec, a process running as a reused service account can ptrace the CA check's program where the host allows it (#136's review, not rated).
+- **Waiting on the owner:**
+  - #5 and #25 (`owner` label), deferred until the deployment is rebuilt behind a tunnel; M3 (#26–#30, #32) waits on #25.
+  - The first release tag.
+  - No real-network test without asking again: the permission to send packets on the test host covered 2026-11-23 only.
+  - The owner is considering Claude Opus 5.5 as orchestrator for a session started before the weekly limit resets; the roster in `.agents/orchestration.md` is unchanged until they say so.
+- **Next:** ready and not started, all owing a briefed round but #31:
+  - `probe.py`, one at a time: #93 (resolver allowlist on the agent's host), #20 (forward-DNS check), #170.
+  - `install.py` / enrolment: #165 (refuse an agent the server cannot answer before its token is spent), then #169; they may share `install.py`, so not together unless #165 turns out to be server-side only.
+  - #31 (deployment document from spec §8): no code, can run beside any of the above.
+  - At most three workers, none sharing a code file. Review briefs and reviews of this session are in `.dev/<issue>/` (not committed).
+
+## 2026-11-25 — Claude Code (Opus 5.5), worker — #164: the job's error counts DNS replies refused for size or record count (PR #168)
+- **Merged:** 2026-11-25, squash `33ea51b`, at head `ae46dda`; branch deleted, #164 closed.
+- **Done:** [PR #168](https://github.com/DeusMaximus/TLG-IPAM/pull/168) closes #164.
+  - `probe.py`: when no server gave a usable answer and one attempt ended in `ReplyTooLarge` or `ReplyTooManyRecords`, `ptr` returns `UnreadReplies(too_large, too_many_records)` instead of None. Only the query's own server can cause it.
+  - `scan.py`:
+    - `refused_unread`: the refusal sentence.
+    - `no_answer`: the unanswered count, then the refusals.
+    - `cut_short`: the refusals after a PTR timeout.
+    - `error_text`: keeps the counts whole or drops them whole.
+  - `protocol.py`: `scan_error_fits`.
+  - Spec §5.2 says what the owner is told and what to do: `minimal-responses` in BIND or Unbound; for a forwarder (dnsmasq, Pi-hole, AdGuard Home, Technitium, a router), the upstream that produces the PTR answer. A PTR record set that is itself over the limit is the zone's own data.
+  - Brief §4.6 and the `AGENTS.md` bullet "The agent never executes…" each get one sentence. The merge with #167 kept `main`'s wording and added only that sentence.
+- **The error now:**
+  - With nothing refused, the text is unchanged from before #164.
+  - With refusals: `rdns: no DNS server gave a usable answer for 3 of 4 addresses, names kept; the agent refused a reply over 1232 bytes in 2 lookups, over 1 question or 32 records in 1 lookup`.
+  - A limit that refused nothing is left out, and one lookup reads "1 lookup".
+  - After a deadline: `timed out after T s during the PTR lookups; rdns: before the timeout, the agent refused a reply …`, counted over the lookups that returned. The plain unanswered count stays out, as before.
+- **Longest error:** 495 characters against the 500 cap, a margin of 5; 405 in the timeout form. Past the cap the counts are dropped whole, never cut before a number.
+- **Decisions:** PR Deliberate calls 1–6.
+  - The count travels as a third "no usable answer" value; None stays legal and no fake resolver had to change.
+  - A lookup a later server answered is not counted.
+  - A lookup can be in both counts.
+  - The second count covers both header limits.
+  - "Their stored names are kept" becomes "names kept" when refusals are reported, so the sentence fits.
+- **Review:**
+  - Codex and Greptile were clean on `30246ab`; Codex was clean on `ae46dda`, which Greptile did not re-review.
+  - Briefed round 1 (Codex, GPT-6 Sol, at `30246ab`): GO with four P3s, all fixed in `c197f10`:
+    1. a deadline hid known refusals;
+    2. the cap was held only by a 2-character margin;
+    3. the wording ("for 0", no unit, "or 1 question");
+    4. two coverage gaps (malformed-only rows, unequal counts).
+  - The orchestrator read the fixes against the remedies; no round 2.
+  - Twelve mutations all fail tests, the reviewer's nine included.
+- **Final counts at `ae46dda`:** agent 1,783 passed, 4 skipped (`main` before it: 1,741 passed, 4 skipped; 42 new); server 1,357 passed; web `install.test.js` 18 passed.
+- **State:** merged. No schema change; `PROTOCOL_VERSION` stays 2; no wire change; `test_invariants.py` unchanged.
+- **Waiting on the owner:** nothing from this PR.
+- **Untested or assumed:**
+  - No real resolver that sends a non-minimal reply over 32 records, or ignores the advertised payload; loopback responders stand in for both.
+  - The forwarder guidance comes from the products' documentation, not from running them.
+  - The longest-error test lists the failure texts `probe.py` raises today. A new raise site, or an exception name longer than the builtins' 22 characters, could drop the counts but never cut them.
+  - How the UI shows a long `last_scan_error`.
+- **Next:** #170 (a first server whose replies are refused while a later one answers goes unreported). Then #93 or #20, one at a time; all touch `probe.py`.
+
 ## 2026-11-25 — Claude Code (Opus 5.5), worker — #159: publish-release stops when it cannot tell whether the tag has a release (PR #166)
 - **Merged:** 2026-11-25, squash `bc3ba04`, at head `5efdd34`; branch deleted, #159 closed. Tests: 1,723 agent at the head; 1,741 passed and 4 skipped on the tree merged with `main` after PR #167 (orchestrator's run).
 - **Done:** [PR #166](https://github.com/DeusMaximus/TLG-IPAM/pull/166).
@@ -119,43 +187,3 @@ Template:
   - The first release, by `.agents/releases.md`: nothing has been published. Step 3 is now the base-image refresh (#94), with a recheck of the DNS ceiling's premise when the image's Python changes (#160); step 5 checks the cross-attempt artefact download (#147).
   - #5 and #25 (`owner` label), deferred. Permission to send packets on the test host covered 2026-11-23 only.
 - **Next:** verify the three PRs as they open and brief Sol on each; then the queue above.
-
-## 2026-11-25 — Claude Code (Opus 5.5), worker — #160: a record budget on DNS replies before parsing (PR #163)
-- **Merged:** 2026-11-25, squash `6cb82b6`, at head `78aa7b3`; branch deleted. Entry committed by the orchestrator, with the review and state lines brought up to date. The head held `main` with PRs #161 and #162, and all nine checks passed on it.
-- **Done:** [PR #163](https://github.com/DeusMaximus/TLG-IPAM/pull/163) (`160-dns-record-budget`) closes #160.
-  - `agent/src/tlg_ipam_agent/probe.py`:
-    - `DNS_QUESTIONS_MAX = 1`, `DNS_RECORDS_MAX = 32` (answer, authority and additional together, as the header claims, OPT included).
-    - `unread(data)` judges both limits from the length and the header alone; `ReplyTooManyRecords(DNSException)` sits beside `ReplyTooLarge`.
-    - `QuerySocket.datagram_received` applies #155's source rule to both: from the server, the attempt ends and the next server is asked; from anywhere else, dropped.
-  - Spec §5.2: the budget, what it refuses (the 32-PTR-plus-OPT reply among them), understated and overstated counts, and the derived ceiling in place of the 29,646 estimate.
-  - Brief §4.6 and the `AGENTS.md` invariant are updated, and a recheck step is added to #94's base-image procedure (`AGENTS.md`, Commands): when the image's Python changes, rerun the premise tests on it.
-  - Tests: 36 new in `test_probe.py`. Agent suite on `main`: 1,644.
-- **Review:** Codex and Greptile were clean on `002a5ef`. GPT-6.1 Sol was stopped by its safety filter a few minutes into the briefed round and posted nothing (`.dev/160/manual-handover.md`); the round ran on GPT-6 Sol with Daybreak Blue: GO at `002a5ef`, the ceiling held (its strongest accepted reply made 1,528 comparisons), seven mutations red, two P3s.
-  - P3 1 (the ceiling's argument) fixed in `91ca355` and `78aa7b3`: the 13th visit is the predecessor of the zero-perturb cycle, OPT is counted (1,651 with one), the premise test is called a tripwire, the 1,736 is scoped to 64-bit CPython with 3.13's probe, and named hashes are tested. Read by the orchestrator against the remedy; Codex clean on `78aa7b3`.
-  - P3 2 (say why a reply was refused) is filed as #164.
-  - Before the round the orchestrator checked the dictionary premise independently: 350,800 hashes on Python 3.15, worst total 1,694, no probe more than 12 over.
-- **Decisions:** PR Deliberate calls 1–7: one budget across the three sections, 32 = 2 × 16; zero questions allowed (FORMERR, NOTIMP); a datagram shorter than a header is left to dnspython; the ceiling is derived, its premise test is a tripwire, and the premise is rechecked whenever the interpreter changes; no per-reason count in the job's error here; TC replies are still parsed before refusal.
-- **Measured (M1 Ultra):** the ceiling is 1,736 name comparisons (1,651 with an OPT). Worst reply built: 1,426 comparisons, 23 ms parse, loop held 24–25 ms (was about 116 ms). The premise held on 3.13.12 (200,000 hashes) and in the image's 3.13.18 (20,007 hashes): at most 12 over.
-- **State:** merged. No schema change; `PROTOCOL_VERSION` 2; `test_invariants.py` unchanged.
-- **Waiting on the owner:** nothing from this PR.
-- **Untested:** the ceiling over every hash, and on Python 3.11, 3.12 and 3.14, which a native install can run; 32-bit builds; real network paths.
-- **Next:** #164, then #93 or #20, one at a time: all touch `probe.py`.
-
-## 2026-11-25 — Claude Code (Opus 5.5), worker — #140: parser and validation errors repeat no argument; the token's form in the wire contract (PR #162)
-- **Merged:** 2026-11-25, squash `873b52a`, at head `46c450e`; branch deleted. Entry committed by the orchestrator, with the state lines brought up to date. Before the merge the orchestrator ran the agent suite on this head merged with `main` after PR #161: 1,608 passed.
-- **Done:** [PR #162](https://github.com/DeusMaximus/TLG-IPAM/pull/162) (`140-parser-errors-token-form`) closes #140.
-  - `8259adb`, parser:
-    - `cli._Parser`'s errors quote nothing typed. argparse's message is kept only when it is made of the parser's own names; unrecognized arguments are counted; every error ends with `cli.TYPED_TOKEN`. Help unchanged.
-    - `agent_protocol` states the token form once (`TOKEN_SECRET_*`, `AGENT_TOKEN_FORM`, `ENROL_TOKEN_FORM`), held on the server side (`test_agents.py`) and the agent side (`test_contract.py`).
-  - `a8c40a0`, the briefed round's two P3s:
-    - `config.parse_allowed` names a bad item by its place, for the installer and the running agent alike. `install._ca_file` and the CA access refusal name the problem, never the path.
-    - End-to-end validation cases cover a token in every option's value.
-    - The `PROTOCOL_VERSION` rule is qualified as necessary but not sufficient wherever it is stated, held by `test_e2e.py` through the real routes: a server issuing a longer secret answers this release's agent `200` at any protocol, and its enrolment token is spent on a token it refuses.
-  - `46c450e` merges `main` (`b1357fb`) with no hand-written change.
-  - Spec §5.6, brief §4.2 and the `AGENTS.md` "Enrolment tokens" and "wire contract" bullets updated.
-- **Decisions:** PR Deliberate calls 1–8. Call 4 was replaced at the reviewer's overrule; call 7: the running agent's `ALLOWED_CIDRS` message changes too; call 8: the enrolment compatibility mechanism is not designed here.
-- **Review:** briefed round (Codex, GPT-6.1 Sol): GO at `8259adb` with two P3s (31,700 generated command lines on five Pythons, no token in any output; nine mutations red). Both fixed in `a8c40a0`, answered on the PR, and read by the orchestrator against the remedies. Codex automatic review clean on `46c450e`. Greptile 5/5 on `8259adb`; it has not read the fix, and the briefed GO stands in for it.
-- **State:** merged. No schema change; `PROTOCOL_VERSION` 2; no new agent import or listed name. No token's form changed.
-- **Waiting on the owner:** nothing from this PR.
-- **Untested:** a real root or systemd install; the container image locally (CI's `agent` job checks it); translated argparse messages.
-- **Next:** #136 (the CA bundle's access checked as the service account), which edits `install.py`, the CA access message changed here included. The enrolment compatibility mechanism is filed as a follow-up.
