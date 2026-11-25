@@ -27,6 +27,27 @@ Template:
 
 ---
 
+## 2026-11-25 — Claude Code (Opus 5.5), worker — #153: no DNS reply over the advertised payload is parsed (PR #155)
+- **Merged:** 2026-11-25, squash `c128179`, at head `793eff3`; branch deleted. Entry committed by the orchestrator, with the review, CI and state lines brought up to date. `793eff3` is GitHub's merge of `main` (holding PR #158) into the worker's last head `9b2acdc`, with no hand-written change (its tree equals `git merge-tree` of the two); the orchestrator made it so CI would test the PR with the #156 fix, and the `agent` job passed there.
+- **Done:** [PR #155](https://github.com/DeusMaximus/TLG-IPAM/pull/155) (`153-dns-reply-size`) closes #153.
+  - `agent/src/tlg_ipam_agent/probe.py`:
+    - `DNS_PAYLOAD = 1232` is both the advertised payload and the largest reply the agent reads.
+    - `QuerySocket.datagram_received` answers an over-size datagram from the query's server and port with `ReplyTooLarge` (a `DNSException`): that attempt ends as no usable answer and the next server is asked.
+    - An over-size datagram from any other source is dropped. `_from_server` matches dnspython's source rule or is stricter.
+  - Spec §5.2 (the limit, what it refuses, the entry count and the estimate), brief §4.6 and `AGENTS.md` are updated.
+  - Tests: 15 new in `test_probe.py`. Agent suite on `main` after this and PR #158: 1,405. Server suite 1,340, unchanged.
+  - Review: GPT-6.1 Sol was stopped by its safety filter a few minutes into the briefed round and posted nothing (`.dev/153/manual-handover.md`); the round ran on GPT-6 Sol with Daybreak Blue: GO at `a06bd29` with one P3 (the comparison figure was called a ceiling on a false premise), fixed in `9b2acdc` with a numbered reply on the PR, and read by the orchestrator against the remedy. Before the round the orchestrator sent back one wrong figure (203 records; a root question is 5 bytes, so 244). Codex clean on `793eff3`; Greptile last read `051cd71`, clean.
+- **Decisions:** PR body Deliberate calls 1–7. Size checked at arrival, in the agent's socket. An over-size reply ends the attempt only when it comes from the server. 1,232 kept: 710 bytes is the largest ordinary answer built, not the largest possible. No exhaustive bound on parse work is claimed.
+- **Measured (M1 Ultra):**
+  - At most 244 entries (5-byte root question); 29,646 comparisons is an estimate, 0.40 s here.
+  - The worst reply built parses in about 0.116 s and holds the loop 115–119 ms; root entries do not raise that.
+  - A 9,856-byte reply takes 8.7 s.
+  - Two colliding answer records make 2, 4 or 6 comparisons, depending on the hash.
+- **State:** merged. No schema change; `PROTOCOL_VERSION` 2; no new import or listed name. Its CI `agent` job failed three times before PR #158, only in `test_answers.py`'s memory test (#156, not this PR's).
+- **Waiting on the owner:** nothing from this PR. The record budget before parsing (Deliberate call 7) is filed as #160.
+- **Untested:** an over-size reply over a real network path; the timings on CI hardware; the full suite on Python 3.11 (the reviewer ran the new cases on 3.11.18).
+- **Next:** #160. #20 and #93 are still open in `probe.py`.
+
 ## 2026-11-25 — Claude Code (Opus 5.5), worker — #156: the answer-cap memory tests measure the client in a fresh interpreter (PR #158)
 - **Merged:** 2026-11-25, squash `606e1d4`, at head `34c9b40`; branch deleted. Entry committed by the orchestrator, with the review and state lines brought up to date.
 - **Done:** [PR #158](https://github.com/DeusMaximus/TLG-IPAM/pull/158) (`156-answer-cap-memory-test`, head `34c9b40`) closes #156. Tests only; `client.py` and `RESPONSE_MAX` unchanged.
@@ -84,15 +105,3 @@ Template:
 - **Waiting on the owner:** nothing from this entry.
 - **Untested:** a real browser with its clock set off or stepped (the tests fake the clocks in jsdom).
 - **Next:** #92 (the plain-HTTP warning before a token is issued) is the dialog's remaining open issue. #147 (release pipeline tests) edits `agent/tests/test_release.py`, which this PR also changed, and can start now.
-
-## 2026-11-24 — Claude Code (Opus 5.5), worker — #149: the CNAME walk keyed by wire bytes; which PTR record wins (PR #151)
-- **Done:** [PR #151](https://github.com/DeusMaximus/TLG-IPAM/pull/151) (`149-cname-walk-keys`, head `ad268e2`) closes #149. (Written by the orchestrator from the PR body: the worker's thread was still finishing when the PR merged.)
-  - `probe.answered_name` keys its CNAME map and visited set by `Name.to_digestable()` (the name's wire form, labels lowercased, lengths included), not by `dns.name.Name`, whose hash in dnspython 2.9.2 ignores where labels split. A 512-link chain of colliding names went from about 724,000 `Name.fullcompare` calls to one. The walk visits the same names in the same order.
-  - Spec §5.2, brief §4.6, `AGENTS.md` and `read_reply`'s docstring state the order the code already had: a PTR at the chain's end is the name (its first record when there are several), whatever else the reply holds; a PTR elsewhere is never the name, and with none at the chain's end makes the reply no usable answer.
-  - Tests (`agent/tests/test_probe.py`, +5): a chain of colliding names costs work in step with its links, counted with `sys.setprofile` and never timed, asserting its own premise that the names hash alike; of several PTR records at the answered name the first is read (Greptile's P2); the counting helper puts back the profiler hook it found (the briefed round's P3).
-  - Merged: `fd1e83e`, squash, on the owner's go-ahead; the remote branch is deleted. CI green and Codex clean on `ad268e2`. Briefed round (Codex, GPT-6.1 Sol): GO at `7cc32ec`, both findings from PR #146 closed, one P3 in the new test, fixed in `ad268e2`; the orchestrator read that diff against the remedy and ran 1,367 agent tests on the head, with no further round for a test-only change.
-- **Decisions:** PR body Deliberate calls 1–4: the key is `to_digestable()`; the test counts work; the spec says the first of several PTR records is read; the spec says the parse is dnspython's own cost.
-- **State:** merged. No new import, query or wire change (`PROTOCOL_VERSION` 2). No schema change.
-- **Waiting on the owner:** whether to file an issue for the remaining exposure the review describes: dnspython's parser has the same collision cost before the walk runs (1.67 s for a 65 KB reply, measured by the reviewer with a substituted socket), and the agent does not refuse a reply larger than the 1,232 bytes it advertises. Only a resolver the owner configured can send one.
-- **Untested:** a near-maximum reply over a real UDP path; the full suite on Python 3.11 and 3.13 by the reviewer (CI runs both).
-- **Next:** #20 and #93 are in the same file and untouched.
