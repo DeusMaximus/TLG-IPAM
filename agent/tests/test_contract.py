@@ -80,10 +80,50 @@ def test_every_token_the_server_issues_has_the_shape_the_agent_takes(kind, prefi
 def test_every_agent_token_the_server_issues_is_the_form_the_enrol_answer_must_carry():
     """`client.ISSUED_AGENT_TOKEN` is the agent's copy of what `agents.issue_token`
     makes (finding 4 of the review of #130): an answer carrying anything else is not
-    stored. A change to the server's form fails here before it fails an enrolment."""
+    stored. A change to the server's form fails here before it fails an enrolment, and
+    `api/tests/test_agents.py` holds the server to `agent_protocol.AGENT_TOKEN_FORM`."""
     for _ in range(500):
         assert client.ISSUED_AGENT_TOKEN.fullmatch(_issued("agent"))
     assert not client.ISSUED_AGENT_TOKEN.fullmatch(_issued("enrol"))
+
+
+def test_the_agents_rule_for_an_issued_agent_token_is_the_wire_contracts_form():
+    """`client.ISSUED_AGENT_TOKEN` is `agent_protocol.AGENT_TOKEN_FORM` written out (the
+    agent does not import pydantic's module), to the character (#140)."""
+    assert client.ISSUED_AGENT_TOKEN.pattern == server.AGENT_TOKEN_FORM.pattern
+    assert client.ISSUED_AGENT_TOKEN.flags == server.AGENT_TOKEN_FORM.flags
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "tlga_" + "A" * 43,
+        "tlga_" + "-_" * 21 + "z",
+        "tlga_" + "A" * 42,
+        "tlga_" + "A" * 44,
+        "tlga_" + "A" * 42 + "=",
+        "tlga_" + "A" * 42 + "+",
+        "tlga_" + "A" * 42 + "/",
+        "tlga_" + "A" * 42 + "é",
+        "tlga_" + "A" * 42 + "\n",
+        "tlge_" + "A" * 43,
+        "TLGA_" + "A" * 43,
+        "",
+    ],
+)
+def test_the_agent_and_the_contract_take_the_same_tokens(token):
+    assert bool(client.ISSUED_AGENT_TOKEN.fullmatch(token)) == bool(server.AGENT_TOKEN_FORM.fullmatch(token))
+
+
+def test_the_tokens_the_tests_spell_by_hand_are_of_the_issued_form():
+    """The agent's tests write their tokens out (`conftest`, and `answer_memory`, which
+    runs in a fresh interpreter); each is one the server could issue."""
+    import answer_memory
+    import conftest
+
+    for token in (conftest.TOKEN, answer_memory.TOKEN):
+        assert server.AGENT_TOKEN_FORM.fullmatch(token)
+    assert server.ENROL_TOKEN_FORM.fullmatch(conftest.ENROL_TOKEN)
 
 
 def test_the_enrol_body_is_what_the_server_accepts_and_stores_unchanged():

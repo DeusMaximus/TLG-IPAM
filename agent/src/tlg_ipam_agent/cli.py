@@ -75,8 +75,89 @@ def configure_logging(*tokens: str | None) -> None:
             redact.add(*known)
 
 
+# What every refused command line says about a token typed into it, as install's
+# refusal of `--enrol-token VALUE` says it (#140)
+TYPED_TOKEN = (
+    "If a token was typed into this command, it was not used, but treat it as exposed: "
+    "re-enrol the agent on the Agents page for a new one, and give that on standard "
+    "input (--enrol-token -)"
+)
+# argparse's messages that hold nothing but the parser's own names, kept as it writes
+# them: "the following arguments are required: --url", "argument --url: expected one
+# argument"
+_REQUIRED = "the following arguments are required: "
+_EXPECTED = ("expected one argument", "expected at most one argument", "expected at least one argument")
+_NOT_REPEATED = "not repeated here"
+
+
+class _Parser(argparse.ArgumentParser):
+    """argparse's parser, whose errors never repeat what was typed (#140).
+
+    argparse quotes the argument it refuses: an unknown command, an unrecognized
+    argument (a value after an unknown option, anything after `--enrol-token -`), an
+    ambiguous option with its `=value`, the value given to `--help` or `--version`. An
+    operator who mistypes the command with the token in it would get the token on the
+    terminal and in whatever records it. Here a message is kept as argparse wrote it only
+    when it is made of the parser's own names alone (`_REQUIRED`, `_EXPECTED`); one
+    argparse builds from what was typed is said again by its kind, and any other
+    message is replaced by a fixed one. Every error ends with TYPED_TOKEN. The help text is argparse's own.
+
+    Only the text after "error:" changes, so the subparsers (which argparse makes of
+    this class) print their usage and exit with 2 as before."""
+
+    def parse_args(self, args=None, namespace=None):
+        # argparse's own parse_args, but the unrecognized arguments are counted, never
+        # joined into the message
+        parsed, extras = self.parse_known_args(args, namespace)
+        if extras:
+            some = "argument" if len(extras) == 1 else "arguments"
+            self._refuse(f"{len(extras)} unrecognized {some} ({_NOT_REPEATED})")
+        return parsed
+
+    def error(self, message: str):
+        self._refuse(_without_typed_text(message, self._names()))
+
+    def _refuse(self, message: str):
+        super().error(f"{message}\n{TYPED_TOKEN}")
+
+    def _names(self) -> dict[str, argparse.Action]:
+        """Each name argparse can give one of this parser's arguments in a message:
+        its option strings, alone and joined with `/`, its metavar and its dest."""
+        names = {}
+        for action in self._actions:
+            spellings = [*action.option_strings, "/".join(action.option_strings), action.metavar, action.dest]
+            for name in spellings:
+                if isinstance(name, str) and name and name != argparse.SUPPRESS:
+                    names[name] = action
+        return names
+
+
+def _without_typed_text(message: str, names: dict[str, argparse.Action]) -> str:
+    """argparse's error `message`, with nothing in it that was typed: kept when it is
+    made of `names` alone, otherwise said again from `names` and fixed text."""
+    if message.startswith(_REQUIRED) and all(n in names for n in message[len(_REQUIRED):].split(", ")):
+        return message
+    if message.startswith("argument "):
+        name, _, problem = message[len("argument "):].partition(": ")
+        action = names.get(name)
+        if action is not None:
+            if problem in _EXPECTED:
+                return message
+            if problem.startswith("invalid choice"):
+                choices = f"; choose from {', '.join(action.choices)}" if action.choices else ""
+                return f"argument {name}: invalid choice ({_NOT_REPEATED}){choices}"
+            if problem.startswith("ignored explicit argument"):
+                return f"argument {name}: takes no value ({_NOT_REPEATED})"
+            return f"argument {name}: not understood (argparse's message is {_NOT_REPEATED})"
+    if message.startswith("unrecognized arguments"):
+        return f"unrecognized arguments ({_NOT_REPEATED})"
+    if message.startswith("ambiguous option"):
+        return f"an option could be more than one of this command's ({_NOT_REPEATED})"
+    return f"the command line was not understood (argparse's message is {_NOT_REPEATED})"
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="tlg-ipam-agent",
         description="TLG-IPAM scan agent. With no command it runs, configured from the "
         "environment: IPAM_URL, IPAM_ENROL_TOKEN (first start) or IPAM_AGENT_TOKEN, "

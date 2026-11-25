@@ -36,9 +36,10 @@ _CODE = re.compile(r"[A-Z][A-Z0-9_]{0,39}")
 _COUNT_MAX = 4096
 # the server's ids are UUIDs (models._uuid)
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-# the agent token the current protocol issues: the prefix and secrets.token_urlsafe(32),
-# 43 characters of the URL-safe base64 alphabet (services/agents.issue_token;
-# tests/test_contract.py holds this to what the server really issues)
+# the agent token the current protocol issues, agent_protocol.AGENT_TOKEN_FORM written
+# out: the prefix, then 43 characters of the URL-safe base64 alphabet, the
+# secrets.token_urlsafe(32) of services/agents.issue_token (tests/test_contract.py holds
+# this to the contract's form and to what the server really issues; #140)
 ISSUED_AGENT_TOKEN = re.compile(r"tlga_[A-Za-z0-9_-]{43}")
 
 

@@ -10,6 +10,7 @@ holds the names it publishes under to the ones the Agents page renders."""
 
 import importlib.util
 import re
+import subprocess
 import tomllib
 import zipfile
 from pathlib import Path
@@ -316,3 +317,217 @@ def test_the_image_is_pushed_only_to_a_tag_the_registry_says_is_absent(workflow)
     assert lines.index("absent)") < copy < lines.index("*)")
     assert lines.index("present)") < lines.index("absent)")
     assert "grep -qiE 'manifest unknown|name unknown' inspect.err" in script
+
+
+# --- The base image (#94) ---
+
+DOCKERFILE = AGENT / "Dockerfile"
+# a name, its tag (kept for the reader) and the digest the build resolves it by
+PINNED_BASE = re.compile(r"[\w.-]+(?:/[\w.-]+)*:[\w.-]+@sha256:[0-9a-f]{64}")
+PIN_STEP = "The base image's pin, against its tag"
+# what Docker takes between an instruction and its arguments, and between arguments
+# (BuildKit's parser, `reWhitespace`)
+DOCKER_SPACE = re.compile(r"[\t\v\f\r ]+")
+
+
+def _instructions(text):
+    """The Dockerfile's instructions as Docker joins them: lines end at a newline alone
+    (not at the vertical tab or form feed `str.splitlines` also breaks at), a comment
+    line is dropped, inside a continued instruction too, and a line ending in a
+    backslash continues."""
+    found, held = [], ""
+    for line in text.split("\n"):
+        if line.lstrip().startswith("#"):
+            continue
+        if line.rstrip().endswith("\\"):
+            held += line.rstrip()[:-1] + " "
+            continue
+        whole = (held + line).strip()
+        held = ""
+        if whole:
+            found.append(whole)
+    if held.strip():
+        found.append(held.strip())
+    return found
+
+
+def _bases(text):
+    """The arguments of each FROM, in any case, split from it and from each other at
+    any of Docker's white space (a tab included, review of #94)."""
+    for instruction in _instructions(text):
+        # `_instructions` strips each, so neither end holds white space
+        word, *rest = DOCKER_SPACE.split(instruction, maxsplit=1)
+        if word.upper() == "FROM":
+            yield DOCKER_SPACE.split(rest[0]) if rest else []
+
+
+def _unpinned(text):
+    """Each FROM that does not name its base by tag and digest. Nothing else is taken:
+    no build argument, which a `--build-arg` could replace, and no `--platform`, since
+    the release builds both of its platforms from the one line."""
+    refused = []
+    for args in _bases(text):
+        image, *rest = args or [""]
+        named = rest == [] or (len(rest) == 2 and rest[0].upper() == "AS")
+        if not (named and PINNED_BASE.fullmatch(image)):
+            refused.append(" ".join(args))
+    return refused
+
+
+def test_the_agent_image_is_built_from_one_base_named_by_digest():
+    """Every build of a commit starts from the same operating-system layer, and the tag
+    records which one a release shipped. One FROM, because the release's pin step reads
+    that line, in the one shape its `sed` reads: `FROM <name>:<tag>@sha256:<digest>` on
+    a line of its own, upper case, one space, nothing after.
+
+    This holds the shape of a pin, not what it names: a 64-hex digest of one platform's
+    manifest passes as well as the index's. That the digest is the tag's multi-platform
+    index is shown by `imagetools inspect` (AGENTS.md's procedure) and by the release
+    building both platforms from it."""
+    text = DOCKERFILE.read_text()
+    (args,) = list(_bases(text))
+    assert _unpinned(text) == []
+    assert re.findall(r"^FROM ([^ ]*)$", text, re.M) == args
+
+
+def test_a_tab_separated_second_stage_is_counted_and_refused():
+    """Docker takes a tab between an instruction and its arguments, and builds the last
+    stage: a lower-case, tab-separated second FROM is a stage, and an unpinned one."""
+    text = f"FROM python:3.13-slim@{DIGEST}\nfrom\tpython:3.13-slim\n"
+    assert len(list(_bases(text))) == 2
+    assert _unpinned(text) == ["python:3.13-slim"]
+
+
+DIGEST = "sha256:" + "ab" * 32
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "FROM python:3.13-slim\n",
+        "from python:3.13-slim\n",
+        "FROM python:3.13-slim AS agent\n",
+        f"FROM python@{DIGEST}\n",  # the tag is kept for the reader
+        f"FROM python:3.13-slim@sha256:{'ab' * 31}\n",
+        f"ARG BASE=python:3.13-slim@{DIGEST}\nFROM $BASE\n",
+        f"FROM --platform=linux/amd64 python:3.13-slim@{DIGEST}\n",
+        f"FROM python:3.13-slim@{DIGEST} extra\n",
+        "FROM \\\n  python:3.13-slim\n",
+        f"FROM python:3.13-slim@{DIGEST} AS one\nFROM python:3.13-slim\n",
+    ],
+)
+def test_a_base_not_named_by_digest_is_refused(text):
+    assert _unpinned(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"FROM python:3.13-slim@{DIGEST}\n",
+        f"# FROM python:3.13-slim\nFROM python:3.13-slim@{DIGEST}\n",
+        f"FROM python:3.13-slim@{DIGEST} AS agent\n",
+        f"FROM \\\n# a comment inside the instruction\n  docker.io/library/python:3.13-slim@{DIGEST}\n",
+    ],
+)
+def test_a_base_named_by_digest_passes(text):
+    assert list(_bases(text)) and _unpinned(text) == []
+
+
+def _pin_step(workflow):
+    steps = workflow["jobs"]["build"]["steps"]
+    names = [step.get("name") for step in steps]
+    assert names.index(PIN_STEP) < names.index("Image, for both platforms, as one OCI archive")
+    return steps[names.index(PIN_STEP)]["run"]
+
+
+@pytest.mark.parametrize(
+    "answer, expected",
+    [
+        ("pinned", "python:3.13-slim still names {pinned}\n"),
+        (
+            DIGEST,
+            "::warning::agent/Dockerfile builds from python:3.13-slim@{pinned}, and"
+            " python:3.13-slim is now " + DIGEST + ": move the pin forward before the"
+            " next release (AGENTS.md, Commands)\n",
+        ),
+        (
+            None,
+            "::warning::could not read the digest python:3.13-slim names now, so whether"
+            " agent/Dockerfile's pin is current is not known\n",
+        ),
+    ],
+    ids=["current", "moved-on", "unreadable"],
+)
+def test_the_release_warns_when_the_base_tag_has_moved_on(workflow, tmp_path, answer, expected):
+    """The build job's step, as the workflow holds it, on the real Dockerfile, with a
+    stand-in `docker` for the registry's answer. A stale pin is a warning and never a
+    failure: the image is built from the pin either way."""
+    (pinned,) = re.findall(r"@(sha256:[0-9a-f]{64})", DOCKERFILE.read_text())
+    done = _run_with_docker(_pin_step(workflow), ROOT, tmp_path, pinned if answer == "pinned" else answer)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == expected.format(pinned=pinned)
+
+
+def _run_with_docker(script, cwd, tmp_path, reply, *, options=("-eo", "pipefail")):
+    """bash runs `script` with a stand-in `docker` that takes only the one registry
+    read the workflow and AGENTS.md make, and answers it with `reply`, or fails."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "docker"
+    stub.write_text(
+        "#!/bin/sh\n"
+        '[ "$*" = "buildx imagetools inspect python:3.13-slim --format {{.Manifest.Digest}}" ]'
+        ' || { echo "unexpected: $*" >&2; exit 2; }\n'
+        + (f"printf %s '{reply}'\n" if reply is not None else "echo 'ERROR: no answer' >&2; exit 1\n")
+    )
+    stub.chmod(0o755)
+    return subprocess.run(
+        ["bash", *options, "-c", script],
+        cwd=cwd,
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+    )
+
+
+def _update_command():
+    """The line of AGENTS.md's procedure that moves the pin: the digest read, its check
+    and the `sed`, as one chain. The other two only show the index and build the result."""
+    section = (ROOT / "AGENTS.md").read_text().split("### The agent's base image\n", 1)[1]
+    block = section.split("```sh\n", 1)[1].split("```", 1)[0]
+    (line,) = [line for line in block.splitlines() if line.startswith("digest=")]
+    assert not [line for line in block.splitlines() if line.startswith("sed ")]  # never a line of its own
+    return line
+
+
+def _update(tmp_path, reply):
+    work = tmp_path / "repo"
+    (work / "agent").mkdir(parents=True)
+    (work / "agent" / "Dockerfile").write_text(DOCKERFILE.read_text())
+    # no `set -e`: an interactive shell runs the next command whatever the last did
+    done = _run_with_docker(_update_command(), work, tmp_path, reply, options=())
+    return done, (work / "agent" / "Dockerfile").read_text(), sorted(p.name for p in (work / "agent").iterdir())
+
+
+def test_the_documented_update_moves_the_pin_and_nothing_else(tmp_path):
+    """AGENTS.md's command, as written, on a copy of the Dockerfile: the pin becomes
+    the digest the registry answers, and every other byte stays."""
+    before = DOCKERFILE.read_text()
+    done, after, files = _update(tmp_path, DIGEST)
+    assert done.returncode == 0, done.stderr
+    (pinned,) = re.findall(r"@(sha256:[0-9a-f]{64})", before)
+    assert after == before.replace(pinned, DIGEST)
+    assert files == ["Dockerfile"]  # no .bak left
+
+
+@pytest.mark.parametrize(
+    "reply", [None, "", "null", "sha256:" + "ab" * 31, f"{DIGEST}|x", "sha256:" + "AB" * 32],
+    ids=["no-answer", "empty", "null", "short", "sed-text", "upper-case"],
+)
+def test_a_failed_or_odd_registry_answer_leaves_the_pin(tmp_path, reply):
+    """A read that fails, or answers anything but a digest, stops the chain before the
+    Dockerfile is touched, without `set -e` (review of #94)."""
+    done, after, files = _update(tmp_path, reply)
+    assert done.returncode != 0
+    assert after == DOCKERFILE.read_text()
+    assert files == ["Dockerfile"]

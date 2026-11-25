@@ -27,6 +27,46 @@ Template:
 
 ---
 
+## 2026-11-25 — Claude Code (Opus 5.5), worker — #140: parser and validation errors repeat no argument; the token's form in the wire contract (PR #162)
+- **Merged:** 2026-11-25, squash `873b52a`, at head `46c450e`; branch deleted. Entry committed by the orchestrator, with the state lines brought up to date. Before the merge the orchestrator ran the agent suite on this head merged with `main` after PR #161: 1,608 passed.
+- **Done:** [PR #162](https://github.com/DeusMaximus/TLG-IPAM/pull/162) (`140-parser-errors-token-form`) closes #140.
+  - `8259adb`, parser:
+    - `cli._Parser`'s errors quote nothing typed. argparse's message is kept only when it is made of the parser's own names; unrecognized arguments are counted; every error ends with `cli.TYPED_TOKEN`. Help unchanged.
+    - `agent_protocol` states the token form once (`TOKEN_SECRET_*`, `AGENT_TOKEN_FORM`, `ENROL_TOKEN_FORM`), held on the server side (`test_agents.py`) and the agent side (`test_contract.py`).
+  - `a8c40a0`, the briefed round's two P3s:
+    - `config.parse_allowed` names a bad item by its place, for the installer and the running agent alike. `install._ca_file` and the CA access refusal name the problem, never the path.
+    - End-to-end validation cases cover a token in every option's value.
+    - The `PROTOCOL_VERSION` rule is qualified as necessary but not sufficient wherever it is stated, held by `test_e2e.py` through the real routes: a server issuing a longer secret answers this release's agent `200` at any protocol, and its enrolment token is spent on a token it refuses.
+  - `46c450e` merges `main` (`b1357fb`) with no hand-written change.
+  - Spec §5.6, brief §4.2 and the `AGENTS.md` "Enrolment tokens" and "wire contract" bullets updated.
+- **Decisions:** PR Deliberate calls 1–8. Call 4 was replaced at the reviewer's overrule; call 7: the running agent's `ALLOWED_CIDRS` message changes too; call 8: the enrolment compatibility mechanism is not designed here.
+- **Review:** briefed round (Codex, GPT-6.1 Sol): GO at `8259adb` with two P3s (31,700 generated command lines on five Pythons, no token in any output; nine mutations red). Both fixed in `a8c40a0`, answered on the PR, and read by the orchestrator against the remedies. Codex automatic review clean on `46c450e`. Greptile 5/5 on `8259adb`; it has not read the fix, and the briefed GO stands in for it.
+- **State:** merged. No schema change; `PROTOCOL_VERSION` 2; no new agent import or listed name. No token's form changed.
+- **Waiting on the owner:** nothing from this PR.
+- **Untested:** a real root or systemd install; the container image locally (CI's `agent` job checks it); translated argparse messages.
+- **Next:** #136 (the CA bundle's access checked as the service account), which edits `install.py`, the CA access message changed here included. The enrolment compatibility mechanism is filed as a follow-up.
+
+## 2026-11-25 — Claude Code (Opus 5.5), worker — #94: pin the agent's base image by digest (PR #161)
+- **Merged:** 2026-11-25, squash `c652f2d`, at head `7d298f1`; branch deleted. Entry committed by the orchestrator, with the state lines brought up to date.
+- **Done:** [PR #161](https://github.com/DeusMaximus/TLG-IPAM/pull/161) (`94-agent-base-image-digest`) closes #94.
+  - `agent/Dockerfile`: `FROM python:3.13-slim@sha256:7249d558…`, the tag's multi-platform index (covers amd64 and arm64).
+  - `release.yml` build job: the new step *The base image's pin, against its tag* warns, never fails, when the tag has moved on from the pin. Its comment names the one `FROM` shape its `sed` reads. The publish jobs are unchanged.
+  - `AGENTS.md`: Commands gets "The agent's base image": a one-line `&&` chain that reads the digest, checks its form and moves the pin. The subsection says the test holds the pin's shape, not that the digest is the index. The "One version" bullet names the base pin.
+  - `.agents/releases.md`, checklist step 3: refresh the base in its own PR before the bump PR, whose Tests section records the base digest and that its Release run reported it current.
+  - `.agents/releases.md`, *Re-run all jobs*: corrected; the base is now fixed and only timestamps differ (measured: file times and 296 `.pyc` files).
+  - Brief §2.4 and spec §5.6: one sentence each.
+- **Tests:** 26 new in `test_release.py`.
+  - Parsing: the `FROM` parser splits at Docker's white space and lines only at newlines. The one-stage test holds the shape the step's `sed` reads, and a tab-separated second stage is counted and refused.
+  - Workflow: the step runs under bash against a stand-in `docker` for three registry answers (current, moved on, unreadable). On the PR's own Release run on the runner it printed `python:3.13-slim still names sha256:7249…`, and both platforms built from the pin.
+  - Documentation: the `AGENTS.md` line runs as written without `set -e`, for one good answer and six bad ones.
+- **Decisions:** PR Deliberate calls 1–7. The pin is the index digest. The digest moves by hand at each release, not by Dependabot. The server's Dockerfile is not pinned: it is built where it runs and never published. A stale pin is a warning, not a failure. Rebuilding a tag to the same digest is out of scope. The outside read overruled none.
+- **Review:** Greptile read `b6fbc68` (one P2, fixed in `df40a87`). In place of its re-run, an outside read by Codex (GPT-6.1 Sol) at `df40a87`: GO, one P3 (a tab-separated second `FROM` went uncounted) and three corrections, all fixed in `7d298f1` and read by the orchestrator against the remedy, with the reviewer's mutant replayed. Codex automatic review clean on every head.
+- **State:** merged. No schema change; `PROTOCOL_VERSION` unchanged; no new agent import or listed name.
+- **Waiting on the owner:** nothing from this PR. At each release, checklist step 3's base refresh comes first.
+- **Known gap, not this PR's:** a secret given to a `build` step through `env` passes every shape test in `test_release.py`. Added to #159's scope with the owner's go-ahead.
+- **Untested:** Docker Hub's anonymous rate limit on the extra lookup (it would show as the "could not read" warning); GNU sed running the documented line outside CI.
+- **Next:** #159 (fail-closed release lookup in `publish-release`).
+
 ## 2026-11-25 — Claude Code (Fable 5.2), orchestrator — state after the wave of 2026-11-24/25; three workers in flight
 - **Done:** since the last orchestrator entry (now in `.agents/handoff/2026-11.md`), merged by squash with the owner's go-ahead for each, every one with a hand-off entry here or in the archive: #91 (PR #134), #133 (#137), #22 (#130), #23 (#141), #100 (#142), #24 (#145), #144 (#146), #139 (#148), #132 (#135), #149 (#151), #143 (#150), #138 (#152), #92 (#157), #156 (#158), #153 (#155), #147 (#154). `main` is at `c4c4e4d` plus hand-off commits: 1,462 agent, 1,340 server and 188 web tests.
 - **In flight** (three, the limit; none shares a code file):
@@ -106,32 +146,3 @@ Template:
 - **Waiting on the owner:** nothing from this PR. The record budget before parsing (Deliberate call 7) is filed as #160.
 - **Untested:** an over-size reply over a real network path; the timings on CI hardware; the full suite on Python 3.11 (the reviewer ran the new cases on 3.11.18).
 - **Next:** #160. #20 and #93 are still open in `probe.py`.
-
-## 2026-11-25 — Claude Code (Opus 5.5), worker — #156: the answer-cap memory tests measure the client in a fresh interpreter (PR #158)
-- **Merged:** 2026-11-25, squash `606e1d4`, at head `34c9b40`; branch deleted. Entry committed by the orchestrator, with the review and state lines brought up to date.
-- **Done:** [PR #158](https://github.com/DeusMaximus/TLG-IPAM/pull/158) (`156-answer-cap-memory-test`, head `34c9b40`) closes #156. Tests only; `client.py` and `RESPONSE_MAX` unchanged.
-  - Cause: each check-in makes httpcore try `import sniffio` (not installed). Under pytest the attempt passes the assertion-rewriting hook, whose `PurePath` interns a fresh string that is then freed (mortal in 3.13). That uses up a slot of the interned-string dict, and when the slots run out the dict rebuilds its table (3,844,800 B in a full run). `tracemalloc` counts the new table in full. The free-slot count at the test moves with every collected module's text: 49 on `main`, 20 on `main` + PR #155 in a `python:3.13-slim` container.
-  - Reproduced in that container with the test unchanged. A plugin (`edge156.py`, in the PR body) uses up interned slots before the test, and the merged tree then fails with CI's figures: 4,022,997–4,028,543 and 5,314,720–5,315,023 B. After the fix, all 10 shifts pass. The orchestrator re-ran one shift of each: 5,313,160 B held before, passing after.
-  - `agent/tests/answer_memory.py` (new, not collected) runs the client in `python -I`: no pytest, no hook, no server. It warms up with one check-in and measures the second. `test_answers._held` runs it, with kill and reap on timeout or cancel (Greptile P2, fixed in `34c9b40`). The compressed-answer, plain-answer and raw-chunk tests use it with their limits unchanged.
-  - New `test_the_measurement_sees_a_client_that_holds_too_much`: a reader with twice the cap (2.7 MB) and one that decodes first (81 MB) are each over their limit.
-  - Tests: agent 1,388 → 1,390. Container: 1,388 + 2 skipped on the branch, 1,403 + 2 skipped merged with PR #155.
-  - Review: Codex clean on `34c9b40`; CI green (9 checks). Greptile read `0b0d71e` (one P2, fixed); in place of its re-run, an outside read by Codex (GPT-6.1 Sol) at `34c9b40`: GO, no findings (`.dev/156/review-1.md` and the PR). It read the interned dict's free slots directly (unchanged over 20 check-ins in the child) and ran the plain test 50 times: largest 1.84 MB, 1.87 MB under CPU load, against 2.10 MB.
-- **Decisions:** PR body Deliberate calls 1–4. A child process, because `tracemalloc` has no filtered peak and the rebuild is on the client's own stack. Limits kept, with the budget and measured figures stated: plain 1.47 MB on Linux, 1.57–1.87 MB on macOS, against 2.10 MB; measured, not derived as a bound. The raw-chunk test moved too, for one rule.
-- **State:** merged. No schema, protocol, brief or `AGENTS.md` change.
-- **Waiting on the owner:** nothing from this PR.
-- **Untested:** the CI runner's exact interned-slot state; Python other than 3.13.
-- **Next:** PR #155's `agent` job on a head that holds this fix.
-
-## 2026-11-25 — Claude Code (Opus 5.5), worker — #92: say before an enrolment token is issued that the page is on plain HTTP (PR #157)
-- **Merged:** 2026-11-25, squash `2abfcb4`, at head `884cda2`; branch deleted. Entry committed by the orchestrator, with the state lines brought up to date. The orchestrator ran lint, the 188 web tests and the build at the head before the merge.
-- **Done:** [PR #157](https://github.com/DeusMaximus/TLG-IPAM/pull/157) (`92-plain-http-warning`, head `884cda2`) closes #92.
-  - `web/src/components/EnrolmentSteps.jsx`: `PlainHttpBeforeIssue` (new, `agent-plain-http-before`) is shown before the request that issues a token. `PlainHttpWarning` (`agent-needs-https`) now has two wordings. With `issued`, beside the token: the token has already crossed in clear; run the agent soon; if its exchange is refused, revoke and re-enrol over HTTPS; the agent token crosses only over a plain-HTTP exchange, which the commands never make. Without it (update commands): no mention of a token.
-  - `AddAgentModal` form and `ReEnrolModal` confirmation show the notice when `!serverUrlFor(location).secure`; both still issue. The rule stays `install.agentServerUrl`'s; `web/` parses no address. No command changed (`install.js` and its test untouched).
-  - Docs: spec §5.6 has a new bullet, "A page served over plain HTTP"; brief §6.2 has a sentence on it; `AGENTS.md` guided-install bullet has one sentence.
-  - Tests: web 179 → 188 (`Agents.test.jsx`). The before-issue tests fail with the notice removed; the before-issue and update tests fail with the old wording restored. Server 1,340 and agent 1,388 pass (no code changes there).
-  - Review: Codex clean and Greptile 5/5 on `884cda2`; CI green (6 checks). No fix commits. It owed no briefed round.
-- **Decisions:** PR body Deliberate calls 1–4. Re-enrol warns before issuing too. The update dialog's warning drops the token wording. The remedy is revoke then re-enrol, not delete (keeps the scan targets) and not disable (enabling would revive the other party's token). The notice warns and does not block.
-- **State:** merged. No schema change; `PROTOCOL_VERSION` unchanged; no server or agent change.
-- **Waiting on the owner:** nothing from this PR.
-- **Untested:** a real browser on a real plain-HTTP origin (jsdom tests pass a `location` object).
-- **Next:** the owner key crossing in clear from such a page stays #31's (deployment guidance).
