@@ -10,8 +10,9 @@ whose FQDN is outside it, by its own domain override or because the subnet has n
 never sent, so whoever can edit a hostname or a host's domain cannot make the agent
 resolve an arbitrary name. The FQDN must also be a DNS hostname in the one form the
 wire takes (`agent_protocol.fdns_name`); any other is not sent. A job names at most
-`FDNS_JOB_MAX` hosts: those never checked first, then those checked longest ago, so a
-subnet with more is covered over several jobs.
+`FDNS_JOB_MAX` hosts: those never asked first, then those asked longest ago, so a
+subnet with more is covered over several jobs, whether or not the names asked were
+answered (Codex on #185).
 
 **What ingest keeps** (`store`). An answer is stored only for a host the job was sent
 (the target's `job_fdns`, kept with the lease), under the name that was sent, and only
@@ -19,7 +20,9 @@ while the host is still in the subnet and in its scan scope, as ingest reads the
 the write lock. An entry whose addresses are not all IPv4 addresses is not stored; a
 second entry for one host is ignored. An empty list is a name a DNS server answered
 does not resolve. A name with no entry got no usable answer, and its stored answer
-stays. Rows whose host no longer exists are deleted.
+stays. Every name the job sent whose host is still there and in scope has its
+`asked_at` set, answered or not, which is what rotates the names. Rows whose host no
+longer exists are deleted.
 
 This module reads `hosts` and never writes it, and writes nothing to the change log:
 scan ingest's rule (spec §7.2, invariant 3), which `test_results.py` holds by counting
@@ -52,7 +55,7 @@ from .scans import in_scope
 #   the longest error, 1,024 of them are about 1.94 MB, and 2,048 would be about 2.6 MB,
 #   past the cap, refused whole (`test_fdns.py`'s
 #   `test_the_largest_result_set_with_answers_fits_the_body_cap`).
-# A /20 can hold 4,094 hosts: past this, the ones checked longest ago (or never) go
+# A /20 can hold 4,094 hosts: past this, the ones asked longest ago (or never) go
 # first, and the rest wait for the next job.
 FDNS_JOB_MAX = 1024
 # host ids bound in one statement: inside the 999 parameters of the oldest SQLite
@@ -81,11 +84,12 @@ async def names_for_job(
 ) -> list[tuple[str, str]]:
     """The `(host_id, fqdn)` pairs a job for `subnet` sends, at most FDNS_JOB_MAX, in
     address order. `scope` is the subnet's scan scope as the caller read it for the
-    job's ranges. One statement: the subnet's hosts with the time each was last
-    checked."""
+    job's ranges. One statement: the subnet's hosts with the time each was last asked
+    (`asked_at`), never-asked first, then oldest. Asked, not answered: a name that
+    never gets a usable answer must not hold its place ahead of the rest."""
     rows = (
         await session.execute(
-            select(Host.id, Host.ip_int, Host.hostname, Host.domain, FdnsResult.checked_at)
+            select(Host.id, Host.ip_int, Host.hostname, Host.domain, FdnsResult.asked_at)
             .outerjoin(FdnsResult, FdnsResult.host_id == Host.id)
             .where(Host.subnet_id == subnet.id)
         )
@@ -97,8 +101,8 @@ async def names_for_job(
         fqdn = sendable_fqdn(row.hostname, row.domain, subnet.domain)
         if fqdn is None:
             continue
-        checked = utc(row.checked_at)
-        candidates.append((checked is not None, checked or _NEVER, row.ip_int, row.id, fqdn))
+        asked = utc(row.asked_at)
+        candidates.append((asked is not None, asked or _NEVER, row.ip_int, row.id, fqdn))
     candidates.sort()
     chosen = sorted(candidates[:FDNS_JOB_MAX], key=lambda c: c[2])
     return [(host_id, fqdn) for _, _, _, host_id, fqdn in chosen]
@@ -127,7 +131,8 @@ async def store(
     now: datetime,
 ) -> None:
     """Upsert the answers of a result set into `fdns_results` (see the module's
-    docstring for which are kept), then delete the rows of hosts that no longer exist.
+    docstring for which are kept), mark every name the job sent as asked, then delete
+    the rows of hosts that no longer exist.
     The caller holds the write lock, and `scope` is the subnet's scope read under it.
     Does not commit."""
     names = {}
@@ -145,7 +150,8 @@ async def store(
             # a malformed entry is not stored, and a later one for the host is not
             # taken in its place
             kept[answer.host_id] = None
-    wanted = [host_id for host_id, addresses in kept.items() if addresses is not None]
+    # every host the job sent is marked asked, answered or not
+    wanted = list(names)
     present: set[str] = set()
     for i in range(0, len(wanted), _IN_BATCH):
         batch = wanted[i : i + _IN_BATCH]
@@ -155,24 +161,30 @@ async def store(
         present.update(
             r.id for r in rows.all() if r.subnet_id == subnet_id and in_scope(scope, r.ip_int)
         )
-    rows = [
-        {"host_id": host_id, "fqdn": names[host_id], "addresses": kept[host_id], "checked_at": now}
-        for host_id in wanted
-        if host_id in present
+    answered = [
+        {"host_id": h, "fqdn": names[h], "addresses": kept[h], "checked_at": now, "asked_at": now}
+        for h in wanted
+        if h in present and kept.get(h) is not None
     ]
-    if rows:
-        statement = insert(FdnsResult)
-        await session.execute(
-            statement.on_conflict_do_update(
-                index_elements=[FdnsResult.host_id],
-                set_={
-                    "fqdn": statement.excluded.fqdn,
-                    "addresses": statement.excluded.addresses,
-                    "checked_at": statement.excluded.checked_at,
-                },
-            ),
-            [{"id": str(uuid4()), **row} for row in rows],
-        )
+    # asked and not answered: the stored answer, if any, stays as it is
+    unanswered = [
+        {"host_id": h, "fqdn": None, "addresses": None, "checked_at": None, "asked_at": now}
+        for h in wanted
+        if h in present and kept.get(h) is None
+    ]
+    statement = insert(FdnsResult)
+    for rows, columns in (
+        (answered, ("fqdn", "addresses", "checked_at", "asked_at")),
+        (unanswered, ("asked_at",)),
+    ):
+        if rows:
+            await session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=[FdnsResult.host_id],
+                    set_={c: getattr(statement.excluded, c) for c in columns},
+                ),
+                [{"id": str(uuid4()), **row} for row in rows],
+            )
     await session.execute(
         delete(FdnsResult)
         .where(~exists().where(Host.id == FdnsResult.host_id))

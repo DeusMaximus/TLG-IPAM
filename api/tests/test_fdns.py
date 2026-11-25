@@ -34,9 +34,12 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def rows() -> dict[str, FdnsResult]:
+async def rows(answered_only: bool = True) -> dict[str, FdnsResult]:
+    """The stored rows, by host: by default only those holding an answer, not the ones
+    a job asked for and no server answered (`asked_at` alone)."""
     async with SessionLocal() as session:
-        return {r.host_id: r for r in await session.scalars(select(FdnsResult))}
+        found = {r.host_id: r for r in await session.scalars(select(FdnsResult))}
+    return {h: r for h, r in found.items() if r.fqdn is not None or not answered_only}
 
 
 async def named(client, agent_api, subnet=None, methods=ALL, **target):
@@ -114,9 +117,9 @@ async def test_a_job_names_no_host_without_a_domain_or_without_fdns(client, agen
     assert (await target_row(target["id"])).job_fdns == ([] if "fdns" in methods else None)
 
 
-async def test_past_the_job_bound_the_names_checked_longest_ago_go_first(client, agent_api, monkeypatch):
-    """At most `FDNS_JOB_MAX` names a job: those never checked first, then those checked
-    longest ago, so every host is checked in turn."""
+async def test_past_the_job_bound_the_names_asked_longest_ago_go_first(client, agent_api, monkeypatch):
+    """At most `FDNS_JOB_MAX` names a job: those never asked first, then those asked
+    longest ago, so every host is asked in turn."""
     monkeypatch.setattr(fdns, "FDNS_JOB_MAX", 2)
     agent, token, subnet, target = await named(client, agent_api, methods=["icmp", "fdns"])
     hosts = [await make_host(client, subnet["id"], f"10.0.0.{n}", hostname=f"h{n}") for n in (10, 11, 12)]
@@ -125,12 +128,53 @@ async def test_past_the_job_bound_the_names_checked_longest_ago_go_first(client,
     await accepted(agent_api, token, job, fdns=[{"host_id": h["id"], "addresses": []} for h in hosts[:2]])
     async with SessionLocal() as session:
         await session.execute(
-            update(FdnsResult).where(FdnsResult.host_id == hosts[1]["id"]).values(checked_at=_now() - timedelta(days=2))
+            update(FdnsResult).where(FdnsResult.host_id == hosts[1]["id"]).values(asked_at=_now() - timedelta(days=2))
         )
         await session.commit()
     job = await next_job(agent_api, token, target["id"])
-    # never checked, then the older of the two
+    # never asked, then the older of the two
     assert [e["host_id"] for e in job["fdns"]] == [hosts[1]["id"], hosts[2]["id"]]
+
+
+@pytest.mark.parametrize("how", ["no-entry", "incomplete", "malformed-entry"])
+async def test_names_no_server_answers_still_rotate_past_the_job_bound(client, agent_api, monkeypatch, how):
+    """Codex on #185: with more names than a job sends, a first batch that never gets a
+    usable answer must not be asked again and again while the rest wait. Every name a
+    job sent is marked asked when its result set is accepted, answered or not, and the
+    stored answer of an unanswered name stays as it was."""
+    monkeypatch.setattr(fdns, "FDNS_JOB_MAX", 2)
+    agent, token, subnet, target = await named(client, agent_api, methods=["icmp", "fdns"])
+    hosts = [await make_host(client, subnet["id"], f"10.0.0.{n}", hostname=f"h{n}") for n in (10, 11, 12, 13)]
+    ids = [h["id"] for h in hosts]
+    await answer(ids[0], "h10.home.arpa", ["10.0.0.99"], checked=_now() - timedelta(days=3))
+    async with SessionLocal() as session:  # asked long ago, so it goes after the others
+        await session.execute(
+            update(FdnsResult).where(FdnsResult.host_id == ids[0]).values(asked_at=_now() - timedelta(days=3))
+        )
+        await session.commit()
+    [job] = await jobs_for(agent_api, token)
+    asked = {e["host_id"] for e in job["fdns"]}
+    assert len(asked) == 2 and ids[0] not in asked  # never asked go first
+    seen = set(asked)
+    for _ in range(3):
+        body = {
+            "no-entry": {},
+            "incomplete": {"complete": False, "error": "fdns: no DNS server gave a usable answer"},
+            "malformed-entry": {"fdns": [{"host_id": h, "addresses": ["not an address"]} for h in asked]},
+        }[how]
+        await accepted(agent_api, token, job, **body)
+        job = await next_job(agent_api, token, target["id"])
+        asked = {e["host_id"] for e in job["fdns"]}
+        assert len(asked) == 2
+        seen |= asked
+    assert seen == set(ids)  # every host was asked, none answered
+    stored = await rows(answered_only=False)
+    assert all(r.asked_at is not None for r in stored.values())
+    # the unanswered names stored no answer; the one stored before stays whole
+    assert {h for h, r in stored.items() if r.fqdn is not None} == {ids[0]}
+    assert stored[ids[0]].addresses == ["10.0.0.99"]
+    found = [f for f in await findings(client, subnet["id"]) if f["type"] == "fdns_mismatch"]
+    assert [(f["ip"], f["observed"]) for f in found] == [("10.0.0.10", "10.0.0.99")]
 
 
 def test_the_name_rule_is_the_hosts_fqdn_under_the_subnets_domain():
@@ -227,6 +271,7 @@ async def test_a_name_with_no_entry_keeps_its_stored_answer(client, agent_api):
     await accepted(agent_api, token, job, complete=False, error="fdns: no DNS server gave a usable answer")
     kept = (await rows())[nas["id"]]
     assert kept.addresses == ["10.0.0.99"] and kept.checked_at == first.checked_at
+    assert kept.asked_at > first.asked_at  # asked again, which moves it back in the queue
     job = await next_job(agent_api, token, target["id"])
     await accepted(agent_api, token, job, fdns=[{"host_id": nas["id"], "addresses": ["10.0.0.10"]}])
     assert (await rows())[nas["id"]].addresses == ["10.0.0.10"]
@@ -243,7 +288,7 @@ async def test_rows_of_hosts_that_are_gone_are_pruned_and_a_host_deleted_mid_sca
     assert (await client.delete(f"/api/v1/hosts/{nas['id']}")).status_code == 204
     assert (await client.delete(f"/api/v1/hosts/{tv['id']}")).status_code == 204
     await accepted(agent_api, token, job, fdns=[{"host_id": tv["id"], "addresses": []}])
-    assert await rows() == {}
+    assert await rows(answered_only=False) == {}
 
 
 async def test_no_answer_is_kept_for_a_host_outside_the_scope_and_leaving_it_deletes_one(client, agent_api):
@@ -269,7 +314,7 @@ async def test_no_answer_is_kept_for_a_host_outside_the_scope_and_leaving_it_del
         json={"start_ip": "10.0.0.10", "end_ip": "10.0.0.10", "scan_excluded": True},
     )
     assert res.status_code == 201, res.text
-    assert await rows() == {}
+    assert await rows(answered_only=False) == {}
 
 
 async def test_ingest_with_answers_writes_no_host_and_no_change_entry(client, agent_api):
