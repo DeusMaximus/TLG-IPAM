@@ -11,7 +11,8 @@ Two modules are allowed some of them, since #22: `store.py` opens, writes, renam
 removes files (the stored agent token, and what `install` puts on the host), and
 `install.py` starts the fixed programs that create the service user and drive systemd,
 and, as the service user, the two that ask the kernel whether it can read the CA
-bundle (#136), in the places `PROCESSES_STARTED_IN` lists.
+bundle (#136) and the unit's interpreter on `reach`, which asks it whether that user
+can use the agent's code (#169), in the places `PROCESSES_STARTED_IN` lists.
 Every other module is held to the lists whole, and only `enrol.py` and `install.py`
 may use `store` (`test_only_the_enrolment_and_the_installer_write_files`). It proves the absence of those names, not the invariant: code that
 reaches the same effect without one of them passes (an uncalled
@@ -35,14 +36,18 @@ MODULES = sorted(PACKAGE.glob("*.py"))
 # loop. `io` is not here: its `FileIO` and `open_code` open files, and the agent needs
 # none of it. #22 added `subprocess`, for `install.py` alone (`IMPORTED_ONLY_IN`): it
 # runs useradd, userdel, groupdel and systemctl with fixed arguments, and (#136) head
-# and test as the service user (`PROCESSES_STARTED_IN`). `pwd` and `grp`
+# and test, and (#169) the unit's interpreter on `reach`, as the service user
+# (`PROCESSES_STARTED_IN`). `pwd` and `grp`
 # came with it, to look the service user and its group up (they read the user
 # database and change nothing), `functools`, for `partial`, `termios`, for
 # `install.py` alone, to turn echo off while the enrolment token is typed, and
 # `fcntl`, for `store.py` alone, to `flock` the state directory so that two agent
-# processes sharing it never enrol into it at once.
+# processes sharing it never enrol into it at once. `errno` came with #169, for
+# `install.runs_as` to tell the kernel's refusal of the exec (EACCES: the service user
+# cannot use the interpreter) from a credential change refused (EPERM); it holds error
+# numbers and their names, and does nothing.
 ALLOWED_IMPORTS = {
-    "argparse", "asyncio", "collections.abc", "dataclasses", "datetime", "enum",
+    "argparse", "asyncio", "collections.abc", "dataclasses", "datetime", "enum", "errno",
     "fcntl", "functools", "grp", "ipaddress", "json", "logging", "os", "pathlib", "platform",
     "pwd", "random", "re", "signal", "socket", "ssl", "stat", "struct", "subprocess",
     "sys", "termios", "threading", "time", "typing", "urllib.parse",
@@ -286,16 +291,20 @@ def test_files_are_opened_only_where_listed():
 
 # Where `install.py`, the one module allowed `subprocess`, starts a process: the
 # function that makes each call, and the keywords the call passes (#136). `Host.run`
-# runs useradd, userdel, groupdel and systemctl as root. `read_as` (its `as_user`) runs
-# `head` and `test` as the service user, to ask the kernel whether that user can read
-# the `--ca-file`; it alone passes `user`, `group` and `extra_groups`, which have the
-# child drop to the service user's ids and groups before it execs. Every call passes
-# `env=COMMAND_ENV`, none `shell`, `executable`, `preexec_fn` or `**keywords`, and
-# `subprocess` is reached by its module name alone, among SUBPROCESS_NAMES. A change
-# to any of it is a review decision: change this list in the same PR and say why.
+# runs useradd, userdel, groupdel and systemctl as root. `as_user` runs a program as
+# the service user, and is the one call that passes `user`, `group` and
+# `extra_groups`, which have the child drop to that user's ids and groups before it
+# execs. It was `read_as`'s own (`read_as.as_user`, #136), for `head` and `test` on the
+# `--ca-file`; #169 made it a module function, with the deadline as a parameter, so
+# that `runs_as` starts the unit's interpreter on `reach` through the same call rather
+# than a third one: one place, with the same keywords, drops the ids for both checks.
+# Every call passes `env=COMMAND_ENV`, none `shell`, `executable`, `preexec_fn` or
+# `**keywords`, and `subprocess` is reached by its module name alone, among
+# SUBPROCESS_NAMES. A change to any of it is a review decision: change this list in
+# the same PR and say why.
 PROCESSES_STARTED_IN = {
     "Host.run": {"env", "stdin", "check"},
-    "read_as.as_user": {
+    "as_user": {
         "env", "cwd", "stdin", "stdout", "stderr", "user", "group", "extra_groups", "timeout", "check",
     },
 }

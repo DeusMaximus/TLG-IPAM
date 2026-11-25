@@ -7,12 +7,14 @@ root. The enrolment exchange is made against the server's real routes, in proces
 
 What this cannot show (a real `useradd`, a real systemd, the file's owner as another
 user) was shown in Linux containers; the PR records how. The CA bundle's check
-(`install.read_as`) runs its real programs here, as the test's own user, since without
-root a process can take on no other user's ids or groups; the cases that need root (an
+(`install.read_as`) and the code's (`install.runs_as`, on a virtual environment made
+for the test) run their real programs here, as the test's own user, since without root
+a process can take on no other user's ids or groups; the cases that need root (an
 ACL, a supplementary group, another user's ids) run only as root on Linux, which the
-PR of #136 records."""
+PRs of #136 and #169 record."""
 
 import asyncio
+import errno
 import os
 import shutil
 import signal
@@ -36,7 +38,7 @@ from app.services import enrolment
 from app.services.device_types import seed_defaults
 
 from conftest import ENROL_TOKEN, TOKEN
-from tlg_ipam_agent import enrol, install, store
+from tlg_ipam_agent import enrol, install, reach, store
 from tlg_ipam_agent.client import Answer, Kind
 from tlg_ipam_agent.install import USERADD, Options, Paths
 
@@ -74,7 +76,9 @@ class FakeHost(install.Host):
         self.group = os.getgid() if user else None
         self.group_stays = group_stays
         self.fail = fail or {}
+        # what the code's check answers (`runs_as`): None, usable, unless set
         self.hidden = None
+        self.run_checks: list[tuple] = []
         self.commands: list[tuple[str, ...]] = []
         # what the CA bundle's check answers: None runs the real `read_as`, as the
         # test's own user; a string is that answer
@@ -93,8 +97,10 @@ class FakeHost(install.Host):
     def service_group(self):
         return self.group
 
-    def code_unreachable(self, interpreter):
+    def service_runs(self, interpreter, uid, gid):
         assert interpreter == PYTHON
+        assert (uid, gid) == self.ids  # asked for the service user found or created
+        self.run_checks.append((interpreter, uid, gid))
         return self.hidden
 
     def service_reads(self, path, uid, gid):
@@ -796,12 +802,14 @@ def test_as_root_a_supplementary_group_that_grants_the_file_is_honoured(shared):
 
 
 def deny_by_acl(path, uid):
-    """What `setfacl -m u:<uid>:--- <path>` does to a file of mode 0644: it writes the
-    POSIX ACL as the `system.posix_acl_access` attribute (version 2, then each entry
-    as tag, permission and id, sorted by tag; the mask is the group's bits, so the mode
-    stays 0644). Written here so that no image needs the acl package."""
+    """What `setfacl -m u:<uid>:--- <path>` does to a file of mode 0644, or a directory
+    of mode 0755: it writes the POSIX ACL as the `system.posix_acl_access` attribute
+    (version 2, then each entry as tag, permission and id, sorted by tag; the mask is
+    the group's bits, so the mode stays as it was). Written here so that no image
+    needs the acl package."""
     unset = 0xFFFFFFFF
-    entries = [(0x01, 6, unset), (0x02, 0, uid), (0x04, 4, unset), (0x10, 4, unset), (0x20, 4, unset)]
+    owner, others = (7, 5) if os.path.isdir(path) else (6, 4)
+    entries = [(0x01, owner, unset), (0x02, 0, uid), (0x04, others, unset), (0x10, others, unset), (0x20, others, unset)]
     blob = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *entry) for entry in entries)
     try:
         os.setxattr(path, "system.posix_acl_access", blob)
@@ -827,6 +835,104 @@ def test_as_root_the_programs_hold_none_of_roots_groups(shared):
     os.chown(shared, 0, 0)
     shared.chmod(0o640)
     assert install.read_as(str(shared), NOBODY, NOBODY, [NOBODY]) == install.AT_THE_FILE
+
+
+@pytest.fixture
+def shared_venv():
+    """`make_venv` in a directory every user can enter, root's, as `shared` makes it;
+    the package and the environment are root's, as an install makes them."""
+    directory = Path(tempfile.mkdtemp(dir=tempfile.gettempdir()))
+    try:
+        directory.chmod(0o755)
+        layout = make_venv(directory)
+        yield layout
+    finally:
+        shutil.rmtree(directory)
+
+
+def _each(layout):
+    """Every path of the environment but its links, the environment included."""
+    return [p for p in (layout["venv"], *layout["venv"].rglob("*")) if not p.is_symlink()]
+
+
+@as_root
+def test_as_root_a_usable_environment_passes_and_the_check_runs_as_the_account(shared_venv):
+    assert install.runs_as(shared_venv["python"], NOBODY, NOBODY, [NOBODY]) is None
+    # the start is the account's: a file only root may read, anywhere in the tree, stops it
+    (shared_venv["package"] / "scan.py").chmod(0o600)
+    assert install.runs_as(shared_venv["python"], NOBODY, NOBODY, [NOBODY]) == install.IN_THE_TREE
+
+
+@as_root
+@pytest.mark.parametrize(
+    "made_under_077, answer",
+    [
+        ("venv", install.NOT_STARTED),  # the whole environment: the exec is refused
+        ("package", install.NOT_STARTED),  # the agent installed into it afterwards
+        ("dependency", install.IN_THE_TREE),  # a dependency installed so: the start passes
+    ],
+)
+def test_as_root_an_environment_made_under_umask_077_is_refused(shared_venv, made_under_077, answer):
+    """The case PR #130 refused, still refused (#169's acceptance): what umask 077
+    makes, directories 0700 and files 0600 (0700 for a program), root's."""
+    if made_under_077 == "dependency":
+        top = shared_venv["site"] / "dependency"
+        (top / "sub").mkdir(parents=True)
+        (top / "sub" / "__init__.py").write_bytes(b"")
+    else:
+        top = shared_venv[made_under_077]
+    for path in (top, *top.rglob("*")):
+        if not path.is_symlink():
+            path.chmod(0o700 if path.is_dir() or path.parent.name == "bin" else 0o600)
+    assert install.runs_as(shared_venv["python"], NOBODY, NOBODY, [NOBODY]) == answer
+
+
+@as_root
+@pytest.mark.parametrize(
+    "where, answer",
+    [
+        ("venv", install.NOT_STARTED),  # the environment itself: no exec through it
+        ("package", install.NOT_STARTED),
+        ("package/loop.py", install.IN_THE_TREE),  # a module the start does not read
+    ],
+)
+def test_as_root_an_acl_that_denies_the_account_the_environment_is_honoured(shared_venv, where, answer):
+    """#169's first case: modes 0755 and 0644, which passed the model of the bits, and
+    an ACL entry for the account with no permission. Another user is let through."""
+    head, _, rest = where.partition("/")
+    path = shared_venv[head] / rest
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    deny_by_acl(path, NOBODY)
+    assert stat.S_IMODE(os.stat(path).st_mode) == mode
+    assert install.runs_as(shared_venv["python"], NOBODY, NOBODY, [NOBODY]) == answer
+    assert install.runs_as(shared_venv["python"], NOBODY - 1, NOBODY, [NOBODY]) is None
+
+
+@as_root
+def test_as_root_an_environment_usable_through_a_supplementary_group_is_accepted(shared_venv):
+    """#169's second case: the environment root's and group 4242's, nothing for others
+    (directories 0750, files 0640), and the account holding 4242 as a supplementary
+    group, not as its primary one. The model of the bits refused it."""
+    group = 4242
+    for path in _each(shared_venv):
+        os.chown(path, 0, group, follow_symlinks=False)
+        path.chmod(0o750 if path.is_dir() or path.parent.name == "bin" else 0o640)
+    # what the installer leaves, as root, importing the agent's modules: bytecode of
+    # root's group and the source's mode, which the account cannot read and Python
+    # does without
+    subprocess.run([shared_venv["python"], "-c", "import tlg_ipam_agent.cli, tlg_ipam_agent.trust"], check=True)
+    caches = [p for p in shared_venv["package"].glob("__pycache__/*.pyc")]
+    assert caches and all((os.stat(p).st_gid, stat.S_IMODE(os.stat(p).st_mode)) == (0, 0o640) for p in caches)
+    assert install.runs_as(shared_venv["python"], NOBODY, NOBODY, [NOBODY, group]) is None
+    assert install.runs_as(shared_venv["python"], NOBODY, NOBODY, [NOBODY]) == install.NOT_STARTED
+
+
+@as_root
+def test_as_root_the_code_check_holds_none_of_roots_groups(shared_venv):
+    for path in _each(shared_venv):
+        os.chown(path, 0, 0, follow_symlinks=False)
+        path.chmod(0o750 if path.is_dir() or path.parent.name == "bin" else 0o640)
+    assert install.runs_as(shared_venv["python"], NOBODY, NOBODY, [NOBODY]) == install.NOT_STARTED
 
 
 @pytest.mark.parametrize(
@@ -963,66 +1069,336 @@ def test_a_state_directory_others_can_write_is_refused_not_repaired(root):
     assert stat.S_IMODE(os.stat(state).st_mode) == 0o777
 
 
-def _venv(root: Path) -> dict:
-    """A virtual environment's layout: `bin/python3` a link to an interpreter outside
-    it, and a package with a module."""
-    system = root / "usr/bin"
-    system.mkdir(parents=True)
-    (system / "python3.13").write_bytes(b"")
-    venv = root / "opt/tlg-ipam-agent"
-    (venv / "bin").mkdir(parents=True)
-    (venv / "bin/python3").symlink_to(system / "python3.13")
-    package = venv / "lib/python3.13/site-packages/tlg_ipam_agent"
-    package.mkdir(parents=True)
-    (package / "cli.py").write_bytes(b"")
-    for directory in (root, *[p for p in root.rglob("*") if p.is_dir()]):
-        directory.chmod(0o755)
-    return dict(interpreter=str(venv / "bin/python3"), prefix=str(venv), package=str(package))
+def test_code_the_service_user_cannot_use_stops_the_install_before_anything_is_written(root):
+    """#169: the check runs as the service user once the account exists, so on a first
+    install after `useradd`, and the refusal takes the account back and leaves no file
+    and no exchange: the token is unspent."""
+    host = FakeHost()
+    host.hidden = install.IN_THE_TREE
+    before = tree(root)
+    code, said = run_install(root, host, exchange=lambda *a: pytest.fail("no exchange"))
+    assert code == 1 and said[-1] == (
+        "install failed: tlg-ipam-agent, which the unit runs as, could not use the agent's code "
+        "(stopped at a directory or file of the virtual environment or of the agent's package), so "
+        "the unit could not run the agent (a virtual environment made under a restrictive umask, "
+        f"say). Make the environment usable by that user, as with `chmod -R o+rX {sys.prefix}`, or "
+        "through a group or ACL it holds, and run install again; `runuser -u tlg-ipam-agent -- "
+        f"{PYTHON} -I -B -m tlg_ipam_agent.reach` names the path it stopped at"
+    )
+    assert tree(root) == before and host.commands == [USERADD, ("userdel", "tlg-ipam-agent")]
+    assert host.run_checks == [(PYTHON, *host.ids)]
 
 
-def _unreachable(root, layout):
-    return install.unreachable(layout["interpreter"], prefix=layout["prefix"], package=layout["package"], top=str(root))
+def test_code_whose_check_could_not_be_made_stops_the_install_before_anything_is_written(root):
+    host = FakeHost(user=True)
+    host.hidden = install.NOT_CHECKED
+    before = tree(root)
+    code, said = run_install(root, host, exchange=lambda *a: pytest.fail("no exchange"))
+    assert code == 1 and "could not check that tlg-ipam-agent, which the unit runs as, can use" in said[-1]
+    assert "ended before the check answered" in said[-1] and "within 60 s" in said[-1]
+    assert "stopped before the token was spent" in said[-1]
+    assert tree(root) == before and host.commands == []
 
 
-def test_code_the_service_user_can_reach_passes(tmp_path):
-    layout = _venv(tmp_path)
-    for path in tmp_path.rglob("*"):
-        if path.is_file():
-            path.chmod(0o755 if path.name.startswith("python") else 0o644)
-    assert _unreachable(tmp_path, layout) is None
+def test_the_code_is_checked_on_an_update_too_and_before_the_ca_file(root):
+    """Run again without `--enrol-token`, the code is checked all the same, first, and
+    a refusal leaves the stored token and the files as they were; the CA bundle is not
+    looked at."""
+    ca = root / "ca.pem"
+    ca.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
+    assert run_install(root, FakeHost(), Options(url=URL, enrol_token="-", ca_file=str(ca)))[0] == 0
+    before = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    host = FakeHost(user=True)
+    host.hidden = install.NOT_STARTED
+    code, said = run_install(root, host, Options(url=URL, ca_file=str(ca)), exchange=lambda *a: pytest.fail("no exchange"))
+    assert code == 1 and "(stopped at the interpreter or the start of the agent's package)" in said[-1], said
+    assert {path: path.read_bytes() for path in root.rglob("*") if path.is_file()} == before
+    assert host.commands == [] and host.read_checks == [] and host.run_checks == [(PYTHON, *host.ids)]
+
+
+def test_the_real_host_checks_the_code_with_the_accounts_groups(monkeypatch, capsys):
+    """`Host.service_runs` gives `runs_as` the groups `service_reads` gives `read_as`,
+    and says what it runs."""
+    seen = []
+    monkeypatch.setattr(install.os, "getgrouplist", lambda name, gid: seen.append((name, gid)) or [gid, 27, 100])
+    monkeypatch.setattr(install, "runs_as", lambda *a: seen.append(a) or None)
+    assert install.Host().service_runs(PYTHON, 999, 998) is None
+    assert seen == [("tlg-ipam-agent", 998), (PYTHON, 999, 998, [998, 27, 100])]
+    assert capsys.readouterr().out == f"+ {PYTHON} -I -B -m tlg_ipam_agent.reach, as tlg-ipam-agent\n"
+
+
+# --- the code's check, `runs_as` and `reach`, as the test's own user ---
+
+SOURCE = Path(install.__file__).resolve().parent
+
+
+def make_venv(where: Path) -> dict:
+    """A virtual environment of the test's interpreter, without pip, with the agent's
+    package copied into its site-packages as an install puts it there; every directory
+    0755 and every file 0644 (or 0755 for one others may run). Returns the paths a
+    case changes."""
+    venv = where / "venv"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)], check=True, env={"PATH": "/usr/bin:/bin"})
+    found = list(venv.glob("lib/python3.*/site-packages"))
+    assert len(found) == 1
+    package = found[0] / "tlg_ipam_agent"
+    shutil.copytree(SOURCE, package, ignore=shutil.ignore_patterns("__pycache__"))
+    for path in (venv, *venv.rglob("*")):
+        if path.is_symlink():
+            continue
+        if path.is_dir():
+            path.chmod(0o755)
+        else:
+            path.chmod(0o755 if path.parent.name == "bin" else 0o644)
+    return dict(venv=venv, bin=venv / "bin", python=str(venv / "bin" / "python"), package=package, site=found[0])
+
+
+def _runs_as_me(layout, asked=None):
+    asked = [] if asked is None else asked
+    with mock.patch.object(install.subprocess, "run", as_the_test_user(asked)):
+        return install.runs_as(layout["python"], os.getuid(), os.getgid(), [os.getgid(), 4242])
+
+
+@pytest.fixture
+def venv(tmp_path):
+    layout = make_venv(tmp_path)
+    yield layout
+    for path in (layout["venv"], *layout["venv"].rglob("*")):  # a case may have closed one off
+        if not path.is_symlink():
+            path.chmod(0o755)
+
+
+def test_the_code_check_runs_the_units_interpreter_as_the_service_user_and_nothing_else(venv):
+    """`runs_as` starts the interpreter the unit names on the fixed module, with the
+    service user's ids and every group it is given, the install's fixed environment,
+    `/` as the working directory, no input, no output, a deadline and no shell; and a
+    usable environment, the package in it, passes, in well under its deadline."""
+    asked = []
+    began = time.monotonic()
+    assert _runs_as_me(venv, asked) is None
+    took = time.monotonic() - began
+    assert took < install.CODE_CHECK_TIMEOUT_S / 10, took
+    assert asked == [(
+        [venv["python"], "-I", "-B", "-m", "tlg_ipam_agent.reach"],
+        {
+            "env": install.COMMAND_ENV,
+            "cwd": "/",
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "user": os.getuid(),
+            "group": os.getgid(),
+            "extra_groups": [os.getgid(), 4242],
+            "timeout": install.CODE_CHECK_TIMEOUT_S,
+            "check": False,
+        },
+    )]
+    assert not list(venv["package"].glob("__pycache__"))  # -B: nothing written
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads and enters whatever the mode bits say")
+@pytest.mark.parametrize(
+    "where, mode, answer",
+    [
+        # the environment not enterable (umask 077 closes it to everyone but its owner,
+        # which only root can show: `test_as_root_an_environment_made_under_umask_077_is_refused`)
+        ("venv", 0o600, install.NOT_STARTED),
+        ("bin", 0o600, install.NOT_STARTED),  # listable, not enterable: the exec's path
+        ("site", 0o300, install.NOT_STARTED),  # enterable, not listable: Python finds no package
+        ("package", 0o600, install.NOT_STARTED),
+        ("package/reach.py", 0o200, install.NOT_STARTED),  # the module itself
+        ("package/loop.py", 0o200, install.IN_THE_TREE),  # a module the start does not read
+        ("package/arp.py", 0o000, install.IN_THE_TREE),
+        ("venv/include", 0o300, install.IN_THE_TREE),  # anywhere in the environment
+        ("venv/pyvenv.cfg", 0o200, install.NOT_STARTED),  # Python does not see the venv
+    ],
+)
+def test_the_kernels_answer_for_the_test_user_is_the_checks(venv, where, mode, answer):
+    """As the test's own user, which owns the files, so the owner's bits are what the
+    kernel applies: each place the user cannot use is refused, by the start or by the
+    walk, as the unit would fail on it."""
+    head, _, rest = where.partition("/")
+    (venv[head] / rest).chmod(mode)
+    assert _runs_as_me(venv) == answer
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads whatever the mode bits say")
+def test_a_package_loaded_from_outside_the_environment_is_walked_too(venv, tmp_path):
+    """An editable install: the package is found through a `.pth` file, outside the
+    environment, and `reach` walks it where it was loaded from, as the unit loads it."""
+    elsewhere = tmp_path / "source"
+    elsewhere.mkdir()
+    venv["package"].rename(elsewhere / "tlg_ipam_agent")
+    (venv["site"] / "tlg_ipam_agent.pth").write_text(f"{elsewhere}\n")
+    (venv["site"] / "tlg_ipam_agent.pth").chmod(0o644)
+    assert _runs_as_me(venv) is None
+    blocked = elsewhere / "tlg_ipam_agent" / "probe.py"
+    blocked.chmod(0o200)
+    try:
+        assert _runs_as_me(venv) == install.IN_THE_TREE
+    finally:
+        blocked.chmod(0o644)
+
+
+@pytest.mark.parametrize("hook", ["early.pth", "sitecustomize.py"])
+def test_a_start_up_hook_that_ends_the_interpreter_early_is_no_answer(venv, hook):
+    """The briefed review of PR #178: `-I` does not stop the environment's `.pth`
+    files or `sitecustomize`, and one that ends the interpreter with status 0 before
+    `reach` runs left an environment with a file the user cannot read looking usable.
+    Only `reach.USABLE` is taken as usable, so it is not checked, and refused."""
+    if os.geteuid() != 0:
+        (venv["package"] / "scan.py").chmod(0o200)  # what the walk would have found
+    line = "import os; os._exit(0)\n"
+    (venv["site"] / hook).write_text(line)
+    (venv["site"] / hook).chmod(0o644)
+    assert _runs_as_me(venv) == install.NOT_CHECKED
+    (venv["site"] / hook).unlink()
+    assert _runs_as_me(venv) == (None if os.geteuid() == 0 else install.IN_THE_TREE)
+
+
+@as_root
+def test_as_root_a_pth_line_that_ends_the_accounts_start_early_is_no_answer(shared_venv):
+    """The reviewer's reproduction, as root: a module the account cannot read, and a
+    root-owned `.pth` line that ends the account's interpreter with status 0."""
+    (shared_venv["package"] / "scan.py").chmod(0o600)
+    assert install.runs_as(shared_venv["python"], NOBODY, NOBODY, [NOBODY, 4242]) == install.IN_THE_TREE
+    early = shared_venv["site"] / "early.pth"
+    early.write_text(f"import os; os.getuid() == {NOBODY} and os._exit(0)\n")
+    early.chmod(0o644)
+    assert install.runs_as(shared_venv["python"], NOBODY, NOBODY, [NOBODY, 4242]) == install.NOT_CHECKED
 
 
 @pytest.mark.parametrize(
-    "path, mode",
+    "outcome, answer",
     [
-        ("opt/tlg-ipam-agent", 0o700),  # a venv made under umask 077
-        ("opt/tlg-ipam-agent/bin", 0o711),  # enterable but not listable, inside the venv
-        ("opt/tlg-ipam-agent/lib/python3.13/site-packages/tlg_ipam_agent", 0o750),
-        ("opt/tlg-ipam-agent/lib/python3.13/site-packages/tlg_ipam_agent/cli.py", 0o600),
-        ("usr/bin/python3.13", 0o744),  # the interpreter others cannot run
-        ("usr/bin", 0o700),
-        ("opt", 0o700),
+        (reach.USABLE, None),
+        (reach.UNUSABLE, install.IN_THE_TREE),
+        # the briefed review of PR #178: an interpreter that ended normally before
+        # `reach` answered is no answer
+        (0, install.NOT_CHECKED),
+        (1, install.NOT_STARTED),  # Python could not start the module
+        (2, install.NOT_STARTED),
+        (-9, install.NOT_CHECKED),  # killed by a signal
+        (PermissionError(errno.EACCES, "Permission denied"), install.NOT_STARTED),  # the exec refused
+        (PermissionError(errno.EPERM, "Operation not permitted"), install.NOT_CHECKED),  # setuid refused
+        (FileNotFoundError(errno.ENOENT, "No such file"), install.NOT_CHECKED),
+        (subprocess.TimeoutExpired(["python"], 60), install.NOT_CHECKED),
+        (OSError(errno.ENOMEM, "Cannot allocate memory"), install.NOT_CHECKED),
     ],
 )
-def test_code_the_service_user_cannot_reach_is_refused(tmp_path, path, mode):
-    """Codex on #130: root's check alone passed a venv the service user could not
-    enter, and the install spent the token on a unit that could not start."""
-    layout = _venv(tmp_path)
-    for each in tmp_path.rglob("*"):
-        if each.is_file():
-            each.chmod(0o755 if each.name.startswith("python") else 0o644)
-    (tmp_path / path).chmod(mode)
-    assert _unreachable(tmp_path, layout) == str(tmp_path / path)
+def test_how_the_code_check_ends_is_read_as_listed(outcome, answer):
+    def run(argv, **keywords):
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return subprocess.CompletedProcess(argv, outcome)
+
+    with mock.patch.object(install.subprocess, "run", run):
+        assert install.runs_as(PYTHON, 1, 1, [1]) == answer
 
 
-def test_an_environment_the_service_user_cannot_reach_stops_the_install_first(root):
-    host = FakeHost()
-    host.hidden = "/opt/tlg-ipam-agent"
-    before = tree(root)
-    code, said = run_install(root, host, exchange=lambda *a: pytest.fail("no exchange"))
-    assert code == 1 and "/opt/tlg-ipam-agent is not readable by other users" in said[-1]
-    assert "chmod -R o+rX" in said[-1]
-    assert host.commands == [] and tree(root) == before
+def test_the_check_module_imports_nothing_of_the_agents_and_reads_no_argument():
+    """`reach` runs as the service user before the token is spent: it imports only
+    `os`, `stat` and `sys`, nothing of the agent's, and names neither `argv` nor
+    `environ`, so what it walks is where it was loaded from."""
+    import ast
+
+    module = ast.parse((SOURCE / "reach.py").read_text())
+    imported = set()
+    for node in ast.walk(module):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add("." * node.level + (node.module or ""))
+    assert imported == {"os", "stat", "sys"}
+    names = {node.attr for node in ast.walk(module) if isinstance(node, ast.Attribute)}
+    assert not names & {"argv", "environ", "getenv", "orig_argv"}
+
+
+def _tree(where: Path) -> Path:
+    for directory in ("a/b", "a/c", "d"):
+        (where / directory).mkdir(parents=True)
+    for file in ("a/b/one.py", "a/two.py", "d/three.txt"):
+        (where / file).write_bytes(b"")
+    return where
+
+
+def test_the_walk_passes_a_tree_the_user_can_use_and_follows_no_link(tmp_path):
+    root = _tree(tmp_path / "tree")
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"")
+    outside.chmod(0o000)
+    (root / "a/to-outside").symlink_to(outside)
+    (root / "a/dangling").symlink_to(tmp_path / "nothing")
+    (root / "lib64").symlink_to(root / "a")
+    try:
+        assert reach.first_unusable([root]) is None
+    finally:
+        outside.chmod(0o644)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads and enters whatever the mode bits say")
+def test_the_walk_passes_over_the_bytecode_cache(tmp_path):
+    """Python compiles the source when it cannot read a module's cached bytecode, so
+    neither an unreadable cache nor one that cannot be entered stops the walk; the same
+    name as a file, and a cache above the trees' own level, are not passed over."""
+    root = _tree(tmp_path / "tree")
+    cache = root / "a" / "__pycache__"
+    cache.mkdir()
+    (cache / "two.cpython-313.pyc").write_bytes(b"")
+    (cache / "two.cpython-313.pyc").chmod(0o000)
+    try:
+        assert reach.first_unusable([root]) is None
+        cache.chmod(0o000)
+        assert reach.first_unusable([root]) is None
+    finally:
+        cache.chmod(0o755)
+        (cache / "two.cpython-313.pyc").chmod(0o644)
+    (root / "d" / "__pycache__").write_bytes(b"")
+    (root / "d" / "__pycache__").chmod(0o000)
+    try:
+        assert reach.first_unusable([root]) == str(root / "d" / "__pycache__")
+    finally:
+        (root / "d" / "__pycache__").chmod(0o644)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads and enters whatever the mode bits say")
+@pytest.mark.parametrize(
+    "path, mode",
+    [
+        ("", 0o300),  # the tree itself
+        ("a", 0o600),  # listable, not enterable
+        ("a/b", 0o300),  # enterable, not listable
+        ("a/b/one.py", 0o200),
+        ("d/three.txt", 0o000),  # any file, not only modules
+    ],
+)
+def test_the_walk_stops_at_the_first_place_the_user_cannot_use(tmp_path, path, mode):
+    root = _tree(tmp_path / "tree")
+    target = root / path if path else root
+    target.chmod(mode)
+    try:
+        assert reach.first_unusable([root]) == str(target)
+    finally:
+        target.chmod(0o755)
+
+
+def test_a_tree_that_is_not_there_is_not_usable(tmp_path):
+    assert reach.first_unusable([tmp_path / "missing"]) == str(tmp_path / "missing")
+
+
+def test_the_check_module_run_by_hand_names_where_it_stopped(venv):
+    """Run as it is in the install, from the environment's interpreter, it exits 0;
+    with a file it cannot read it exits UNUSABLE and names it on stderr, which the
+    install discards and the refusal tells the operator how to see."""
+    argv = [venv["python"], *install.CODE_CHECK]
+    assert subprocess.run(argv, env=install.COMMAND_ENV, cwd="/", capture_output=True).returncode == reach.USABLE
+    if os.geteuid() == 0:
+        return  # root reads it all the same
+    blocked = venv["package"] / "scan.py"
+    blocked.chmod(0o200)
+    ran = subprocess.run(argv, env=install.COMMAND_ENV, cwd="/", capture_output=True, text=True)
+    assert ran.returncode == reach.UNUSABLE
+    assert ran.stderr == f"not usable by this user: {str(blocked)!r}\n"
 
 
 # --- uninstall ---
