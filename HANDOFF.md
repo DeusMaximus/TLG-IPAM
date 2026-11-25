@@ -27,6 +27,26 @@ Template:
 
 ---
 
+## 2026-11-25 — Claude Code (Fable 5.2), orchestrator — state after #94, #140 and #160 merged; three workers in flight
+- **Done:** since the orchestrator entry below this one's worker entries (same date; it holds the session's decisions and lessons, which still stand), merged by squash with the owner's go-ahead: #94 (PR #161), #140 (PR #162), #160 (PR #163). Filed with the owner's go-ahead: #164 and #165. #159's scope gained a bullet (a secret handed to a `build` step passes every shape test). `main` is at `6cb82b6` plus hand-off commits: 1,644 agent, 1,357 server and 188 web tests.
+- **In flight** (three, the limit; none shares a code file):
+  - **#136** (check the CA bundle's access as the service account), branch `136-ca-access-as-service`. Owes a briefed round. It will widen `test_invariants.py`'s lists.
+  - **#159** (stop `publish-release` when it cannot tell whether the tag has a release; hold which steps are given a secret), branch `159-release-lookup-fail-closed`. Owes a briefed round.
+  - **#164** (say in the job's error how many DNS replies were refused for size or record count), branch `164-dns-refusal-reasons`. Owes a briefed round.
+  - Nothing wakes the orchestrator when a worker opens its PR: list open PRs at the start of each turn, then watch, verify and brief.
+- **Queue:** #93 and #20 after #164, one at a time (all in `probe.py`); #165 (refuse an agent the server cannot answer before its enrolment token is spent) after #136, since both reach the installer's exchange; #31 (deployment document from spec §8) is unblocked and not started. M3 (#26–#30, #32) waits on #25.
+- **Decisions since the last orchestrator entry:**
+  - P3s from a briefed round or an outside read go back to the PR's worker to fix in the same PR, on stretch issues too (#94), not only on follow-ups; the orchestrator reads the fix against the reviewer's remedy, with Codex clean on the new head.
+  - A reviewer's recommendation that reaches past the PR's files (#164, #165) is put to the owner as a new issue instead.
+  - Before merging a PR whose CI ran against an older `main`, either update its branch (when the two may interact) or run the suite on the merged tree locally (when their files are disjoint: done for #162 after #161).
+- **Reviewer models:** GPT-6.1 Sol completed the rounds on #156, #140 and #94, and was stopped by its safety filter on #160, as on #132, #153 and #147: every time on work that builds hostile input (DNS replies, pipelined requests, a shell harness). GPT-6 Sol with Daybreak Blue completed each restarted round. The orchestrator proposed starting rounds on DNS replies on GPT-6 Sol directly; the owner has not answered, so the roster's order stands: 6.1 first.
+- **State:** nothing half-finished in `main`; CI green on it. `PROTOCOL_VERSION` is 2. Review briefs, reviews and hand-over files are in `.dev/<issue>/` in the main checkout (not committed).
+- **Waiting on the owner:**
+  - The first build of the server image with `CMD ["python", "-m", "app.serve"]` (#132); no proxy has been run against spec §8.
+  - The first release, by `.agents/releases.md`: nothing has been published. Step 3 is now the base-image refresh (#94), with a recheck of the DNS ceiling's premise when the image's Python changes (#160); step 5 checks the cross-attempt artefact download (#147).
+  - #5 and #25 (`owner` label), deferred. Permission to send packets on the test host covered 2026-11-23 only.
+- **Next:** verify the three PRs as they open and brief Sol on each; then the queue above.
+
 ## 2026-11-25 — Claude Code (Opus 5.5), worker — #160: a record budget on DNS replies before parsing (PR #163)
 - **Merged:** 2026-11-25, squash `6cb82b6`, at head `78aa7b3`; branch deleted. Entry committed by the orchestrator, with the review and state lines brought up to date. The head held `main` with PRs #161 and #162, and all nine checks passed on it.
 - **Done:** [PR #163](https://github.com/DeusMaximus/TLG-IPAM/pull/163) (`160-dns-record-budget`) closes #160.
@@ -113,36 +133,3 @@ Template:
   - #5 and #25 (`owner` label), deferred until the deployment is rebuilt behind a tunnel.
   - Permission to send packets on the test host covered 2026-11-23 only: ask again before any real-network test.
 - **Next:** verify the three PRs as they open; brief Sol on #140 and #160; then the queue above.
-
-## 2026-11-25 — Claude Code (Opus 5.5), worker — #147: run the release's publish steps against stand-ins; the retry window (PR #154)
-- **Merged:** 2026-11-25, squash `c4c4e4d`, at head `6261c8b`; branch deleted. Entry committed by the orchestrator, with the review and state lines brought up to date. `6261c8b` is GitHub's merge of `main` (holding PRs #158 and #155) into the worker's last head `c3855d4`, with no hand-written change (its tree equals `git merge-tree` of the two); CI passed on it and Codex read it clean.
-- **Done:** [PR #154](https://github.com/DeusMaximus/TLG-IPAM/pull/154) (`147-release-publish-tests`) closes #147. Tests and runbook only; `release.yml` and `.github/scripts/` are byte for byte what they were.
-  - `agent/tests/test_release_publish.py` (57 tests) runs both publish jobs' `run` scripts as written, against stand-ins for `gh`, `skopeo` and `sleep` (`agent/tests/release_stubs.py`). It covers every registry answer, draft and published release states, failed lookups and downloads, and every order of gh's lookup race, checked against the release each lookup really returned.
-  - A one-`printf` DEBUG trap records the commands each step runs, and `Publish.run` fails on one that is not approved. Every command-holding line must run in some test, and the line reader refuses a here-document. Seven good-faith mutations run on both jobs.
-  - The command record is documented everywhere as a tripwire, not a sandbox, with what it does not see named.
-  - `.agents/releases.md`:
-    - the retry window: artefact configured for 7 days; re-run failed jobs versus re-run all;
-    - past the window, once the image is published, the version is spent;
-    - cross-attempt artefact download is an unmeasured assumption, with a check on the first release (checklist step 5);
-    - the leftover-draft cleanup, and which jobs a `publish-release` re-run runs.
-  - `AGENTS.md` and brief §2.4 updated.
-- **Review:** three outside reads in place of Greptile's re-run, every finding answered on the PR.
-  - Codex (GPT-6.1 Sol) at `30f7f0c`: NO-GO, one P2 and two P3s, fixed.
-  - At `7ec01c8`, GPT-6.1 Sol was stopped by its safety filter part way (`.dev/147/manual-handover.md`); the read ran on GPT-6 Sol with Daybreak Blue: NO-GO, two P2s and two P3s. Two NO-GOs went to the owner, who decided the answer: the command record is a tripwire for changes made in good faith, not a boundary, so the claims were narrowed (pre-run skip, `extdebug` and the static `/dev/tcp` check removed; the trace stays a file) and the two P3s fixed (lookup race recorded and asserted; here-document refused).
-  - Codex (GPT-6 Sol) at `c3855d4`: GO, no findings; all four round-two findings answered in the owner's terms, and every acceptance mutation red.
-  - Codex automatic review clean on every head, the last `6261c8b`. Greptile read only `d2ec97a`; its one P2 was fixed in `30f7f0c`.
-- **Decisions:** PR Deliberate calls 1–6:
-  - the `run` text is tested in place;
-  - the artefact stays at 7 days;
-  - the failed-lookup fallback is unchanged (all three reads would prefer failing closed: filed as #159);
-  - the stubs are not checked against the real services;
-  - a DEBUG trap with no `extdebug`;
-  - the owner's tripwire-not-boundary decision.
-- **State:** merged. Agent suite on `main`: 1,462. This file passes on bash 3.2 and 5.2. No schema change; `PROTOCOL_VERSION` unchanged. Note for bash: `shopt -s extdebug` in a startup file makes bash 5 try to start its debugger and turns `functrace` off.
-- **Waiting on the owner:** nothing from this PR. The first tag is still the owner's.
-- **Untested:**
-  - the real gh, skopeo, ghcr.io and GitHub API, including GitHub refusing to publish a draft over a published tag (assumed);
-  - cross-attempt artefact download (measured on the first release);
-  - anything a script written to get past the record would do;
-  - `actionlint` (not installed; workflows unchanged).
-- **Next:** #159 (fail-closed release lookup) and #94 (pin the agent's base image by digest), one at a time: both touch the release workflow.
