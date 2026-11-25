@@ -99,11 +99,16 @@ class Responder(asyncio.DatagramProtocol):
     a second question ("two-questions"), with records in all to one over the budget a
     header may claim ("over-budget") and to exactly the budget ("at-budget"), and the
     budget's reply with a header that claims only the question and the PTR record
-    ("understated"). `sent` holds the length of every datagram it sends, from any
-    port."""
+    ("understated"). #164 adds the over-size reply and the over-budget one sent from
+    another port alone, the server itself silent ("oversize-elsewhere-only",
+    "over-budget-elsewhere-only"). `sent` holds the length of every datagram it sends,
+    from any port."""
 
-    def __init__(self, script=("answer",)):
+    def __init__(self, script=("answer",), by_name=None):
         self.script = list(script)
+        # the action for a question name, which wins over `script` (#164): lookups of
+        # several addresses run at once, so the order of their queries is not fixed
+        self.by_name = dict(by_name or {})
         self.arrivals: list[float] = []
         self.questions = []
         self.queries: list[dns.message.Message] = []
@@ -119,6 +124,7 @@ class Responder(asyncio.DatagramProtocol):
         question = query.question[0]
         self.questions.append((question.name.to_text(), dns.rdatatype.to_text(question.rdtype)))
         action = self.script.pop(0) if len(self.script) > 1 else self.script[0]
+        action = self.by_name.get(question.name.to_text(), action)
         if action == "silent":
             return
         if action == "malformed":
@@ -219,6 +225,16 @@ class Responder(asyncio.DatagramProtocol):
                 self.sent.append(len(wire))
                 self.transport.sendto(wire, addr)
                 return
+        elif action in ("oversize-elsewhere-only", "over-budget-elsewhere-only"):
+            reply.answer.append(dns.rrset.from_text(question.name, 60, "IN", "PTR", ANSWERS[question.name.to_text()]))
+            if action == "oversize-elsewhere-only":
+                wire = padded(reply, probe.DNS_PAYLOAD + 1)
+            else:
+                wire = with_records(reply, probe.DNS_RECORDS_MAX + 1)
+            with socket.socket(socket.AF_INET6 if ":" in addr[0] else socket.AF_INET, socket.SOCK_DGRAM) as other:
+                other.sendto(wire, addr)
+            self.sent.append(len(wire))
+            return
         elif action == "truncated-ptr":
             # TC set, yet carrying a complete, usable PTR RRset
             reply.flags |= dns.flags.TC
@@ -897,8 +913,9 @@ async def test_a_reply_over_the_advertised_payload_is_not_parsed_and_the_next_se
     """One byte over the payload the query advertised, from the server's own address
     and port, a reply is never parsed: the attempt ends at once as no usable answer and
     the next configured server is asked, its answer deciding. With no other server the
-    lookup is None, which keeps a stored name. Each query takes its one slot, and none
-    is sent after the lookup."""
+    lookup is no usable answer, which keeps a stored name, and says the reply was
+    refused for its size (`UnreadReplies`, #164). Each query takes its one slot, and
+    none is sent after the lookup."""
     if host == "::1" and not _ipv6_loopback():
         pytest.skip("no IPv6 loopback here")
     seen = parsed_sizes(monkeypatch)
@@ -918,7 +935,8 @@ async def test_a_reply_over_the_advertised_payload_is_not_parsed_and_the_next_se
 
         proto.script = ["oversize"]
         started = time.monotonic()
-        assert await resolver.ptr(address, (host,), slot) is None
+        # no usable answer, which keeps a stored name, saying the agent refused it (#164)
+        assert await resolver.ptr(address, (host,), slot) == probe.UnreadReplies(too_large=True, too_many_records=False)
         assert time.monotonic() - started < PATIENT / 2
         await asyncio.sleep(0.1)
         assert len(proto.arrivals) == 3 and len(taken) == 3
@@ -1016,8 +1034,9 @@ async def test_a_reply_claiming_more_than_a_ptr_answer_needs_is_not_parsed_and_t
     """A reply with a second question, or one record over the budget, from the server's
     own address and port, is never parsed, though it carries the PTR record: the attempt
     ends at once as no usable answer and the next configured server is asked, its answer
-    deciding. With no other server the lookup is None, which keeps a stored name. Each
-    query takes its one slot, and none is sent after the lookup."""
+    deciding. With no other server the lookup is no usable answer, which keeps a stored
+    name, and says the reply was refused for its header's counts (`UnreadReplies`,
+    #164). Each query takes its one slot, and none is sent after the lookup."""
     if host == "::1" and not _ipv6_loopback():
         pytest.skip("no IPv6 loopback here")
     seen = parsed_headers(monkeypatch)
@@ -1036,7 +1055,8 @@ async def test_a_reply_claiming_more_than_a_ptr_answer_needs_is_not_parsed_and_t
 
         proto.script = [action]
         started = time.monotonic()
-        assert await resolver.ptr(address, (host,), slot) is None
+        # no usable answer, which keeps a stored name, saying the agent refused it (#164)
+        assert await resolver.ptr(address, (host,), slot) == probe.UnreadReplies(too_large=False, too_many_records=True)
         assert time.monotonic() - started < PATIENT / 2
         await asyncio.sleep(0.1)
         assert len(proto.arrivals) == 3 and len(taken) == 3
@@ -1129,6 +1149,109 @@ def test_only_an_over_budget_datagram_from_the_querys_server_ends_the_attempt(de
         assert isinstance(queued[0], probe.ReplyTooManyRecords)
         queued = queued[1:]
     assert queued == [(inside, source)]
+
+
+# --- a lookup says which of the agent's limits refused its replies (#164) ---
+
+
+TOO_LARGE = probe.UnreadReplies(too_large=True, too_many_records=False)
+TOO_MANY = probe.UnreadReplies(too_large=False, too_many_records=True)
+BOTH = probe.UnreadReplies(too_large=True, too_many_records=True)
+
+
+@pytest.mark.parametrize(
+    "script, expected",
+    [
+        (("oversize", "over-budget"), BOTH),
+        (("over-budget", "oversize"), BOTH),
+        (("two-questions", "oversize"), BOTH),
+        (("oversize", "silent"), TOO_LARGE),
+        (("silent", "oversize"), TOO_LARGE),
+        (("oversize", "servfail"), TOO_LARGE),
+        (("oversize", "oversize"), TOO_LARGE),
+        (("over-budget", "malformed"), TOO_MANY),
+        (("referral", "two-questions"), TOO_MANY),
+        (("silent", "silent"), None),
+        (("servfail", "truncated"), None),
+        # round 1 of the briefed review, finding 4: a malformed or truncated reply on
+        # its own is no refusal of either limit
+        (("malformed", "malformed"), None),
+        (("truncated", "truncated"), None),
+        (("malformed", "truncated"), None),
+    ],
+)
+async def test_a_lookup_no_server_answered_says_which_limits_refused_its_replies(script, expected):
+    """#164: a lookup no server gave a usable answer to is UnreadReplies when any of
+    its attempts ended with a reply from its server refused unread, saying which
+    limits refused one, whatever the other attempts met; with none refused it is None,
+    as before. Every server is asked, once each, whatever an earlier one sent."""
+    transport, proto, port = await responder(script=script)
+    try:
+        answer = await DnsResolver(port=port).ptr(ipaddress.ip_address("10.0.0.9"), ("127.0.0.1",) * 2, unpaced(0.3))
+        assert answer == expected if expected is not None else answer is None
+        await asyncio.sleep(0.05)
+        assert len(proto.arrivals) == 2
+    finally:
+        transport.close()
+
+
+@pytest.mark.parametrize("first", ["oversize", "over-budget", "two-questions"])
+@pytest.mark.parametrize("then, expected", [("answer", "nas.home.arpa."), ("nxdomain", probe.NO_NAME)])
+async def test_a_refused_reply_a_later_server_answered_past_is_not_reported(first, then, expected):
+    """#164: the lookup had a usable answer, so it is that answer, a name or that there
+    is none, and says nothing of the refused reply before it: the job's error counts
+    only the lookups that got no usable answer."""
+    transport, proto, port = await responder(script=(first, then))
+    try:
+        answer = await DnsResolver(port=port).ptr(ipaddress.ip_address("10.0.0.9"), ("127.0.0.1",) * 2, unpaced())
+        assert answer == expected if isinstance(expected, str) else answer is expected
+        assert len(proto.arrivals) == 2
+    finally:
+        transport.close()
+
+
+@pytest.mark.parametrize("action", ["oversize-elsewhere-only", "over-budget-elsewhere-only"])
+async def test_a_refused_datagram_from_another_source_is_not_counted_as_the_servers(action, monkeypatch):
+    """#164: a datagram over the size limit or the record budget from anywhere but the
+    query's server and port is dropped, as before, and is not that server's refusal:
+    the attempt waits out its time, and the lookup is None, not UnreadReplies."""
+    seen = parsed_sizes(monkeypatch)
+    got = received(monkeypatch)
+    transport, proto, port = await responder(script=(action,))
+    try:
+        answer = await DnsResolver(port=port).ptr(ipaddress.ip_address("10.0.0.9"), ("127.0.0.1",), unpaced(0.3))
+        assert answer is None
+        assert len(proto.sent) == 1 and [source for _, source in got if source != port]  # it reached the socket
+        assert all(source != port for _, source in got)
+        assert max(seen) <= probe.DNS_PAYLOAD
+    finally:
+        transport.close()
+
+
+@pytest.mark.parametrize("action, expected", [("oversize", TOO_LARGE), ("over-budget", TOO_MANY)])
+async def test_a_refusal_is_reported_when_the_lookups_time_runs_out_before_the_next_server(action, expected):
+    """#164: after a refused reply, a lookup whose time is up before its next server's
+    slot (`left <= 0`) is no usable answer, and still says the refusal it met."""
+    transport, proto, port = await responder(script=(action,))
+    lefts = iter([2.0, 0.0])
+
+    async def slot():
+        return next(lefts)
+
+    try:
+        answer = await DnsResolver(port=port).ptr(ipaddress.ip_address("10.0.0.9"), ("127.0.0.1",) * 2, slot)
+        assert answer == expected
+        await asyncio.sleep(0.05)
+        assert len(proto.arrivals) == 1
+    finally:
+        transport.close()
+
+
+def test_a_lookup_with_no_refusal_is_none_and_with_any_says_which():
+    assert probe.no_usable_answer(False, False) is None
+    assert probe.no_usable_answer(True, False) == TOO_LARGE
+    assert probe.no_usable_answer(False, True) == TOO_MANY
+    assert probe.no_usable_answer(True, True) == BOTH
 
 
 def _largest_ordinary_answer() -> tuple[bytes, dns.name.Name, str]:
