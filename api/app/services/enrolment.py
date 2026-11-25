@@ -20,7 +20,7 @@ run on a session that carries one.
 
 A refusal for the protocol is recorded in process memory alone
 (`agents.enrol_refusals`, #175), for the Agents page to say why the agent never
-arrived: the server's code, the token and the time, with nothing locked or written.
+arrived: by token, the server's code and the time, with nothing locked or written.
 
 What it records of the token's use: `used_at` on the enrolment token, which is what
 makes it single-use. It writes no `last_used_at`, on either token: the new agent
@@ -192,12 +192,12 @@ async def _exchange(
     # shape differently) and before the claim, so an agent this server cannot answer
     # is refused with its enrolment token unspent (#165). An attempt refused here
     # counts against the throttle, as every refusal but its own does. What the owner is
-    # shown of it (#175) is kept in process memory (`agents.enrol_refusals`): the
-    # server's code, the token and the time, never a value the body sent, and no
+    # shown of it (#175) is kept in process memory (`agents.enrol_refusals`), keyed by
+    # this token: the server's code and time, never a value the body sent, and no
     # database write, so nothing here locks, writes or needs an audit entry.
     refusal = enrol_protocol_refusal(body)
     if refusal is not None:
-        agents.enrol_refusals.record(agent.id, token.id, refusal, _now())
+        agents.enrol_refusals.record(token.id, refusal, _now())
         raise _protocol_refused(refusal)
     try:
         report = EnrolRequest.model_validate(body)
@@ -276,8 +276,8 @@ async def _exchange(
     except OperationalError as exc:
         await session.rollback()
         raise database_unavailable("enrolment", exc) from exc
-    # tidiness only: the spent token already hides a refusal (`agents.enrol_refusal`)
-    agents.enrol_refusals.clear(agent.id)
+    # tidiness only: a spent token is no agent's current one (`agents.current_enrolment`)
+    agents.enrol_refusals.drop([token.id])
     return answer
 
 

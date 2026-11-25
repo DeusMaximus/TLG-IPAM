@@ -16,7 +16,7 @@ def _out(agent) -> dict:
 @router.get("")
 async def list_agents(session: AsyncSession = Depends(get_session)):
     rows = await svc.list_agents(session)
-    return {"data": [_out(a) for a in rows], "total": len(rows)}
+    return {"data": svc.agents_out(rows), "total": len(rows)}
 
 
 def _enrolment(agent, token, plain: str) -> dict:

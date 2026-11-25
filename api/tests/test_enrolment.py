@@ -32,6 +32,7 @@ from app.database import SessionLocal, engine
 from app.main import app
 from app.models import Agent, Change, Token
 from app.services import agents as agents_svc
+from app.routers import agent as agent_router
 from app.services import enrolment, jobs
 from app.services.changes import WITHHELD
 
@@ -575,6 +576,27 @@ def test_enrolment_refuses_exactly_the_integer_protocols_check_in_refuses(monkey
 # --- What the owner is shown of a protocol refusal (#175) ---
 
 
+def _refusals() -> int:
+    return len(agents_svc.enrol_refusals)
+
+
+@pytest.fixture
+def during_the_body(monkeypatch):
+    """Run owner requests, and other agents' attempts, while one attempt's body arrives:
+    after its token was found usable, before the protocol is judged (round 1 of #184's
+    briefed review drove the same point through the real route)."""
+    steps = []
+    real = agent_router._json_body
+
+    async def body_after_steps(request):
+        while steps:
+            await steps.pop(0)()
+        return await real(request)
+
+    monkeypatch.setattr(agent_router, "_json_body", body_after_steps)
+    return steps
+
+
 @pytest.mark.parametrize("protocol", [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1], ids=["old", "new"])
 async def test_a_protocol_refusal_is_shown_to_the_owner_and_writes_nothing(
     client, agent_api, protocol
@@ -614,21 +636,23 @@ async def test_a_later_refusal_replaces_the_earlier(client, agent_api, monkeypat
 async def test_the_enrolment_that_spends_the_token_ends_the_refusal(client, agent_api):
     created = await create(client)
     await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION + 1)
+    assert _refusals() == 1
     assert (await enrol(agent_api, created["enrol_token"], **REPORT)).status_code == 200
     agent = await get_agent(client, created["id"])
     assert agent["state"] == "active" and agent["enrol_refusal"] is None
-    assert agents_svc.enrol_refusals.get(created["id"]) is None
+    assert _refusals() == 0
 
 
-async def test_a_refusal_is_shown_only_while_its_token_is_unspent_and_unrevoked(client, agent_api):
-    """The refusal is judged on read against the token it was refused for, so a record
-    that lands after that token was spent (an exchange of the same token that finished
-    first) is not shown."""
+async def test_a_refusal_is_shown_only_while_its_token_is_current(client, agent_api):
+    """The refusal is judged on read against the agent's tokens, so a record that lands
+    after its token was spent (an exchange of the same token that finished first) is not
+    shown."""
     created = await create(client)
     [token] = await tokens_of(created["id"])
     assert (await enrol(agent_api, created["enrol_token"])).status_code == 200
-    agents_svc.enrol_refusals.record(created["id"], token.id, ENROL_TOO_OLD, _now())
+    agents_svc.enrol_refusals.record(token.id, ENROL_TOO_OLD, _now())
     assert (await get_agent(client, created["id"]))["enrol_refusal"] is None
+    assert _refusals() == 0  # and that read dropped it
 
 
 @pytest.mark.parametrize("action", ["re-enrol", "revoke"])
@@ -663,23 +687,113 @@ async def test_an_expired_token_keeps_the_refusal_until_a_re_enrol_replaces_it(c
     assert (await get_agent(client, created["id"]))["enrol_refusal"] is None
 
 
-async def test_a_token_issued_in_the_same_instant_hides_the_refusal(client, agent_api):
+@pytest.mark.parametrize("step", [timedelta(0), timedelta(seconds=-60)], ids=["equal", "backward"])
+@pytest.mark.parametrize("first", ["live", "expired"])
+async def test_which_token_is_current_never_depends_on_when_tokens_were_issued(
+    client, agent_api, monkeypatch, step, first
+):
+    """Round 1 of #184's briefed review, finding 2: with the replacement issued at the
+    same instant as the first token, or before it by a clock stepped back, the first
+    token's refusal is hidden and the replacement's own is shown. The first token is
+    live when re-enrolled (and so revoked) or expired (and so left unrevoked)."""
+    t0 = _now()
+    clock = {"now": t0}
+    monkeypatch.setattr(agents_svc, "_now", lambda: clock["now"])
+    monkeypatch.setattr(enrolment, "_now", lambda: clock["now"])
+    created = await create(client)
+    [a] = await tokens_of(created["id"])
+    await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+    if first == "expired":
+        await set_token(a.id, expires_at=t0 + step - timedelta(seconds=1))
+    clock["now"] = t0 + step
+    res = await re_enrol(client, created["id"])
+    assert res.status_code == 201, res.text
+    tokens = {t.id: t for t in await tokens_of(created["id"])}
+    assert len(tokens) == 2 and (tokens[a.id].revoked_at is None) == (first == "expired")
+    b = next(t for t in tokens.values() if t.id != a.id)
+    assert b.created_at.replace(tzinfo=timezone.utc) <= a.created_at.replace(tzinfo=timezone.utc)
+    assert (await get_agent(client, created["id"]))["enrol_refusal"] is None  # A's hidden
+    res = await enrol(agent_api, res.json()["data"]["enrol_token"], protocol=PROTOCOL_VERSION + 1)
+    assert res.status_code == 409, res.text
+    refusal = (await get_agent(client, created["id"]))["enrol_refusal"]
+    assert refusal is not None and refusal["code"] == ENROL_TOO_NEW  # B's shown
+
+
+async def test_a_late_attempt_with_a_replaced_token_leaves_the_current_refusal(
+    client, agent_api, during_the_body
+):
+    """Round 1 of #184's briefed review, finding 1: an attempt with token A, its body
+    still arriving, while the owner re-enrols (B, revoking A) and B is refused. A's
+    refusal, landing last, neither replaces nor clears B's."""
+    created = await create(client)
+    issued = {}
+
+    async def re_enrol_then_refuse_b():
+        res = await re_enrol(client, created["id"])
+        assert res.status_code == 201, res.text
+        issued["b"] = res.json()["data"]["enrol_token"]
+        res = await enrol(agent_api, issued["b"], protocol=PROTOCOL_VERSION + 1)
+        assert res.status_code == 409, res.text
+
+    during_the_body.append(re_enrol_then_refuse_b)
+    res = await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
+    assert res.status_code == 409 and res.json()["error"]["code"] == ENROL_TOO_OLD
+    refusal = (await get_agent(client, created["id"]))["enrol_refusal"]
+    assert refusal is not None and refusal["code"] == ENROL_TOO_NEW
+    assert _refusals() == 1  # A's, no token's current one, went with that read
+
+
+async def test_an_attempt_whose_agent_is_deleted_during_its_body_leaves_nothing_behind(
+    client, agent_api, during_the_body
+):
+    """Round 1 of #184's briefed review, finding 3: three agents, each deleted while an
+    attempt's body arrives. Each attempt still records after its delete; the agents list
+    drops them, and the store never holds more than its bound."""
+    for name in ("a", "b", "c"):
+        created = await create(client, name=name)
+
+        async def delete_it(agent_id=created["id"]):
+            res = await client.delete(f"/api/v1/agents/{agent_id}")
+            assert res.status_code == 204, res.text
+
+        during_the_body.append(delete_it)
+        res = await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION + 1)
+        assert res.status_code == 409, res.text
+    assert _refusals() == 3  # recorded after each delete committed
+    assert (await client.get("/api/v1/agents")).json()["data"] == []
+    assert _refusals() == 0
+
+
+def test_the_store_holds_at_most_its_bound(monkeypatch):
+    store = agents_svc.EnrolRefusals(limit=3)
+    for i in range(5):
+        store.record(f"token-{i}", ENROL_TOO_OLD, _now())
+    assert len(store) == 3
+    assert store.get("token-0") is None and store.get("token-1") is None
+    store.record("token-2", ENROL_TOO_NEW, _now())  # refused again: the newest kept
+    store.record("token-5", ENROL_TOO_OLD, _now())
+    assert store.get("token-3") is None and store.get("token-2").code == ENROL_TOO_NEW
+    assert agents_svc.ENROL_REFUSALS_MAX == 1024
+
+
+async def test_a_disabled_agents_refusal_is_not_shown_until_it_is_enabled(client, agent_api):
+    """Round 1 of #184's briefed review, finding 4: a disabled agent's token is refused
+    whatever release it runs, so installing one is not the advice."""
     created = await create(client)
     await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
-    async with SessionLocal() as session:
-        agent = await session.scalar(select(Agent).where(Agent.id == created["id"]))
-        [first] = await session.scalars(select(Token).where(Token.agent_id == agent.id))
-        again, _ = agents_svc.issue_token(session, agent, "enrol", first.created_at)
-        await session.commit()
+    res = await client.put(f"/api/v1/agents/{created['id']}", json={"enabled": False})
+    assert res.json()["data"]["enrol_refusal"] is None
     assert (await get_agent(client, created["id"]))["enrol_refusal"] is None
+    res = await client.put(f"/api/v1/agents/{created['id']}", json={"enabled": True})
+    assert res.json()["data"]["enrol_refusal"]["code"] == ENROL_TOO_OLD
 
 
 async def test_deleting_the_agent_forgets_its_refusal(client, agent_api):
     created = await create(client)
     await enrol(agent_api, created["enrol_token"], protocol=PROTOCOL_VERSION - 1)
-    assert agents_svc.enrol_refusals.get(created["id"]) is not None
+    assert _refusals() == 1
     assert (await client.delete(f"/api/v1/agents/{created['id']}")).status_code == 204
-    assert agents_svc.enrol_refusals.get(created["id"]) is None
+    assert _refusals() == 0
 
 
 @pytest.mark.parametrize("case", ["unknown", "used", "expired", "revoked", "disabled", "not-an-integer"])
@@ -705,14 +819,14 @@ async def test_a_refusal_before_the_protocol_is_judged_records_none(
         protocol, status = str(PROTOCOL_VERSION + 1), 422
     res = await enrol(agent_api, bearer, protocol=protocol)
     assert res.status_code == status, res.text
-    assert agents_svc.enrol_refusals.get(created["id"]) is None
+    assert _refusals() == 0
     assert (await get_agent(client, created["id"]))["enrol_refusal"] is None
 
 
 def test_a_refusal_is_recorded_only_as_one_of_the_servers_codes():
     with pytest.raises(ValueError):
-        agents_svc.enrol_refusals.record("agent-1", "token-1", "PROTOCOL_MISMATCH", _now())
-    assert agents_svc.enrol_refusals.get("agent-1") is None
+        agents_svc.enrol_refusals.record("token-1", "PROTOCOL_MISMATCH", _now())
+    assert _refusals() == 0
 
 
 # --- Re-enrol (acceptance: the old agent token is refused, the scan targets unchanged) ---

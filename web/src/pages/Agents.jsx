@@ -23,6 +23,7 @@ import {
   activeToken,
   agentStatus,
   blockedEnrolment,
+  ENROL_REFUSAL_RETENTION,
   enrolRefusalText,
   liveEnrolment,
   monotonicNow,
@@ -30,6 +31,7 @@ import {
   openEnrolment,
   pendingEnrolments,
   received,
+  shownEnrolRefusal,
   relativeTime,
   sinceAsked,
   STATUS_LABELS,
@@ -216,9 +218,13 @@ function AgentRow({
         {agent.last_error && (
           <div className="mt-1 max-w-64 text-red-400">Last check-in refused: {agent.last_error}</div>
         )}
-        {agent.enrol_refusal && (
-          <div className="mt-1 max-w-64 text-red-400" data-testid="enrol-refusal">
-            {enrolRefusalText(agent.enrol_refusal, now)}
+        {shownEnrolRefusal(agent) && (
+          <div
+            className="mt-1 max-w-64 text-red-400"
+            data-testid="enrol-refusal"
+            title={ENROL_REFUSAL_RETENTION}
+          >
+            {enrolRefusalText(shownEnrolRefusal(agent), now)}
           </div>
         )}
       </td>
@@ -300,14 +306,17 @@ function PendingEnrolments({ agents, elapsed, now }) {
               {agent.state === 'pending' ? 'waiting for its first enrolment' : 'being re-enrolled'},
               expires {timeLeft(token, elapsed) ?? 'soon'}
             </span>
-            {agent.enrol_refusal && (
+            {shownEnrolRefusal(agent) && (
               <span className="basis-full text-red-400" data-testid="pending-refusal">
-                {enrolRefusalText(agent.enrol_refusal, now)}
+                {enrolRefusalText(shownEnrolRefusal(agent), now)}
               </span>
             )}
           </li>
         ))}
       </ul>
+      <p className="mt-1 text-xs text-slate-500" data-testid="enrol-refusal-retention">
+        {ENROL_REFUSAL_RETENTION}
+      </p>
     </section>
   )
 }

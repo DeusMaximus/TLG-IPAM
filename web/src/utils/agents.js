@@ -57,6 +57,17 @@ const ENROL_REFUSALS = {
     'its agent release is newer than the server. Update the server, or install the agent release that matches it',
 }
 
+// The server keeps these refusals in its memory alone (`agents.enrol_refusals`), so a
+// restart forgets them until the agent tries again; the page says so where they appear
+export const ENROL_REFUSAL_RETENTION =
+  'A refusal for the agent’s release is shown here and in its row until the server restarts, and again after the agent’s next attempt. A systemd install tries once: its output says why it was refused.'
+
+// The refusal to show for an agent: none while it is disabled, whose token the server
+// refuses whatever it runs (the server already gives none then)
+export function shownEnrolRefusal(agent) {
+  return agent.state === 'disabled' ? null : agent.enrol_refusal || null
+}
+
 export function enrolRefusalText(refusal, now = Date.now()) {
   if (!refusal) return null
   const why = ENROL_REFUSALS[refusal.code] ?? 'its agent release speaks another protocol than the server'

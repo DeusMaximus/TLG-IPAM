@@ -759,6 +759,29 @@ describe('Agents page', () => {
     expect(within(row).queryByTestId('protocol-mismatch')).toBeNull()
     expect(within(row).queryByText(/Last check-in refused/)).toBeNull()
     expect(within(row).queryByRole('button', { name: /Update command/ })).toBeNull()
+    // where it shows, the page says the server keeps it only until it restarts
+    expect(within(row).getByTestId('enrol-refusal')).toHaveAttribute('title', expect.stringMatching(/until the server restarts/))
+    expect(within(list).getByTestId('enrol-refusal-retention')).toHaveTextContent(/until the server restarts, and again after the agent’s next attempt/)
+  })
+
+  it('shows no enrolment refusal for a disabled agent, whose token is refused whatever it runs (#184)', async () => {
+    ipam.listAgents.mockResolvedValue({
+      data: [
+        agentRow({
+          id: 'off',
+          name: 'off',
+          state: 'disabled',
+          last_checkin_at: null,
+          tokens: [enrolToken({ expires_in_s: 3000 })],
+          enrol_refusal: { code: 'AGENT_TOO_OLD', refused_at: new Date().toISOString() },
+        }),
+      ],
+      total: 1,
+    })
+    renderPage()
+    const row = await screen.findByTestId('agent-off')
+    expect(within(row).queryByTestId('enrol-refusal')).toBeNull()
+    expect(within(row).getByText(/enrolment blocked until it is enabled/)).toBeInTheDocument()
   })
 
   it('says nothing of an enrolment refusal the server does not report', async () => {
