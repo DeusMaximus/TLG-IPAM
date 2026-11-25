@@ -8,6 +8,7 @@ import errno
 import ipaddress
 import itertools
 import os
+import random
 import socket
 import stat
 import struct
@@ -94,8 +95,12 @@ class Responder(asyncio.DatagramProtocol):
     ("cname-chain-ptr") or the end's zone's SOA ("cname-chain-nodata"). #153 adds the
     answer padded to exactly the payload the query advertised ("at-size") and to one
     byte over it ("oversize"), and that over-size reply sent first from another port,
-    the server's own answer after it ("oversize-elsewhere"). `sent` holds the length
-    of every datagram it sends, from any port."""
+    the server's own answer after it ("oversize-elsewhere"). #160 adds the answer with
+    a second question ("two-questions"), with records in all to one over the budget a
+    header may claim ("over-budget") and to exactly the budget ("at-budget"), and the
+    budget's reply with a header that claims only the question and the PTR record
+    ("understated"). `sent` holds the length of every datagram it sends, from any
+    port."""
 
     def __init__(self, script=("answer",)):
         self.script = list(script)
@@ -200,6 +205,20 @@ class Responder(asyncio.DatagramProtocol):
                 self.sent.append(len(wire))
                 self.transport.sendto(wire, addr)
                 return
+        elif action in ("two-questions", "over-budget", "at-budget", "understated"):
+            reply.answer.append(dns.rrset.from_text(question.name, 60, "IN", "PTR", ANSWERS[question.name.to_text()]))
+            if action == "two-questions":
+                reply.question.append(dns.rrset.RRset(dns.name.from_text("2.0.0.10.in-addr.arpa."), 1, 12))
+            else:
+                records = probe.DNS_RECORDS_MAX + (1 if action == "over-budget" else 0)
+                wire = with_records(reply, records)
+                if action == "understated":
+                    # the header claims the question and the PTR record alone: the
+                    # rest, filler and OPT, is bytes past what it claims
+                    wire = wire[:4] + struct.pack("!HHHH", 1, 1, 0, 0) + wire[12:]
+                self.sent.append(len(wire))
+                self.transport.sendto(wire, addr)
+                return
         elif action == "truncated-ptr":
             # TC set, yet carrying a complete, usable PTR RRset
             reply.flags |= dns.flags.TC
@@ -229,6 +248,24 @@ def padded(reply: dns.message.Message, size: int) -> bytes:
             return wire
         length += size - len(wire)
     raise AssertionError(f"no padding gives {size} bytes")
+
+
+def header_counts(wire: bytes) -> tuple[int, int]:
+    """The questions and the records (answer, authority and additional) a header claims."""
+    questions, *sections = struct.unpack("!HHHH", wire[4:12])
+    return questions, sum(sections)
+
+
+def with_records(reply: dns.message.Message, records: int) -> bytes:
+    """`reply` on the wire with A records of filler in its additional section, so that
+    its header claims `records` records in all, OPT included, and the answer untouched."""
+    reply.additional = []
+    _, held = header_counts(reply.to_wire(max_size=65535))
+    for k in range(records - held):
+        reply.additional.append(dns.rrset.from_text(f"f{k}.home.arpa.", 60, "IN", "A", f"192.0.2.{k % 256}"))
+    wire = reply.to_wire(max_size=65535)
+    assert header_counts(wire)[1] == records and len(wire) <= probe.DNS_PAYLOAD
+    return wire
 
 
 async def responder(host="127.0.0.1", port=0, **kwargs):
@@ -920,19 +957,20 @@ async def test_an_over_size_reply_from_another_port_is_dropped_and_the_servers_o
         transport.close()
 
 
-@pytest.mark.parametrize(
-    "destination, source, from_server",
-    [
-        (("192.0.2.53", 53), ("192.0.2.53", 53), True),
-        (("192.0.2.53", 53), ("192.0.2.53", 5353), False),
-        (("192.0.2.53", 53), ("192.0.2.54", 53), False),
-        (("2001:db8::53", 53, 0, 0), ("2001:db8:0:0::53", 53, 0, 0), True),  # one address, two spellings
-        (("2001:db8::53", 53, 0, 0), ("2001:db8::53", 53, 0, 2), False),  # another scope
-        (("2001:db8::53", 53, 0, 0), ("2001:db8::54", 53, 0, 0), False),
-        (("224.0.0.251", 53), ("192.0.2.53", 53), False),  # dnspython would take it; not here
-        (None, ("192.0.2.53", 53), False),  # nothing sent yet
-    ],
-)
+# where a datagram comes from, and whether it is the query's server (`_from_server`)
+SOURCES = [
+    (("192.0.2.53", 53), ("192.0.2.53", 53), True),
+    (("192.0.2.53", 53), ("192.0.2.53", 5353), False),
+    (("192.0.2.53", 53), ("192.0.2.54", 53), False),
+    (("2001:db8::53", 53, 0, 0), ("2001:db8:0:0::53", 53, 0, 0), True),  # one address, two spellings
+    (("2001:db8::53", 53, 0, 0), ("2001:db8::53", 53, 0, 2), False),  # another scope
+    (("2001:db8::53", 53, 0, 0), ("2001:db8::54", 53, 0, 0), False),
+    (("224.0.0.251", 53), ("192.0.2.53", 53), False),  # dnspython would take it; not here
+    (None, ("192.0.2.53", 53), False),  # nothing sent yet
+]
+
+
+@pytest.mark.parametrize("destination, source, from_server", SOURCES)
 def test_only_an_over_size_datagram_from_the_querys_server_ends_the_attempt(destination, source, from_server):
     """The over-size check judges the source as dnspython's `ignore_unexpected` does,
     or more strictly: from the server, the attempt ends (ReplyTooLarge); from anywhere
@@ -949,12 +987,156 @@ def test_only_an_over_size_datagram_from_the_querys_server_ends_the_attempt(dest
     assert queued == [(b"\0" * probe.DNS_PAYLOAD, source)]
 
 
-def test_the_largest_ordinary_ptr_answer_fits_the_advertised_payload():
-    """Why 1232 bytes stays (#153): a 253-character name behind two CNAMEs of classless
-    reverse delegation (RFC 2317, nested once), with four name servers and an IPv4 and
-    an IPv6 address for each beside it, for an IPv6 address (the longest question), is
-    well inside the payload the query advertises. dnspython compresses it as a server
-    would."""
+# --- a reply whose header claims more than a PTR answer needs is not parsed (#160) ---
+
+
+def parsed_headers(monkeypatch) -> list[tuple[int, int]]:
+    """The questions and records claimed by the header of every message handed to
+    `dns.message.from_wire` from now on, the responders' queries included. One over the
+    budget fails the test where it would be parsed, as in `parsed_sizes`."""
+    seen: list[tuple[int, int]] = []
+    real = dns.message.from_wire
+
+    def from_wire(wire, *args, **kwargs):
+        claimed = header_counts(wire) if len(wire) >= probe.DNS_HEADER else (0, 0)
+        seen.append(claimed)
+        if claimed[0] > probe.DNS_QUESTIONS_MAX or claimed[1] > probe.DNS_RECORDS_MAX:
+            raise AssertionError(f"a reply claiming {claimed} reached dnspython's parser")
+        return real(wire, *args, **kwargs)
+
+    monkeypatch.setattr(dns.message, "from_wire", from_wire)
+    return seen
+
+
+@pytest.mark.parametrize("action", ["two-questions", "over-budget"])
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1"])
+async def test_a_reply_claiming_more_than_a_ptr_answer_needs_is_not_parsed_and_the_next_server_is_asked(
+    host, action, monkeypatch
+):
+    """A reply with a second question, or one record over the budget, from the server's
+    own address and port, is never parsed, though it carries the PTR record: the attempt
+    ends at once as no usable answer and the next configured server is asked, its answer
+    deciding. With no other server the lookup is None, which keeps a stored name. Each
+    query takes its one slot, and none is sent after the lookup."""
+    if host == "::1" and not _ipv6_loopback():
+        pytest.skip("no IPv6 loopback here")
+    seen = parsed_headers(monkeypatch)
+    got = received(monkeypatch)
+    transport, proto, port = await responder(host=host, script=(action, "answer"))
+    try:
+        resolver = DnsResolver(port=port)
+        address = ipaddress.ip_address("10.0.0.9")
+        slot, taken = counted(PATIENT)
+        started = time.monotonic()
+        assert await resolver.ptr(address, (host, host), slot) == "nas.home.arpa."
+        # ended by the refused reply, not by waiting out the attempt's time
+        assert time.monotonic() - started < PATIENT / 2
+        assert proto.sent[0] <= probe.DNS_PAYLOAD and (proto.sent[0], port) in got  # it reached the socket
+        assert len(proto.arrivals) == 2 and len(taken) == 2
+
+        proto.script = [action]
+        started = time.monotonic()
+        assert await resolver.ptr(address, (host,), slot) is None
+        assert time.monotonic() - started < PATIENT / 2
+        await asyncio.sleep(0.1)
+        assert len(proto.arrivals) == 3 and len(taken) == 3
+        assert all(q <= probe.DNS_QUESTIONS_MAX and r <= probe.DNS_RECORDS_MAX for q, r in seen)
+    finally:
+        transport.close()
+
+
+async def test_a_reply_at_exactly_the_record_budget_is_read(monkeypatch):
+    seen = parsed_headers(monkeypatch)
+    transport, proto, port = await responder(script=("at-budget",))
+    try:
+        answer = await DnsResolver(port=port).ptr(ipaddress.ip_address("10.0.0.9"), ("127.0.0.1",) * 2, unpaced())
+        assert answer == "nas.home.arpa."
+        assert (1, probe.DNS_RECORDS_MAX) in seen
+        assert len(proto.arrivals) == 1
+    finally:
+        transport.close()
+
+
+async def test_a_reply_that_holds_more_than_its_header_claims_is_not_used(monkeypatch):
+    """The budget's reply, its header claiming the question and the PTR record alone:
+    dnspython reads as far as the counts and refuses the bytes past them (a bad
+    response), so the PTR record it did read is not used and the next server is asked."""
+    seen = parsed_headers(monkeypatch)
+    transport, proto, port = await responder(script=("understated", "nxdomain"))
+    try:
+        resolver = DnsResolver(port=port)
+        address = ipaddress.ip_address("10.0.0.9")
+        assert await resolver.ptr(address, ("127.0.0.1",) * 2, unpaced()) is probe.NO_NAME
+        assert (1, 1) in seen and len(proto.arrivals) == 2
+    finally:
+        transport.close()
+
+
+@pytest.mark.parametrize(
+    "counts, refused",
+    [
+        ((0, 0, 0, 0), False),  # FORMERR and NOTIMP may carry no question
+        ((1, 0, 0, 0), False),
+        ((1, 32, 0, 0), False),
+        ((1, 0, 0, 32), False),
+        ((1, 10, 11, 11), False),
+        ((2, 1, 0, 1), True),
+        ((1, 33, 0, 0), True),
+        ((1, 0, 33, 0), True),
+        ((1, 0, 0, 33), True),
+        ((1, 11, 11, 11), True),
+        ((65535, 0, 0, 0), True),
+        ((1, 65535, 65535, 65535), True),
+    ],
+)
+def test_what_a_header_may_claim(counts, refused):
+    """The budget is the questions and the sum of the other three sections' records,
+    read from the header alone: the datagram holds nothing after it here, and is judged
+    without being parsed."""
+    data = struct.pack("!HHHHHH", 0, 0x8180, *counts)
+    assert isinstance(probe.unread(data), probe.ReplyTooManyRecords) is refused
+    if refused:
+        assert isinstance(probe.unread(data), dns.exception.DNSException)
+
+
+@pytest.mark.parametrize("length", [0, 5, 11])
+def test_a_datagram_shorter_than_a_header_is_left_to_dnspython(length):
+    """It has no counts to read: dnspython refuses it as malformed (the "malformed"
+    reply above), at a cost that does not grow."""
+    assert probe.unread(b"\xff" * length) is None
+    with pytest.raises(dns.message.ShortHeader):
+        dns.message.from_wire(b"\xff" * length)
+
+
+def test_the_size_is_judged_before_the_counts():
+    over = struct.pack("!HHHHHH", 0, 0x8180, 2, 0, 0, 0) + b"\0" * probe.DNS_PAYLOAD
+    assert isinstance(probe.unread(over), probe.ReplyTooLarge)
+
+
+@pytest.mark.parametrize("destination, source, from_server", SOURCES)
+def test_only_an_over_budget_datagram_from_the_querys_server_ends_the_attempt(destination, source, from_server):
+    """The same source rule as the size's: from the server, ReplyTooManyRecords ends the
+    attempt; from anywhere else the datagram is dropped, where dnspython would have
+    ignored it. A header inside the budget is queued for dnspython as before."""
+    sock = probe.QuerySocket(socket.AF_INET6 if ":" in source[0] else socket.AF_INET)
+    sock._destination = destination
+    over = struct.pack("!HHHHHH", 0, 0x8180, 1, probe.DNS_RECORDS_MAX + 1, 0, 0)
+    inside = struct.pack("!HHHHHH", 0, 0x8180, 1, probe.DNS_RECORDS_MAX, 0, 0)
+    sock.datagram_received(over, source)
+    sock.datagram_received(inside, source)
+    queued = [sock._received.get_nowait() for _ in range(sock._received.qsize())]
+    if from_server:
+        assert isinstance(queued[0], probe.ReplyTooManyRecords)
+        queued = queued[1:]
+    assert queued == [(inside, source)]
+
+
+def _largest_ordinary_answer() -> tuple[bytes, dns.name.Name, str]:
+    """The largest ordinary PTR answer #153 built, on the wire as dnspython compresses
+    it, with its question and its PTR name: a 253-character name behind two CNAMEs of
+    classless reverse delegation (RFC 2317, nested once), with four name servers and
+    an IPv4 and an IPv6 address for each beside it, for an IPv6 address (the longest
+    question)."""
     ptr = ".".join(["h" * 63] * 3 + ["h" * 49]) + ".example.com."
     assert len(ptr) == 254  # 253 characters and the root
     question = dns.reversename.from_address("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff")
@@ -970,9 +1152,37 @@ def test_the_largest_ordinary_ptr_answer_fits_the_advertised_payload():
         reply.authority.append(dns.rrset.from_text(owner.parent(), 3600, "IN", "NS", server))
         reply.additional.append(dns.rrset.from_text(server, 3600, "IN", "A", f"192.0.2.{k}"))
         reply.additional.append(dns.rrset.from_text(server, 3600, "IN", "AAAA", f"2001:db8::{k}"))
-    wire = reply.to_wire(max_size=65535)
+    return reply.to_wire(max_size=65535), question, ptr
+
+
+def test_the_largest_ordinary_ptr_answer_fits_the_advertised_payload():
+    """Why 1232 bytes stays (#153): the largest ordinary answer built is well inside the
+    payload the query advertises."""
+    wire, question, ptr = _largest_ordinary_answer()
     assert len(wire) < 800 < probe.DNS_PAYLOAD
     assert probe.read_reply(dns.message.from_wire(wire), question) == ptr
+
+
+def test_the_largest_legitimate_ptr_answers_are_inside_the_record_budget():
+    """Why the budget is 32 records (#160): the largest legitimate answers #153 built
+    claim 16 (the 710-byte answer: two CNAMEs and the PTR record, four name servers,
+    eight addresses, and OPT) and 5 (four PTR records of 253 characters at one name,
+    and OPT), so the budget is twice the larger. Each is parsed and read as before."""
+    wire, question, ptr = _largest_ordinary_answer()
+    assert (len(wire), header_counts(wire)) == (710, (1, 16))
+    assert probe.unread(wire) is None
+    assert probe.read_reply(dns.message.from_wire(wire), question) == ptr
+
+    question = dns.reversename.from_address("10.0.0.9")
+    reply = dns.message.make_response(dns.message.make_query(question, "PTR", use_edns=0, payload=probe.DNS_PAYLOAD))
+    names = [".".join([letter * 63] * 3 + [letter * 49]) + ".example.com." for letter in "abcd"]
+    reply.answer.append(dns.rrset.from_text_list(question, 3600, "IN", "PTR", names))
+    wire = reply.to_wire(max_size=65535)
+    assert header_counts(wire) == (1, 5) and 1_000 < len(wire) <= probe.DNS_PAYLOAD  # 1,085 bytes
+    assert probe.unread(wire) is None
+    assert probe.read_reply(dns.message.from_wire(wire), question) in names
+
+    assert 2 * 16 == probe.DNS_RECORDS_MAX and probe.DNS_QUESTIONS_MAX == 1
 
 
 def _question_entries(wire_names: list[bytes]) -> bytes:
@@ -982,9 +1192,10 @@ def _question_entries(wire_names: list[bytes]) -> bytes:
     return struct.pack("!HHHHHH", 0, 0x8180, len(wire_names), 0, 0, 0) + body
 
 
-def _comparisons(wire: bytes) -> tuple[dns.message.Message, int]:
-    """The message `from_wire` reads from `wire`, and the `Name.fullcompare` calls it
-    made, counted with the profiler; the hook found is put back."""
+def _comparisons(wire: bytes, **kwargs) -> tuple[dns.message.Message | Exception, int]:
+    """The message `from_wire` reads from `wire` (or the error it raises), and the
+    `Name.fullcompare` calls it made, counted with the profiler; the hook found is put
+    back."""
     fullcompare = dns.name.Name.fullcompare.__code__
     compared = 0
 
@@ -996,57 +1207,190 @@ def _comparisons(wire: bytes) -> tuple[dns.message.Message, int]:
     previous = sys.getprofile()
     sys.setprofile(count)
     try:
-        message = dns.message.from_wire(wire)
+        message = dns.message.from_wire(wire, **kwargs)
+    except dns.exception.DNSException as exc:
+        message = exc
     finally:
         sys.setprofile(previous)
     return message, compared
 
 
-def test_the_parse_of_a_reply_the_agent_reads_is_bounded_by_its_size():
-    """What #153 buys, counted and never timed (the PR gives the times). dnspython
-    2.9.2 indexes a reply's records by keys that hold the owner name, hashed as
-    h = 9*h + byte over its labels' bytes from 0, so distinct names can hash alike and
-    their keys are compared one by one. The smallest entry a reply can carry is a
-    question at the root: its 1-byte name, its type and class, 5 bytes (a record of any
-    other section adds a TTL and RDLENGTH, 11 bytes at the least). So a message of
-    DNS_PAYLOAD bytes holds at most (DNS_PAYLOAD - 12) // 5 = 244 entries.
+# the most name comparisons dnspython's parse of a reply inside both limits can make,
+# on a 64-bit CPython whose dictionary probes as 3.13's does (spec §5.2; derived in the
+# docstring below): the keys a probe can compare more than once, and the ceiling with
+# no OPT record and with one (an OPT takes a record's place and costs one comparison)
+PROBE_EXTRA = 12
+CEILING = (probe.DNS_RECORDS_MAX - 1) * (probe.DNS_RECORDS_MAX + 2 * PROBE_EXTRA)
+CEILING_WITH_OPT = 1 + 2 * sum(PROBE_EXTRA + m for m in range(1, probe.DNS_RECORDS_MAX - 1))
 
-    No bound on the comparisons follows from that alone: 29,646, one per earlier entry
-    of 244, is an estimate, since the next test shows a record can be compared with an
-    earlier one more than once. It is kept here as a tripwire, not a proof: a reply
-    built to the limit from colliding names that passed it would send the stated
-    figures back for review.
 
-    Two replies are built to the limit. Of root entries alone, it holds exactly 244. Of
-    a name of 126 zero-byte labels, its suffixes by pointer, the root (leading zero
-    bytes leave h at 0, so all 127 hash alike) and then repeats of the root, it makes
-    more comparisons than any reply the PR measured, and stays under the estimate."""
+def _colliding_answers(count: int, h: int = 5237, tail: int = 125) -> bytes:
+    """A reply inside both limits built for the most comparisons: one question, then
+    `count` answer records at distinct owners whose names hash alike, each a 3-byte
+    label of one h = 81*a + 9*b + c (no byte an upper-case letter, which would fold
+    into another) over one shared tail of `tail` one-byte labels, spelled once and then
+    named by pointer, so that every comparison walks the whole tail."""
+    allowed = [byte for byte in range(256) if not 0x41 <= byte <= 0x5A]
+    labels = []
+    for a, b in itertools.product(allowed, allowed):
+        c = h - 81 * a - 9 * b
+        if c in allowed:
+            labels.append(bytes((a, b, c)))
+    question = b"\x011\x010\x010\x0210\x07in-addr\x04arpa\x00" + struct.pack("!HH", 12, 1)
+    body = b""
+    tail_at = None
+    for label in labels[:count]:
+        owner = bytes((len(label),)) + label
+        if tail_at is None:
+            tail_at = 12 + len(question) + len(body) + len(owner)
+            owner += b"\x01a" * tail + b"\x00"
+        else:
+            owner += struct.pack("!H", 0xC000 | tail_at)
+        body += owner + struct.pack("!HHIH", 65280, 1, 0, 0)
+    return struct.pack("!HHHHHH", 0, 0x8180, 1, count, 0, 0) + question + body
+
+
+def test_the_parse_of_a_reply_the_agent_reads_is_bounded_by_its_counts():
+    """What #160 buys, counted and never timed (the PR gives the times). dnspython
+    2.9.2 indexes a reply's records in one dictionary by keys that start with the
+    section's number and the owner name, hashed as h = 9*h + byte over its labels' bytes
+    from 0, so distinct names can hash alike and their keys are compared one by one
+    (`Name.fullcompare`, over at most 127 labels). A question is inserted once; a record
+    of another section is looked up and, when new, inserted: at most two probes. A key
+    is compared only with a stored key of the same hash, and a name only when the two
+    keys are of one section. CPython's probe (3.13's `dictobject.c`) visits slot i,
+    then 5*i + perturb + 1, perturb starting as the 64-bit hash and shifted right by 5
+    before each step. The step to the 14th visit is the first with perturb 0 for every
+    hash (for 0x8000000000000000, perturb is still 8 at the step to the 13th), and
+    from there each visit is 5*i + 1 of the last, a recurrence whose one cycle passes
+    through every slot of the table. The 13th visit is the slot just before the 14th on
+    that cycle, so the 13th and every later visit are consecutive points of it, and
+    none repeats before the probe meets an empty slot, which it does within one turn.
+    Only the first 12 visits can repeat a slot: a probe compares each of the m stored
+    keys of its hash at least once and at most PROBE_EXTRA (12) keys more, and none
+    when m is 0 (the next test holds that, as a tripwire). With one question, which
+    meets no key of its section, and at most DNS_RECORDS_MAX = 32 records, the worst
+    is every record new in one section: 2 * (12 + m) summed over m from 1 to 31,
+    which is (32 - 1) * (32 + 24) = 1,736.
+
+    The index is not the parse's only comparison of an owner name: an OPT record's is
+    compared once with the root (`_parse_special_rr_header`; a second OPT is refused
+    before that comparison). An OPT takes a record's place, so a reply with one makes
+    at most 1 + 2 * (12 + m) summed over m from 1 to 30, 1,651 (CEILING_WITH_OPT). A
+    TSIG record adds none: the lookup passes no keyring, so dnspython refuses it.
+
+    Before #160, a reply of DNS_PAYLOAD bytes could hold 244 root questions or 168
+    questions at names of zero-byte labels; neither is parsed now. The reply built for
+    the most comparisons inside both limits makes at least one per earlier key in each
+    of its probes (every key of one hash lies on the one probe sequence, before its
+    first empty slot) and stays under the ceiling."""
     most = (probe.DNS_PAYLOAD - 12) // 5
-    estimate = most * (most - 1) // 2
-    assert (most, estimate) == (244, 29_646)
-
     roots = _question_entries([b"\x00"] * most)
-    assert len(roots) == probe.DNS_PAYLOAD  # the entry count is reached exactly
-    message, compared = _comparisons(roots)
-    assert len(message.question) == most
-    assert compared == most - 1  # each repeat meets the one equal key
-
+    assert len(roots) == probe.DNS_PAYLOAD and isinstance(probe.unread(roots), probe.ReplyTooManyRecords)
     labels = 126
-    names = [b"\x01\x00" * labels + b"\x00"]  # spelled once, at offset 12
-    names += [struct.pack("!H", 0xC000 | (12 + 2 * i)) for i in range(labels - 1, 0, -1)]  # its suffixes
-    names += [b"\x00"]  # the root, last of the distinct names
-    while len(_question_entries(names + [b"\x00"])) <= probe.DNS_PAYLOAD:
-        names.append(b"\x00")
-    wire = _question_entries(names)
-    assert probe.DNS_PAYLOAD - 5 < len(wire) <= probe.DNS_PAYLOAD
-    assert len({hash(dns.name.Name((b"\x00",) * i + (b"",))) for i in range(labels + 1)}) == 1  # the premise
+    names = [b"\x01\x00" * labels + b"\x00"]
+    names += [struct.pack("!H", 0xC000 | (12 + 2 * i)) for i in range(labels - 1, 0, -1)]
+    names += [b"\x00"] * 41
+    assert len(_question_entries(names)) <= probe.DNS_PAYLOAD
+    assert isinstance(probe.unread(_question_entries(names)), probe.ReplyTooManyRecords)
+
+    assert sys.hash_info.width <= 64  # the premise of PROBE_EXTRA
+    assert (CEILING, CEILING_WITH_OPT) == (1_736, 1_651)
+    opt_alone = struct.pack("!HHHHHH", 0, 0x8180, 0, 0, 0, 1) + b"\x00" + struct.pack("!HHIH", 41, 1232, 0, 0)
+    message, compared = _comparisons(opt_alone)
+    assert message.edns == 0 and compared == 1  # the OPT's owner, with the root
+    records = probe.DNS_RECORDS_MAX
+    wire = _colliding_answers(records)
+    assert len(wire) <= probe.DNS_PAYLOAD and probe.unread(wire) is None
     message, compared = _comparisons(wire)
-    assert len(message.question) == len(names) and len({rrset.name for rrset in message.question}) == labels + 1
-    assert 13_000 < compared <= estimate  # quadratic in the entries; under the estimate, a tripwire
+    owners = [rrset.name for rrset in message.answer]
+    assert len(owners) == len(set(owners)) == records and len(owners[0]) == 127
+    assert len({hash(owner) for owner in owners}) == 1  # the premise
+    assert records * (records - 1) <= compared <= CEILING
+    assert isinstance(probe.unread(_colliding_answers(records + 1)), probe.ReplyTooManyRecords)
+
+
+class _Key:
+    """A dictionary key whose hash is chosen, and which counts its comparisons."""
+
+    compared = 0
+    __slots__ = ("hashed", "n")
+
+    def __init__(self, hashed: int, n: int):
+        self.hashed, self.n = hashed, n
+
+    def __hash__(self) -> int:
+        return self.hashed
+
+    def __eq__(self, other) -> bool:
+        _Key.compared += 1
+        return self.n == other.n
+
+
+def test_one_probe_compares_at_most_twelve_keys_more_than_it_holds_of_one_hash():
+    """The premise of the ceiling above, against the interpreter that runs the test:
+    in a dictionary that also holds another key, as dnspython's index holds the
+    question's, each of DNS_RECORDS_MAX keys of one hash is looked up and then inserted,
+    for the named hashes (0x8000000000000000, whose perturb is last to reach 0, among
+    them) and 3,000 drawn at random (seeded). Each probe compares every stored key of
+    that hash at least once and at most PROBE_EXTRA more, so one record costs at most
+    2 * (12 + m), and all of them at most CEILING.
+
+    It is a tripwire, not a proof: a change to CPython's probe that affected only
+    hashes it does not try would pass it. The ceiling rests on the argument above, for
+    the probe as 3.13 has it; when the agent's interpreter changes (the image's base
+    pin moves, or a native install runs another CPython), this test is run on the new
+    one and the argument read against its `dictobject.c` (spec §5.2; `AGENTS.md`,
+    Commands, "The agent's base image")."""
+    draw = random.Random(160)
+    named = [-(2**63), 2**63 - 1, 2**60, 2**60 - 1, 1, 0, -2]  # as size_t: 0x8000000000000000, …
+    worst = 0
+    for hashed in named + [draw.getrandbits(63) * draw.choice((1, -1)) for _ in range(3000)]:
+        index = {("question", 0): None}
+        total = 0
+        for m in range(probe.DNS_RECORDS_MAX):
+            key = _Key(-2 if hashed == -1 else hashed, m)
+            for probe_ in (lambda: index.get(key), lambda: index.__setitem__(key, None)):
+                _Key.compared = 0
+                probe_()
+                assert (m <= _Key.compared <= m + PROBE_EXTRA) if m else _Key.compared == 0
+                total += _Key.compared
+        worst = max(worst, total)
+    assert worst <= CEILING
+
+
+def _probe_slots(hashed: int, size: int, visits: int) -> list[tuple[int, int]]:
+    """The slot and the perturb each of a probe's first `visits` visits uses, by the
+    rule of CPython 3.13's `dictobject.c` (a model of it, for the argument above)."""
+    perturb = hashed % 2**64  # Py_hash_t to size_t
+    slot = perturb & (size - 1)
+    seen = [(slot, perturb)]
+    for _ in range(visits - 1):
+        perturb >>= 5
+        slot = (slot * 5 + perturb + 1) & (size - 1)
+        seen.append((slot, perturb))
+    return seen
+
+
+@pytest.mark.parametrize("size", [8, 64, 1024])
+def test_from_the_13th_visit_a_probe_visits_no_slot_twice(size):
+    """The corrected count of round 1 of #163's briefed review, on the hash it names:
+    for 0x8000000000000000 perturb is still 8 at the 13th visit and first 0 at the
+    14th, yet the 13th is the slot just before the 14th on the cycle of 5*i + 1, so the
+    13th and every visit after it, for a whole turn of the table, are distinct."""
+    hashed = -(2**63)
+    slots = _probe_slots(hashed, size, PROBE_EXTRA + size)
+    assert [perturb for _, perturb in slots[12:14]] == [8, 0]
+    assert slots[13][0] == (5 * slots[12][0] + 1) % size
+    later = [slot for slot, _ in slots[PROBE_EXTRA:]]
+    assert len(later) == size and len(set(later)) == size
+    for hashed in (2**63 - 1, 2**60, 1, 0):
+        later = [slot for slot, _ in _probe_slots(hashed, size, PROBE_EXTRA + size)[PROBE_EXTRA:]]
+        assert len(set(later)) == size
 
 
 def test_two_answer_records_whose_owners_hash_alike_can_be_compared_more_than_once():
-    """Why the figure above is an estimate (round 1 of the briefed review of PR #155):
+    """Why the ceiling carries PROBE_EXTRA (round 1 of the briefed review of PR #155):
     each record of the answer section is looked up in dnspython's index and then
     inserted, two dictionary probes, and one probe can meet the same colliding key more
     than once. Two answer records at distinct owners of one h (two-letter labels whose
@@ -1070,6 +1414,25 @@ def test_two_answer_records_whose_owners_hash_alike_can_be_compared_more_than_on
         counts.append(compared)
     assert min(counts) >= 2  # a lookup and an insertion
     assert max(counts) > 2  # and a probe that compared one key twice
+    assert max(counts) <= 2 * (1 + PROBE_EXTRA)  # and within the ceiling's term
+
+
+def test_a_header_that_understates_its_records_is_parsed_only_as_far_as_its_counts():
+    """The header's counts are the sender's claim (#160). dnspython reads by them, so a
+    reply that holds more records than it claims is parsed only as far as the counts,
+    and its remaining bytes are refused (`ignore_trailing` off, as the lookup sets it):
+    a header that claims one answer before 60 records whose owners hash alike makes no
+    comparison, and the reply is not used. One that claims more than it holds runs out
+    and is refused as malformed."""
+    wire = _colliding_answers(60, tail=40)
+    assert len(wire) <= probe.DNS_PAYLOAD
+    claimed_one = wire[:6] + struct.pack("!H", 1) + wire[8:]
+    assert probe.unread(claimed_one) is None
+    message, compared = _comparisons(claimed_one, ignore_trailing=False)
+    assert isinstance(message, dns.message.TrailingJunk) and compared == 0
+    claims_more = _colliding_answers(10)[:-11]  # the tenth record cut off
+    message, _ = _comparisons(claims_more, ignore_trailing=False)
+    assert isinstance(message, dns.exception.FormError)
 
 
 # --- no server to ask is not a completed lookup (#78) ---
