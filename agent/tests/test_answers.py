@@ -7,7 +7,9 @@ import asyncio
 import io
 import json
 import logging
+import sys
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -323,23 +325,35 @@ async def _serving(head: bytes, body_chunks):
     return server, server.sockets[0].getsockname()[1], seen
 
 
-async def _peak_during(coro) -> tuple[object, int]:
-    import tracemalloc
+ANSWER_MEMORY = Path(__file__).with_name("answer_memory.py")
 
-    tracemalloc.start()
+
+async def _held(*args: str) -> dict:
+    """What the agent's client held of one check-in at its peak, as `answer_memory.py`
+    measures it in a fresh interpreter (`python -I`): its peak in bytes above where
+    tracing began, and the answer's kind, status and message.
+
+    Not measured in this process (#156): here the figure would also count the test's
+    own server, garbage from earlier tests, and the interpreter's interned-string
+    table, which pytest's import hook makes rebuild (1.9 or 3.8 MB, counted in full)
+    at a point that moves with the text of every collected test module."""
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-I", str(ANSWER_MEMORY), *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
     try:
-        tracemalloc.reset_peak()
-        base = tracemalloc.get_traced_memory()[0]
-        result = await coro
-        peak = tracemalloc.get_traced_memory()[1] - base
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=60)
     finally:
-        tracemalloc.stop()
-    return result, peak
+        # a timed-out or cancelled wait leaves no child behind the test
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+    assert proc.returncode == 0, err.decode(errors="replace")
+    return json.loads(out)
 
 
-async def test_a_compressed_answer_is_refused_undecoded():
-    """32 KiB of gzip that would decode to 32 MiB: the agent asks for identity, refuses
-    the encoding, and never holds more than a fraction of the cap."""
+def _compressed_server():
+    """32 KiB of gzip that would decode to 32 MiB, declared with its length."""
     import gzip
 
     payload = gzip.compress(b'{"data": {"checkin_interval_s": 60, "jobs": [' + b" " * (32 * 1024 * 1024) + b"]}}")
@@ -348,38 +362,61 @@ async def test_a_compressed_answer_is_refused_undecoded():
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\n"
         + f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode()
     )
-    server, port, seen = await _serving(head, lambda: [payload])
+    return _serving(head, lambda: [payload])
+
+
+def _plain_server():
+    """32 MiB of JSON whitespace with no declared length, streamed in 64 KiB writes."""
+    chunk = b" " * 65536
+    head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+    return _serving(head, lambda: (chunk for _ in range(512)))
+
+
+async def test_a_compressed_answer_is_refused_undecoded():
+    """32 KiB of gzip that would decode to 32 MiB: the agent asks for identity, refuses
+    the encoding, and never holds more than a fraction of the cap (measured: about
+    0.3 MB, below RESPONSE_MAX by more than half of it)."""
+    server, port, seen = await _compressed_server()
     async with server:
-        async with make_http(f"http://127.0.0.1:{port}", TOKEN) as http:
-            answer, peak = await _peak_during(AgentClient(http).checkin({}))
-    assert peak < RESPONSE_MAX, f"held {peak} bytes"
-    assert answer.kind is Kind.RETRY and "content encoding" in answer.message
-    assert b"accept-encoding: identity" in seen[0].lower()
+        held = await _held("network", f"http://127.0.0.1:{port}", "agent")
+    assert held["peak"] < RESPONSE_MAX, f"held {held['peak']} bytes"
+    assert held["kind"] == "RETRY" and "content encoding" in held["message"]
+    assert seen and all(b"accept-encoding: identity" in request.lower() for request in seen)
 
 
 async def test_a_plain_answer_far_over_the_cap_never_fills_memory():
     """32 MiB with no declared length, streamed: reads stop at the cap, and what is
-    held never passes it by more than one network read."""
-    chunk = b" " * 65536
-    head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
-    server, port, _ = await _serving(head, lambda: (chunk for _ in range(512)))
+    held past it is what the network reads hold on the way to the buffer.
+
+    The limit is 2 * RESPONSE_MAX (2.10 MB). What the agent holds at its peak is the
+    buffer, at most RESPONSE_MAX with the bytearray's growth room of an eighth
+    (1.18 MB), and what the reads below it hold on the way: asyncio reads up to
+    256 KiB at a time, anyio splits each read into 64 KiB pieces, and httpcore and h11
+    copy each piece through their own buffers. Measured in Python 3.13, in the
+    interpreter `answer_memory.py` runs: 1.47 MB on Linux and 1.57 to 1.87 MB on
+    macOS, the largest made of the buffer (1.18 MB), anyio's pieces (0.26 MB) and the
+    copies above them (0.26 MB). A client holding a second copy of the cap is over the
+    limit, at 2.7 MB (`test_the_measurement_sees_a_client_that_holds_too_much`)."""
+    server, port, _ = await _plain_server()
     async with server:
-        async with make_http(f"http://127.0.0.1:{port}", TOKEN) as http:
-            answer, peak = await _peak_during(AgentClient(http).checkin({}))
-    assert peak < 2 * RESPONSE_MAX, f"held {peak} bytes"
-    assert answer.kind is Kind.RETRY and str(RESPONSE_MAX) in answer.message
+        held = await _held("network", f"http://127.0.0.1:{port}", "agent")
+    assert held["peak"] < 2 * RESPONSE_MAX, f"held {held['peak']} bytes"
+    assert held["kind"] == "RETRY" and held["status"] == 200 and str(RESPONSE_MAX) in held["message"]
 
 
-class Chunks(httpx.AsyncByteStream):
-    """Raw chunks allocated before tracing starts, so what is measured is only what
-    the agent holds of them."""
-
-    def __init__(self, chunks):
-        self.chunks = chunks
-
-    async def __aiter__(self):
-        for chunk in self.chunks:
-            yield chunk
+@pytest.mark.parametrize(
+    "serve, reader, limit",
+    [(_plain_server, "twice-the-cap", 2 * RESPONSE_MAX), (_compressed_server, "decodes", RESPONSE_MAX)],
+    ids=["twice the cap", "decoded before the cap"],
+)
+async def test_the_measurement_sees_a_client_that_holds_too_much(serve, reader, limit):
+    """The two tests above are not passed by a measurement that sees nothing: with the
+    client's body reader replaced by one whose cap is twice the agent's, or one that
+    decodes before it caps, the same measurement is over each test's limit."""
+    server, port, _ = await serve()
+    async with server:
+        held = await _held("network", f"http://127.0.0.1:{port}", reader)
+    assert held["peak"] > limit, f"held only {held['peak']} bytes"
 
 
 @pytest.mark.parametrize(
@@ -390,9 +427,9 @@ class Chunks(httpx.AsyncByteStream):
 async def test_a_raw_chunk_is_checked_before_it_is_appended(sizes):
     """The buffer never passes RESPONSE_MAX: a chunk that would take it past is not
     appended (briefed review round 3 of PR #70; real network reads are at most 64 KiB,
-    so only a transport that hands over larger chunks shows the order of the check)."""
-    chunks = [b"x" * n for n in sizes]
-    client = _client(lambda request: httpx.Response(200, stream=Chunks(chunks)))
-    answer, peak = await _peak_during(client.checkin({}))
-    assert peak < RESPONSE_MAX, f"held {peak} bytes"
-    assert answer.kind is Kind.RETRY and str(RESPONSE_MAX) in answer.message
+    so only a transport that hands over larger chunks shows the order of the check).
+    The chunks are allocated before tracing starts, so what is measured is only what
+    the agent holds of them."""
+    held = await _held("chunks", ",".join(str(n) for n in sizes))
+    assert held["peak"] < RESPONSE_MAX, f"held {held['peak']} bytes"
+    assert held["kind"] == "RETRY" and str(RESPONSE_MAX) in held["message"]
