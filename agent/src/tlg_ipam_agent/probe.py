@@ -234,6 +234,20 @@ RESOLV_CONF_TIMEOUT_S = 1.0
 RESOLV_CONF_MAX = 64 * 1024
 # the error of a job whose PTR lookups had no server to ask (spec §5.2): fixed text
 NO_DNS_SERVER = "rdns not run: the agent has no DNS server to ask (the job names none, and the host's resolv.conf lists none it can use)"
+# the UDP payload a PTR query advertises (EDNS(0), RFC 6891 §6.2.5), and the largest
+# reply the agent reads (#153). 1232 bytes is the size DNS Flag Day 2020 settled on to
+# keep a reply out of IP fragments; the largest ordinary PTR answer measured (a
+# 253-character name behind two CNAMEs of RFC 2317 delegation, for an IPv6 address,
+# with four name servers and their addresses beside it) is 710 bytes. A server that
+# honours EDNS truncates a longer answer instead, and a truncated reply is not used:
+# a larger datagram is one the agent did not ask for.
+DNS_PAYLOAD = 1232
+
+
+class ReplyTooLarge(dns.exception.DNSException):
+    """A datagram from the query's server longer than DNS_PAYLOAD: it is not parsed
+    (#153). The attempt ends as one that got no usable answer: the query was sent, and
+    the next configured server is asked."""
 
 
 class QuerySocket(asyncio.DatagramProtocol):
@@ -251,12 +265,27 @@ class QuerySocket(asyncio.DatagramProtocol):
     with it, and the send fails, so the query counts as not sent. `close` aborts the
     transport as well: nothing of a lookup's leaves after it. A send the kernel refuses
     (no route, say) is reported by asyncio to `error_received`, and `recvfrom` raises
-    it, as dnspython's own socket does."""
+    it, as dnspython's own socket does.
+
+    No datagram longer than DNS_PAYLOAD, the payload the query advertised, reaches
+    dnspython (#153): `dns.asyncquery.receive_udp` hands every datagram `recvfrom`
+    returns from the server's address and port straight to `dns.message.from_wire`,
+    whose cost grows with the square of a reply's records when their names hash alike
+    (dnspython 2.9.2 hashes a name by arithmetic that distinct names share), and the
+    parse holds the event loop until it ends. One from the address and port the query
+    went to (`_from_server`) is answered with ReplyTooLarge, which `recvfrom` raises
+    and dnspython passes on unparsed, so the attempt ends at once and the next server
+    is asked. Whatever its id: one from there with the wrong id ends the attempt too,
+    once parsed (a bad response), so no sender gains anything it did not have. One from
+    anywhere else is dropped, as dnspython would ignore it (`ignore_unexpected`): no
+    other sender can end the attempt, at any size."""
 
     def __init__(self, family: int):
         self.family = family
         self._transport: asyncio.DatagramTransport | None = None
         self._received: asyncio.Queue = asyncio.Queue()
+        # where the query went (dnspython's address tuple), once it has gone
+        self._destination: tuple | None = None
 
     @classmethod
     async def made(cls, family: int) -> "QuerySocket":
@@ -268,7 +297,26 @@ class QuerySocket(asyncio.DatagramProtocol):
         self._transport = transport
 
     def datagram_received(self, data: bytes, addr) -> None:
+        if len(data) > DNS_PAYLOAD:
+            if self._from_server(addr):
+                self._received.put_nowait(ReplyTooLarge(f"a {len(data)}-byte reply, over {DNS_PAYLOAD}"))
+            return
         self._received.put_nowait((data, addr))
+
+    def _from_server(self, addr) -> bool:
+        """Whether a datagram came from the address and port the query was sent to,
+        judged as strictly as dnspython judges it (`dns.query._addresses_equal`: the
+        address as a value, not as text, and the rest of the tuple equal), or more
+        strictly: a source dnspython would take from a multicast destination, or a
+        scoped IPv6 address, is not the server here, so its over-size datagram is
+        dropped rather than ending the attempt."""
+        if self._destination is None or not isinstance(addr, tuple) or len(addr) < 2:
+            return False
+        try:
+            same = ipaddress.ip_address(addr[0]) == ipaddress.ip_address(self._destination[0])
+        except (TypeError, ValueError):
+            return False
+        return same and tuple(addr[1:]) == tuple(self._destination[1:])
 
     def error_received(self, exc: Exception) -> None:
         self._received.put_nowait(exc)
@@ -278,6 +326,7 @@ class QuerySocket(asyncio.DatagramProtocol):
 
     async def sendto(self, what: bytes, destination, timeout) -> int:
         """Hands the query to the kernel now, or raises: it is never kept for later."""
+        self._destination = tuple(destination)
         self._transport.sendto(what, destination)
         if self._transport.get_write_buffer_size():
             # the socket could not take it, and the transport kept it: it goes with
@@ -455,9 +504,11 @@ class DnsResolver:
     failover, retransmission and TCP fallback would put datagrams on the wire that the
     packet budget never saw. Here a lookup is one UDP query per server, to at most
     MAX_DNS_SERVERS servers in turn, with no retransmission and no TCP; a truncated
-    reply is not used. Before each query it awaits `slot()`, which takes one packet
-    from the budget (`MAX_PPS`, shared with the ICMP and ARP sweeps) and returns the
-    seconds the lookup has left; the query goes on its own `QuerySocket`, made first.
+    reply is not used, nor one longer than the DNS_PAYLOAD bytes the query advertised,
+    which is not parsed either. Before each query it awaits `slot()`, which takes one
+    packet from the budget (`MAX_PPS`, shared with the ICMP and ARP sweeps) and returns
+    the seconds the lookup has left; the query goes on its own `QuerySocket`, made
+    first.
 
     A lookup that could not be made is not a lookup that found no name: with no server
     to ask, or when every attempt failed before the query went out (until the servers
@@ -538,8 +589,8 @@ class DnsResolver:
         no server asked gave a usable answer (silence, SERVFAIL, REFUSED, another rcode,
         a referral, a CNAME the reply leaves unresolved, a PTR record at an owner the
         question does not reach, an SOA for a zone that does not hold the name, a
-        truncated, malformed or mismatched reply), or when the lookup's
-        time ran out after a query was sent (or before its first attempt, which only
+        truncated, malformed or mismatched reply, a reply longer than DNS_PAYLOAD, which
+        is not parsed), or when the lookup's time ran out after a query was sent (or before its first attempt, which only
         the job's deadline does). Raises ProbeError when there is no server to ask, or
         when no query was sent before the servers or the lookup's time ran out."""
         if not servers:
@@ -570,13 +621,14 @@ class DnsResolver:
                         raise ProbeError(no_query_sent(unsent))
                     return None
                 # A fresh query, so a fresh id, for every datagram. It carries EDNS(0)
-                # advertising a 1232-byte UDP payload, so a resolver can send a PTR
-                # answer whole instead of truncating it (a truncated reply is not used);
-                # without EDNS a plain query allows only 512 bytes. Recursion desired,
-                # no DNSSEC. The advertised payload is not a limit on what is read:
-                # dnspython receives up to 65,535 bytes.
+                # advertising a DNS_PAYLOAD (1232-byte) UDP payload, so a resolver can
+                # send a PTR answer whole instead of truncating it (a truncated reply
+                # is not used); without EDNS a plain query allows only 512 bytes.
+                # Recursion desired, no DNSSEC. The advertised payload is also the
+                # most the agent reads: a longer reply from the server is not parsed
+                # (QuerySocket, #153), and the next server is asked.
                 query = dns.message.make_query(
-                    name, dns.rdatatype.PTR, use_edns=0, payload=1232, want_dnssec=False,
+                    name, dns.rdatatype.PTR, use_edns=0, payload=DNS_PAYLOAD, want_dnssec=False,
                     flags=dns.flags.RD,
                 )
                 try:
@@ -598,9 +650,9 @@ class DnsResolver:
                         ignore_trailing=False,
                     )
                 except (dns.exception.DNSException, TimeoutError):
-                    # no answer in time, a truncated or broken one: the query was sent,
-                    # and the next server is asked. (TimeoutError is an OSError: caught
-                    # first.)
+                    # no answer in time, a truncated, broken or over-size one
+                    # (ReplyTooLarge): the query was sent, and the next server is
+                    # asked. (TimeoutError is an OSError: caught first.)
                     asked = True
                     continue
                 except (OSError, ValueError) as exc:
