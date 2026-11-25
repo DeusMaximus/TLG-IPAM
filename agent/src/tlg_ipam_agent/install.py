@@ -284,8 +284,24 @@ def service_trust(ca_file: str | None) -> dict[str, str]:
     """The trust settings the unit's agent is given, through agent.env, and so the only
     ones the exchange is made with (the round-2 review of #130: an exchange that trusted
     what root's environment named, and a unit given nothing, spent the token on an agent
-    that could not verify its server). A unit inherits nothing of root's environment."""
+    that could not verify its server). A unit inherits nothing of root's environment,
+    and the unit discards what the system manager's own environment would add
+    (`discarded_trust`)."""
     return {"SSL_CERT_FILE": ca_file} if ca_file is not None else {}
+
+
+def discarded_trust(ca_file: str | None) -> tuple[str, ...]:
+    """The trust settings the unit unsets (`UnsetEnvironment=`): every one that
+    `service_trust` does not give it. A unit also receives the system manager's
+    environment (`systemctl set-environment`, `DefaultEnvironment=`), which the
+    installer never sees (#138: a manager's `SSL_CERT_FILE` made a unit installed
+    without `--ca-file` fail verification after the token was spent). systemd applies
+    `UnsetEnvironment=` after the manager's environment, `Environment=` and
+    `EnvironmentFile=`, whatever the order of the lines, so a name it lists reaches the
+    agent from nowhere; and agent.env's `SSL_CERT_FILE` overrides the manager's, so it
+    is not listed when `--ca-file` sets it."""
+    given = service_trust(ca_file)
+    return tuple(name for name in TRUST_VARIABLES if name not in given)
 
 
 def inherited_trust(environ, ca_file: str | None) -> str | None:
@@ -314,12 +330,14 @@ def render_env(url: str, allowed, max_pps: int | None, ca_file: str | None, toke
     return "\n".join(lines) + "\n"
 
 
-def render_unit(env_path: str, interpreter: str) -> str:
+def render_unit(env_path: str, interpreter: str, ca_file: str | None) -> str:
     """The unit. It runs the agent as the service user with CAP_NET_RAW as its one
-    capability, for the raw ICMP and ARP sockets. Namespace-based sandboxing
-    (`ProtectSystem=` and the like) is left out: the unit is meant for an LXC as well,
-    where those can stop it from starting; add them in a drop-in where they work."""
+    capability, for the raw ICMP and ARP sockets, and with no trust setting but
+    agent.env's (`discarded_trust`). Namespace-based sandboxing (`ProtectSystem=` and
+    the like) is left out: the unit is meant for an LXC as well, where those can stop
+    it from starting; add them in a drop-in where they work."""
     _plain(interpreter, "the agent's interpreter path")
+    discarded = " ".join(discarded_trust(ca_file))
     return f"""# Written by `tlg-ipam-agent install`; `tlg-ipam-agent uninstall` removes it.
 [Unit]
 Description=TLG-IPAM scan agent
@@ -331,6 +349,8 @@ Type=exec
 User={SERVICE_USER}
 Group={SERVICE_USER}
 EnvironmentFile={env_path}
+# Trust only what agent.env gives: drop what the system manager's environment adds.
+UnsetEnvironment={discarded}
 ExecStart={interpreter} -m tlg_ipam_agent
 AmbientCapabilities=CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_RAW
@@ -505,7 +525,7 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out, envir
         token = config.parse_token(token, "--enrol-token", config.ENROL_TOKEN_PREFIX)
         secret(token)
     env = render_env(url, allowed, max_pps, ca_file, paths.token)
-    unit = render_unit(paths.env, interpreter)
+    unit = render_unit(paths.env, interpreter, ca_file)
 
     stored = enrol.stored_token(paths.state)
     if stored is not None and token is not None:

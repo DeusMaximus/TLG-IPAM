@@ -6,6 +6,8 @@ import { ApiError } from '../api/client'
 import * as ipam from '../api/ipam'
 import { ToastProvider } from '../context'
 import AddAgentModal from '../components/AddAgentModal'
+import ReEnrolModal from '../components/ReEnrolModal'
+import UpdateModal from '../components/UpdateModal'
 import Agents from './Agents'
 
 vi.mock('../api/ipam', () => ({
@@ -291,12 +293,45 @@ describe('Agents page', () => {
     expect(ipam.createAgent).toHaveBeenCalledTimes(1)
   })
 
+  const PLAIN_HTTP = { protocol: 'http:', hostname: '10.0.0.2', origin: 'http://10.0.0.2:8080' }
+
+  it('says before the agent is created that the page is on plain http, and still creates it', async () => {
+    const user = userEvent.setup()
+    ipam.createAgent.mockResolvedValue(created())
+    render(
+      <AddAgentModal serverVersion="0.2.0" onClose={vi.fn()} onCreated={vi.fn()} location={PLAIN_HTTP} />
+    )
+    // before anything is sent: the token will cross in clear, and the agent needs https
+    const before = screen.getByTestId('agent-plain-http-before')
+    expect(before).toHaveTextContent('served over plain HTTP')
+    expect(before).toHaveTextContent('reaches this browser across the network in clear')
+    expect(before).toHaveTextContent("The agent will need the server's HTTPS address")
+    expect(screen.queryByTestId('agent-needs-https')).toBeNull()
+    expect(ipam.createAgent).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Create agent' })).toBeEnabled()
+
+    await user.type(screen.getByLabelText('Name'), 'lab-vlan20')
+    await user.click(screen.getByRole('button', { name: 'Create agent' }))
+    expect(ipam.createAgent).toHaveBeenCalledWith({ name: 'lab-vlan20' })
+    expect(await screen.findByTestId('agent-token')).toHaveTextContent(ENROL_TOKEN)
+
+    // after: what has crossed (the enrolment token) and what has not (the agent token)
+    expect(screen.queryByTestId('agent-plain-http-before')).toBeNull()
+    const after = screen.getByTestId('agent-needs-https')
+    expect(after).toHaveTextContent('the enrolment token above has already crossed the network in clear')
+    expect(after).toHaveTextContent(
+      'The agent token, which the exchange returns, crosses in clear only if the exchange is made over plain HTTP'
+    )
+    // and what to do if someone else made the exchange first
+    expect(after).toHaveTextContent("revoke this agent's token, then re-enrol it")
+    expect(after).not.toHaveTextContent('would carry')
+  })
+
   it('never builds a command that sends a token over plain http across a network', async () => {
     const user = userEvent.setup()
     ipam.createAgent.mockResolvedValue(created())
-    const location = { protocol: 'http:', hostname: '10.0.0.2', origin: 'http://10.0.0.2:8080' }
     render(
-      <AddAgentModal serverVersion="0.2.0" onClose={vi.fn()} onCreated={vi.fn()} location={location} />
+      <AddAgentModal serverVersion="0.2.0" onClose={vi.fn()} onCreated={vi.fn()} location={PLAIN_HTTP} />
     )
     await user.type(screen.getByLabelText('Name'), 'lab-vlan20')
     await user.click(screen.getByRole('button', { name: 'Create agent' }))
@@ -307,6 +342,29 @@ describe('Agents page', () => {
     const systemd = screen.getByTestId('agent-systemd-commands').textContent
     expect(systemd).toContain("--url 'https://<server>' --enrol-token -")
     for (const text of [command, systemd]) expect(text).not.toContain('http://10.0.0.2')
+  })
+
+  it.each([
+    ['https', { protocol: 'https:', hostname: 'ipam.home.arpa', origin: 'https://ipam.home.arpa' }],
+    ['https on a private address', { protocol: 'https:', hostname: '10.0.0.2', origin: 'https://10.0.0.2' }],
+    ['http on localhost', { protocol: 'http:', hostname: 'localhost', origin: 'http://localhost:5173' }],
+    ['http on 127.0.0.1', { protocol: 'http:', hostname: '127.0.0.1', origin: 'http://127.0.0.1:8080' }],
+    ['http on [::1]', { protocol: 'http:', hostname: '[::1]', origin: 'http://[::1]:8080' }],
+  ])('warns at neither step over %s', async (_, location) => {
+    const user = userEvent.setup()
+    ipam.createAgent.mockResolvedValue(created())
+    render(
+      <AddAgentModal serverVersion="0.2.0" onClose={vi.fn()} onCreated={vi.fn()} location={location} />
+    )
+    expect(screen.queryByTestId('agent-plain-http-before')).toBeNull()
+    await user.type(screen.getByLabelText('Name'), 'lab-vlan20')
+    await user.click(screen.getByRole('button', { name: 'Create agent' }))
+    expect(await screen.findByTestId('agent-token')).toHaveTextContent(ENROL_TOKEN)
+    expect(screen.queryByTestId('agent-needs-https')).toBeNull()
+    expect(screen.queryByTestId('agent-plain-http-before')).toBeNull()
+    // the page's own origin, shell-quoted where it needs it ([::1])
+    expect(screen.getByTestId('agent-command').textContent).toContain(location.origin)
+    expect(screen.getByTestId('agent-command').textContent).not.toContain('<server>')
   })
 
   it('pins nothing to a guess when the server version is unknown', async () => {
@@ -532,6 +590,44 @@ describe('Agents page', () => {
     expect(screen.queryByTestId('agent-token')).toBeNull()
   })
 
+  it('says before a re-enrol issues its token that the page is on plain http, and still issues it', async () => {
+    const user = userEvent.setup()
+    ipam.reEnrolAgent.mockResolvedValue({
+      data: { ...agentRow(), enrol_token: ENROL_TOKEN, enrol_token_expires_at: EXPIRES },
+    })
+    render(
+      <ReEnrolModal
+        agent={agentRow()}
+        serverVersion="0.2.0"
+        onClose={vi.fn()}
+        onIssued={vi.fn()}
+        location={PLAIN_HTTP}
+      />
+    )
+    expect(screen.getByTestId('agent-plain-http-before')).toHaveTextContent(
+      'reaches this browser across the network in clear'
+    )
+    expect(ipam.reEnrolAgent).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Issue a new enrolment token' }))
+    expect(await screen.findByTestId('agent-token')).toHaveTextContent(ENROL_TOKEN)
+    expect(screen.queryByTestId('agent-plain-http-before')).toBeNull()
+    expect(screen.getByTestId('agent-needs-https')).toHaveTextContent('has already crossed the network in clear')
+  })
+
+  it('warns at neither re-enrol step on a loopback page', async () => {
+    const user = userEvent.setup()
+    ipam.reEnrolAgent.mockResolvedValue({
+      data: { ...agentRow(), enrol_token: ENROL_TOKEN, enrol_token_expires_at: EXPIRES },
+    })
+    renderPage()
+    const row = await screen.findByTestId('agent-agent-1')
+    await user.click(within(row).getByRole('button', { name: /Re-enrol/ }))
+    expect(screen.queryByTestId('agent-plain-http-before')).toBeNull()
+    await user.click(screen.getByRole('button', { name: 'Issue a new enrolment token' }))
+    expect(await screen.findByTestId('agent-token')).toHaveTextContent(ENROL_TOKEN)
+    expect(screen.queryByTestId('agent-needs-https')).toBeNull()
+  })
+
   // --- Version flags ---
 
   it('flags an agent older than the server, with the update command', async () => {
@@ -563,6 +659,15 @@ describe('Agents page', () => {
       'sudo /opt/tlg-ipam-agent/bin/pip install https://github.com/DeusMaximus/TLG-IPAM/releases/download/v0.2.0/tlg_ipam_agent-0.2.0-py3-none-any.whl',
       `sudo /opt/tlg-ipam-agent/bin/tlg-ipam-agent install --url ${window.location.origin}`,
     ])
+  })
+
+  it('says on plain http that the update commands need the https address, and names no token', () => {
+    const agent = agentRow({ version: '0.1.0', update_available: true })
+    render(<UpdateModal agent={agent} serverVersion="0.2.0" onClose={vi.fn()} location={PLAIN_HTTP} />)
+    const warning = screen.getByTestId('agent-needs-https')
+    expect(warning).toHaveTextContent("put the server's HTTPS address in its place")
+    expect(warning).not.toHaveTextContent(/token/i)
+    expect(screen.getByTestId('agent-update-command').textContent).not.toContain('http://10.0.0.2')
   })
 
   it('does not flag an agent the server does not flag', async () => {

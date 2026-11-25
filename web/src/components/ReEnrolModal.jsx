@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { reEnrolAgent } from '../api/ipam'
 import { parseServerTime } from '../utils/time'
-import EnrolmentSteps from './EnrolmentSteps'
+import EnrolmentSteps, { PlainHttpBeforeIssue, serverUrlFor } from './EnrolmentSteps'
 import Modal, { primaryBtn, secondaryBtn } from './Modal'
 
 // Re-enrol (spec §5.6): a new enrolment token for an existing agent, which keeps its
@@ -9,7 +9,9 @@ import Modal, { primaryBtn, secondaryBtn } from './Modal'
 // the agent still holds unexchanged; then the guided install with the new token, and
 // the commands that remove the old agent token from a host that still holds it. As in
 // AddAgentModal, the token lives only in this component's state, and no path closes the
-// dialog while the request is in flight or (by a stray backdrop click) once it answers.
+// dialog while the request is in flight or (by a stray backdrop click) once it answers,
+// and on a page served over plain http across a network the confirmation says the new
+// token will cross in clear, as Add agent's form does.
 export default function ReEnrolModal({
   agent,
   serverVersion,
@@ -73,6 +75,7 @@ export default function ReEnrolModal({
           running. An enrolment token it has not exchanged yet is revoked now.
         </p>
       </div>
+      {!serverUrlFor(location).secure && <PlainHttpBeforeIssue />}
       {error && (
         <p role="alert" className="mt-2 text-xs text-red-400">
           {error}

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { createAgent } from '../api/ipam'
 import { parseServerTime } from '../utils/time'
-import EnrolmentSteps from './EnrolmentSteps'
+import EnrolmentSteps, { PlainHttpBeforeIssue, serverUrlFor } from './EnrolmentSteps'
 import Modal, { inputCls, labelCls, primaryBtn, secondaryBtn } from './Modal'
 
 const NAME_MAX = 74
@@ -12,7 +12,9 @@ const NAME_MAX = 74
 // (whose responses never carry a token), and closing unmounts the dialog, so nothing
 // on the page can show the token again. While the create request is in flight no path
 // closes the dialog either: the agent may already exist, and its response is the only
-// place its token will ever appear.
+// place its token will ever appear. On a page served over plain http across a network,
+// the form says before the agent is created that its token will cross in clear, and
+// still creates it (spec §5.6).
 // `location` is the page's own (`window.location`); a test passes another.
 export default function AddAgentModal({
   serverVersion,
@@ -88,6 +90,7 @@ export default function AddAgentModal({
           Up to {NAME_MAX} characters, unique. Its enrolment token is shown once, on the next
           step.
         </p>
+        {!serverUrlFor(location).secure && <PlainHttpBeforeIssue />}
         {error && (
           <p role="alert" className="mt-2 text-xs text-red-400">
             {error}
