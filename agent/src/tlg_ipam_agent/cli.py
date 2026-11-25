@@ -182,6 +182,11 @@ def _parser() -> argparse.ArgumentParser:
         "stored (an update)",
     )
     setup.add_argument("--allowed-cidrs", metavar="CIDRS", help="ALLOWED_CIDRS for the agent")
+    setup.add_argument(
+        "--allowed-dns-servers",
+        metavar="CIDRS",
+        help="ALLOWED_DNS_SERVERS for the agent; left out, the value agent.env holds is kept",
+    )
     setup.add_argument("--max-pps", metavar="N", help="MAX_PPS for the agent")
     setup.add_argument(
         "--ca-file",
@@ -235,6 +240,7 @@ def main(argv: list[str] | None = None) -> int:
                 url=args.url,
                 enrol_token=args.enrol_token,
                 allowed_cidrs=args.allowed_cidrs,
+                allowed_dns_servers=args.allowed_dns_servers,
                 max_pps=args.max_pps,
                 ca_file=args.ca_file,
             ),

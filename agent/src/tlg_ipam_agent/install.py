@@ -28,7 +28,9 @@ is taken back.
 
 Run again without `--enrol-token`, `install` keeps the stored token and rewrites the
 settings and the unit (an update: install the new release into the same environment,
-then run it). With a token already stored, `--enrol-token` is refused: `uninstall`
+then run it). Every setting is the run's own options but `ALLOWED_DNS_SERVERS`, which a
+run without `--allowed-dns-servers` keeps as agent.env holds it (`kept_allowed_dns`,
+#179). With a token already stored, `--enrol-token` is refused: `uninstall`
 first, then enrol again.
 
 `uninstall` stops and disables the unit and removes everything `install` created: the
@@ -125,6 +127,8 @@ class Options:
     # as given: "-" for standard input, or None; any other value is refused
     enrol_token: str | None = None
     allowed_cidrs: str | None = None
+    # None keeps the value agent.env holds (`kept_allowed_dns`, #179)
+    allowed_dns_servers: str | None = None
     max_pps: str | None = None
     ca_file: str | None = None
 
@@ -400,7 +404,75 @@ def inherited_trust(environ, ca_file: str | None) -> str | None:
     return None
 
 
-def render_env(url: str, allowed, max_pps: int | None, ca_file: str | None, token_path: str) -> str:
+# a line of agent.env `kept_allowed_dns` reads as an assignment: an unquoted name, `=`,
+# and a value of `_PLAIN` characters
+_ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(" + _PLAIN.pattern + r")")
+# what any line may hold: printable ASCII, no backslash
+_PRINTABLE = re.compile(r"[\x20-\x5b\x5d-\x7e]*")
+
+
+def env_assignments(text: str, env_path: str) -> list[tuple[str, str]]:
+    """The assignments of an agent.env, in order, when the whole file is in the grammar
+    `install` writes; otherwise InstallError, before any assignment is read (round 1
+    of the briefed review of #179). systemd's `EnvironmentFile=` grammar is wider:
+    quoted values run across lines, a backslash continues a value onto the next line,
+    and `\r` ends one. Read line by line, a file using any of it can hold a line that
+    looks like an assignment and is not one to systemd (`OTHER="a` … `b"`), or hide
+    one systemd reads. So every line, unrelated ones included, is split at `\n`
+    alone, may end in one `\r` (a CRLF file), and must be printable ASCII with no
+    backslash, and then either empty, a comment (`#` or `;` first), or
+    `NAME=<plain value>` (`_PLAIN`, as `install` writes values). Everything `install`
+    writes is in it. The refusal names the line by its number, never its content."""
+    assignments = []
+    for number, line in enumerate(text.split("\n"), 1):
+        line = line.removesuffix("\r")
+        if _PRINTABLE.fullmatch(line):
+            if line == "" or line.startswith(("#", ";")):
+                continue
+            if found := _ASSIGNMENT.fullmatch(line):
+                assignments.append((found[1], found[2]))
+                continue
+        raise InstallError(
+            f"line {number} of {env_path} is in a form install does not read back (it reads "
+            "only unquoted NAME=value lines of plain characters, comments and empty lines), "
+            "so the ALLOWED_DNS_SERVERS in it could not be kept; give --allowed-dns-servers, "
+            "or rewrite or remove that line"
+        )
+    return assignments
+
+
+def kept_allowed_dns(env_path: str):
+    """The `ALLOWED_DNS_SERVERS` agent.env holds, for a run without
+    `--allowed-dns-servers` (#179), as `config.parse_allowed_dns` reads it: None when
+    there is no agent.env or it sets none.
+
+    Kept, unlike `--allowed-cidrs`, which a run without it drops back to the default:
+    that default is the private ranges, while this setting's absence is "any server",
+    so dropping it on an update copied from the Agents page would widen what the agent
+    may ask without a word. To remove it, delete its line from agent.env.
+
+    The file is read by `store.read_small`, and only when the whole of it is in the
+    grammar `install` writes (`env_assignments`); then the last assignment of the name
+    decides, as in systemd. A file outside that grammar, or one that cannot be read,
+    is refused rather than guessed at; giving the option skips the read. A bad item
+    is named by its place, never by its value (#140)."""
+    name = "ALLOWED_DNS_SERVERS"
+    where = f"the {name} in {env_path}"
+    try:
+        data = store.read_small(env_path)
+    except store.StoreError as exc:
+        raise InstallError(f"{exc}, so {where} could not be kept; give --allowed-dns-servers") from None
+    if data is None:
+        return None
+    try:
+        text = data.decode("ascii")
+    except UnicodeDecodeError:
+        raise InstallError(f"{env_path} is not ASCII, so {where} could not be kept; give --allowed-dns-servers") from None
+    values = [value for key, value in env_assignments(text, env_path) if key == name]
+    return config.parse_allowed_dns(values[-1], where) if values else None
+
+
+def render_env(url: str, allowed, allowed_dns, max_pps: int | None, ca_file: str | None, token_path: str) -> str:
     lines = [
         "# Written by `tlg-ipam-agent install`; `tlg-ipam-agent uninstall` removes it.",
         f"# No secrets: the agent token is in {token_path}, which only the service user can read.",
@@ -408,6 +480,10 @@ def render_env(url: str, allowed, max_pps: int | None, ca_file: str | None, toke
     ]
     if allowed is not None:
         lines.append("ALLOWED_CIDRS=" + _plain(",".join(str(n) for n in allowed), "--allowed-cidrs"))
+    if allowed_dns is not None:
+        lines.append(
+            "ALLOWED_DNS_SERVERS=" + _plain(",".join(str(n) for n in allowed_dns), "--allowed-dns-servers")
+        )
     if max_pps is not None:
         lines.append(f"MAX_PPS={max_pps}")
     lines += [f"{name}={value}" for name, value in service_trust(ca_file).items()]
@@ -577,6 +653,12 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out, envir
     _preflight(host)
     url = config.parse_url(options.url, "--url")
     allowed = None if options.allowed_cidrs is None else config.parse_allowed(options.allowed_cidrs, "--allowed-cidrs")
+    if options.allowed_dns_servers is None:
+        allowed_dns = kept_allowed_dns(paths.env)
+        kept = allowed_dns is not None
+    else:
+        kept = False
+        allowed_dns = config.parse_allowed_dns(options.allowed_dns_servers, "--allowed-dns-servers")
     max_pps = None if options.max_pps is None else config.parse_max_pps(options.max_pps, "--max-pps")
     ca_file = _ca_file(options.ca_file)
     inherited = inherited_trust(environ, ca_file)
@@ -603,7 +685,13 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out, envir
     if token is not None:
         token = config.parse_token(token, "--enrol-token", config.ENROL_TOKEN_PREFIX)
         secret(token)
-    env = render_env(url, allowed, max_pps, ca_file, paths.token)
+    env = render_env(url, allowed, allowed_dns, max_pps, ca_file, paths.token)
+    if len(env) > store.READ_MAX:
+        # a later run reads it back (`kept_allowed_dns`), through `store.read_small`
+        raise InstallError(
+            f"the settings given would make {paths.env} longer than {store.READ_MAX} bytes, "
+            "which a later install could not read back; give shorter lists"
+        )
     unit = render_unit(paths.env, interpreter, ca_file)
 
     stored = enrol.stored_token(paths.state)
@@ -619,6 +707,11 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out, envir
             "(--enrol-token - reads it from standard input)"
         )
 
+    if kept:
+        out(
+            f"ALLOWED_DNS_SERVERS: kept the {len(allowed_dns)} network(s) {paths.env} holds "
+            "(--allowed-dns-servers replaces them)"
+        )
     undo: list[Callable[[], object]] = []
     try:
         user = host.service_user()

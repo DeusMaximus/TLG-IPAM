@@ -17,12 +17,14 @@ def test_install_takes_its_options_and_passes_them_on(monkeypatch):
     monkeypatch.setattr(install, "install", lambda options, **kw: seen.update(options=options, **kw) or 0)
     cli.main([
         "install", "--url", "https://ipam.home.arpa", "--enrol-token", "-",
-        "--allowed-cidrs", "10.0.0.0/8", "--max-pps", "50", "--ca-file", "/etc/ca.pem",
+        "--allowed-cidrs", "10.0.0.0/8", "--allowed-dns-servers", "10.0.0.53", "--max-pps", "50",
+        "--ca-file", "/etc/ca.pem",
     ])
     assert seen["options"] == install.Options(
         url="https://ipam.home.arpa",
         enrol_token="-",
         allowed_cidrs="10.0.0.0/8",
+        allowed_dns_servers="10.0.0.53",
         max_pps="50",
         ca_file="/etc/ca.pem",
     )
