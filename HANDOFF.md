@@ -27,6 +27,39 @@ Template:
 
 ---
 
+## 2026-11-25 — Claude Code (Opus 5.5), worker — #147: run the release's publish steps against stand-ins; the retry window (PR #154)
+- **Merged:** 2026-11-25, squash `c4c4e4d`, at head `6261c8b`; branch deleted. Entry committed by the orchestrator, with the review and state lines brought up to date. `6261c8b` is GitHub's merge of `main` (holding PRs #158 and #155) into the worker's last head `c3855d4`, with no hand-written change (its tree equals `git merge-tree` of the two); CI passed on it and Codex read it clean.
+- **Done:** [PR #154](https://github.com/DeusMaximus/TLG-IPAM/pull/154) (`147-release-publish-tests`) closes #147. Tests and runbook only; `release.yml` and `.github/scripts/` are byte for byte what they were.
+  - `agent/tests/test_release_publish.py` (57 tests) runs both publish jobs' `run` scripts as written, against stand-ins for `gh`, `skopeo` and `sleep` (`agent/tests/release_stubs.py`). It covers every registry answer, draft and published release states, failed lookups and downloads, and every order of gh's lookup race, checked against the release each lookup really returned.
+  - A one-`printf` DEBUG trap records the commands each step runs, and `Publish.run` fails on one that is not approved. Every command-holding line must run in some test, and the line reader refuses a here-document. Seven good-faith mutations run on both jobs.
+  - The command record is documented everywhere as a tripwire, not a sandbox, with what it does not see named.
+  - `.agents/releases.md`:
+    - the retry window: artefact configured for 7 days; re-run failed jobs versus re-run all;
+    - past the window, once the image is published, the version is spent;
+    - cross-attempt artefact download is an unmeasured assumption, with a check on the first release (checklist step 5);
+    - the leftover-draft cleanup, and which jobs a `publish-release` re-run runs.
+  - `AGENTS.md` and brief §2.4 updated.
+- **Review:** three outside reads in place of Greptile's re-run, every finding answered on the PR.
+  - Codex (GPT-6.1 Sol) at `30f7f0c`: NO-GO, one P2 and two P3s, fixed.
+  - At `7ec01c8`, GPT-6.1 Sol was stopped by its safety filter part way (`.dev/147/manual-handover.md`); the read ran on GPT-6 Sol with Daybreak Blue: NO-GO, two P2s and two P3s. Two NO-GOs went to the owner, who decided the answer: the command record is a tripwire for changes made in good faith, not a boundary, so the claims were narrowed (pre-run skip, `extdebug` and the static `/dev/tcp` check removed; the trace stays a file) and the two P3s fixed (lookup race recorded and asserted; here-document refused).
+  - Codex (GPT-6 Sol) at `c3855d4`: GO, no findings; all four round-two findings answered in the owner's terms, and every acceptance mutation red.
+  - Codex automatic review clean on every head, the last `6261c8b`. Greptile read only `d2ec97a`; its one P2 was fixed in `30f7f0c`.
+- **Decisions:** PR Deliberate calls 1–6:
+  - the `run` text is tested in place;
+  - the artefact stays at 7 days;
+  - the failed-lookup fallback is unchanged (all three reads would prefer failing closed: filed as #159);
+  - the stubs are not checked against the real services;
+  - a DEBUG trap with no `extdebug`;
+  - the owner's tripwire-not-boundary decision.
+- **State:** merged. Agent suite on `main`: 1,462. This file passes on bash 3.2 and 5.2. No schema change; `PROTOCOL_VERSION` unchanged. Note for bash: `shopt -s extdebug` in a startup file makes bash 5 try to start its debugger and turns `functrace` off.
+- **Waiting on the owner:** nothing from this PR. The first tag is still the owner's.
+- **Untested:**
+  - the real gh, skopeo, ghcr.io and GitHub API, including GitHub refusing to publish a draft over a published tag (assumed);
+  - cross-attempt artefact download (measured on the first release);
+  - anything a script written to get past the record would do;
+  - `actionlint` (not installed; workflows unchanged).
+- **Next:** #159 (fail-closed release lookup) and #94 (pin the agent's base image by digest), one at a time: both touch the release workflow.
+
 ## 2026-11-25 — Claude Code (Opus 5.5), worker — #153: no DNS reply over the advertised payload is parsed (PR #155)
 - **Merged:** 2026-11-25, squash `c128179`, at head `793eff3`; branch deleted. Entry committed by the orchestrator, with the review, CI and state lines brought up to date. `793eff3` is GitHub's merge of `main` (holding PR #158) into the worker's last head `9b2acdc`, with no hand-written change (its tree equals `git merge-tree` of the two); the orchestrator made it so CI would test the PR with the #156 fix, and the `agent` job passed there.
 - **Done:** [PR #155](https://github.com/DeusMaximus/TLG-IPAM/pull/155) (`153-dns-reply-size`) closes #153.
@@ -91,17 +124,3 @@ Template:
 - **Waiting on the owner:** nothing from this PR.
 - **Untested:** an LXC, distributions other than Debian, systemd versions other than 257.
 - **Next:** #136 and #140 each edit `install.py`, one at a time. The image `ipam130-sol-systemd:review` on this machine runs systemd for installer checks; `docker exec` in it starts with umask 0000, so set `umask 022` first or `trust.check` refuses the venv.
-
-## 2026-11-24 — Claude Code (Opus 5.5), worker — #143: open enrolments by the server's clock, none for a disabled agent; release versions in normal form (PR #150)
-- **Done:** [PR #150](https://github.com/DeusMaximus/TLG-IPAM/pull/150) (`143-agents-page-followups`, head `dabbfce`) closes #143. (Written by the orchestrator from the PR body: the worker's thread was still waiting on CI when the PR merged.)
-  - Server, response only: `services/agents.expires_in_s` and `schemas.TokenOut.expires_in_s`, the whole seconds a live enrolment token has left by the server's clock (`agents.live`), rounded down, null for a token that is not live and for an agent token. Every owner answer for an agent carries it. No MCP tool reads it.
-  - Page (`web/src/utils/agents.js`, `pages/Agents.jsx`): the countdown is the server's number less the time since the request was sent, measured with `performance.now()` (`monotonicNow`), never the wall clock, and it updates on its own timer, not only on the 30-second list refresh. A disabled agent's live token is shown as "enrolment blocked until it is enabled" and is not listed in Pending enrolments; Revoke stays enabled for it.
-  - `web/src/utils/install.js`: `releaseVersion` refuses a leading zero in any numeric part, so `00.02.00` and `0.2.0rc01` render the `<version>` placeholder.
-  - `web/src/utils/install.test.js` reads its accepted and refused version cases from `agent/tests/test_release.py`, strictly: a case in a shape it cannot read exactly as Python does (single quotes, a tuple across lines, an escape) fails the test instead of being skipped. The page and the release check judge one list.
-  - Docs: brief §3.9 (the `expires_in_s` row) and §6.2, spec §5.6 and §5.8, the `AGENTS.md` guided-install bullet.
-  - Merged: `a095c64`, squash, on the owner's go-ahead; the remote branch is deleted. CI green and Codex clean on `dabbfce`. Greptile read only the first head (one finding, fixed), so Sol (GPT-6.1 Sol) read it twice in its place: GO at `24494f4` with two P3s (the countdown used the wall clock and only moved on the refresh; the case reader did not decode Python escapes), both fixed in `89614c9`; GO at `d4fb98e` with one P3 (a fractional timer delay could fire before the clock moved), fixed in `dabbfce` with the reviewer's own one-line remedy. The orchestrator read that last diff against the remedy and ran 179 web tests, lint and build on the head, and 1,340 server and 1,371 agent tests on `d4fb98e`. No follow-ups.
-- **Decisions:** PR body Deliberate calls 1–7. The main ones: the clock item is decided from a duration the server gives, not shown as uncertain; `expires_in_s` follows the token's rule alone, and the page applies the disabled rule from the agent's state; counting from the request errs early by the request's own time.
-- **State:** merged. No schema change; `PROTOCOL_VERSION` unchanged; no command's shape or artefact name changed.
-- **Waiting on the owner:** nothing from this entry.
-- **Untested:** a real browser with its clock set off or stepped (the tests fake the clocks in jsdom).
-- **Next:** #92 (the plain-HTTP warning before a token is issued) is the dialog's remaining open issue. #147 (release pipeline tests) edits `agent/tests/test_release.py`, which this PR also changed, and can start now.
