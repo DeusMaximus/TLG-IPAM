@@ -9,7 +9,9 @@ or evaluate code, reach an object's attributes by computed name, or write a file
 
 Two modules are allowed some of them, since #22: `store.py` opens, writes, renames and
 removes files (the stored agent token, and what `install` puts on the host), and
-`install.py` starts the fixed programs that create the service user and drive systemd.
+`install.py` starts the fixed programs that create the service user and drive systemd,
+and, as the service user, the two that ask the kernel whether it can read the CA
+bundle (#136), in the places `PROCESSES_STARTED_IN` lists.
 Every other module is held to the lists whole, and only `enrol.py` and `install.py`
 may use `store` (`test_only_the_enrolment_and_the_installer_write_files`). It proves the absence of those names, not the invariant: code that
 reaches the same effect without one of them passes (an uncalled
@@ -32,7 +34,8 @@ MODULES = sorted(PACKAGE.glob("*.py"))
 # before anything opens it, and a daemon thread keeps a blocked read off the event
 # loop. `io` is not here: its `FileIO` and `open_code` open files, and the agent needs
 # none of it. #22 added `subprocess`, for `install.py` alone (`IMPORTED_ONLY_IN`): it
-# runs useradd, userdel, groupdel and systemctl with fixed arguments. `pwd` and `grp`
+# runs useradd, userdel, groupdel and systemctl with fixed arguments, and (#136) head
+# and test as the service user (`PROCESSES_STARTED_IN`). `pwd` and `grp`
 # came with it, to look the service user and its group up (they read the user
 # database and change nothing), `functools`, for `partial`, `termios`, for
 # `install.py` alone, to turn echo off while the enrolment token is typed, and
@@ -86,7 +89,8 @@ ALLOWED_QUALIFIED = {"re.compile", "sys.executable"}
 # FIFO, and creating a file exclusively), sets the new file's owner and mode on its
 # descriptor before writing it, renames it into place, and makes and removes the
 # install's directories and files. `install.py` names `subprocess`, to run its fixed
-# programs. What each does with them is in its docstring; review holds the rest.
+# programs, where `PROCESSES_STARTED_IN` says. What each does with them is in its
+# docstring; review holds the rest.
 NAMES_WHERE = {
     "store.py": {"open", "fchown", "fchmod", "rename", "unlink", "rmdir", "mkdir"},
     "install.py": {"subprocess"},
@@ -278,6 +282,126 @@ def test_files_are_opened_only_where_listed():
     (the comment on READ_OPENERS says what it does not see)."""
     used = {p.name: _file_opens(ast.parse(p.read_text())) for p in MODULES}
     assert {name: ways for name, ways in used.items() if ways} == OPENED_WHERE
+
+
+# Where `install.py`, the one module allowed `subprocess`, starts a process: the
+# function that makes each call, and the keywords the call passes (#136). `Host.run`
+# runs useradd, userdel, groupdel and systemctl as root. `read_as` (its `as_user`) runs
+# `head` and `test` as the service user, to ask the kernel whether that user can read
+# the `--ca-file`; it alone passes `user`, `group` and `extra_groups`, which have the
+# child drop to the service user's ids and groups before it execs. Every call passes
+# `env=COMMAND_ENV`, none `shell`, `executable`, `preexec_fn` or `**keywords`, and
+# `subprocess` is reached by its module name alone, among SUBPROCESS_NAMES. A change
+# to any of it is a review decision: change this list in the same PR and say why.
+PROCESSES_STARTED_IN = {
+    "Host.run": {"env", "stdin", "check"},
+    "read_as.as_user": {
+        "env", "cwd", "stdin", "stdout", "stderr", "user", "group", "extra_groups", "timeout", "check",
+    },
+}
+SUBPROCESS_NAMES = {"run", "DEVNULL", "SubprocessError"}
+
+
+def _process_starts(tree) -> tuple[dict[str, set[str]], list[str]]:
+    """The `subprocess.run` calls of a module, by the dotted name of the function that
+    holds each, with the keywords each passes; and what else it does with `subprocess`
+    that PROCESSES_STARTED_IN does not allow: the module named anywhere but as the base
+    of one of SUBPROCESS_NAMES (so an import alias, an assignment alias such as
+    `process = subprocess`, or the module passed as a value), its name as a string
+    (`sys.modules["subprocess"]`), a `from` import, another name, a reference to `run`
+    that is not a call, a second call in one function, an `env` other than
+    COMMAND_ENV. Spellings, not behaviour: review holds what a call runs, and what
+    reaches the module without spelling its name (#136's review, round 1: an
+    assignment alias passed an earlier version of this check)."""
+    starts: dict[str, set[str]] = {}
+    refused: list[str] = []
+
+    def is_run(node) -> bool:
+        return isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "subprocess" and node.attr == "run"
+
+    def visit(node, scope: tuple[str, ...]) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            scope = (*scope, node.name)
+        if isinstance(node, ast.Call) and is_run(node.func):
+            where = ".".join(scope) or "<module>"
+            names = {k.arg for k in node.keywords}
+            env = next((k.value for k in node.keywords if k.arg == "env"), None)
+            if None in names:
+                refused.append(f"{where}: **keywords")
+            if not (isinstance(env, ast.Name) and env.id == "COMMAND_ENV"):
+                refused.append(f"{where}: env is not COMMAND_ENV")
+            if where in starts:
+                refused.append(f"{where}: a second start")
+            starts[where] = names - {None}
+            for child in (*node.args, *node.keywords):
+                visit(child, scope)
+            return
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "subprocess":
+            if node.attr not in SUBPROCESS_NAMES:
+                refused.append(f"subprocess.{node.attr}")
+            elif node.attr == "run":
+                refused.append("subprocess.run, not called")
+            return  # the module's name as the base of the attribute: checked above
+        if isinstance(node, ast.Name) and node.id == "subprocess":
+            refused.append("subprocess, not as the base of one of its names")
+        elif isinstance(node, ast.Constant) and node.value == "subprocess":
+            refused.append("'subprocess' as a string")
+        elif isinstance(node, ast.Import):
+            refused.extend(f"import subprocess as {a.asname}" for a in node.names if a.name == "subprocess" and a.asname)
+        elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
+            refused.append("from subprocess import")
+        for child in ast.iter_child_nodes(node):
+            visit(child, scope)
+
+    visit(tree, ())
+    return starts, refused
+
+
+def test_the_installer_starts_processes_only_where_listed():
+    """`install.py` starts processes in the two places PROCESSES_STARTED_IN names, with
+    exactly the keywords it lists, and no module but it names `subprocess` at all
+    (`IMPORTED_ONLY_IN`, `NAMES_WHERE`)."""
+    starts, refused = _process_starts(ast.parse((PACKAGE / "install.py").read_text()))
+    assert refused == []
+    assert starts == PROCESSES_STARTED_IN
+    for path in MODULES:
+        if path.name != "install.py":
+            assert _process_starts(ast.parse(path.read_text())) == ({}, []), path.name
+
+
+@pytest.mark.parametrize(
+    "source, extra, reasons",
+    [
+        # a third place, or a shell, or the caller's environment
+        ("def f():\n    subprocess.run(['x'], env=COMMAND_ENV)\n", {"f": {"env"}}, []),
+        ("def f():\n    subprocess.run('x', env=COMMAND_ENV, shell=True)\n", {"f": {"env", "shell"}}, []),
+        ("def f():\n    subprocess.run(['x'], env=os.environ)\n", {"f": {"env"}}, ["f: env is not COMMAND_ENV"]),
+        ("def f(**k):\n    subprocess.run(['x'], **k)\n", {"f": set()}, ["f: **keywords", "f: env is not COMMAND_ENV"]),
+        # the service user's ids passed anywhere else
+        ("class Host:\n    def run(self):\n        subprocess.run(['x'], env=COMMAND_ENV, user=0)\n", {},
+         ["Host.run: a second start"]),
+        # ways round the call's name
+        ("start = subprocess.run\n", {}, ["subprocess.run, not called"]),
+        ("subprocess.Popen(['x'])\n", {}, ["subprocess.Popen"]),
+        ("import subprocess as s\n", {}, ["import subprocess as s"]),
+        ("from subprocess import run\n", {}, ["from subprocess import"]),
+        # the review of #136, round 1: an assignment alias, then a call through it
+        ("process = subprocess\ndef f():\n    process.run(['head'], env=COMMAND_ENV)\n", {},
+         ["subprocess, not as the base of one of its names"]),
+        ("def f(m=subprocess):\n    m.run(['head'], env=COMMAND_ENV)\n", {},
+         ["subprocess, not as the base of one of its names"]),
+        ("import sys\nsys.modules['subprocess'].run(['head'], env=COMMAND_ENV)\n", {}, ["'subprocess' as a string"]),
+    ],
+)
+def test_a_process_started_anywhere_else_or_otherwise_is_refused(source, extra, reasons):
+    """Appended to the real `install.py`, each source changes what `_process_starts`
+    finds by exactly its own case: a new place, a new keyword, or a refusal."""
+    starts, refused = _process_starts(ast.parse((PACKAGE / "install.py").read_text() + "\n" + source))
+    assert refused == reasons
+    expected = {**PROCESSES_STARTED_IN, **extra}
+    if reasons == ["Host.run: a second start"]:
+        expected["Host.run"] = {"env", "user"}  # the later call is the one recorded
+    assert starts == expected
 
 
 def test_the_real_modules_pass_every_check():

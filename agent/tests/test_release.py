@@ -8,6 +8,7 @@ workflow is (`.github/workflows/release.yml`) and the checks it runs before it p
 steps against stand-ins for the registry and GitHub. `web/src/utils/install.test.js`
 holds the names it publishes under to the ones the Agents page renders."""
 
+import copy
 import importlib.util
 import re
 import subprocess
@@ -299,6 +300,170 @@ def test_no_expression_is_expanded_into_a_script(workflow):
     """Every value reaches a `run` through `env`, so none can become shell code."""
     for _, step in _steps(workflow):
         assert "${{" not in step.get("run", ""), step.get("name")
+
+
+# The credentials the rule checks are the two an expression can name: the `secrets`
+# context (the repository's and organisation's secrets and `GITHUB_TOKEN`), in any
+# spelling, `secrets.X`, `secrets['X']` or `toJSON(secrets)`; and the job's token through
+# the `github` context, as `github.token`, `github['token']` or the whole object
+# (`toJSON(github)`, `fromJSON(toJSON(github)).token`, `github.*`, `github[x]`), which
+# holds it (review of PR #166). A named property of `github` other than `token`
+# (`github.event_name`, `github['sha']`) is not one. GitHub reads context names in any
+# case.
+SECRETS = re.compile(r"\bsecrets\b", re.I)
+# the `github` context itself, not a property of that name (`steps.github`) or a longer
+# name (`my-github`)
+GITHUB = re.compile(r"(?<![\w.-])github\b(?!-)", re.I)
+# what follows it when one property is read: `.name` or `['name']`
+PROPERTY = re.compile(r"\s*(?:\.\s*([A-Za-z_][\w-]*)|\[\s*'((?:[^']|'')*)'\s*\])")
+# an expression's string literal, in single quotes with '' for a quote
+LITERAL = re.compile(r"'(?:[^']|'')*'")
+EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+
+
+def _names_a_credential(expression):
+    """Whether an expression can hand on a credential the rule checks (above)."""
+    if SECRETS.search(expression):
+        return True
+    # a literal is not the context, so `'github'` is blanked, keeping each position
+    code = LITERAL.sub(lambda m: " " * len(m.group()), expression)
+    for found in GITHUB.finditer(code):
+        read = PROPERTY.match(expression, found.end())
+        name = read and (read.group(1) or read.group(2))
+        if not name or name.lower() == "token":
+            return True
+    return False
+# the one step of each publish job that publishes, and the variable it is given the token in
+TOKEN_ENV = {"publish-image": "TOKEN", "publish-release": "GH_TOKEN"}
+
+
+def _given_secrets(node, path=()):
+    """Every place in the workflow that hands a credential the rule checks (above) to a
+    job or a step, by its path, with its value: a value whose expression (`${{ }}`)
+    names one, an `if`, which is an expression whole, that does, and a job's `secrets:`
+    (a reusable workflow's `inherit`). Keys are read as values are.
+
+    It does not see a credential no expression names: one an action takes by default
+    (`actions/checkout`'s `token` input defaults to the job's token, which
+    `test_checkout_keeps_no_credential` holds it to dropping; the artifact actions use
+    the `ACTIONS_RUNTIME_TOKEN` the runner gives every action), or anything a step reads
+    from the runner's environment or files."""
+    found = {}
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "secrets":
+                found[path + (key,)] = value
+            found.update(_given_secrets(key, path + ("<key>",)))
+            if key == "if" and isinstance(value, str) and _names_a_credential(value):
+                found[path + (key,)] = value
+            found.update(_given_secrets(value, path + (key,)))
+    elif isinstance(node, list):
+        for i, value in enumerate(node):
+            found.update(_given_secrets(value, path + (i,)))
+    elif isinstance(node, str) and any(_names_a_credential(e) for e in EXPRESSION.findall(node)):
+        found[path] = node
+    return found
+
+
+def _publish_step(workflow, job):
+    (index,) = [i for i, step in enumerate(workflow["jobs"][job]["steps"]) if "run" in step]
+    return index
+
+
+def _token_holders(workflow):
+    return {
+        ("jobs", job, "steps", _publish_step(workflow, job), "env", name): "${{ secrets.GITHUB_TOKEN }}"
+        for job, name in TOKEN_ENV.items()
+    }
+
+
+def test_only_the_two_publish_steps_are_given_the_token(workflow):
+    """The job's `GITHUB_TOKEN`, through `env`, to the one step of each publish job that
+    publishes, and no credential to any other step or job, through `env`, `with` or
+    anything else: not the build, which runs the tag's code, nor `verify`, nor the
+    publish jobs' download step (#159)."""
+    assert _given_secrets(workflow) == _token_holders(workflow)
+
+
+def _put(workflow, path, value):
+    *parents, last = path
+    node = workflow
+    for key in parents:
+        node = node.setdefault(key, {}) if isinstance(node, dict) else node[key]
+    node[last] = value
+
+
+def _step(workflow, job, name_or_uses):
+    steps = workflow["jobs"][job]["steps"]
+    (index,) = [i for i, s in enumerate(steps) if name_or_uses in (s.get("name"), s.get("uses", "").split("@")[0])]
+    return ("jobs", job, "steps", index)
+
+
+# Credentials handed where none may go. The first is the outside read's of PR #161: a
+# build step's `env`, which every other test of this file let through.
+GIVEN = {
+    "build-step-env": (("build", "Wheel"), ("env", "TOKEN"), "${{ secrets.GITHUB_TOKEN }}"),
+    "build-step-with": (("build", "actions/checkout"), ("with", "token"), "${{ github.token }}"),
+    "build-step-if": (("build", "Wheel"), ("if",), "secrets.GITHUB_TOKEN != ''"),
+    "build-step-name": (("build", "Wheel"), ("name",), "Wheel ${{ secrets.OTHER }}"),
+    "build-step-all": (("build", "Wheel"), ("env", "ALL"), "${{ toJSON(secrets) }}"),
+    "build-step-index": (("build", "Wheel"), ("env", "T"), "${{ secrets['GITHUB_TOKEN'] }}"),
+    "build-step-case": (("build", "Wheel"), ("env", "T"), "${{ Secrets.github_token }}"),
+    "build-step-github-index": (("build", "Wheel"), ("env", "T"), "${{ github['token'] }}"),
+    # the whole `github` context, which holds the token (review of PR #166)
+    "build-step-github-context": (("build", "Wheel"), ("env", "GH_CONTEXT"), "${{ toJSON(github) }}"),
+    "build-step-github-converted": (("build", "Wheel"), ("env", "T"), "${{ fromJSON(toJSON(github)).token }}"),
+    "build-step-github-filter": (("build", "Wheel"), ("env", "T"), "${{ join(github.*, ' ') }}"),
+    "build-step-github-computed": (("build", "Wheel"), ("env", "T"), "${{ github[format('{0}', 'token')] }}"),
+    "build-step-github-case": (("build", "Wheel"), ("env", "T"), "${{ toJSON(GitHub) }}"),
+    "verify-step": (("verify", "The wheel, installed by the systemd tab's command"), ("env", "TOKEN"), "${{ github.token }}"),
+    "download-step": (("publish-release", "actions/download-artifact"), ("with", "github-token"), "${{ secrets.GITHUB_TOKEN }}"),
+    "publish-step-other": (("publish-release", "Release v<version> with the wheel"), ("env", "PAT"), "${{ secrets.RELEASE_PAT }}"),
+    "publish-step-replaced": (("publish-release", "Release v<version> with the wheel"), ("env", "GH_TOKEN"), "${{ secrets.RELEASE_PAT }}"),
+}
+
+
+@pytest.mark.parametrize("where, at, value", GIVEN.values(), ids=GIVEN.keys())
+def test_a_credential_given_to_any_other_step_fails_the_check(workflow, where, at, value):
+    changed = copy.deepcopy(workflow)
+    _put(changed, _step(changed, *where) + at, value)
+    assert _given_secrets(changed) != _token_holders(changed)
+
+
+@pytest.mark.parametrize(
+    "path, value",
+    [
+        (("jobs", "publish-release", "env", "GH_TOKEN"), "${{ secrets.GITHUB_TOKEN }}"),
+        (("env", "GH_TOKEN"), "${{ github.token }}"),
+        (("jobs", "build", "secrets"), "inherit"),
+        (("jobs", "build", "env", "${{ secrets.GITHUB_TOKEN }}"), "x"),
+    ],
+    ids=["job-env", "workflow-env", "inherit", "in-a-key"],
+)
+def test_a_credential_given_to_a_whole_job_or_workflow_fails_the_check(workflow, path, value):
+    changed = copy.deepcopy(workflow)
+    _put(changed, path, value)
+    assert _given_secrets(changed) != _token_holders(changed)
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "github.event_name == 'push'",
+        "github.repository",
+        "github['sha']",
+        "github . ref_type",
+        "steps.github.outputs.x",
+        "contains(github.ref, 'github')",
+        "format('{0}', 'toJSON(github)')",
+        "github.event.head_commit.message",
+    ],
+)
+def test_a_named_property_of_the_github_context_is_not_a_credential(expression):
+    """The workflow reads `github.event_name`, `github.ref_type` and `github.ref`, and
+    may read any named property but `token`; a literal or a property called `github`
+    is not the context."""
+    assert not _names_a_credential(expression)
 
 
 def test_checkout_keeps_no_credential(workflow):

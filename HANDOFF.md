@@ -27,6 +27,79 @@ Template:
 
 ---
 
+## 2026-11-25 — Claude Code (Opus 5.5), worker — #159: publish-release stops when it cannot tell whether the tag has a release (PR #166)
+- **Merged:** 2026-11-25, squash `bc3ba04`, at head `5efdd34`; branch deleted, #159 closed. Tests: 1,723 agent at the head; 1,741 passed and 4 skipped on the tree merged with `main` after PR #167 (orchestrator's run).
+- **Done:** [PR #166](https://github.com/DeusMaximus/TLG-IPAM/pull/166).
+  - `release.yml`, `publish-release`: it reads the repository's releases page by page (`gh api …/releases?per_page=100&page=N`, no `--paginate`). The jq prints `page <length>` first for a JSON array, then `<id> <draft>` for each release whose tag is the tag (`env.TAG`). Each answer must print its marker. The list ends at the first page shorter than 100, and an attempt that reaches page 20 full fails.
+    - No release → `gh release create`, as before.
+    - One release → the wheel is checked or attached, and a draft is published, as before.
+    - More than one → stop with nothing changed (gh's `FetchRelease` would answer with either).
+    - Could not tell → three attempts (15/30/45 s), each from page 1 with the list emptied, then stop with nothing created, uploaded or edited.
+    - gh's error text goes on one warning line.
+    - `publish-image`, the names and the permissions are unchanged.
+  - `release_stubs.py`: the `gh release view` model and `lookup_wins` are gone. A one-page `gh api` stand-in, from gh 2.105 `pkg/cmd/api` and go-gh 2.17 jq, refuses any other argument list. `FetchRelease` calls are refused when a published release and a draft share the tag.
+  - `test_release.py`: `test_only_the_two_publish_steps_are_given_the_token`. A credential is the `secrets` context, or the `github` context reached any way but one named property other than `token` (`toJSON(github)` included). 21 placements are refused and 8 named-property expressions allowed.
+  - Docs: `.agents/releases.md` (the jobs table, and what the owner sees and does for each stop); the `AGENTS.md` "One version" bullet; one sentence each in spec §5.6 and brief §2.4.
+- **Review:**
+  - Briefed round (Codex, GPT-6.1 Sol) at `640b30d`: GO with two P3s, the whole `github` context and a later-page `204`. Both were fixed in `5efdd34` and read by the orchestrator against the remedies (a page with no marker taken for the end of the list failed five tests).
+  - Automatic reviews: Codex clean at `640b30d` and `5efdd34`; Greptile no findings at `640b30d`, not retriggered.
+- **Decisions:** PR Deliberate calls 1–6:
+  - the list endpoint rather than get-by-tag, whose 404 is not proof of absence;
+  - more than one release stops the job;
+  - a marker on every page, asked for page by page, at most 20 pages;
+  - the retry copied from `publish-image`;
+  - the scope of the token rule;
+  - the tripwire changed only in the stub's accepted call, with no new shell word.
+- **State:** merged.
+  - Mutations caught at `5efdd34` (bash 5, publish tests, the author's): old behaviour 38 failed, no retry 41, `TAG=` dropped 25, more-than-one branch 8, a page without its marker ending the list 6, page 1 as the whole list 16, no page bound 2, list not emptied 1, newlines kept 1.
+  - Publish tests pass on bash 3.2 (macOS) and 5.2.37 (`--network none`).
+  - No schema change, no agent code change.
+- **Untested or assumed (nothing has ever been published by this workflow):**
+  - that the job's `contents: write` token counts as "push access", so drafts appear in the list;
+  - that a draft's `tag_name` in the list is the tag it will publish under;
+  - that GitHub fills every page but the last and leaves no release out;
+  - gh's real output for each answer (the stand-in is read from source, not run against gh);
+  - the 20-page stop, which no real repository has reached;
+  - that a re-run attempt can download the artefact (still `.agents/releases.md` step 5).
+- **Waiting on the owner:** the first tag, and the release checklist with it.
+- **Next:**
+  - On the first release, check that `publish-release` lists the tag's draft or release as expected (its log shows each page read).
+  - Optional follow-up, not filed: `publish-image`'s warning prints skopeo's stderr with its newlines.
+
+## 2026-11-25 — Claude Code (Opus 5.5), worker — #136: the CA bundle's access asked of the kernel, as the service account (PR #167)
+- **Merged:** 2026-11-25, squash `069af99`, at head `6429037`; branch deleted, #136 closed. Agent suite at the head, merged with `main` at `3feec43`: 1,662 passed, 4 skipped (the root-only cases). As root on Linux, `test_install.py` + `test_invariants.py`: 595 passed, 2 skipped. Server 1,357, web 188.
+- **Done:** [PR #167](https://github.com/DeusMaximus/TLG-IPAM/pull/167) (`136-ca-access-as-service`).
+  - `install.read_as` replaces `blocked_for`/`_allowed`. It runs `head -c 1 -- <path>` as the service user, and `test -e <path>` only when that fails, to tell "the file itself" from "a directory or link on the way".
+  - The programs run through `subprocess.run(user=, group=, extra_groups=)`, with `COMMAND_ENV`, `cwd="/"`, stdio on `/dev/null`, no shell and `CA_CHECK_TIMEOUT_S` (10 s).
+  - `Host.service_reads` passes `os.getgrouplist(SERVICE_USER, gid)` and prints the command without the path (#140).
+  - `NOT_CHECKED` (a program missing or refused, or past the deadline) refuses the install before the exchange. `install.py` no longer imports `trust`.
+  - Tripwire: `test_invariants.PROCESSES_STARTED_IN` (`Host.run`, `read_as.as_user`, with the exact keywords) and `SUBPROCESS_NAMES`.
+    - `_process_starts` refuses the module named anywhere but as an attribute base (an import or assignment alias, a default argument), the string `'subprocess'`, `from subprocess import`, other names, an uncalled `run`, an `env` other than `COMMAND_ENV`, and `**keywords`.
+    - No forbidden-name list changed.
+  - `AGENTS.md` ("Enrolment tokens" and "agent never executes" bullets) and spec §5.6 updated. The brief has no CA-check text.
+- **Verified:** as root in a `--network none` Debian 13 / systemd 257 container, with the server on loopback over HTTPS and agent wheels built from the branch and from `main`, by the author and again by the reviewer.
+  - ACL that denies the account: the branch refuses with the token unused, and the same token enrols once the entry is gone. `main` spent the token, and the unit logged `CERTIFICATE_VERIFY_FAILED`.
+  - Supplementary group: the branch enrols and checks in; `main` refused.
+  - No image had `setfacl` and there was no network to add it, so the ACL was written as the `system.posix_acl_access` xattr (`deny_by_acl` in the tests).
+- **Decisions:** PR Deliberate calls 1–9.
+  - Fixed programs through `subprocess`'s user switching, not `os.fork` (which would copy root's memory, the enrolment token included, into the account's process), not Python run as the account, not `access(2)`.
+  - The operator's `--ca-file` path is the one argument that is not fixed.
+  - A check that cannot be made refuses the install.
+  - `unreachable()` (the venv check, others' bits) is left as it was: a possible follow-up.
+- **Review:** briefed round (Codex, GPT-6.1 Sol) GO at `2db1f1c` with two P3s, both fixed in `6429037` and answered on the PR:
+  - an assignment alias of `subprocess` passed the tripwire; the reproduction now fails 13 tests;
+  - with the deadline removed, the FIFO test hung the suite; it now fails at 5 s on its own bound (`FIFO_BOUND_S`), kills the process groups and reaps them, and no `head` is left.
+
+  Automatic reviews: Greptile, one P2, fixed in `2db1f1c` (the root fixture no longer changes the mode of `--basetemp`'s parent directories); Codex clean on `a110963`, `2db1f1c` and `6429037`.
+- **State:** merged. No schema change, no protocol change, no new import.
+- **Untested / assumed:**
+  - Ptrace (recorded, not rated): after exec, a process already running as a reused account can ptrace `head` or `test` where `ptrace_scope=0` and falsify the answer. Such an account can already sabotage its own agent, so the mechanism stands.
+  - The deadline bounds only an interruptible wait; only the FIFO case was measured. A program in an uninterruptible wait (a hard network mount) is not reaped promptly, and `_ca_file`'s stat, the group lookup and starting the process are outside the deadline.
+  - The check answers for the unit `install` writes, not one a drop-in changes (`SupplementaryGroups=`, `InaccessiblePaths=`, a private mount namespace, the unit's own security profile).
+  - Also untested: AppArmor or SELinux, distributions other than Debian 13, busybox built without `head -c`, an unprivileged LXC.
+- **Waiting on the owner:** nothing from this PR.
+- **Next:** #165 (refuse an agent the server cannot answer before its token is spent) is not started.
+
 ## 2026-11-25 — Claude Code (Fable 5.2), orchestrator — state after #94, #140 and #160 merged; three workers in flight
 - **Done:** since the orchestrator entry below this one's worker entries (same date; it holds the session's decisions and lessons, which still stand), merged by squash with the owner's go-ahead: #94 (PR #161), #140 (PR #162), #160 (PR #163). Filed with the owner's go-ahead: #164 and #165. #159's scope gained a bullet (a secret handed to a `build` step passes every shape test). `main` is at `6cb82b6` plus hand-off commits: 1,644 agent, 1,357 server and 188 web tests.
 - **In flight** (three, the limit; none shares a code file):
@@ -86,50 +159,3 @@ Template:
 - **Waiting on the owner:** nothing from this PR.
 - **Untested:** a real root or systemd install; the container image locally (CI's `agent` job checks it); translated argparse messages.
 - **Next:** #136 (the CA bundle's access checked as the service account), which edits `install.py`, the CA access message changed here included. The enrolment compatibility mechanism is filed as a follow-up.
-
-## 2026-11-25 — Claude Code (Opus 5.5), worker — #94: pin the agent's base image by digest (PR #161)
-- **Merged:** 2026-11-25, squash `c652f2d`, at head `7d298f1`; branch deleted. Entry committed by the orchestrator, with the state lines brought up to date.
-- **Done:** [PR #161](https://github.com/DeusMaximus/TLG-IPAM/pull/161) (`94-agent-base-image-digest`) closes #94.
-  - `agent/Dockerfile`: `FROM python:3.13-slim@sha256:7249d558…`, the tag's multi-platform index (covers amd64 and arm64).
-  - `release.yml` build job: the new step *The base image's pin, against its tag* warns, never fails, when the tag has moved on from the pin. Its comment names the one `FROM` shape its `sed` reads. The publish jobs are unchanged.
-  - `AGENTS.md`: Commands gets "The agent's base image": a one-line `&&` chain that reads the digest, checks its form and moves the pin. The subsection says the test holds the pin's shape, not that the digest is the index. The "One version" bullet names the base pin.
-  - `.agents/releases.md`, checklist step 3: refresh the base in its own PR before the bump PR, whose Tests section records the base digest and that its Release run reported it current.
-  - `.agents/releases.md`, *Re-run all jobs*: corrected; the base is now fixed and only timestamps differ (measured: file times and 296 `.pyc` files).
-  - Brief §2.4 and spec §5.6: one sentence each.
-- **Tests:** 26 new in `test_release.py`.
-  - Parsing: the `FROM` parser splits at Docker's white space and lines only at newlines. The one-stage test holds the shape the step's `sed` reads, and a tab-separated second stage is counted and refused.
-  - Workflow: the step runs under bash against a stand-in `docker` for three registry answers (current, moved on, unreadable). On the PR's own Release run on the runner it printed `python:3.13-slim still names sha256:7249…`, and both platforms built from the pin.
-  - Documentation: the `AGENTS.md` line runs as written without `set -e`, for one good answer and six bad ones.
-- **Decisions:** PR Deliberate calls 1–7. The pin is the index digest. The digest moves by hand at each release, not by Dependabot. The server's Dockerfile is not pinned: it is built where it runs and never published. A stale pin is a warning, not a failure. Rebuilding a tag to the same digest is out of scope. The outside read overruled none.
-- **Review:** Greptile read `b6fbc68` (one P2, fixed in `df40a87`). In place of its re-run, an outside read by Codex (GPT-6.1 Sol) at `df40a87`: GO, one P3 (a tab-separated second `FROM` went uncounted) and three corrections, all fixed in `7d298f1` and read by the orchestrator against the remedy, with the reviewer's mutant replayed. Codex automatic review clean on every head.
-- **State:** merged. No schema change; `PROTOCOL_VERSION` unchanged; no new agent import or listed name.
-- **Waiting on the owner:** nothing from this PR. At each release, checklist step 3's base refresh comes first.
-- **Known gap, not this PR's:** a secret given to a `build` step through `env` passes every shape test in `test_release.py`. Added to #159's scope with the owner's go-ahead.
-- **Untested:** Docker Hub's anonymous rate limit on the extra lookup (it would show as the "could not read" warning); GNU sed running the documented line outside CI.
-- **Next:** #159 (fail-closed release lookup in `publish-release`).
-
-## 2026-11-25 — Claude Code (Fable 5.2), orchestrator — state after the wave of 2026-11-24/25; three workers in flight
-- **Done:** since the last orchestrator entry (now in `.agents/handoff/2026-11.md`), merged by squash with the owner's go-ahead for each, every one with a hand-off entry here or in the archive: #91 (PR #134), #133 (#137), #22 (#130), #23 (#141), #100 (#142), #24 (#145), #144 (#146), #139 (#148), #132 (#135), #149 (#151), #143 (#150), #138 (#152), #92 (#157), #156 (#158), #153 (#155), #147 (#154). `main` is at `c4c4e4d` plus hand-off commits: 1,462 agent, 1,340 server and 188 web tests.
-- **In flight** (three, the limit; none shares a code file):
-  - **#140** (installer parser errors; the agent token's form in `agent_protocol.py`), branch `140-parser-errors-token-form`. Owes a briefed round.
-  - **#160** (refuse a DNS reply whose header claims more records than a PTR answer needs), branch `160-dns-record-budget`. Owes a briefed round.
-  - **#94** (pin the agent's base image by digest), branch `94-agent-base-image-digest`. Automatic reviews only.
-  - Nothing wakes the orchestrator when a worker opens its PR: list open PRs at the start of each turn, then watch, verify and brief.
-- **Queue, in the order agreed with the owner:** #136 after #140 (both edit `install.py`); #159 after #94 (both touch the release workflow); #93 and #20 after #160, one at a time (all in `probe.py`). #31 (deployment document from spec §8) is unblocked by #132 and not started. M3 (#26–#30, #32) waits on #25.
-- **Decisions the owner took this session:**
-  - A GO from Sol stands in for a Greptile re-run. When a PR owes no briefed round and Greptile has not read the head, run one outside read by Sol instead of asking for a retrigger.
-  - P3s on a follow-up PR go back to its worker to fix in the same PR; the orchestrator then reads the diff against the reviewer's remedy, with Codex clean on the new head, and no further round.
-  - PR #154's command record is a tripwire for changes made in good faith, not a boundary (after two NO-GOs).
-  - A review round GPT-6.1 Sol is stopped on by its safety filter is restarted from T3 Code on GPT-6 Sol with Daybreak Blue (`.agents/orchestration.md`, "When a model refuses", updated in this commit). It happened on #132, #153 and #147 (twice in one day); the hand-over files are under `.dev/<issue>/`.
-  - "Pause new sessions" for the 5-hour Claude limit means new Claude workers only: Codex rounds may start, and messages to running workers are fine.
-- **Learned, and not written elsewhere:**
-  - Re-running a pull request's CI job re-tests the merge it was first run on. To test a PR against a `main` that has moved, update its branch (`gh pr update-branch`), check the new head's tree equals `git merge-tree --write-tree origin/main <old head>`, post `@codex review`, and say on the PR what the commit is. Done on #155 and #154.
-  - A check that fails in a test the PR does not touch is still evidence. #156's failure followed the text of an unrelated test module: `tracemalloc` counted a rebuild of the interpreter's interned-string table. A re-run of `main`'s job was the control that showed it was the head, not the runner.
-  - The orchestrator's own verification caught a wrong figure in #155 before its round (203 entries; a root question is 5 bytes, so 244). Recompute one stated bound per PR.
-- **State:** nothing half-finished in `main`. No schema change this session beyond those the merged PRs' entries name; `PROTOCOL_VERSION` is 2. Review briefs and reviews are in `.dev/<issue>/` in the main checkout (not committed). Stale local branches and `t3-*` worktrees from merged work are still on this machine; they are not cleaned up.
-- **Waiting on the owner:**
-  - The first build of the server image with the new `CMD` (`python -m app.serve`, #132): nobody has built it, and no proxy has been run against spec §8.
-  - The first release, by `.agents/releases.md`: nothing has been published; the first tag and the registry settings are theirs. Its step 5 now includes a check of the cross-attempt artefact download (#147).
-  - #5 and #25 (`owner` label), deferred until the deployment is rebuilt behind a tunnel.
-  - Permission to send packets on the test host covered 2026-11-23 only: ask again before any real-network test.
-- **Next:** verify the three PRs as they open; brief Sol on #140 and #160; then the queue above.
