@@ -242,12 +242,54 @@ NO_DNS_SERVER = "rdns not run: the agent has no DNS server to ask (the job names
 # honours EDNS truncates a longer answer instead, and a truncated reply is not used:
 # a larger datagram is one the agent did not ask for.
 DNS_PAYLOAD = 1232
+# the most a reply's 12-byte header may claim (#160): the one question a PTR query
+# asks, and records in its answer, authority and additional sections together (the
+# OPT record of EDNS among them). The largest legitimate PTR answers built hold 16
+# (the 710-byte answer above: two CNAMEs and the PTR record, four name servers, an A
+# and an AAAA record for each, and OPT) and 5 (four PTR records of 253 characters at
+# one name, and OPT); 32 is twice the larger. A reply that claims more is not parsed:
+# dnspython's parse of one whose owner names hash alike costs work that grows with
+# the square of its records, and holds the event loop while it runs. Under these
+# counts it makes at most (32 - 1) * (32 + 24) = 1,736 name comparisons (spec §5.2).
+DNS_QUESTIONS_MAX = 1
+DNS_RECORDS_MAX = 32
+# a DNS message's header: id, flags, then the four section counts, 2 bytes each
+DNS_HEADER = 12
 
 
 class ReplyTooLarge(dns.exception.DNSException):
     """A datagram from the query's server longer than DNS_PAYLOAD: it is not parsed
     (#153). The attempt ends as one that got no usable answer: the query was sent, and
     the next configured server is asked."""
+
+
+class ReplyTooManyRecords(dns.exception.DNSException):
+    """A datagram from the query's server whose header claims more than
+    DNS_QUESTIONS_MAX questions, or more than DNS_RECORDS_MAX records in its other
+    sections: it is not parsed (#160), and the attempt ends as ReplyTooLarge's does."""
+
+
+def unread(data: bytes) -> dns.exception.DNSException | None:
+    """Why a datagram is not handed to dnspython's parser, or None when it is: longer
+    than DNS_PAYLOAD (ReplyTooLarge), or a header that claims more than a PTR answer
+    needs (ReplyTooManyRecords). Only the length and the header's counts are read; the
+    counts are the sender's claim. dnspython reads by them, so a reply that holds more
+    than it claims is parsed only as far as the counts and then refused for its
+    trailing bytes (`ignore_trailing` is off), and one that holds less runs out and is
+    refused as malformed. A datagram shorter than a header has no counts to read, and
+    dnspython refuses it as malformed, at no cost that grows."""
+    if len(data) > DNS_PAYLOAD:
+        return ReplyTooLarge(f"a {len(data)}-byte reply, over {DNS_PAYLOAD}")
+    if len(data) < DNS_HEADER:
+        return None
+    questions = int.from_bytes(data[4:6], "big")
+    records = sum(int.from_bytes(data[at:at + 2], "big") for at in (6, 8, 10))
+    if questions > DNS_QUESTIONS_MAX or records > DNS_RECORDS_MAX:
+        return ReplyTooManyRecords(
+            f"a reply claiming {questions} questions and {records} records, over "
+            f"{DNS_QUESTIONS_MAX} and {DNS_RECORDS_MAX}"
+        )
+    return None
 
 
 class QuerySocket(asyncio.DatagramProtocol):
@@ -272,13 +314,15 @@ class QuerySocket(asyncio.DatagramProtocol):
     returns from the server's address and port straight to `dns.message.from_wire`,
     whose cost grows with the square of a reply's records when their names hash alike
     (dnspython 2.9.2 hashes a name by arithmetic that distinct names share), and the
-    parse holds the event loop until it ends. One from the address and port the query
-    went to (`_from_server`) is answered with ReplyTooLarge, which `recvfrom` raises
-    and dnspython passes on unparsed, so the attempt ends at once and the next server
-    is asked. Whatever its id: one from there with the wrong id ends the attempt too,
-    once parsed (a bad response), so no sender gains anything it did not have. One from
-    anywhere else is dropped, as dnspython would ignore it (`ignore_unexpected`): no
-    other sender can end the attempt, at any size."""
+    parse holds the event loop until it ends. Nor does one whose header claims more
+    than one question, or more than DNS_RECORDS_MAX records (#160), which bounds that
+    cost at a size the agent reads (`unread`). One from the address and port the query
+    went to (`_from_server`) is answered with ReplyTooLarge or ReplyTooManyRecords,
+    which `recvfrom` raises and dnspython passes on unparsed, so the attempt ends at
+    once and the next server is asked. Whatever its id: one from there with the wrong
+    id ends the attempt too, once parsed (a bad response), so no sender gains anything
+    it did not have. One from anywhere else is dropped, as dnspython would ignore it
+    (`ignore_unexpected`): no other sender can end the attempt, whatever it holds."""
 
     def __init__(self, family: int):
         self.family = family
@@ -297,9 +341,10 @@ class QuerySocket(asyncio.DatagramProtocol):
         self._transport = transport
 
     def datagram_received(self, data: bytes, addr) -> None:
-        if len(data) > DNS_PAYLOAD:
+        refused = unread(data)
+        if refused is not None:
             if self._from_server(addr):
-                self._received.put_nowait(ReplyTooLarge(f"a {len(data)}-byte reply, over {DNS_PAYLOAD}"))
+                self._received.put_nowait(refused)
             return
         self._received.put_nowait((data, addr))
 
@@ -504,8 +549,9 @@ class DnsResolver:
     failover, retransmission and TCP fallback would put datagrams on the wire that the
     packet budget never saw. Here a lookup is one UDP query per server, to at most
     MAX_DNS_SERVERS servers in turn, with no retransmission and no TCP; a truncated
-    reply is not used, nor one longer than the DNS_PAYLOAD bytes the query advertised,
-    which is not parsed either. Before each query it awaits `slot()`, which takes one
+    reply is not used, nor one longer than the DNS_PAYLOAD bytes the query advertised
+    or one whose header claims more questions or records than a PTR answer needs,
+    neither of which is parsed. Before each query it awaits `slot()`, which takes one
     packet from the budget (`MAX_PPS`, shared with the ICMP and ARP sweeps) and returns
     the seconds the lookup has left; the query goes on its own `QuerySocket`, made
     first.
@@ -589,8 +635,9 @@ class DnsResolver:
         no server asked gave a usable answer (silence, SERVFAIL, REFUSED, another rcode,
         a referral, a CNAME the reply leaves unresolved, a PTR record at an owner the
         question does not reach, an SOA for a zone that does not hold the name, a
-        truncated, malformed or mismatched reply, a reply longer than DNS_PAYLOAD, which
-        is not parsed), or when the lookup's time ran out after a query was sent (or before its first attempt, which only
+        truncated, malformed or mismatched reply, a reply longer than DNS_PAYLOAD or one
+        claiming more questions or records than a PTR answer needs, neither of which is
+        parsed), or when the lookup's time ran out after a query was sent (or before its first attempt, which only
         the job's deadline does). Raises ProbeError when there is no server to ask, or
         when no query was sent before the servers or the lookup's time ran out."""
         if not servers:
@@ -626,7 +673,8 @@ class DnsResolver:
                 # is not used); without EDNS a plain query allows only 512 bytes.
                 # Recursion desired, no DNSSEC. The advertised payload is also the
                 # most the agent reads: a longer reply from the server is not parsed
-                # (QuerySocket, #153), and the next server is asked.
+                # (QuerySocket, #153), nor one whose header claims more than a PTR
+                # answer needs (#160), and the next server is asked.
                 query = dns.message.make_query(
                     name, dns.rdatatype.PTR, use_edns=0, payload=DNS_PAYLOAD, want_dnssec=False,
                     flags=dns.flags.RD,
@@ -651,8 +699,9 @@ class DnsResolver:
                     )
                 except (dns.exception.DNSException, TimeoutError):
                     # no answer in time, a truncated, broken or over-size one
-                    # (ReplyTooLarge): the query was sent, and the next server is
-                    # asked. (TimeoutError is an OSError: caught first.)
+                    # (ReplyTooLarge), or one claiming too many records
+                    # (ReplyTooManyRecords): the query was sent, and the next server
+                    # is asked. (TimeoutError is an OSError: caught first.)
                     asked = True
                     continue
                 except (OSError, ValueError) as exc:
