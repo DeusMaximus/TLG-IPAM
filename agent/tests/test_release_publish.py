@@ -153,7 +153,9 @@ class Publish:
         }
 
         # what GitHub and the registry hold before the step runs
-        self.github = {"tags": [self.tag], "releases": [], "fail": {}, "lookup_wins": [], "looked_up": []}
+        self.github = {
+            "tags": [self.tag], "releases": [], "fail": {}, "list_answers": [], "list_requests": 0, "looked_up": [],
+        }
         self.registry = {
             "tags": {},
             "repository_exists": True,
@@ -336,6 +338,7 @@ def _functions(script: str) -> set[str]:
 def test_reading_a_command_word():
     assert _command_word('have=$(digest_of manifest.json)') is None
     assert _command_word('draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" 2> /dev/null)') is None
+    assert _command_word('TAG=$tag gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100"') == "gh"
     assert _command_word('flags=(--prerelease)') is None
     assert _command_word('ref="docker://$IMAGE:$VERSION"') is None
     assert _command_word('x="a b" y=$(c d) skopeo copy a b') == "skopeo"
@@ -564,36 +567,141 @@ def test_a_failed_download_of_a_draft_without_the_wheel_attaches_it_and_publishe
     _published_with_this_wheel(release, finished)
 
 
-def test_a_failed_lookup_is_taken_for_no_release(tmp_path, workflow):
-    """`gh release view` failing for any reason leads to `gh release create`, which
-    gh itself refuses when a release with the tag is already published. When only a
-    draft has it, gh makes and publishes a second release with this build's wheel and
-    the draft stays: `.agents/releases.md` says to delete it."""
-    fail = "HTTP 502: Bad Gateway (https://api.github.com/graphql)"
+def _error(status: int, message: str) -> dict:
+    """A page GitHub answers with a JSON error body, as its REST API does."""
+    return {"status": status, "json": True, "body": json.dumps({"message": message, "status": str(status)})}
 
-    none = Publish(tmp_path / "none", workflow, "publish-release")
-    none.github["fail"]["view"] = fail
-    assert none.run().returncode == 0
-    (made,) = none.github["releases"]
-    _published_with_this_wheel(none, made)
 
-    for wheel in (None, b"a wheel some other build made"):
-        published = Publish(tmp_path / f"published-{wheel is None}", workflow, "publish-release")
-        published.release(draft=False, wheel=wheel)
-        before = json.loads(json.dumps(published.github["releases"]))
-        published.github["fail"]["view"] = fail
-        result = published.run()
-        assert result.returncode == 1
-        assert "a release with the same tag name already exists" in result.stderr
-        assert published.github["releases"] == before
+# What a read of the list of releases can get that is not a list (#159), one answer per
+# page request: GitHub's own refusals, a body that is not JSON (a proxy's or a load
+# balancer's page), no answer at all, and success statuses that carry no list.
+LIST_FAILURES = {
+    "401": _error(401, "Bad credentials"),
+    "403-permission": _error(403, "Resource not accessible by integration"),
+    "403-rate-limit": _error(403, "API rate limit exceeded for installation ID 1."),
+    "404": _error(404, "Not Found"),
+    "429": _error(429, "You have exceeded a secondary rate limit. Please wait a few minutes before you try again."),
+    "500": _error(500, "Server Error"),
+    "502-html": {"status": 502, "json": False, "body": "<html><body><h1>502 Bad Gateway</h1></body></html>"},
+    "503-html": {"status": 503, "json": False, "body": "<html><body>No server is available</body></html>"},
+    "504": _error(504, "We couldn't respond to your request in time. Sorry about that."),
+    "no-answer": {"network": 'Get "https://api.github.com/repos/DeusMaximus/TLG-IPAM/releases?per_page=100": '
+                             "dial tcp: lookup api.github.com: i/o timeout"},
+    "200-html": {"status": 200, "json": False, "body": "<html><body>Sign in to the network</body></html>"},
+    "200-object": {"status": 200, "json": True, "body": json.dumps({"message": "not a list"})},
+    "204": {"status": 204},
+}
+UNREAD = "could not tell whether v{version} has a release, so nothing was created, uploaded or edited; re-run the failed jobs"
+OTHER = b"a wheel some other build made"
 
-    draft = Publish(tmp_path / "draft", workflow, "publish-release")
-    left = draft.release(draft=True)
-    draft.github["fail"]["view"] = fail
-    assert draft.run().returncode == 0
-    (made,) = [r for r in draft.github["releases"] if not r["draft"]]
-    _published_with_this_wheel(draft, made)
-    assert [r for r in draft.github["releases"] if r["draft"]] == [left]
+
+def _seed(publish: Publish, held: str) -> None:
+    """What the tag holds before the step: no release, a draft an interrupted run left,
+    or a published release with this build's wheel."""
+    if held == "draft":
+        publish.release(draft=True)
+    elif held == "published":
+        publish.release(draft=False, wheel=publish.wheel)
+
+
+def _nothing_written(publish: Publish, before: list[dict]) -> None:
+    assert _writes(publish) == []
+    assert publish.github["releases"] == before
+    # nor read through gh's own lookup, which the step makes only once it knows
+    assert publish.argvs("gh", "download") == []
+
+
+@pytest.mark.parametrize("failure", LIST_FAILURES.values(), ids=LIST_FAILURES.keys())
+@pytest.mark.parametrize("held", ["none", "draft"])
+def test_a_list_that_cannot_be_read_publishes_nothing(release, failure, held):
+    """Three reads that do not say what the tag holds stop the job: no create, upload
+    or edit, and the error says to re-run the failed jobs. Before #159 both of these
+    went on to `gh release create`, beside the draft in the second."""
+    _seed(release, held)
+    before = copy.deepcopy(release.github["releases"])
+    release.github["list_answers"] = [failure] * 3
+    result = release.run()
+    assert result.returncode == 1
+    _nothing_written(release, before)
+    assert len(release.argvs("gh", "api")) == 3 and release.github["list_requests"] == 3
+    assert UNREAD.format(version=VERSION) in result.stdout
+    assert result.stdout.count("::warning::listing the releases of") == 3
+    assert [c["argv"] for c in release.calls if c["program"] == "sleep"] == [["15"], ["30"], ["45"]]
+
+
+def _many(publish: Publish, count: int) -> None:
+    """`count` releases of other versions, listed before the tag's own."""
+    for n in range(count):
+        publish.release(draft=False, tag=f"v0.1.{n}")
+
+
+@pytest.mark.parametrize("where", ["first-page", "second-page", "nowhere"])
+def test_a_list_whose_later_page_fails_is_not_read(tmp_path, workflow, where):
+    """What gh printed before a page failed is not a list: a failed second page stops
+    the job whichever page the tag's release is on, or if it has none."""
+    publish = Publish(tmp_path, workflow, "publish-release")
+    if where == "first-page":
+        publish.release(draft=True)
+    _many(publish, 150)
+    if where == "second-page":
+        publish.release(draft=True)
+    before = copy.deepcopy(publish.github["releases"])
+    publish.github["list_answers"] = [None, LIST_FAILURES["502-html"]] * 3
+    result = publish.run()
+    assert result.returncode == 1
+    _nothing_written(publish, before)
+    assert publish.github["list_requests"] == 6
+    assert UNREAD.format(version=VERSION) in result.stdout
+
+
+@pytest.mark.parametrize("held", ["none", "draft", "published"])
+def test_a_list_that_fails_and_then_answers_is_judged_by_the_answer(release, held):
+    _seed(release, held)
+    before = copy.deepcopy(release.github["releases"])
+    release.github["list_answers"] = [LIST_FAILURES["502-html"], LIST_FAILURES["no-answer"]]
+    result = release.run()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert release.github["list_requests"] == 3
+    assert result.stdout.count("::warning::listing the releases of") == 2
+    (after,) = release.github["releases"]
+    if held == "published":
+        assert release.github["releases"] == before and _writes(release) == []
+    else:
+        _published_with_this_wheel(release, after)
+    assert len(release.argvs("gh", "create")) == (1 if held == "none" else 0)
+
+
+@pytest.mark.parametrize("held", ["none", "draft", "published"])
+def test_every_page_of_the_list_is_read(tmp_path, workflow, held):
+    """The tag's release on the second page of 100 is found: a draft there is finished,
+    not created again beside, and a published release there is left as it is."""
+    publish = Publish(tmp_path, workflow, "publish-release")
+    _many(publish, 150)
+    _seed(publish, held)
+    before = copy.deepcopy(publish.github["releases"])
+    result = publish.run()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert publish.github["list_requests"] == 2
+    mine = [r for r in publish.github["releases"] if r["tag"] == publish.tag]
+    assert len(mine) == 1
+    if held == "published":
+        assert publish.github["releases"] == before and _writes(publish) == []
+    else:
+        _published_with_this_wheel(publish, mine[0])
+    assert len(publish.argvs("gh", "create")) == (1 if held == "none" else 0)
+
+
+def test_other_tags_releases_are_not_the_tags(release):
+    """Only a release whose tag is exactly v<version> is the tag's: a release candidate,
+    a longer tag that ends with it and a draft of another version are not."""
+    release.release(draft=False, tag=f"{release.tag}rc1", wheel=OTHER)
+    release.release(draft=True, tag=f"x{release.tag}")
+    release.release(draft=True, tag="v0.1.0")
+    result = release.run()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(release.argvs("gh", "create")) == 1
+    (made,) = [r for r in release.github["releases"] if r["tag"] == release.tag]
+    _published_with_this_wheel(release, made)
 
 
 def test_a_wheel_that_is_not_the_one_the_build_checked_is_not_released(release):
@@ -633,6 +741,8 @@ def _scenarios(tmp_path, workflow, job):
             yield "draft-missing", lambda p: p.release(draft=True)
             yield "draft-other", lambda p: p.release(draft=True, wheel=other)
             yield "published-same", lambda p: p.release(draft=False, wheel=p.wheel)
+            yield "unread", lambda p: p.github["list_answers"].extend([LIST_FAILURES["500"]] * 3)
+            yield "two", lambda p: (p.release(draft=False, wheel=p.wheel), p.release(draft=True))
     for name, setup in setups():
         publish = Publish(tmp_path / name, workflow, job)
         setup(publish)
@@ -717,47 +827,42 @@ def test_a_command_the_step_may_not_run_is_caught_whatever_it_does_with_its_fail
         assert publish.refused() == []
 
 
-# --- A published release and a draft under one tag ---
+# --- More than one release under one tag ---
 
 
 @pytest.mark.parametrize("leftover", ["none", "same", "other"])
-def test_a_rerun_over_a_published_release_and_a_leftover_draft(tmp_path, workflow, leftover):
-    """A failed lookup can leave a draft beside the published release (above). gh's
-    lookup then answers with either, call by call: every order of winners is run, each
-    lookup is checked to have returned the release its order names, and in each run the
-    published release keeps its wheel and stays published, and no wheel is replaced
-    anywhere. When `view` returns the published release the step edits nothing; when
-    every lookup returns the draft, the step goes on to publish it unless it holds
-    another wheel."""
-    wheels = {"none": None, "same": "this", "other": b"a wheel some other build made"}
-    explored: list[tuple[str, ...]] = []
-    for order in itertools.product(("published", "draft"), repeat=4):
-        if any(order[: len(done)] == done for done in explored):
-            continue
-        publish = Publish(tmp_path / "-".join(order), workflow, "publish-release")
-        wheel = publish.wheel if wheels[leftover] == "this" else wheels[leftover]
+@pytest.mark.parametrize("first", ["published", "draft"])
+def test_a_published_release_and_a_leftover_draft_stop_the_job_unchanged(tmp_path, workflow, leftover, first):
+    """A draft beside the published release (left by a run before #159, or made by
+    hand): gh's own lookups would answer with either, by a race (`FetchRelease`), so
+    the step makes none, writes nothing, and says to delete the draft and re-run. In
+    whichever order the list holds them, and whatever wheel the draft holds."""
+    publish = Publish(tmp_path, workflow, "publish-release")
+    wheel = {"none": None, "same": publish.wheel, "other": OTHER}[leftover]
+    if first == "published":
         published = publish.release(draft=False, wheel=publish.wheel)
         draft = publish.release(draft=True, wheel=wheel)
-        before = copy.deepcopy(publish.github["releases"])
-        publish.github["lookup_wins"] = list(order)
-        publish.run()
-        returned = [
-            "draft" if lookup["id"] == draft["id"] else "published"
-            for lookup in publish.github["looked_up"] if lookup["both"]
-        ]
-        assert returned == list(order[: len(returned)])
-        explored.append(order[: len(returned)])
-        edits = publish.argvs("gh", "edit")
-        if returned[0] == "published":
-            assert edits == []
-        if set(returned) == {"draft"}:
-            assert bool(edits) is (leftover != "other")
-        after = {r["id"]: r for r in publish.github["releases"]}
-        assert after[published["id"]]["draft"] is False
-        assert after[published["id"]]["assets"] == published["assets"]
-        for release in before:
-            for name, data in release["assets"].items():
-                assert after[release["id"]]["assets"][name] == data
-        assert len(after) == 2
-    # every lookup of one run returned the draft, and every lookup of another the published release
-    assert {"draft"} in [set(done) for done in explored] and {"published"} in [set(done) for done in explored]
+    else:
+        draft = publish.release(draft=True, wheel=wheel)
+        published = publish.release(draft=False, wheel=publish.wheel)
+    before = copy.deepcopy(publish.github["releases"])
+    result = publish.run()
+    assert result.returncode == 1
+    _nothing_written(publish, before)
+    assert publish.github["looked_up"] == []
+    held = "; ".join(f"{r['id']} {str(r['draft']).lower()}" for r in before)
+    assert (
+        f"::error::{publish.tag} has more than one release (id, draft: {held}), so nothing was changed; "
+        "delete the leftover draft on the Releases page" in result.stdout
+    )
+    assert {published["id"], draft["id"]} == {r["id"] for r in before}
+
+
+def test_two_drafts_under_one_tag_stop_the_job_unchanged(release):
+    release.release(draft=True)
+    release.release(draft=True, wheel=release.wheel)
+    before = copy.deepcopy(release.github["releases"])
+    result = release.run()
+    assert result.returncode == 1
+    _nothing_written(release, before)
+    assert f"{release.tag} has more than one release (id, draft: 1 true; 2 true)" in result.stdout

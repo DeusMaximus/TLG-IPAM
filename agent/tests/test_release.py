@@ -8,6 +8,7 @@ workflow is (`.github/workflows/release.yml`) and the checks it runs before it p
 steps against stand-ins for the registry and GitHub. `web/src/utils/install.test.js`
 holds the names it publishes under to the ones the Agents page renders."""
 
+import copy
 import importlib.util
 import re
 import subprocess
@@ -299,6 +300,112 @@ def test_no_expression_is_expanded_into_a_script(workflow):
     """Every value reaches a `run` through `env`, so none can become shell code."""
     for _, step in _steps(workflow):
         assert "${{" not in step.get("run", ""), step.get("name")
+
+
+# What names a credential in an expression: the `secrets` context in any spelling
+# (`secrets.X`, `secrets['X']`, `toJSON(secrets)`) and `github.token`, which is the job's
+# `GITHUB_TOKEN` under another name. GitHub reads context names in any case.
+SECRET = re.compile(r"\bsecrets\b|\bgithub\s*(\.\s*token\b|\[\s*['\"]token['\"]\s*\])", re.I)
+EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+# the one step of each publish job that publishes, and the variable it is given the token in
+TOKEN_ENV = {"publish-image": "TOKEN", "publish-release": "GH_TOKEN"}
+
+
+def _given_secrets(node, path=()):
+    """Every place in the workflow that hands a credential to a job or a step, by its
+    path, with its value: a value whose expression (`${{ }}`) names one, an `if`, which
+    is an expression whole, that does, and a job's `secrets:` (a reusable workflow's
+    `inherit`). Keys are read as values are."""
+    found = {}
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "secrets":
+                found[path + (key,)] = value
+            found.update(_given_secrets(key, path + ("<key>",)))
+            if key == "if" and isinstance(value, str) and SECRET.search(value):
+                found[path + (key,)] = value
+            found.update(_given_secrets(value, path + (key,)))
+    elif isinstance(node, list):
+        for i, value in enumerate(node):
+            found.update(_given_secrets(value, path + (i,)))
+    elif isinstance(node, str) and any(SECRET.search(e) for e in EXPRESSION.findall(node)):
+        found[path] = node
+    return found
+
+
+def _publish_step(workflow, job):
+    (index,) = [i for i, step in enumerate(workflow["jobs"][job]["steps"]) if "run" in step]
+    return index
+
+
+def _token_holders(workflow):
+    return {
+        ("jobs", job, "steps", _publish_step(workflow, job), "env", name): "${{ secrets.GITHUB_TOKEN }}"
+        for job, name in TOKEN_ENV.items()
+    }
+
+
+def test_only_the_two_publish_steps_are_given_the_token(workflow):
+    """The job's `GITHUB_TOKEN`, through `env`, to the one step of each publish job that
+    publishes, and no credential to any other step or job, through `env`, `with` or
+    anything else: not the build, which runs the tag's code, nor `verify`, nor the
+    publish jobs' download step (#159)."""
+    assert _given_secrets(workflow) == _token_holders(workflow)
+
+
+def _put(workflow, path, value):
+    *parents, last = path
+    node = workflow
+    for key in parents:
+        node = node.setdefault(key, {}) if isinstance(node, dict) else node[key]
+    node[last] = value
+
+
+def _step(workflow, job, name_or_uses):
+    steps = workflow["jobs"][job]["steps"]
+    (index,) = [i for i, s in enumerate(steps) if name_or_uses in (s.get("name"), s.get("uses", "").split("@")[0])]
+    return ("jobs", job, "steps", index)
+
+
+# Credentials handed where none may go. The first is the outside read's of PR #161: a
+# build step's `env`, which every other test of this file let through.
+GIVEN = {
+    "build-step-env": (("build", "Wheel"), ("env", "TOKEN"), "${{ secrets.GITHUB_TOKEN }}"),
+    "build-step-with": (("build", "actions/checkout"), ("with", "token"), "${{ github.token }}"),
+    "build-step-if": (("build", "Wheel"), ("if",), "secrets.GITHUB_TOKEN != ''"),
+    "build-step-name": (("build", "Wheel"), ("name",), "Wheel ${{ secrets.OTHER }}"),
+    "build-step-all": (("build", "Wheel"), ("env", "ALL"), "${{ toJSON(secrets) }}"),
+    "build-step-index": (("build", "Wheel"), ("env", "T"), "${{ secrets['GITHUB_TOKEN'] }}"),
+    "build-step-case": (("build", "Wheel"), ("env", "T"), "${{ Secrets.github_token }}"),
+    "build-step-github-index": (("build", "Wheel"), ("env", "T"), "${{ github['token'] }}"),
+    "verify-step": (("verify", "The wheel, installed by the systemd tab's command"), ("env", "TOKEN"), "${{ github.token }}"),
+    "download-step": (("publish-release", "actions/download-artifact"), ("with", "github-token"), "${{ secrets.GITHUB_TOKEN }}"),
+    "publish-step-other": (("publish-release", "Release v<version> with the wheel"), ("env", "PAT"), "${{ secrets.RELEASE_PAT }}"),
+    "publish-step-replaced": (("publish-release", "Release v<version> with the wheel"), ("env", "GH_TOKEN"), "${{ secrets.RELEASE_PAT }}"),
+}
+
+
+@pytest.mark.parametrize("where, at, value", GIVEN.values(), ids=GIVEN.keys())
+def test_a_credential_given_to_any_other_step_fails_the_check(workflow, where, at, value):
+    changed = copy.deepcopy(workflow)
+    _put(changed, _step(changed, *where) + at, value)
+    assert _given_secrets(changed) != _token_holders(changed)
+
+
+@pytest.mark.parametrize(
+    "path, value",
+    [
+        (("jobs", "publish-release", "env", "GH_TOKEN"), "${{ secrets.GITHUB_TOKEN }}"),
+        (("env", "GH_TOKEN"), "${{ github.token }}"),
+        (("jobs", "build", "secrets"), "inherit"),
+        (("jobs", "build", "env", "${{ secrets.GITHUB_TOKEN }}"), "x"),
+    ],
+    ids=["job-env", "workflow-env", "inherit", "in-a-key"],
+)
+def test_a_credential_given_to_a_whole_job_or_workflow_fails_the_check(workflow, path, value):
+    changed = copy.deepcopy(workflow)
+    _put(changed, path, value)
+    assert _given_secrets(changed) != _token_holders(changed)
 
 
 def test_checkout_keeps_no_credential(workflow):

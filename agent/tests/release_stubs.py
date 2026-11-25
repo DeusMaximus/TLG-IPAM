@@ -5,17 +5,34 @@ a test reads what a step did and what it left. Nothing here opens a socket.
 
 Standard library only: each stub runs as `python -I -S` with this directory on its path.
 
-What they answer is taken from `gh` (2.105, `pkg/cmd/release`) and skopeo, as far as
-the publish steps use them:
+What they answer is taken from `gh` (2.105, `pkg/cmd/api` and `pkg/cmd/release`) and
+skopeo, as far as the publish steps use them:
 
-- `gh release view`, `download`, `upload` and `edit` find the release by its tag as
-  gh's `FetchRelease` does (`pkg/cmd/release/shared/fetch.go`): it asks for the
-  published release with the tag and for a draft with it as its pending tag at once,
-  and takes whichever answers first. With neither it fails with `release not found`.
-  When both exist, either can win, call by call: the state's `lookup_wins` lists the
-  winner of each such lookup in turn (`published` or `draft`), so a test runs every
-  order, and a lookup it did not plan for is refused. `looked_up` records each lookup:
-  the verb, the id of the release it returned, and whether both existed.
+- `gh api --paginate repos/<repo>/releases?per_page=100 --jq <RELEASES_JQ>` reads the
+  list of releases (REST `GET /repos/{owner}/{repo}/releases`), drafts included, one
+  page of 100 at a time, following each page's `Link: rel="next"` until a page has
+  none (`pkg/cmd/api/api.go`, `pagination.go`). Each page is answered as gh's
+  `processResponse` handles it: a `204` prints nothing and ends the listing with exit
+  0; a JSON error body with a status above 299 prints `gh: <message> (HTTP <status>)`
+  and exits 1; any other body goes through the jq (`--jq` is evaluated by go-gh's
+  gojq, which reads `env.TAG` from the environment), and a body that is not JSON, or
+  that the jq stops on, exits 1; a status above 299 that the jq did not stop on exits
+  1 as `gh: HTTP <status>`. A request that gets no answer exits 1 with Go's error. What
+  earlier pages printed stays printed. The state's `list_answers` replaces the answer
+  to each page request in turn (`null` for the real page; `json` says whether its
+  `Content-Type` is JSON, `more` whether it links a next page), so a test sends any
+  of these; once it is used up every page is the real one. Taken from GitHub's
+  documentation, not checked against GitHub: the list holds drafts for a token that can
+  push ("only users with push access will receive listings for draft releases"), as
+  this job's `contents: write` token can, and a page links the next whenever more
+  follow.
+- `gh release download`, `upload` and `edit` find the release by its tag as gh's
+  `FetchRelease` does (`pkg/cmd/release/shared/fetch.go`): it asks for the published
+  release with the tag and for a draft with it as its pending tag at once, and takes
+  whichever answers first. With neither it fails with `release not found`. When both
+  exist, which one it returns is a race, and the stub refuses the call: the step is to
+  make none then. `looked_up` records each lookup: the verb and the id of the release
+  it returned.
 - `gh release create <tag> <asset>` with an asset refuses a tag that a *published*
   release already has (`a release with the same tag name already exists`). A draft
   with the tag does not stop it: it makes a new draft, uploads, then publishes it.
@@ -23,10 +40,6 @@ the publish steps use them:
   release has no asset, and `no assets match the file pattern` when it has others.
 - `gh release upload` without `--clobber` refuses a name the release already has
   (`asset under the same name already exists`), so an asset is never replaced.
-- Assumed, not taken from gh or checked against GitHub: publishing a draft
-  (`gh release edit --draft=false`) whose tag a published release already has is
-  refused (`422`, `tag_name already_exists`). The tests that reach it assert only what
-  holds either way: the published release is not changed.
 - `skopeo inspect --raw` prints the manifest a tag names, byte for byte, and fails with
   the registry's `manifest unknown` (`name unknown` before a repository's first push)
   for a tag that is absent. `skopeo copy --all --preserve-digests` from an OCI archive
@@ -91,33 +104,111 @@ def take_flags(argv: list[str], valued: set[str], plain: set[str]) -> tuple[list
 # --- gh ---
 
 
-class Unplanned(Exception):
-    """A lookup with both a published release and a draft that `lookup_wins` has no
-    winner left for."""
+# The one jq the step lists releases with: a line `page` for each page that is a JSON
+# array, and a line `<id> <draft>` for each release on it whose tag is `env.TAG`.
+RELEASES_JQ = (
+    'if type == "array" then "page", (.[] | select(.tag_name == env.TAG) | "\\(.id) \\(.draft)")'
+    ' else error("not a list of releases") end'
+)
+PER_PAGE = 100
 
 
-def _find(stub: Stub, state: dict, tag: str) -> dict | None:
+class Race(Exception):
+    """A FetchRelease lookup with both a published release and a draft for the tag."""
+
+
+def _find(state: dict, tag: str) -> dict | None:
     """As `gh`'s FetchRelease: the published release with the tag or a draft with it,
-    whichever answers first; `lookup_wins` says which when both exist."""
+    whichever answers first, which is a race when both exist."""
     published = [r for r in state["releases"] if r["tag"] == tag and not r["draft"]]
     drafts = [r for r in state["releases"] if r["tag"] == tag and r["draft"]]
     if published and drafts:
-        if not state["lookup_wins"]:
-            raise Unplanned
-        winner = state["lookup_wins"].pop(0)
-        return published[0] if winner == "published" else drafts[0]
+        raise Race
     return (published or drafts or [None])[0]
+
+
+def _release_json(release: dict) -> dict:
+    """A release as `GET /repos/{owner}/{repo}/releases` lists it, in the fields the
+    step's jq reads and a few it does not."""
+    return {
+        "id": release["id"],
+        "tag_name": release["tag"],
+        "name": release["title"],
+        "draft": release["draft"],
+        "prerelease": release["prerelease"],
+        "assets": [{"name": name} for name in release["assets"]],
+    }
+
+
+def _jq(body: str, tag: str | None) -> tuple[list[str], str | None]:
+    """`RELEASES_JQ` on one page's body: the lines it prints before it ends or stops,
+    and gojq's error if it stops."""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return [], "invalid character '<' looking for beginning of value"
+    if not isinstance(data, list):
+        return [], "not a list of releases"
+    lines = ["page"]
+    for release in data:
+        if not isinstance(release, dict):
+            return lines, f"expected an object but got: {type(release).__name__}"
+        if release.get("tag_name") == tag:
+            lines.append(f"{json.dumps(release.get('id'))} {json.dumps(release.get('draft'))}")
+    return lines, None
+
+
+def gh_api(stub: Stub, state: dict, argv: list[str]) -> int:
+    """`gh api --paginate <the releases list> --jq RELEASES_JQ`, page by page, as gh's
+    `processResponse` answers each (module docstring)."""
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    path = f"repos/{repo}/releases?per_page={PER_PAGE}"
+    if argv != ["api", "--paginate", path, "--jq", RELEASES_JQ] or not os.environ.get("GH_TOKEN"):
+        return refuse("gh", argv)
+    releases = [_release_json(r) for r in state["releases"]]
+    page = 0
+    while True:
+        answer = state["list_answers"].pop(0) if state["list_answers"] else None
+        state["list_requests"] += 1
+        stub.save("github", state)
+        if answer is None:
+            more = len(releases) > (page + 1) * PER_PAGE
+            answer = {"status": 200, "json": True, "body": json.dumps(releases[page * PER_PAGE : (page + 1) * PER_PAGE])}
+        else:
+            more = answer.get("more", False)
+        if "network" in answer:
+            return fail(answer["network"])
+        status = answer["status"]
+        if status == 204:
+            return 0
+        if answer["json"] and status >= 400:
+            error_body = json.loads(answer["body"])
+            message = error_body.get("message") if isinstance(error_body, dict) else None
+            if message:
+                return fail(f"gh: {message} (HTTP {status})")
+        lines, error = _jq(answer["body"], os.environ.get("TAG"))
+        if lines:
+            print("\n".join(lines), flush=True)
+        if error:
+            return fail(error)
+        if status > 299:
+            return fail(f"gh: HTTP {status}")
+        if not more:
+            return 0
+        page += 1
 
 
 def gh(stub: Stub, argv: list[str]) -> int:
     state = stub.load("github")
     repo = os.environ.get("GITHUB_REPOSITORY")
+    if argv[:1] == ["api"]:
+        return gh_api(stub, state, argv)
     if argv[:1] != ["release"] or len(argv) < 3:
         return refuse("gh", argv)
     verb, rest = argv[1], argv[2:]
     parsed = take_flags(
         rest,
-        valued={"--repo", "--json", "--jq", "--pattern", "--dir", "--title", "--notes-file"},
+        valued={"--repo", "--pattern", "--dir", "--title", "--notes-file"},
         plain={"--verify-tag", "--prerelease", "--draft=false"},
     )
     if parsed is None:
@@ -129,13 +220,12 @@ def gh(stub: Stub, argv: list[str]) -> int:
         return fail(state["fail"][verb])
     releases = state["releases"]
     tag = args[0]
-    if verb in ("view", "download", "upload", "edit"):
+    if verb in ("download", "upload", "edit"):
         try:
-            release = _find(stub, state, tag)
-        except Unplanned:
+            release = _find(state, tag)
+        except Race:
             return refuse("gh", argv)
-        both = {r["draft"] for r in releases if r["tag"] == tag} == {False, True}
-        state["looked_up"].append({"verb": verb, "id": release and release["id"], "both": both})
+        state["looked_up"].append({"verb": verb, "id": release and release["id"]})
         stub.save("github", state)
 
     def notes() -> str:
@@ -144,13 +234,6 @@ def gh(stub: Stub, argv: list[str]) -> int:
     def asset(path: str) -> tuple[str, str]:
         return Path(path).name, Path(path).read_bytes().hex()
 
-    if verb == "view" and args == [tag] and flags.keys() == {"--repo", "--json", "--jq"}:
-        if (flags["--json"], flags["--jq"]) != ("isDraft", ".isDraft"):
-            return refuse("gh", argv)
-        if release is None:
-            return fail("release not found")
-        print("true" if release["draft"] else "false")
-        return 0
     if verb == "create" and len(args) == 2 and {"--repo", "--verify-tag", "--title", "--notes-file"} <= flags.keys() <= {
         "--repo", "--verify-tag", "--title", "--notes-file", "--prerelease"
     }:
@@ -160,7 +243,7 @@ def gh(stub: Stub, argv: list[str]) -> int:
             return fail(f"a release with the same tag name already exists: {tag}")
         name, data = asset(args[1])
         releases.append({
-            "tag": tag, "draft": False, "prerelease": "--prerelease" in flags,
+            "id": max((r["id"] for r in releases), default=0) + 1, "tag": tag, "draft": False, "prerelease": "--prerelease" in flags,
             "title": flags["--title"], "notes": notes(), "assets": {name: data},
         })
     elif verb == "download" and args == [tag] and flags.keys() == {"--repo", "--pattern", "--dir"}:
@@ -185,10 +268,6 @@ def gh(stub: Stub, argv: list[str]) -> int:
     }:
         if release is None:
             return fail("release not found")
-        if "--draft=false" in flags and release["draft"] and any(
-            r["tag"] == tag and not r["draft"] for r in releases
-        ):
-            return fail("HTTP 422: Validation Failed [{\"resource\":\"Release\",\"code\":\"already_exists\",\"field\":\"tag_name\"}]")
         release.update(title=flags["--title"], notes=notes(), prerelease="--prerelease" in flags)
         if "--draft=false" in flags:
             release["draft"] = False

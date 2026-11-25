@@ -294,13 +294,48 @@ jobs:
           } > notes.md
           flags=()
           if [ "$PRERELEASE" = true ]; then flags=(--prerelease); fi
-          # gh finds a draft by its tag too, which an interrupted create leaves behind
-          if ! draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2> /dev/null); then
-            # gh creates it as a draft, attaches the wheel, then publishes it
-            gh release create "$tag" "dist/$name" --repo "$GITHUB_REPOSITORY" --verify-tag \
-              --title "$tag" --notes-file notes.md "${flags[@]}"
-            exit 0
+          # The tag's releases, drafts included (an interrupted create leaves one), from
+          # the list of the repository's releases (REST `GET /repos/{owner}/{repo}/releases`,
+          # which holds drafts for a token that can push, as this job's can), every page.
+          # gh exits non-zero for a page answered above 299, or with a body its jq cannot
+          # read, or not answered; it prints nothing for a 204; and the jq prints `page`
+          # only for a JSON array. So the tag has no release only when every page was
+          # read as a list and none holds it. Any other read is retried, then stops the
+          # job with nothing created, uploaded or edited (#159). `gh release view` cannot
+          # tell the two apart: it reports `release not found` when one of its two
+          # lookups fails and the other finds nothing.
+          listed=false
+          for attempt in 1 2 3; do
+            if TAG=$tag gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+                --jq 'if type == "array" then "page", (.[] | select(.tag_name == env.TAG) | "\(.id) \(.draft)") else error("not a list of releases") end' \
+                > listed.txt 2> list.err \
+                && grep -qx page listed.txt; then
+              listed=true
+              break
+            fi
+            echo "::warning::listing the releases of $GITHUB_REPOSITORY failed (attempt $attempt): $(head -c 300 list.err)"
+            sleep $((attempt * 15))
+          done
+          if [ "$listed" != true ]; then
+            echo "::error::could not tell whether $tag has a release, so nothing was created, uploaded or edited; re-run the failed jobs"
+            exit 1
           fi
+          # one line per release with the tag: its id, and whether it is a draft
+          held=$(grep -vx page listed.txt || true)
+          case $held in
+            "")
+              # gh creates it as a draft, attaches the wheel, then publishes it
+              gh release create "$tag" "dist/$name" --repo "$GITHUB_REPOSITORY" --verify-tag \
+                --title "$tag" --notes-file notes.md "${flags[@]}"
+              exit 0
+              ;;
+            *$'\n'*)
+              # gh's own lookups would answer with either, so neither is written to
+              echo "::error::$tag has more than one release (id, draft: ${held//$'\n'/; }), so nothing was changed; delete the leftover draft on the Releases page (its Draft label tells it apart, its title is the same) and re-run the failed jobs"
+              exit 1
+              ;;
+          esac
+          draft=${held#* }
           # A re-run of this workflow: the wheel attached must be this build's
           if gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir attached; then
             echo "$WHEEL_SHA256  attached/$name" | sha256sum -c - \
