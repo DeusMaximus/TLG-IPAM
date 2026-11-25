@@ -1338,9 +1338,10 @@ def test_one_probe_compares_at_most_twelve_keys_more_than_it_holds_of_one_hash()
 
     It is a tripwire, not a proof: a change to CPython's probe that affected only
     hashes it does not try would pass it. The ceiling rests on the argument above, for
-    the probe as 3.13 has it; when the agent's interpreter changes (the image's base,
-    or the CPython a native install runs), this test is run on the new one and the
-    argument read against its `dictobject.c` (spec §5.2)."""
+    the probe as 3.13 has it; when the agent's interpreter changes (the image's base
+    pin moves, or a native install runs another CPython), this test is run on the new
+    one and the argument read against its `dictobject.c` (spec §5.2; `AGENTS.md`,
+    Commands, "The agent's base image")."""
     draw = random.Random(160)
     named = [-(2**63), 2**63 - 1, 2**60, 2**60 - 1, 1, 0, -2]  # as size_t: 0x8000000000000000, …
     worst = 0
