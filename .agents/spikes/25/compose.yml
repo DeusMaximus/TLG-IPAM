@@ -1,0 +1,13 @@
+# From the repository root: PUBLIC_BASE_URL=https://mcp-spike.example.com docker compose -f .agents/spikes/25/compose.yml up -d --build
+services:
+  spike:
+    build:
+      context: ../../..
+      dockerfile: .agents/spikes/25/Dockerfile
+    environment:
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL to the public https URL}
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./logs:/logs
+    restart: "no"
