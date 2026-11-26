@@ -7,7 +7,15 @@ import Modal, { dangerBtn, primaryBtn, secondaryBtn } from '../components/Modal'
 import { useToast } from '../context'
 import { useFetch } from '../hooks/useFetch'
 import { relativeTime } from '../utils/agents'
-import { access, liveLinks, nameText, REFRESH_MS, revokedLinks, shortId } from '../utils/links'
+import {
+  access,
+  liveLinks,
+  nameText,
+  neverCompletedNote,
+  REFRESH_MS,
+  revokedLinks,
+  shortId,
+} from '../utils/links'
 import { formatServerTime } from '../utils/time'
 
 // The name the client gave itself: its own claim, which this server does not check. It is
@@ -43,8 +51,9 @@ function When({ value, now }) {
   return <span title={formatServerTime(value)}>{relativeTime(value, now)}</span>
 }
 
-function LinkRow({ link, now, onRevoke }) {
+function LinkRow({ link, links, now, onRevoke }) {
   const { label, note } = access(link)
+  const unfinished = neverCompletedNote(link, links)
   return (
     <tr className="border-t border-slate-700/60 align-top">
       <td className="px-3 py-2">
@@ -60,6 +69,7 @@ function LinkRow({ link, now, onRevoke }) {
       </td>
       <td className="px-3 py-2">
         <When value={link.last_used_at} now={now} />
+        {unfinished && <span className="block max-w-xs text-xs text-amber-300/80">{unfinished}</span>}
       </td>
       <td className="px-3 py-2 text-right">
         <button
@@ -226,7 +236,7 @@ export default function LinkedClients() {
               </thead>
               <tbody className="text-slate-300">
                 {live.map((link) => (
-                  <LinkRow key={link.id} link={link} now={now} onRevoke={setRevoking} />
+                  <LinkRow key={link.id} link={link} links={live} now={now} onRevoke={setRevoking} />
                 ))}
               </tbody>
             </table>

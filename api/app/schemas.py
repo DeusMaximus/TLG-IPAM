@@ -671,3 +671,6 @@ class LinkedClientOut(BaseModel):
     # heartbeat and not the owner's last use
     last_used_at: UtcDatetime | None
     revoked_at: UtcDatetime | None
+    # the owner approved it, its code expired unexchanged, and it holds no token and can
+    # get none (`oauth.never_completed`, #190); false for a revoked link
+    never_completed: bool

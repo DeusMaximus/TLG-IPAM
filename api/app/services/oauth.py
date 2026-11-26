@@ -48,7 +48,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import AnyUrl
-from sqlalchemy import delete, exists, func, or_, select, update
+from sqlalchemy import and_, delete, exists, func, or_, select, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -104,9 +104,12 @@ CLIENTS_MAX = 50
 # what removes the spare of a client that registers twice for one link. One that was
 # ever linked (`linked_at` set) is never deleted by this rule, revoked or not.
 UNLINKED_LIFETIME = timedelta(hours=24)
+# A registration's place is freed only once every link it holds is revoked (#190,
+# round 1 of PR #197's briefed review): one registration may hold several links
 REGISTRY_FULL = (
-    f"This server already holds {CLIENTS_MAX} linked clients; a link must be revoked in "
-    "the IPAM's own web interface before another client can register."
+    f"This server already holds {CLIENTS_MAX} registered clients, each with a link; "
+    "every link of one of them must be revoked in the IPAM's own web interface before "
+    "another client can register."
 )
 
 # What a registration may hold. Gemini registers six redirect URIs (§6.8).
@@ -430,7 +433,22 @@ async def register_client(
 async def _make_room(session: AsyncSession) -> bool:
     """Leave room for one more registration, deleting the oldest reclaimable ones when
     `CLIENTS_MAX` are held. False when there are not enough to reclaim. The caller
-    holds the write lock."""
+    holds the write lock.
+
+    The order is `created_at` (then `client_id`) alone, and `pending` is never read
+    (#190, spec §6.3): a registration with an authorise request waiting for the owner
+    is reclaimed like any other, and a request added or dropped while this runs changes
+    nothing it decides. Preferring to keep such a registration would raise an
+    outsider's cost only where its registration is cheaper to reclaim than its request
+    is to push out of `pending`, and only up to that: at most `PENDING_MAX` authorise
+    requests on any registration still end the owner's request, after which the
+    registration is reclaimable again. That constant was judged too little to tie this
+    rule to process memory. Never reclaiming such a registration would let an
+    outsider's pending requests make this refuse while registrations are reclaimable.
+
+    A registration is kept while **any** of its grants is unrevoked, a link never
+    completed (`never_completed`) included: one registration can hold several links,
+    and its place is freed only once every one of them is revoked."""
     held = await session.scalar(select(func.count()).select_from(OAuthClient))
     excess = held - CLIENTS_MAX + 1
     if excess <= 0:
@@ -655,6 +673,52 @@ def grant_scopes(grant: OAuthGrant, *, remote_writes: bool) -> list[str]:
     if grant.can_write and remote_writes:
         return [SCOPE_READ, SCOPE_WRITE]
     return [SCOPE_READ]
+
+
+def never_completed(now: datetime):
+    """SQL, over `OAuthGrant`: whether a grant is a link **never completed** at `now`
+    (spec §6.6, #190). The owner approved it, the server issued its code, and the code
+    expired with no exchange committed, so the grant holds no token and can get none
+    from that code. It is left for the owner: listed as a link, marked, until the owner
+    revokes it. While it is unrevoked its registration is not reclaimable; revoking it
+    frees the registration's place only when the registration holds no other
+    unrevoked link (`_make_room`).
+
+    True exactly when all three hold:
+
+    - the grant is unrevoked (`revoked_at` null);
+    - it has never been used (`last_used_at` null). The code exchange sets it in the
+      transaction that claims the code and stores the first tokens (`exchange_code`),
+      and nothing ever clears it;
+    - it has no row in `oauth_tokens` but codes, and none of those has time left: no
+      access or refresh token, expired or not, and no code with `expires_at` after
+      `now`, used or not.
+
+    Either of the last two alone excludes every grant that holds a token today: a grant
+    whose code was exchanged has its tokens' rows and `last_used_at`, from one commit.
+    Both are asked so that each guards the other: a later change that pruned expired
+    rows could not make a grant that lapsed after use (its tokens all expired, 30 days
+    unused) read as never completed, and a grant written with a token but no
+    `last_used_at` would not either. A grant that lapsed after use is not this case: it
+    was completed, and stays a link with its last contact, for the owner to judge.
+
+    The clock is the server's (`_now`), and the comparison with a code's `expires_at`
+    is the exact complement of the one `exchange_code` claims a code by (`expires_at >
+    now`): at any instant a code is claimable or the grant can be flagged, never both.
+    The rule reads committed rows, so it does not see a claim made before the code
+    expired whose transaction has not committed yet: every read before that commit
+    may flag the grant, and every read after it does not (`list_links`). The rule only
+    reads, and is judged here alone; `linked_clients.list_links` asks it in its one
+    statement. It revokes nothing, so even a stale answer takes no token from anyone."""
+    holds_more_than_a_spent_code = exists().where(
+        OAuthToken.grant_id == OAuthGrant.id,
+        or_(OAuthToken.kind != "code", OAuthToken.expires_at > now),
+    )
+    return and_(
+        OAuthGrant.revoked_at.is_(None),
+        OAuthGrant.last_used_at.is_(None),
+        ~holds_more_than_a_spent_code,
+    )
 
 
 _LIFETIMES = {"code": CODE_LIFETIME, "access": ACCESS_LIFETIME, "refresh": REFRESH_LIFETIME}

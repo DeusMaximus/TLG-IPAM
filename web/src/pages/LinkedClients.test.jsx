@@ -62,6 +62,7 @@ const link = (over = {}) => ({
   created_at: '2026-11-26T10:00:00+00:00',
   last_used_at: '2026-11-26T11:00:00+00:00',
   revoked_at: null,
+  never_completed: false,
   ...over,
 })
 
@@ -182,6 +183,39 @@ describe('Linked clients list', () => {
     expect(t.getByText(/no name this server keeps/)).toBeInTheDocument()
     expect(t.getByText(/registration deleted/)).toBeInTheDocument()
     expect(t.getByText('link a0000000')).toBeInTheDocument()
+  })
+
+  it('says which link was never completed, from the server’s flag alone, and offers revoke', async () => {
+    ipam.listLinkedClients.mockResolvedValue({
+      data: [
+        link({ id: 'a', last_used_at: null, never_completed: true }),
+        // approved a moment ago, its code not yet expired: never contacted, not flagged
+        link({ id: 'b', last_used_at: null, redirect_host: 'young.example.com' }),
+      ],
+    })
+    renderPage()
+    const t = await table()
+    const notes = t.getAllByText(/^Never completed: as of this list/)
+    expect(notes).toHaveLength(1)
+    const row = notes[0].closest('tr')
+    expect(within(row).getByText('client.example.com')).toBeInTheDocument()
+    expect(within(row).getByRole('button', { name: /Revoke the link to client.example.com/ })).toBeInTheDocument()
+    const young = t.getByText('young.example.com').closest('tr')
+    expect(within(young).queryByText(/Never completed/)).toBeNull()
+  })
+
+  it('says a revoke frees no place when the registration holds another live link', async () => {
+    ipam.listLinkedClients.mockResolvedValue({
+      data: [
+        link({ id: 'a', client_id: 'shared', last_used_at: null, never_completed: true }),
+        link({ id: 'b', client_id: 'shared', redirect_host: 'other.example.com' }),
+      ],
+    })
+    renderPage()
+    const t = await table()
+    const [note] = t.getAllByText(/^Never completed/)
+    expect(note).toHaveTextContent(/frees no place: its registration holds another link listed here/)
+    expect(note).not.toHaveTextContent(/link it again/)
   })
 
   it('says a link made read-write is read-only while remote writes are off', async () => {

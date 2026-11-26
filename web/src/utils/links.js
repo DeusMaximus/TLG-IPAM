@@ -97,6 +97,39 @@ export function nameText(link) {
   return link.client_registered ? 'no name this server keeps' : 'registration deleted'
 }
 
+// What the list says of a link the owner approved whose client never collected its
+// tokens: the code the approval issued expired unexchanged (`never_completed`, from the
+// server, #190). The page never works this out from the times it is given. The note says
+// what the list establishes, as of when it was read, and points to a refresh: an exchange
+// that was finishing at that moment shows as completed on the next list
+// (docs/deployment.md says so in full). Kept short at the owner's request.
+//
+// A place among the 50 belongs to the client's registration, not to a link, and the
+// server keeps a registration while any of its links is unrevoked (round 1 of PR #197's
+// briefed review). Every unrevoked link is in the list with its `client_id`, so which
+// case this is comes from the list alone: no other unrevoked link of the registration
+// (revoking this frees the place), another one (it frees none), or the registration
+// already gone (it holds none). None of them advises linking again: the deployment page
+// says when to. Null for any other link.
+export const NEVER_COMPLETED =
+  'Never completed: as of this list, the code from your approval expired unused, so this link has no token and cannot get one. Refresh to confirm.'
+export const PLACE_FREED = 'Revoking it frees its registration’s place.'
+export const PLACE_SHARED =
+  'Revoking it frees no place: its registration holds another link listed here.'
+export const PLACE_GONE = 'Its registration is gone, so it holds no place.'
+
+export function neverCompletedNote(link, links = []) {
+  if (!link || !link.never_completed || link.revoked_at) return null
+  let place = PLACE_FREED
+  if (!link.client_registered) place = PLACE_GONE
+  else if (
+    (links || []).some((l) => l.id !== link.id && !l.revoked_at && l.client_id === link.client_id)
+  ) {
+    place = PLACE_SHARED
+  }
+  return `${NEVER_COMPLETED} ${place}`
+}
+
 export const liveLinks = (links) => (links || []).filter((l) => !l.revoked_at)
 export const revokedLinks = (links) => (links || []).filter((l) => l.revoked_at)
 

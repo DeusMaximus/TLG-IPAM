@@ -95,6 +95,7 @@ async def test_a_link_is_listed_with_its_host_name_access_and_times(web):
         "created_at": link["created_at"],
         "last_used_at": link["last_used_at"],
         "revoked_at": None,
+        "never_completed": False,
     }
     # a code exchange is a contact (`oauth._touch`), and every time is UTC with its offset
     assert link["created_at"].endswith("+00:00") and link["last_used_at"].endswith("+00:00")
@@ -237,6 +238,417 @@ async def test_the_window_state_gives_the_url_a_client_is_given(web):
     assert res.json()["data"]["mcp_url"] == f"{BASE}/mcp"
     res = await web.delete("/api/v1/link-window", headers=OWNER)
     assert res.json()["data"]["mcp_url"] == f"{BASE}/mcp"
+
+
+# --- A link never completed (#190) ---
+
+
+async def approved_through_window(web, **metadata):
+    """A client the owner approved through the window and the consent page, which never
+    exchanged its code: the registration and the code it was sent."""
+    window = await open_window(web)
+    client = await register(web, **metadata)
+    back = await consent_with_code(web, client, window["code"])
+    return client, back.params["code"]
+
+
+async def expire_codes(by=timedelta(seconds=1)):
+    """Every code's five minutes run out, as time passing does: its `expires_at` is
+    `by` behind the server's clock."""
+    async with SessionLocal() as session:
+        await session.execute(
+            update(OAuthToken)
+            .where(OAuthToken.kind == "code")
+            .values(expires_at=datetime.now(timezone.utc) - by)
+        )
+        await session.commit()
+
+
+async def expire_all_tokens():
+    async with SessionLocal() as session:
+        await session.execute(
+            update(OAuthToken).values(expires_at=datetime.now(timezone.utc) - timedelta(seconds=1))
+        )
+        await session.commit()
+
+
+async def flags(web) -> dict:
+    return {link["id"]: link["never_completed"] for link in await links(web)}
+
+
+async def register_at(web, when):
+    client = await register(web)
+    async with SessionLocal() as session:
+        (await session.get(OAuthClient, client["client_id"])).created_at = when
+        await session.commit()
+    return client
+
+
+async def test_a_link_whose_code_expired_unexchanged_is_never_completed_and_keeps_its_place(web):
+    """The issue's first acceptance line. The grant stays a link, unrevoked, listed with
+    `never_completed`; its registration is never reclaimed at the cap nor deleted at 24
+    hours while it stands; the owner's revoke frees the place, as for any link. The
+    server writes nothing for it, and the client is answered for its code as before."""
+    client, code = await approved_through_window(web, client_name="Example")
+    grant = await the_grant()
+    [link] = await links(web)
+    # inside its five minutes the code can still be exchanged: not flagged
+    assert link["last_used_at"] is None and link["never_completed"] is False
+    await expire_codes()
+    before = database_dump()
+    [link] = await links(web)
+    assert (link["id"], link["revoked_at"], link["never_completed"]) == (grant.id, None, True)
+    assert link["last_used_at"] is None and link["client_name"] == "Example"
+    # reading the list wrote nothing, the change log included
+    assert database_dump() == before
+    # the client presenting its code now is refused as an expired code always was
+    res = await exchange(web, client, code)
+    assert invalid_grant(res) and res.json()["error_description"] == "authorization code has expired"
+    assert database_dump() == before
+
+    # its registration is the oldest and two days old, and the registry is at the cap
+    now = datetime.now(timezone.utc)
+    async with SessionLocal() as session:
+        (await session.get(OAuthClient, client["client_id"])).created_at = now - timedelta(days=2)
+        await session.commit()
+    # the link closed its window: registering takes another
+    await open_window(web)
+    others = [await register_at(web, now - timedelta(hours=2, seconds=-i)) for i in range(oauth.CLIENTS_MAX - 1)]
+    held = {c.client_id for c in await all_rows(OAuthClient)}
+    assert len(held) == oauth.CLIENTS_MAX
+    await register(web)
+    held = {c.client_id for c in await all_rows(OAuthClient)}
+    # the oldest reclaimable went; the never-completed link's registration holds its place
+    assert client["client_id"] in held and others[0]["client_id"] not in held
+    assert [c.entity_type for c in await all_rows(Change)].count("grant") == 1
+
+    # the owner revokes it: the next registration at the cap takes its place
+    assert (await revoke(web, grant.id)).status_code == 200
+    await open_window(web)
+    [listed] = [entry for entry in await links(web) if entry["id"] == grant.id]
+    assert listed["revoked_at"] is not None and listed["never_completed"] is False
+    await register(web)
+    assert client["client_id"] not in {c.client_id for c in await all_rows(OAuthClient)}
+
+
+async def test_the_rule_holds_for_a_grant_made_before_it(web):
+    """A grant as #26 to #30 left one whose code was never exchanged, written straight
+    to the tables long ago: the rule is computed on read, from rows every such grant
+    has, so it needs no migration and no write to apply."""
+    long_ago = datetime.now(timezone.utc) - timedelta(days=40)
+    async with SessionLocal() as session:
+        session.add(
+            OAuthClient(
+                client_id="00000000-0000-4000-8000-000000000190",
+                redirect_uris=["https://client.example.com/cb"],
+                token_endpoint_auth_method="none",
+                grant_types=["authorization_code", "refresh_token"],
+                scope="ipam:read",
+                created_at=long_ago,
+                linked_at=long_ago,
+            )
+        )
+        grant = OAuthGrant(
+            client_id="00000000-0000-4000-8000-000000000190",
+            redirect_uri="https://client.example.com/cb",
+            created_at=long_ago,
+        )
+        session.add(grant)
+        await session.flush()
+        session.add(
+            OAuthToken(
+                token_hash="0" * 64,
+                grant_id=grant.id,
+                kind="code",
+                created_at=long_ago,
+                expires_at=long_ago + oauth.CODE_LIFETIME,
+                code_challenge="c" * 43,
+            )
+        )
+        await session.commit()
+        grant_id = grant.id
+    assert await flags(web) == {grant_id: True}
+
+
+async def test_each_condition_of_the_rule_spares_a_grant_on_its_own():
+    """Grants written straight to the tables in shapes the server does not leave today,
+    each failing one condition of `oauth.never_completed` alone: revoked; used
+    (`last_used_at` set) though it holds only a spent code, as a grant that lapsed would
+    if expired rows were ever pruned; holding an expired access token though never
+    marked used; and holding an unexpired code. Only the grant failing none is flagged."""
+    from sqlalchemy import select
+
+    now = datetime.now(timezone.utc)
+    past = now - timedelta(days=1)
+    shapes = {
+        "never completed": ({}, [("code", past)]),
+        "revoked": ({"revoked_at": past}, [("code", past)]),
+        "used": ({"last_used_at": past}, [("code", past)]),
+        "a token": ({}, [("code", past), ("access", past)]),
+        "a live code": ({}, [("code", now + timedelta(minutes=1))]),
+    }
+    ids = {}
+    async with SessionLocal() as session:
+        for n, (name, (fields, rows)) in enumerate(shapes.items()):
+            grant = OAuthGrant(
+                client_id="00000000-0000-4000-8000-000000000190",
+                redirect_uri="https://client.example.com/cb",
+                created_at=past,
+                **fields,
+            )
+            session.add(grant)
+            await session.flush()
+            ids[grant.id] = name
+            for m, (kind, expires) in enumerate(rows):
+                session.add(
+                    OAuthToken(
+                        token_hash=f"{n:032d}{m:032d}",
+                        grant_id=grant.id,
+                        kind=kind,
+                        created_at=past,
+                        expires_at=expires,
+                    )
+                )
+        await session.commit()
+        flagged = await session.scalars(
+            select(OAuthGrant.id).where(oauth.never_completed(now))
+        )
+        assert [ids[g] for g in flagged] == ["never completed"]
+
+
+async def test_a_grant_whose_code_was_exchanged_in_its_last_second_is_completed(web):
+    client, code = await approved_through_window(web)
+    await expire_codes(by=-timedelta(seconds=1))  # one second of its five minutes left
+    res = await exchange(web, client, code)
+    assert res.status_code == 200, res.text
+    await expire_codes()
+    assert set((await flags(web)).values()) == {False}
+
+
+async def test_no_grant_that_holds_or_held_a_token_is_never_completed(web):
+    """Each grant a refresh token or the reuse rule could still act on, and each that
+    lapsed after use, is not flagged: its access tokens all expired with its refresh
+    token live; one mid-chain, rotated, with a retry answered inside the 60 seconds;
+    one whose every token has expired (30 days unused), which was completed and is left
+    to the owner as a link with its last contact; one whose client takes no refresh
+    token, its one access token expired; and a revoked one, listed as revoked."""
+    expired_access, tokens = await linked_through_window(web)
+    async with SessionLocal() as session:
+        await session.execute(
+            update(OAuthToken)
+            .where(OAuthToken.kind.in_(("access", "code")))
+            .values(expires_at=datetime.now(timezone.utc) - timedelta(seconds=1))
+        )
+        await session.commit()
+    mid_chain, first = await linked_through_window(web)
+    second = await rotate(web, mid_chain, first["refresh_token"])
+    again = await refresh(web, mid_chain, first["refresh_token"])
+    assert again.status_code == 200 and again.json()["refresh_token"] == second["refresh_token"]
+    revoked, _ = await linked_through_window(web)
+    no_refresh, _ = await linked_through_window(web, grant_types=["authorization_code"])
+    await expire_codes()
+    grants = {g.client_id: g.id for g in await all_rows(OAuthGrant)}
+    assert (await revoke(web, grants[revoked["client_id"]])).status_code == 200
+    listed = await flags(web)
+    assert len(listed) == 4 and set(listed.values()) == {False}
+    # a refresh token still works for the one whose access tokens all expired
+    assert (await refresh(web, expired_access, tokens["refresh_token"])).status_code == 200
+    # every token run out, after real use
+    await expire_all_tokens()
+    listed = await links(web)
+    assert {link["never_completed"] for link in listed} == {False}
+    assert all(link["last_used_at"] for link in listed if not link["revoked_at"])
+
+
+async def test_at_the_codes_last_instant_it_is_claimable_or_flagged_never_both(web, monkeypatch):
+    """The rule's comparison is the exact complement of the claim's, by one clock: at
+    the code's `expires_at` the claim refuses it and the rule flags the grant, a
+    microsecond before the claim takes it and the rule does not."""
+    from sqlalchemy import select
+
+    from app.times import utc
+
+    client, code = await approved_through_window(web)
+    [row] = [t for t in await all_rows(OAuthToken) if t.kind == "code"]
+    expires = utc(row.expires_at)
+
+    async def flagged(at) -> bool:
+        async with SessionLocal() as session:
+            return bool(await session.scalar(select(oauth.never_completed(at))))
+
+    assert await flagged(expires) is True
+    assert await flagged(expires - timedelta(microseconds=1)) is False
+    before = database_dump()
+    monkeypatch.setattr(oauth, "_now", lambda: expires)
+    with pytest.raises(oauth.Refused):
+        async with SessionLocal() as session:
+            await oauth.exchange_code(session, client["client_id"], code, remote_writes=False)
+    assert database_dump() == before
+    monkeypatch.setattr(oauth, "_now", lambda: expires - timedelta(microseconds=1))
+    async with SessionLocal() as session:
+        await oauth.exchange_code(session, client["client_id"], code, remote_writes=False)
+    assert await flagged(expires + timedelta(days=1)) is False
+
+
+async def test_an_exchange_committing_while_the_list_reads_is_never_flagged(web, monkeypatch):
+    """Both orders, with the code still claimable. The exchange commits between the
+    list's clock reading and its statement, or after the statement: the answer is one
+    snapshot, and in neither is the link flagged; the next answer has its contact."""
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    for when in ("before the statement", "after the statement"):
+        client, code = await approved_through_window(web)
+        grant_id = max(await all_rows(OAuthGrant), key=lambda g: g.created_at).id
+        real_execute = AsyncSession.execute
+        done = False
+
+        async def execute(self, *args, **kwargs):
+            nonlocal done
+
+            async def commit_exchange():
+                async with http_client() as other:
+                    assert (await exchange(other, client, code)).status_code == 200
+
+            if not done and when == "before the statement":
+                done = True
+                await commit_exchange()
+                return await real_execute(self, *args, **kwargs)
+            result = await real_execute(self, *args, **kwargs)
+            if not done:
+                done = True
+                await commit_exchange()
+            return result
+
+        monkeypatch.setattr(AsyncSession, "execute", execute)
+        async with SessionLocal() as session:
+            listed = await linked_clients.list_links(session, remote_writes=False)
+        monkeypatch.undo()
+        assert done
+        [mine] = [link for link in listed if link["id"] == grant_id]
+        assert mine["never_completed"] is False
+        [mine] = [link for link in await links(web) if link["id"] == grant_id]
+        assert mine["never_completed"] is False and mine["last_used_at"] is not None
+
+
+async def test_a_registration_holding_another_link_keeps_its_place_until_every_link_is_revoked(web):
+    """Round 1 of PR #197's briefed review, finding 1. One registration approved twice:
+    the first code never exchanged, the second exchanged. With 49 other linked clients
+    the registry is full of links and refuses. Revoking the marked link removes it but
+    frees no place, since the registration still holds a link; revoking that one too
+    frees it, and the next registration takes it."""
+    client, _ = await approved_through_window(web)
+    window = await open_window(web)
+    back = await consent_with_code(web, client, window["code"])
+    assert (await exchange(web, client, back.params["code"])).status_code == 200
+    await expire_codes()
+    for _ in range(oauth.CLIENTS_MAX - 1):
+        await linked_through_window(web)
+    listed = await links(web)
+    [marked] = [link for link in listed if link["never_completed"]]
+    [other] = [
+        link for link in listed if link["client_id"] == client["client_id"] and link is not marked
+    ]
+    assert len(listed) == oauth.CLIENTS_MAX + 1 and marked["client_id"] == client["client_id"]
+    await open_window(web)
+
+    async def registers() -> int:
+        res = await web.post("/mcp/register", json={"redirect_uris": ["https://new.example.com/cb"]})
+        if res.status_code == 403:
+            assert res.json()["error_description"] == oauth.REGISTRY_FULL
+        return res.status_code
+
+    assert await registers() == 403
+    assert (await revoke(web, marked["id"])).status_code == 200
+    assert await registers() == 403
+    assert client["client_id"] in {c.client_id for c in await all_rows(OAuthClient)}
+    assert (await revoke(web, other["id"])).status_code == 200
+    assert await registers() == 201
+    assert client["client_id"] not in {c.client_id for c in await all_rows(OAuthClient)}
+
+
+async def test_a_list_read_before_an_exchange_commits_may_flag_it_and_none_after(web, monkeypatch):
+    """Round 1 of PR #197's briefed review, finding 3. The client's exchange claims the
+    code a microsecond before it expires, and its transaction has not committed when
+    the list reads at the expiry: every such read (two here) marks the link never
+    completed, since the claim is not yet in what the list can see. Once the exchange
+    commits, the next read does not, and the token it issued works."""
+    import asyncio
+
+    from app.times import utc
+
+    client, code = await approved_through_window(web)
+    [row] = [t for t in await all_rows(OAuthToken) if t.kind == "code"]
+    expires = utc(row.expires_at)
+    monkeypatch.setattr(oauth, "_now", lambda: expires - timedelta(microseconds=1))
+    monkeypatch.setattr(linked_clients, "_now", lambda: expires)
+    at_commit, release = asyncio.Event(), asyncio.Event()
+    async with SessionLocal() as writer:
+        real_commit = writer.commit
+
+        async def held_commit():
+            at_commit.set()
+            await release.wait()
+            await real_commit()
+
+        monkeypatch.setattr(writer, "commit", held_commit)
+        exchanging = asyncio.create_task(
+            oauth.exchange_code(writer, client["client_id"], code, remote_writes=False)
+        )
+        try:
+            await asyncio.wait_for(at_commit.wait(), timeout=5)
+            assert [link["never_completed"] for link in await links(web)] == [True]
+            assert [link["never_completed"] for link in await links(web)] == [True]
+            release.set()
+            issued = await asyncio.wait_for(exchanging, timeout=5)
+        finally:
+            release.set()
+            if not exchanging.done():
+                exchanging.cancel()
+    [link] = await links(web)
+    assert link["never_completed"] is False and link["last_used_at"] is not None
+    async with SessionLocal() as session:
+        assert await oauth.load_access(session, issued.access_token, remote_writes=False)
+
+
+def test_a_revoked_link_is_never_answered_as_never_completed():
+    """Round 1 of PR #197's briefed review, finding 4: `link_out`'s own guard, apart
+    from the predicate's revoked clause, which masks it in the list."""
+    now = datetime.now(timezone.utc)
+    grant = OAuthGrant(
+        id="00000000-0000-4000-8000-000000000190",
+        client_id="00000000-0000-4000-8000-000000000191",
+        redirect_uri="https://client.example.com/cb",
+        created_at=now,
+        revoked_at=now,
+    )
+    out = linked_clients.link_out(grant, None, remote_writes=False, never_completed=True)
+    assert out["never_completed"] is False
+    grant.revoked_at = None
+    out = linked_clients.link_out(grant, None, remote_writes=False, never_completed=True)
+    assert out["never_completed"] is True
+
+
+async def test_the_list_with_never_completed_links_is_still_one_statement(web):
+    from sqlalchemy import event
+
+    from app.database import engine
+
+    await linked_through_window(web)
+    await approved_through_window(web)
+    await expire_codes()
+    statements = []
+
+    def count(conn, cursor, statement, *args):
+        statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", count)
+    try:
+        async with SessionLocal() as session:
+            listed = await linked_clients.list_links(session, remote_writes=False)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", count)
+    assert len(statements) == 1
+    assert sorted(link["never_completed"] for link in listed) == [False, True]
 
 
 # --- Revoke ---
