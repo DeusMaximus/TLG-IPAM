@@ -50,10 +50,11 @@ export default function UpdateModal({ agent, serverVersion, onClose, location = 
               />
               <p className="mt-3 text-xs text-slate-400">
                 <code>install</code> without <code>--enrol-token</code> keeps the stored agent token
-                and rewrites the settings and the unit: give it the same{' '}
-                <code>--allowed-cidrs</code>, <code>--max-pps</code> and <code>--ca-file</code> it
-                was installed with. It keeps the <code>ALLOWED_DNS_SERVERS</code> its settings file
-                holds unless given <code>--allowed-dns-servers</code>.
+                and the <code>ALLOWED_CIDRS</code>, <code>ALLOWED_DNS_SERVERS</code> and{' '}
+                <code>MAX_PPS</code> its settings file holds, each replaced only by its option
+                (<code>--allowed-cidrs</code>, <code>--allowed-dns-servers</code>,{' '}
+                <code>--max-pps</code>). It rewrites the rest of the settings and the unit: give it
+                the same <code>--ca-file</code> it was installed with.
               </p>
             </>
           )

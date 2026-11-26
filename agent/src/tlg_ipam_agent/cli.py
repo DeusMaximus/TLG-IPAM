@@ -181,13 +181,21 @@ def _parser() -> argparse.ArgumentParser:
         "could read from the command line. Leave it out to keep the agent token already "
         "stored (an update)",
     )
-    setup.add_argument("--allowed-cidrs", metavar="CIDRS", help="ALLOWED_CIDRS for the agent")
+    setup.add_argument(
+        "--allowed-cidrs",
+        metavar="CIDRS",
+        help="ALLOWED_CIDRS for the agent; left out, the value agent.env holds is kept",
+    )
     setup.add_argument(
         "--allowed-dns-servers",
         metavar="CIDRS",
         help="ALLOWED_DNS_SERVERS for the agent; left out, the value agent.env holds is kept",
     )
-    setup.add_argument("--max-pps", metavar="N", help="MAX_PPS for the agent")
+    setup.add_argument(
+        "--max-pps",
+        metavar="N",
+        help="MAX_PPS for the agent; left out, the value agent.env holds is kept",
+    )
     setup.add_argument(
         "--ca-file",
         metavar="PATH",
