@@ -39,7 +39,9 @@ import ipaddress
 import logging
 import re
 import secrets
+import string
 import time
+import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -98,6 +100,10 @@ ROTATION_MIN_AGE = timedelta(minutes=5)
 # place of the oldest that holds no unrevoked grant; when every one holds an unrevoked
 # grant, it is refused until the owner revokes a link.
 CLIENTS_MAX = 50
+# A registration never linked is deleted once it is this old (spec §6.6, #29): that is
+# what removes the spare of a client that registers twice for one link. One that was
+# ever linked (`linked_at` set) is never deleted by this rule, revoked or not.
+UNLINKED_LIFETIME = timedelta(hours=24)
 REGISTRY_FULL = (
     f"This server already holds {CLIENTS_MAX} linked clients; a link must be revoked in "
     "the IPAM's own web interface before another client can register."
@@ -106,9 +112,13 @@ REGISTRY_FULL = (
 # What a registration may hold. Gemini registers six redirect URIs (§6.8).
 REDIRECT_URIS_MAX = 16
 REDIRECT_URI_MAX = 2048
-# A declared name is kept only when it is already at most this long and printable
-# (`kept_name`); #29 replaces the rule with the sanitising of spec §4.3
+# A declared name as stored (`sanitise_name`, spec §4.3, #29): at most this many
+# characters, each an ASCII letter or digit, a space, a hyphen or an underscore
 CLIENT_NAME_MAX = 60
+CLIENT_NAME_CHARACTERS = frozenset(string.ascii_letters + string.digits + " -_")
+# How much of a declared name is read: a name is cut to `CLIENT_NAME_MAX` anyway, and
+# this bounds the work a 2 MiB name could ask for
+CLIENT_NAME_READ = 256
 # An authorise request's `state` is the client's, returned to it unread
 STATE_MAX = 4096
 
@@ -275,16 +285,36 @@ def names_this_server(resource: str | None, public_base_url: str) -> bool:
 # --- Registration ---
 
 
-def kept_name(declared: str | None) -> str | None:
-    """A client's declared name as this server keeps it: unchanged when it is 1 to
-    `CLIENT_NAME_MAX` printable characters with none of them whitespace at either end,
-    else nothing. It is never cut or cleaned here (#29 owns that rule); a name that
-    would need either is not stored at all."""
-    if not declared or len(declared) > CLIENT_NAME_MAX:
+def sanitise_name(declared: object) -> str | None:
+    """A client's declared name as this server stores it (spec §4.3, #29), or None.
+
+    The name is the client's own claim, shown on the consent page, in `actor` and in
+    the owner's list of links, so it is cut down to a stated set of characters and
+    nothing else: ASCII letters and digits, a space, a hyphen and an underscore
+    (`CLIENT_NAME_CHARACTERS`). A letter with accents keeps its base letter (the
+    canonical decomposition, NFD, with its combining marks dropped); every other
+    character outside the set (punctuation such as `.` `:` `·` `|` and quotation marks,
+    symbols, check marks, emoji, controls, format and bidirectional characters, and
+    letters of other scripts) becomes a space, so two words are never joined into one.
+    Runs of spaces become one, the ends are trimmed, and the result is cut to
+    `CLIENT_NAME_MAX` characters. A result with no letter or digit is no name (None),
+    and so is anything that is not a string. Only the first `CLIENT_NAME_READ`
+    characters of the declared value are read.
+
+    Without `.` or `:` a name cannot spell a host name or a URL, and without quotation
+    marks it cannot close the quotation the consent page shows it in. The function is
+    idempotent: a stored name is returned unchanged.
+    """
+    if not isinstance(declared, str):
         return None
-    if not declared.isprintable() or declared != declared.strip():
-        return None
-    return declared
+    kept = []
+    for char in unicodedata.normalize("NFD", declared[:CLIENT_NAME_READ]):
+        if char in CLIENT_NAME_CHARACTERS:
+            kept.append(char)
+        elif not unicodedata.category(char).startswith("M"):
+            kept.append(" ")
+    name = " ".join("".join(kept).split())[:CLIENT_NAME_MAX].rstrip()
+    return name if any(char.isalnum() for char in name) else None
 
 
 def actor_for(client: OAuthClient | None) -> str | None:
@@ -302,7 +332,7 @@ GRANT_ID_ACTOR_PREFIX = "grant-id:"
 async def grant_actor(session: AsyncSession, grant_id: str) -> str:
     """The `actor` of an MCP write made with a token of this grant (spec §4.3, #28):
     `grant:<client name>`, or `grant-id:<grant id>` when the client's declared name was
-    not kept (`kept_name`) or its registration is gone. Never null, so a write from a
+    not kept (`sanitise_name`) or its registration is gone. Never null, so a write from a
     grant is never taken for the owner's."""
     grant = await session.get(OAuthGrant, grant_id)
     client = await session.get(OAuthClient, grant.client_id) if grant is not None else None
@@ -333,19 +363,21 @@ async def register_client(
 
     Refused whole (`invalid_redirect_uri`) when any redirect URI is outside the policy
     of `redirect_problem`, or there are more than `REDIRECT_URIS_MAX`. Only the SHA-256
-    of the secret is stored. Of the rest, only what the server uses: the name when
-    `kept_name` keeps it, and the grant types and scopes among the server's own.
+    of the secret is stored. Of the rest, only what the server uses: the name as
+    `sanitise_name` leaves it, and the grant types and scopes among the server's own.
 
-    At most `CLIENTS_MAX` registrations exist, counted under the write lock, so that
-    requests at once cannot pass it. At the cap the oldest registration that holds no
+    Under the write lock, registrations never linked that are `UNLINKED_LIFETIME` old
+    are deleted first (`_delete_unlinked`). At most `CLIENTS_MAX` registrations exist,
+    counted under the write lock after that, so that requests at once cannot pass it.
+    At the cap the oldest registration that holds no
     unrevoked grant (never linked, or its links revoked, alike) is deleted to make
     room; its grants and their audit entries stay, and its tokens were deleted when
     its grants were revoked. When every registration holds an unrevoked grant the new
     one is refused (`access_denied`) and nothing changes.
 
-    Not audit-logged, storing or reclaiming: a registration is not a link (§6.3), it
-    comes from a caller with no credential, and it grants nothing. The grant that may
-    follow is logged.
+    Not audit-logged, storing, deleting or reclaiming: a registration is not a link
+    (§6.3), it comes from a caller with no credential, and it grants nothing. The grant
+    that may follow is logged.
     """
     if not linking_open():
         raise Refused("access_denied", LINKING_CLOSED)
@@ -365,12 +397,14 @@ async def register_client(
         raise Refused("invalid_client_metadata", "token_endpoint_auth_method is not supported")
     asked = set((scope or "").split())
     stored = Registered(
-        client_name=kept_name(client_name),
+        client_name=sanitise_name(client_name),
         grant_types=[g for g in GRANT_TYPES if g in grant_types],
         scope=" ".join(s for s in VALID_SCOPES if s in asked),
     )
     try:
         await scans.take_write_lock(session)
+        now = _now()
+        await _delete_unlinked(session, now)
         if not await _make_room(session):
             await session.rollback()
             raise Refused("access_denied", REGISTRY_FULL)
@@ -383,7 +417,7 @@ async def register_client(
                 client_secret_hash=_sha256(client_secret) if client_secret is not None else None,
                 grant_types=stored.grant_types,
                 scope=stored.scope,
-                created_at=_now(),
+                created_at=now,
             )
         )
         await session.commit()
@@ -422,12 +456,66 @@ async def _make_room(session: AsyncSession) -> bool:
     return True
 
 
+def _unlinked_since(now: datetime) -> datetime:
+    """Registrations never linked and created at or before this time are past
+    `UNLINKED_LIFETIME`."""
+    return now - UNLINKED_LIFETIME
+
+
+def _past_lifetime(client: OAuthClient, now: datetime) -> bool:
+    return client.linked_at is None and utc(client.created_at) <= _unlinked_since(now)
+
+
+async def _delete_unlinked(session: AsyncSession, now: datetime) -> None:
+    """Delete every registration that was never linked and is `UNLINKED_LIFETIME` old
+    (spec §6.6, #29). One statement over a registry `CLIENTS_MAX` bounds; the caller
+    holds the write lock. Nothing refers to what it deletes: a grant is written only
+    with the `linked_at` that keeps its registration, so a registration never linked
+    has no grant, token or audit entry. An authorise request still pending for one is
+    refused at approval as for a reclaimed registration (`approve`). Not audit-logged,
+    as a registration is not."""
+    await session.execute(
+        delete(OAuthClient)
+        .where(OAuthClient.linked_at.is_(None), OAuthClient.created_at <= _unlinked_since(now))
+        .execution_options(synchronize_session=False)
+    )
+
+
 async def get_client(session: AsyncSession, client_id: str) -> OAuthClient | None:
     """The registration with this id. An id that is not in the form the server issues
-    is not looked up."""
+    is not looked up, and a registration never linked that is `UNLINKED_LIFETIME` old
+    is not there: it is deleted at the next write that tidies the registry, and until
+    then this read, which writes nothing, answers as if it were gone."""
     if not CLIENT_ID_FORM.fullmatch(client_id):
         return None
-    return await session.get(OAuthClient, client_id)
+    client = await session.get(OAuthClient, client_id)
+    if client is not None and _past_lifetime(client, _now()):
+        return None
+    return client
+
+
+async def tidy_registrations(session: AsyncSession) -> None:
+    """What the server does to the registry when it starts (#29): delete the
+    registrations past `UNLINKED_LIFETIME`, and store every kept name as
+    `sanitise_name` gives it now, so that a name stored under an earlier rule (until
+    #29 a name was kept whole when it was printable) is never shown. At most
+    `CLIENTS_MAX` rows, under the write lock, one transaction; a name that sanitises to
+    nothing is cleared. Not audit-logged, as a registration is not. Past change-log
+    entries keep the `actor` they were written with: the log is a record."""
+    try:
+        await scans.take_write_lock(session)
+        await _delete_unlinked(session, _now())
+        named = await session.scalars(
+            select(OAuthClient).where(OAuthClient.client_name.is_not(None))
+        )
+        for client in named:
+            name = sanitise_name(client.client_name)
+            if name != client.client_name:
+                client.client_name = name
+        await session.commit()
+    except BaseException:
+        await session.rollback()
+        raise
 
 
 def secret_matches(client: OAuthClient, presented: str | None) -> bool:
@@ -705,18 +793,23 @@ async def approve(session: AsyncSession, txn_id: str, *, can_write: bool) -> str
     sends the browser back to the client, with the code and the client's `state`.
 
     `Refused` (`access_denied`) when the transaction is unknown, already taken or
-    expired, or its registration is gone; nothing is written then.
+    expired, or its registration is gone: reclaimed at the cap, or deleted because it
+    was never linked and is now `UNLINKED_LIFETIME` old, which is decided here, under
+    the write lock, by the time read after it (the deletion runs first). Nothing else
+    is written then.
     """
     txn = pending.take(txn_id)
     if txn is None:
         raise Refused("access_denied", "this authorisation request is no longer pending")
     try:
         await scans.take_write_lock(session)
+        now = _now()
+        await _delete_unlinked(session, now)
         client = await session.get(OAuthClient, txn.client_id, populate_existing=True)
         if client is None:
-            await session.rollback()
+            # the deletion is kept: a registration past its lifetime is gone either way
+            await session.commit()
             raise Refused("access_denied", "the client's registration no longer exists")
-        now = _now()
         grant = OAuthGrant(
             client_id=client.client_id,
             redirect_uri=txn.redirect_uri,
