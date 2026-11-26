@@ -193,6 +193,33 @@ async def test_the_state_names_the_window_by_its_own_id(web):
     assert res.json()["data"]["window_id"] is None
 
 
+async def test_each_end_names_the_window_it_ended(web):
+    """`ended_window_id` (#30, round 1 of #195's briefed review): the end the state
+    reports is the latest of any window's, so it names which window it was. Window A
+    links; B opens and is cancelled before A's page asks: the state's end is B's."""
+    a = await open_window(web)
+    client = await register(web)
+    back = await consent_with_code(web, client, a["code"])
+    assert back.params["code"]
+    state = await window_state(web)
+    assert (state["ended"], state["ended_window_id"]) == ("linked", a["window_id"])
+    b = await open_window(web)
+    await web.delete("/api/v1/link-window", params={"window_id": b["window_id"]}, headers=OWNER)
+    state = await window_state(web)
+    assert (state["ended"], state["ended_window_id"]) == ("cancelled", b["window_id"])
+    # a window replaced: its end names it, and the open one is the other
+    c = await open_window(web)
+    d = await open_window(web)
+    state = await window_state(web)
+    assert state["open"] and state["window_id"] == d["window_id"]
+    assert state["ended_window_id"] is None
+    assert c["window_id"] != d["window_id"]
+    # after a restart nothing is known of any end
+    link_window.reset()
+    state = await window_state(web)
+    assert (state["ended"], state["ended_window_id"]) == (None, None)
+
+
 async def test_a_cancel_naming_its_window_ends_that_window(web):
     opened = await open_window(web)
     res = await web.delete(

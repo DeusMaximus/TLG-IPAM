@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { cancelLinkWindow, getLinkWindow, openLinkWindow } from '../api/ipam'
 import { useToast } from '../context'
 import { monotonicNow, received } from '../utils/agents'
-import { countdown, ENDED_TEXT, groupedCode, POLL_MS, sameWindow, windowLeft } from '../utils/links'
+import { countdown, ENDED_TEXT, endedOutcome, groupedCode, POLL_MS, windowLeft } from '../utils/links'
 import CopyBlock from './CopyBlock'
 import Modal, { primaryBtn, secondaryBtn } from './Modal'
 
@@ -125,13 +125,10 @@ export default function LinkClientModal({ state, onClose, onChanged }) {
         if (!alive) return
         setPollError(null)
         const now = res.data
-        if (sameWindow(openedRef.current, now)) {
-          setOpened(received(now, askedAt))
-        } else if (now.open) {
-          finish('replaced')
-        } else {
-          finish(now.ended || 'gone')
-        }
+        // the window's own end only when the state names it (`endedOutcome`)
+        const outcome = endedOutcome(openedRef.current, now)
+        if (outcome === null) setOpened(received(now, askedAt))
+        else finish(outcome)
       } catch (err) {
         if (alive) setPollError(err.message)
       }
@@ -259,9 +256,10 @@ export default function LinkClientModal({ state, onClose, onChanged }) {
               {opened.wrong_codes === 1
                 ? '1 wrong code has been typed'
                 : `${opened.wrong_codes} wrong codes have been typed`}{' '}
-              on this window’s consent pages. A wrong code ends only that request, never the
-              window. If you did not type it, someone else is trying: you can cancel the window
-              and open a new one when you are ready.
+              on this window’s consent pages. A wrong code shows that consent page again; the fifth
+              on one request ends that request, and its client has to start again. None of them
+              closes this window. If you did not type them, someone else is trying: you can cancel
+              the window and open a new one when you are ready.
             </p>
           )}
           {pollError && (

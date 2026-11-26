@@ -147,8 +147,8 @@ class _Window:
 
 
 _current: _Window | None = None
-# how the latest window ended, and when: (reason, at)
-_last_end: tuple[str, datetime] | None = None
+# how the latest window ended, when, and which window it was: (reason, at, window id)
+_last_end: tuple[str, datetime, str | None] | None = None
 # wrong codes by pending transaction, in the open window; only pending ones are kept
 _wrong: dict[str, int] = {}
 # held by every change of which window is current and by an approval through its commit
@@ -158,8 +158,9 @@ _transitions = asyncio.Lock()
 def _end(reason: str, at: datetime | None = None) -> None:
     """End the open window, and every transaction pending in it."""
     global _current, _last_end
+    ended = _current.id if _current is not None else None
     _current = None
-    _last_end = (reason, at or _now())
+    _last_end = (reason, at or _now(), ended)
     _wrong.clear()
     oauth.pending.reset()
 
@@ -194,7 +195,12 @@ def state_out(*, configured: bool, remote_writes: bool) -> dict:
     open, what its link may do, how long it has left by the server's clock
     (`expires_in_s`, which a countdown starts from, so it does not depend on the
     browser's clock) and how many wrong codes its requests have had, or how the latest
-    one ended. Never the code: that is in the one answer that opened it."""
+    one ended. Never the code: that is in the one answer that opened it.
+
+    `ended`, `ended_at` and `ended_window_id` are the latest end of any window, and
+    `ended_window_id` says which window that was (#30): a page that opened a window
+    takes `ended` for its own only when that id is its window's, since another window
+    may have opened and ended since, and a restart forgets every end."""
     writes = configured and writes_may_be_allowed(remote_writes)
     window = _live() if configured else None
     if window is not None:
@@ -210,8 +216,11 @@ def state_out(*, configured: bool, remote_writes: bool) -> dict:
             "wrong_codes": window.wrong_codes,
             "ended": None,
             "ended_at": None,
+            "ended_window_id": None,
         }
-    ended, ended_at = _last_end if configured and _last_end else (None, None)
+    ended, ended_at, ended_window_id = (
+        _last_end if configured and _last_end else (None, None, None)
+    )
     return {
         "configured": configured,
         "remote_writes": writes,
@@ -224,6 +233,7 @@ def state_out(*, configured: bool, remote_writes: bool) -> dict:
         "wrong_codes": None,
         "ended": ended,
         "ended_at": ended_at,
+        "ended_window_id": ended_window_id,
     }
 
 

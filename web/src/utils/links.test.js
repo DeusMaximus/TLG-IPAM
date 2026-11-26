@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { access, countdown, groupedCode, nameText, sameWindow, windowLeft } from './links'
+import { access, countdown, endedOutcome, groupedCode, nameText, sameWindow, windowLeft } from './links'
 
 describe('windowLeft', () => {
   const state = { open: true, expires_in_s: 600, askedAt: 1000, arrivedAt: 1200 }
@@ -54,4 +54,22 @@ it('names a link with no kept name by what is known', () => {
   expect(nameText({ client_name: 'X', client_registered: true })).toBeNull()
   expect(nameText({ client_name: null, client_registered: true })).toMatch(/no name/)
   expect(nameText({ client_name: null, client_registered: false })).toMatch(/registration deleted/)
+})
+
+describe('endedOutcome', () => {
+  const mine = { window_id: 'a' }
+  it('is null while its own window is open', () => {
+    expect(endedOutcome(mine, { open: true, window_id: 'a' })).toBeNull()
+  })
+  it('takes an end for its own only when the end names its window', () => {
+    for (const ended of ['linked', 'expired', 'cancelled', 'replaced', 'failed']) {
+      expect(endedOutcome(mine, { open: false, ended, ended_window_id: 'a' })).toBe(ended)
+      expect(endedOutcome(mine, { open: false, ended, ended_window_id: 'b' })).toBe('unknown')
+    }
+  })
+  it('knows nothing of an end when another window is open, or none is recorded', () => {
+    expect(endedOutcome(mine, { open: true, window_id: 'b' })).toBe('superseded')
+    expect(endedOutcome(mine, { open: false, ended: null, ended_window_id: null })).toBe('unknown')
+    expect(endedOutcome({}, { open: false, ended: 'linked', ended_window_id: undefined })).toBe('unknown')
+  })
 })

@@ -39,19 +39,41 @@ export const groupedCode = (code) =>
 export const sameWindow = (opened, state) =>
   Boolean(opened && state && state.open && opened.window_id && state.window_id === opened.window_id)
 
-// How a window that the dialog opened ended, from the state the server gave once it
-// was no longer open (`ended`), or 'replaced' when another window took its place
+// What the dialog says when its window is no longer open, by what the server's state
+// establishes about that window. The state's `ended` is the latest end of any window, so
+// it is this window's only when `ended_window_id` is this window's id (#30, round 1 of
+// #195's briefed review). Of its own end:
+// - linked: the grant is committed (the end is written after `approve`'s commit).
+// - expired, cancelled, replaced: nothing was linked by it. A link and those ends are
+//   serialised by the server's `_transitions`, a claimed window does not expire, and
+//   an approval rechecks its window is current under that lock, so a window that ended
+//   so made no grant.
+// - failed: the approval failed unexpectedly, possibly after its commit: not known.
+// Anything else is not known either: another window is open (`superseded`), or the end
+// the state reports is another window's or none, after a restart (`unknown`). Then the
+// dialog says so, and never that nothing was linked.
+export function endedOutcome(opened, state) {
+  if (sameWindow(opened, state)) return null
+  if (state?.open) return 'superseded'
+  if (state?.ended && opened?.window_id && state.ended_window_id === opened.window_id) {
+    return state.ended
+  }
+  return 'unknown'
+}
+
+const NOT_KNOWN = 'Whether a client was linked with it is not known here: check the list below and the change log.'
+
 export const ENDED_TEXT = {
   linked: 'Linked. The client is in the list below.',
   expired:
-    'The window ran out before a client was linked. Nothing was linked: open a new window to try again.',
-  cancelled: 'The window was cancelled. Nothing was linked by it.',
+    'The window ran out before a client was linked with it. Nothing was linked: open a new window to try again.',
+  cancelled:
+    'The window was cancelled elsewhere (another tab, or the API) before a client was linked with it. Nothing was linked by it.',
   replaced:
-    'This window was replaced by one opened elsewhere (another tab, or the API), and its code no longer works.',
-  failed:
-    'The approval failed on the server, which ended the window. Nothing was linked: open a new window to try again.',
-  // no end recorded: the server forgets the last end when it restarts, which ends a window
-  gone: 'The window is gone: the server has restarted since it was opened. Nothing was linked by it.',
+    'The window was replaced by one opened elsewhere (another tab, or the API) before a client was linked with it. Nothing was linked by it.',
+  failed: `The approval failed on the server, which ended the window. ${NOT_KNOWN}`,
+  superseded: `This window has ended: another one is open now, opened elsewhere (another tab, or the API), and this window's code no longer works. ${NOT_KNOWN}`,
+  unknown: `This window has ended, but the server no longer says how: another window has ended since, or the server has restarted. ${NOT_KNOWN}`,
 }
 
 // What a link may do now, and what was chosen when it was made. A link made read-write

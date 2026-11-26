@@ -171,6 +171,12 @@ export default function LinkedClients() {
             restart. Until then <code>/mcp</code> takes the API key alone, as a local client such
             as Claude Desktop sends it, and no client can link.
           </p>
+          {live.length > 0 && (
+            <p className="mt-2 text-amber-300">
+              The links below do not work while it is unset: their tokens are refused. They work
+              again once it is set, unless you revoke them, which you still can here.
+            </p>
+          )}
         </div>
       )}
 

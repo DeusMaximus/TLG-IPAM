@@ -94,6 +94,46 @@ afterEach(async () => {
   sessionStorage.clear()
 })
 
+// Not bold, as production would make it so: by an element (above), or by a weight
+// utility class or an inline weight on the name or anything around it in its cell. jsdom
+// has no Tailwind sheet, so the classes are read, not the computed style (round 1 of
+// #195's briefed review, finding 3).
+const BOLD_CLASS = /(^|\s)(font-(semibold|bold|extrabold|black)|font-\[(\d+|bold|bolder)\])(\s|$)/
+function expectNotBold(element) {
+  for (let el = element; el && el.tagName !== 'TD'; el = el.parentElement) {
+    expect(el.className).not.toMatch(BOLD_CLASS)
+    const weight = el.style.fontWeight
+    expect(['bold', 'bolder'].includes(weight) || Number(weight) >= 600).toBe(false)
+  }
+}
+
+// Whether any mounted component holds the link code, in its state, its props or its
+// refs: a walk of React's tree from the page's root (round 1 of #195's briefed review,
+// finding 4). It reads what React keeps for the mounted components, not the JavaScript
+// heap: a closure or a value React has let go of but not yet freed is not seen.
+function reactHolds(text) {
+  const roots = [...document.body.children]
+    .map((el) => el[Object.keys(el).find((k) => k.startsWith('__reactContainer$'))])
+    .filter(Boolean)
+  const skip = new Set(['return', 'alternate', 'stateNode', '_owner', '_debugOwner', '_store', 'deletions', 'sibling', 'child'])
+  const seen = new Set()
+  const found = (value, depth) => {
+    if (typeof value === 'string') return value.includes(text)
+    if (!value || typeof value !== 'object' || depth > 25 || seen.has(value)) return false
+    if (value instanceof Node) return false
+    seen.add(value)
+    return Object.keys(value).some((k) => !skip.has(k) && found(value[k], depth + 1))
+  }
+  const visit = (fiber) => {
+    for (let f = fiber; f; f = f.sibling) {
+      if (found(f.memoizedState, 0) || found(f.memoizedProps, 0)) return true
+      if (visit(f.child)) return true
+    }
+    return false
+  }
+  return roots.some((root) => visit(root.child ?? root.current?.child))
+}
+
 const table = async () => within(await screen.findByRole('table', { name: 'Linked clients' }))
 
 describe('Linked clients list', () => {
@@ -106,7 +146,7 @@ describe('Linked clients list', () => {
     // the name is a quotation, attributed to the client, and is not bold
     const name = t.getByText('“Example Assistant”')
     expect(name.closest('strong, b, h1, h2, h3, th')).toBeNull()
-    expect(getComputedStyle(name).fontWeight).not.toBe('bold')
+    expectNotBold(name)
     expect(name.parentElement).toHaveTextContent('unverified calls itself “Example Assistant”')
     // the host comes first and is the larger text
     expect(host.compareDocumentPosition(name) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
@@ -195,8 +235,21 @@ describe('Linked clients list', () => {
     })
     renderPage()
     expect(await screen.findByText('Remote MCP is not configured.')).toBeInTheDocument()
-    expect(screen.getByText(/PUBLIC_BASE_URL/)).toBeInTheDocument()
+    expect(screen.getAllByText(/PUBLIC_BASE_URL/).length).toBeGreaterThan(0)
     expect(screen.getByRole('button', { name: /Link a client/ })).toBeDisabled()
+    // with no link there is nothing more to say
+    expect(screen.queryByText(/do not work while it is unset/)).toBeNull()
+  })
+
+  it('says existing links do not work while remote MCP is off, and still offers revoke', async () => {
+    ipam.getLinkWindow.mockResolvedValue({ data: closed({ configured: false, mcp_url: null }) })
+    ipam.listLinkedClients.mockResolvedValue({ data: [link()] })
+    renderPage()
+    expect(await screen.findByText(/do not work while it is unset/)).toHaveTextContent(
+      'their tokens are refused'
+    )
+    const t = await table()
+    expect(t.getByRole('button', { name: 'Revoke the link to client.example.com' })).toBeInTheDocument()
   })
 
   it('warns of a window opened elsewhere, whose code it cannot show, and cancels it', async () => {
@@ -449,7 +502,7 @@ describe('Link a client dialog', () => {
       await advance(4000)
       expect(screen.getByRole('timer')).toHaveTextContent('Closing…')
       expect(screen.getByTestId('link-code')).toBeInTheDocument()
-      ipam.getLinkWindow.mockResolvedValue({ data: closed({ ended: 'expired' }) })
+      ipam.getLinkWindow.mockResolvedValue({ data: closed({ ended: 'expired', ended_window_id: WINDOW_ID }) })
       await advance(POLL_MS)
       expect(screen.getByRole('dialog')).toHaveTextContent('The window ran out')
       expect(screen.queryByTestId('link-code')).toBeNull()
@@ -461,13 +514,18 @@ describe('Link a client dialog', () => {
       await openDialog()
       await advance(POLL_MS)
       expect(screen.getByTestId('link-code')).toBeInTheDocument()
+      // the walk finds the code while the window is open: it can see where it is held
+      expect(reactHolds('ABCDE')).toBe(true)
       const listed = ipam.listLinkedClients.mock.calls.length
-      ipam.getLinkWindow.mockResolvedValue({ data: closed({ ended: 'linked' }) })
+      ipam.getLinkWindow.mockResolvedValue({ data: closed({ ended: 'linked', ended_window_id: WINDOW_ID }) })
       ipam.listLinkedClients.mockResolvedValue({ data: [link()] })
       await advance(POLL_MS)
       expect(screen.getByRole('dialog')).toHaveTextContent('Linked. The client is in the list below.')
       expect(screen.queryByTestId('link-code')).toBeNull()
       expect(document.body.textContent).not.toContain('ABCDE')
+      // and no mounted component holds it once the window has ended, though the dialog is
+      // still open: not in the DOM alone, in no state, prop or ref
+      expect(reactHolds('ABCDE')).toBe(false)
       expect(ipam.listLinkedClients.mock.calls.length).toBeGreaterThan(listed)
       const polls = ipam.getLinkWindow.mock.calls.length
       await advance(5 * POLL_MS)
@@ -478,21 +536,60 @@ describe('Link a client dialog', () => {
       expect(ipam.cancelLinkWindow).not.toHaveBeenCalled()
     })
 
-    it('says the window was replaced when another one is open in its place', async () => {
+    // Round 1 of #195's briefed review, finding 1: the state's end is the latest of any
+    // window's, so the dialog claims an outcome only for an end that names its window
+    async function endedAs(state) {
       ipam.getLinkWindow.mockResolvedValueOnce({ data: closed() })
-      ipam.getLinkWindow.mockResolvedValue({ data: open(OTHER) })
+      ipam.getLinkWindow.mockResolvedValue({ data: state })
       await openDialog()
       await advance(POLL_MS)
-      expect(screen.getByRole('dialog')).toHaveTextContent('This window was replaced')
       expect(screen.queryByTestId('link-code')).toBeNull()
+      expect(reactHolds('ABCDE')).toBe(false)
+      return screen.getByRole('dialog')
+    }
+    const NOT_KNOWN = 'Whether a client was linked with it is not known here'
+
+    it('does not say it was replaced, or that nothing linked, when another window is open', async () => {
+      const dialog = await endedAs(open(OTHER))
+      expect(dialog).toHaveTextContent('another one is open now')
+      expect(dialog).toHaveTextContent(NOT_KNOWN)
+      expect(dialog).not.toHaveTextContent('Nothing was linked')
     })
 
-    it('says the window is gone when the server forgot it in a restart', async () => {
-      ipam.getLinkWindow.mockResolvedValueOnce({ data: closed() })
-      ipam.getLinkWindow.mockResolvedValue({ data: closed() })
-      await openDialog()
-      await advance(POLL_MS)
-      expect(screen.getByRole('dialog')).toHaveTextContent('the server has restarted')
+    it('does not take a later window’s cancel for its own: it may have linked first', async () => {
+      // A links; B opens and is cancelled before A's dialog asks
+      const dialog = await endedAs(closed({ ended: 'cancelled', ended_window_id: OTHER.window_id }))
+      expect(dialog).toHaveTextContent(NOT_KNOWN)
+      expect(dialog).not.toHaveTextContent('Nothing was linked')
+      expect(dialog).not.toHaveTextContent('cancelled')
+    })
+
+    it('does not take a later window’s link for its own', async () => {
+      // A is replaced by B, and B links before A's dialog asks
+      const dialog = await endedAs(closed({ ended: 'linked', ended_window_id: OTHER.window_id }))
+      expect(dialog).toHaveTextContent(NOT_KNOWN)
+      expect(dialog).not.toHaveTextContent('Linked.')
+    })
+
+    it('does not say nothing linked after a restart forgot every end', async () => {
+      // A may have linked, then the server restarted before the dialog asked
+      const dialog = await endedAs(closed())
+      expect(dialog).toHaveTextContent('the server has restarted')
+      expect(dialog).toHaveTextContent(NOT_KNOWN)
+      expect(dialog).not.toHaveTextContent('Nothing was linked')
+    })
+
+    it('does not say nothing linked when its own approval failed', async () => {
+      const dialog = await endedAs(closed({ ended: 'failed', ended_window_id: WINDOW_ID }))
+      expect(dialog).toHaveTextContent('The approval failed on the server')
+      expect(dialog).toHaveTextContent(NOT_KNOWN)
+      expect(dialog).not.toHaveTextContent('Nothing was linked')
+    })
+
+    it('says nothing linked only for its own cancel, expiry or replacement', async () => {
+      const dialog = await endedAs(closed({ ended: 'cancelled', ended_window_id: WINDOW_ID }))
+      expect(dialog).toHaveTextContent('The window was cancelled elsewhere')
+      expect(dialog).toHaveTextContent('Nothing was linked by it.')
     })
 
     it('shows the wrong codes typed on the window, which do not close it', async () => {
@@ -502,7 +599,7 @@ describe('Link a client dialog', () => {
       expect(screen.queryByText(/wrong code/)).toBeNull()
       await advance(POLL_MS)
       expect(screen.getByText(/3 wrong codes have been typed/)).toHaveTextContent(
-        'A wrong code ends only that request, never the window'
+        'the fifth on one request ends that request, and its client has to start again. None of them closes this window.'
       )
       expect(screen.getByTestId('link-code')).toBeInTheDocument()
     })

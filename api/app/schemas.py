@@ -628,6 +628,9 @@ class LinkWindowOut(BaseModel):
     # that failed unexpectedly, which ends the window
     ended: LinkWindowEnd | None
     ended_at: UtcDatetime | None
+    # which window that end was (its `window_id`), so a page that opened a window can
+    # tell its own end from a later window's (#30); null with `ended`
+    ended_window_id: str | None = None
     # the URL a client is given to link: `<PUBLIC_BASE_URL>/mcp`, the resource the OAuth
     # server publishes; null when `configured` is false (#30)
     mcp_url: str | None = None
