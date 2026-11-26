@@ -72,7 +72,7 @@ export function access(link) {
 // as a quotation (`ClientName`); a link with none is called by what is known instead
 export function nameText(link) {
   if (link.client_name) return null
-  return link.client_registered ? 'gave no name this server keeps' : 'registration deleted'
+  return link.client_registered ? 'no name this server keeps' : 'registration deleted'
 }
 
 export const liveLinks = (links) => (links || []).filter((l) => !l.revoked_at)

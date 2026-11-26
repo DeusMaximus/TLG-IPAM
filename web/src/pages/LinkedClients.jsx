@@ -12,7 +12,9 @@ import { formatServerTime } from '../utils/time'
 
 // The name the client gave itself: its own claim, which this server does not check. It is
 // quoted and set in small, plain, muted text under the host, never bold and never where
-// the page's own words go, so it does not read as the server vouching for the client.
+// the page's own words go, so it does not read as the server vouching for the client. It
+// reads as the consent page shows it (#29): "unverified", then "calls itself" and the
+// name in quotation marks, or "no name this server keeps".
 function ClientName({ link }) {
   const missing = nameText(link)
   return (
@@ -22,6 +24,9 @@ function ClientName({ link }) {
     >
       {missing ?? (
         <>
+          <span className="mr-1 rounded border border-slate-600 px-1 text-[10px] uppercase tracking-wide text-slate-400">
+            unverified
+          </span>{' '}
           calls itself <span className="italic text-slate-400">“{link.client_name}”</span>
         </>
       )}

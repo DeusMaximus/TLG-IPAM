@@ -107,7 +107,7 @@ describe('Linked clients list', () => {
     const name = t.getByText('“Example Assistant”')
     expect(name.closest('strong, b, h1, h2, h3, th')).toBeNull()
     expect(getComputedStyle(name).fontWeight).not.toBe('bold')
-    expect(name.parentElement).toHaveTextContent('calls itself “Example Assistant”')
+    expect(name.parentElement).toHaveTextContent('unverified calls itself “Example Assistant”')
     // the host comes first and is the larger text
     expect(host.compareDocumentPosition(name) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(host.className).toMatch(/text-sm/)
@@ -139,7 +139,7 @@ describe('Linked clients list', () => {
     })
     renderPage()
     const t = await table()
-    expect(t.getByText(/gave no name this server keeps/)).toBeInTheDocument()
+    expect(t.getByText(/no name this server keeps/)).toBeInTheDocument()
     expect(t.getByText(/registration deleted/)).toBeInTheDocument()
     expect(t.getByText('link a0000000')).toBeInTheDocument()
   })
