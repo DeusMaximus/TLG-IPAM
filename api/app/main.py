@@ -16,7 +16,7 @@ from .config import settings
 from .database import SessionLocal, init_models
 from .errors import ApiError
 from .mcp_server import mcp
-from .oauth_provider import public_base_url_of
+from .oauth_provider import public_base_url_of, remote_writes_of
 from .routers import agent, agents, changes, device_types, hosts, scan_targets, sections, subnets
 from .routers import findings, link_window
 from .services import oauth as oauth_svc
@@ -120,8 +120,10 @@ def create_app(server: FastMCP = mcp) -> FastAPI:
         openapi_url="/api/v1/openapi.json",
     )
 
-    # What the owner's link-window routes ask: whether this app has the OAuth server
+    # What the owner's link-window routes ask: whether this app has the OAuth server,
+    # and whether that server may give a link write access (`MCP_REMOTE_WRITES`)
     app.state.public_base_url = public_base_url_of(server.auth)
+    app.state.remote_writes = remote_writes_of(server.auth)
 
     app.add_middleware(MCPPathRewriteMiddleware)
     # Added last, so it wraps everything above: the body cap runs before routing, before

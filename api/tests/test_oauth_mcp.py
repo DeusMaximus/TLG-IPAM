@@ -1,5 +1,6 @@
 """What a grant's token may do on `/mcp`, and what the owner key still does (#26; the
-scope checks of v0.2 spec §6.5, which ship here so that no grant can write before #28).
+scope checks of v0.2 spec §6.5). These run on the server with `MCP_REMOTE_WRITES` off,
+the default, where no grant writes; the setting itself is `test_remote_writes.py`'s (#28).
 
 Each test that speaks for a grant uses `no_ambient_token`: the token FastMCP sees is the
 one the request carried, and the owner's from `conftest` is out of reach.
@@ -58,10 +59,11 @@ async def test_every_write_tool_requires_ipam_write_and_no_read_tool_does(server
         assert tools[name].auth is None, name
 
 
-def test_a_grant_carries_ipam_read_alone_whatever_can_write_says():
-    """The rule #28 will change. Until it does, `can_write` grants nothing."""
+def test_with_remote_writes_off_a_grant_carries_ipam_read_alone_whatever_can_write_says():
     for can_write in (False, True):
-        assert oauth.grant_scopes(OAuthGrant(can_write=can_write)) == ["ipam:read"]
+        grant = OAuthGrant(can_write=can_write)
+        assert oauth.grant_scopes(grant, remote_writes=False) == ["ipam:read"]
+    assert oauth_mcp.auth.server.remote_writes is False
     assert OWNER_SCOPES == ["ipam:read", "ipam:write"]
 
 
@@ -82,8 +84,8 @@ async def test_the_owner_token_of_the_test_session_sees_every_tool():
 async def test_a_grant_lists_no_write_tool_and_calling_one_is_unknown_tool(
     web, linking, no_ambient_token, client, can_write
 ):
-    """Every write tool, `request_scan` included, for a grant of either kind: not
-    listed, `Unknown tool` when called with arguments that would work, and nothing in
+    """With `MCP_REMOTE_WRITES` off, every write tool, `request_scan` included, for a
+    grant of either kind: not listed, `Unknown tool` when called with arguments that would work, and nothing in
     the database changed. The read tools answer."""
     section = await make_section(client)
     subnet = await make_subnet(client, section["id"], "10.0.0.0/24", gateway="10.0.0.1")

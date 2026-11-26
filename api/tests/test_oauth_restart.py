@@ -193,3 +193,129 @@ def test_a_grant_outlives_the_process_that_issued_it_and_a_server_restart(tmp_pa
             assert http.get(f"{base}/mcp/authorize", params=_authorise(other.json())).status_code == 403
     finally:
         _stop(proc, reader)
+
+
+# --- MCP_REMOTE_WRITES across a restart (#28) ---
+
+LINK_READ_WRITE = LINK.replace("can_write=False", "can_write=True")
+
+
+def _rpc(http, base, bearer, session, method, params=None, *, rid=2):
+    """One JSON-RPC request on an MCP session over HTTP; its result, from a JSON body or
+    from the event stream's one message."""
+    headers = {
+        "Authorization": f"Bearer {bearer}",
+        "Accept": "application/json, text/event-stream",
+        "mcp-session-id": session,
+    }
+    res = http.post(
+        f"{base}/mcp",
+        json={"jsonrpc": "2.0", "id": rid, "method": method, "params": params or {}},
+        headers=headers,
+    )
+    assert res.status_code == 200, res.text
+    if res.headers["content-type"].startswith("text/event-stream"):
+        [data] = [line[5:] for line in res.text.splitlines() if line.startswith("data:")]
+        return json.loads(data)
+    return res.json()
+
+
+def _session(http, base, bearer):
+    res = _mcp(http, base, bearer)
+    assert res.status_code == 200, res.text
+    session = res.headers["mcp-session-id"]
+    http.post(
+        f"{base}/mcp",
+        json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        headers={
+            "Authorization": f"Bearer {bearer}",
+            "Accept": "application/json, text/event-stream",
+            "mcp-session-id": session,
+        },
+    )
+    return session
+
+
+def _tools(http, base, bearer):
+    session = _session(http, base, bearer)
+    return session, {t["name"] for t in _rpc(http, base, bearer, session, "tools/list")["result"]["tools"]}
+
+
+def _call(http, base, bearer, session, name, arguments):
+    return _rpc(http, base, bearer, session, "tools/call", {"name": name, "arguments": arguments})["result"]
+
+
+def test_a_read_write_grant_writes_while_the_setting_is_on_and_not_after_a_restart_with_it_off(
+    tmp_path,
+):
+    """The acceptance line across processes: a grant linked read-write with
+    `MCP_REMOTE_WRITES=true` writes, and is recorded as `grant:<client name>`; the
+    server restarted with the setting off loads the same token with `ipam:read` alone,
+    with no relink; and the owner key keeps both scopes on each."""
+    env = _child_env(tmp_path, REAL_KEY)
+    env.update(PUBLIC_BASE_URL=BASE, MCP_REMOTE_WRITES="true")
+    linked = subprocess.run(
+        [sys.executable, "-c", LINK_READ_WRITE], cwd=API_DIR, env=env, capture_output=True, text=True, timeout=60
+    )
+    assert linked.returncode == 0, linked.stderr
+    issued = json.loads(linked.stdout.strip().splitlines()[-1])
+    client, tokens = issued["client"], issued["tokens"]
+    assert tokens["scope"] == "ipam:read ipam:write"
+    owner = {"X-API-Key": REAL_KEY}
+    access = tokens["access_token"]
+
+    deadline = time.monotonic() + START_DEADLINE
+    proc = _image(tmp_path, REAL_KEY, env={"PUBLIC_BASE_URL": BASE, "MCP_REMOTE_WRITES": "true"})
+    lines, reader = _read_stderr(proc)
+    try:
+        base = f"http://127.0.0.1:{_wait_until_serving(lines, deadline)}"
+        with httpx.Client(trust_env=False) as http:
+            assert http.get(f"{base}/api/v1/link-window", headers=owner).json()["data"]["remote_writes"] is True
+            section = http.post(f"{base}/api/v1/sections", json={"name": "Homelab"}, headers=owner).json()["data"]
+            subnet = http.post(
+                f"{base}/api/v1/subnets",
+                json={"section_id": section["id"], "cidr": "10.0.0.0/24", "name": "lab"},
+                headers=owner,
+            ).json()["data"]
+            session, tools = _tools(http, base, access)
+            assert {"create_host", "request_scan", "list_hosts"} <= tools
+            made = _call(http, base, access, session, "create_host", {"subnet_id": subnet["id"], "ip": "10.0.0.20", "hostname": "nas"})
+            assert made.get("isError") is not True, made
+            [entry] = [
+                c for c in http.get(f"{base}/api/v1/changes", headers=owner).json()["data"] if c["source"] == "mcp"
+            ]
+            assert entry["actor"] == "grant:Example"
+            assert "create_host" in _tools(http, base, REAL_KEY)[1]
+    finally:
+        _stop(proc, reader)
+
+    # Restarted with the setting off (unset): the same grant and token, no relink
+    _five_minutes_pass(tmp_path)
+    deadline = time.monotonic() + START_DEADLINE
+    proc, lines, reader = _serve(tmp_path)
+    try:
+        base = f"http://127.0.0.1:{_wait_until_serving(lines, deadline)}"
+        with httpx.Client(trust_env=False) as http:
+            assert http.get(f"{base}/api/v1/link-window", headers=owner).json()["data"]["remote_writes"] is False
+            session, tools = _tools(http, base, access)
+            assert "list_hosts" in tools and not tools & {"create_host", "request_scan"}
+            for name, arguments in (
+                ("create_host", {"subnet_id": subnet["id"], "ip": "10.0.0.21"}),
+                ("request_scan", {"subnet_id": subnet["id"]}),
+            ):
+                refused = _call(http, base, access, session, name, arguments)
+                assert refused["isError"] is True
+                assert refused["content"][0]["text"] == f"Unknown tool: '{name}'"
+            listed = _call(http, base, access, session, "list_hosts", {"subnet_id": subnet["id"]})
+            assert listed.get("isError") is not True
+            assert [h["hostname"] for h in listed["structuredContent"]["hosts"]] == ["nas"]
+            res = _refresh(http, base, client, tokens["refresh_token"])
+            assert res.status_code == 200, res.text
+            assert res.json()["scope"] == "ipam:read"
+            # the owner key keeps both scopes with the setting off
+            assert {"create_host", "request_scan"} <= _tools(http, base, REAL_KEY)[1]
+            # and no read-write window can be opened
+            refused = http.post(f"{base}/api/v1/link-window", json={"can_write": True}, headers=owner)
+            assert refused.status_code == 409 and refused.json()["error"]["code"] == "REMOTE_WRITES_OFF"
+    finally:
+        _stop(proc, reader)

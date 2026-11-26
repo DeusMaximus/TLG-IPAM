@@ -204,7 +204,7 @@ def _while_linking_is_open(handle, *, page: bool):
 class IpamOAuthProvider(OAuthProvider):
     """The OAuth authorisation server for `/mcp`, on the app's SQLite database."""
 
-    def __init__(self, public_base_url: str):
+    def __init__(self, public_base_url: str, *, remote_writes: bool = False):
         super().__init__(
             # where the operational routes are served: inside the `/mcp` mount
             base_url=public_base_url + oauth.MCP_MOUNT,
@@ -222,6 +222,10 @@ class IpamOAuthProvider(OAuthProvider):
             revocation_options=RevocationOptions(enabled=False),
         )
         self.public_base_url = public_base_url
+        # `MCP_REMOTE_WRITES` (#28), passed to every `services/oauth` function that
+        # answers with a token's scopes (`oauth.grant_scopes`), and read by the owner's
+        # link-window routes through `remote_writes_of`: one value for both rules
+        self.remote_writes = remote_writes
 
     # --- URLs and routes ---
 
@@ -350,7 +354,9 @@ class IpamOAuthProvider(OAuthProvider):
         self, client: OAuthClientInformationFull, authorization_code: str
     ) -> AuthorizationCode | None:
         async with SessionLocal() as session:
-            code = await oauth.load_code(session, client.client_id, authorization_code)
+            code = await oauth.load_code(
+                session, client.client_id, authorization_code, remote_writes=self.remote_writes
+            )
         if code is None:
             return None
         return AuthorizationCode(
@@ -369,7 +375,10 @@ class IpamOAuthProvider(OAuthProvider):
         try:
             async with SessionLocal() as session:
                 issued = await oauth.exchange_code(
-                    session, client.client_id, authorization_code.code
+                    session,
+                    client.client_id,
+                    authorization_code.code,
+                    remote_writes=self.remote_writes,
                 )
         except oauth.Refused as refusal:
             raise TokenError(refusal.error, refusal.description) from None
@@ -397,7 +406,9 @@ class IpamOAuthProvider(OAuthProvider):
         (`oauth.grant_scopes`), and the answer's `scope` says so."""
         try:
             async with SessionLocal() as session:
-                issued = await oauth.exchange_refresh(session, client.client_id, refresh_token.token)
+                issued = await oauth.exchange_refresh(
+                    session, client.client_id, refresh_token.token, remote_writes=self.remote_writes
+                )
         except oauth.Refused as refusal:
             raise TokenError(refusal.error, refusal.description) from None
         return _token_answer(issued)
@@ -408,7 +419,7 @@ class IpamOAuthProvider(OAuthProvider):
         tells a client its token is no good."""
         try:
             async with SessionLocal() as session:
-                found = await oauth.load_access(session, token)
+                found = await oauth.load_access(session, token, remote_writes=self.remote_writes)
         except SQLAlchemyError as exc:
             raise TokenVerificationError("the token store could not be read") from exc
         if found is None:
@@ -450,16 +461,24 @@ def public_base_url_of(auth: AuthProvider | None) -> str:
     return auth.server.public_base_url if isinstance(auth, IpamAuth) else ""
 
 
-def mcp_auth(public_base_url: str) -> AuthProvider:
+def remote_writes_of(auth: AuthProvider | None) -> bool:
+    """Whether the OAuth server behind `auth` may give a grant write access
+    (`MCP_REMOTE_WRITES`, #28): False when `auth` is not the OAuth provider, since no
+    grant can reach `/mcp` then."""
+    return auth.server.remote_writes if isinstance(auth, IpamAuth) else False
+
+
+def mcp_auth(public_base_url: str, *, remote_writes: bool = False) -> AuthProvider:
     """What guards `/mcp` (spec §6.1, §6.2). Without a public base URL, the owner key
-    alone, as before M3, and no OAuth route exists. With one, the OAuth provider with
-    the owner-key verifier beside it: a bearer is tried as an access token first,
-    which costs the owner key no statement (`oauth.TOKEN_FORMS`), then as the owner
-    key."""
+    alone, as before M3, and no OAuth route exists (`remote_writes` then changes
+    nothing). With one, the OAuth provider with the owner-key verifier beside it: a
+    bearer is tried as an access token first, which costs the owner key no statement
+    (`oauth.TOKEN_FORMS`), then as the owner key. `remote_writes` is
+    `MCP_REMOTE_WRITES`: whether a grant with `can_write` carries `ipam:write`."""
     if not public_base_url:
         return OwnerKeyVerifier()
     return IpamAuth(
-        server=IpamOAuthProvider(public_base_url),
+        server=IpamOAuthProvider(public_base_url, remote_writes=remote_writes),
         verifiers={OWNER_SOURCE: OwnerKeyVerifier()},
         server_source_id=OAUTH_SOURCE,
     )

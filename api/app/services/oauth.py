@@ -6,7 +6,9 @@ verification and the parsing of each request. This module supplies what a client
 register, how an authorise request's redirect URI and `resource` are judged, the grant,
 and the life of every code and token.
 
-Nothing here reads the settings: the provider passes the public base URL in.
+Nothing here reads the settings: the provider passes the public base URL in, and
+`MCP_REMOTE_WRITES` as `remote_writes` to every function that answers with a token's
+scopes.
 
 **The link window and the consent page (#27)** are built on three things here:
 
@@ -25,8 +27,9 @@ Nothing here reads the settings: the provider passes the public base URL in.
   consent), and every way a window ends drops them all.
 
 **Scopes (#28).** A token's scopes are never stored: `grant_scopes` is asked each time
-one is loaded. Here it answers `ipam:read` alone, whatever `can_write` says, so no grant
-can write through `/mcp` before #28 adds the `MCP_REMOTE_WRITES` rule to that function.
+one is loaded, and answers `ipam:write` only for a grant with `can_write` while
+`MCP_REMOTE_WRITES` is on. Turning the setting off (a restart) takes write access from
+every grant at once, with no relink; turning it on gives none to a read-only grant.
 """
 
 import base64
@@ -290,6 +293,22 @@ def actor_for(client: OAuthClient | None) -> str | None:
     return f"grant:{client.client_name}" if client is not None and client.client_name else None
 
 
+# The `actor` of an MCP write by a grant whose client has no kept name: the grant's own
+# id, which the server drew. A prefix of its own, because any text after `grant:` is a
+# name some client could declare.
+GRANT_ID_ACTOR_PREFIX = "grant-id:"
+
+
+async def grant_actor(session: AsyncSession, grant_id: str) -> str:
+    """The `actor` of an MCP write made with a token of this grant (spec §4.3, #28):
+    `grant:<client name>`, or `grant-id:<grant id>` when the client's declared name was
+    not kept (`kept_name`) or its registration is gone. Never null, so a write from a
+    grant is never taken for the owner's."""
+    grant = await session.get(OAuthGrant, grant_id)
+    client = await session.get(OAuthClient, grant.client_id) if grant is not None else None
+    return actor_for(client) or f"{GRANT_ID_ACTOR_PREFIX}{grant_id}"
+
+
 @dataclass(frozen=True)
 class Registered:
     """What a registration was stored as, where that is narrower than what was sent."""
@@ -540,13 +559,13 @@ def _with_query(uri: str, **params: str | None) -> str:
 # --- Tokens ---
 
 
-def grant_scopes(grant: OAuthGrant) -> list[str]:
-    """The scopes a token of this grant carries now, asked each time one is loaded.
-
-    `ipam:read` alone, for every grant: until #28 adds its rule here (`ipam:write` only
-    while the grant has `can_write` and `MCP_REMOTE_WRITES` is on), no grant writes
-    through `/mcp`, whichever of #27 and #28 merges first.
-    """
+def grant_scopes(grant: OAuthGrant, *, remote_writes: bool) -> list[str]:
+    """The scopes a token of this grant carries now, asked each time one is loaded
+    (spec §6.5): `ipam:write` as well as `ipam:read` only while the grant has
+    `can_write` **and** `MCP_REMOTE_WRITES` is on (`remote_writes`, from the provider).
+    Nothing else widens it, a client's request included."""
+    if grant.can_write and remote_writes:
+        return [SCOPE_READ, SCOPE_WRITE]
     return [SCOPE_READ]
 
 
@@ -593,7 +612,12 @@ class Issued:
 
 
 def _issue_pair(
-    session: AsyncSession, grant: OAuthGrant, refresh: str | None, now: datetime
+    session: AsyncSession,
+    grant: OAuthGrant,
+    refresh: str | None,
+    now: datetime,
+    *,
+    remote_writes: bool,
 ) -> Issued:
     """Store a new refresh token `refresh`, with a salt of its own, and the access
     token derived from the two; or, for a client that registered for no refresh token
@@ -609,7 +633,7 @@ def _issue_pair(
         access_token=access,
         refresh_token=refresh,
         expires_in=int(ACCESS_LIFETIME.total_seconds()),
-        scopes=grant_scopes(grant),
+        scopes=grant_scopes(grant, remote_writes=remote_writes),
     )
 
 
@@ -743,7 +767,9 @@ class CodeInfo:
     scopes: list[str]
 
 
-async def load_code(session: AsyncSession, client_id: str, plain: str) -> CodeInfo | None:
+async def load_code(
+    session: AsyncSession, client_id: str, plain: str, *, remote_writes: bool
+) -> CodeInfo | None:
     """The unused code of an unrevoked grant of this client, or None. Only reads: the
     code is spent by `exchange_code`, which checks all of this again as it claims it."""
     found = await _find(session, plain, "code")
@@ -758,11 +784,13 @@ async def load_code(session: AsyncSession, client_id: str, plain: str) -> CodeIn
         code_challenge=token.code_challenge or "",
         redirect_uri=grant.redirect_uri,
         redirect_uri_explicit=bool(token.redirect_uri_explicit),
-        scopes=grant_scopes(grant),
+        scopes=grant_scopes(grant, remote_writes=remote_writes),
     )
 
 
-async def exchange_code(session: AsyncSession, client_id: str, plain: str) -> Issued:
+async def exchange_code(
+    session: AsyncSession, client_id: str, plain: str, *, remote_writes: bool
+) -> Issued:
     """Spend an authorisation code for the grant's first tokens.
 
     The SDK's handler has authenticated the client and verified the redirect URI and
@@ -802,7 +830,7 @@ async def exchange_code(session: AsyncSession, client_id: str, plain: str) -> Is
         grant = found[1]
         # the grant's one chain of refresh tokens starts here, with a drawn one
         first = _random("refresh") if "refresh_token" in client.grant_types else None
-        issued = _issue_pair(session, grant, first, now)
+        issued = _issue_pair(session, grant, first, now, remote_writes=remote_writes)
         await _touch(session, grant.id, now)
         await session.commit()
     except OperationalError as exc:
@@ -867,7 +895,13 @@ async def revoke_grant(
 
 
 async def _same_pair(
-    session: AsyncSession, grant: OAuthGrant, refresh: str, salt: str | None, now: datetime
+    session: AsyncSession,
+    grant: OAuthGrant,
+    refresh: str,
+    salt: str | None,
+    now: datetime,
+    *,
+    remote_writes: bool,
 ) -> Issued | None:
     """The pair the refresh token `refresh` was issued in, as it stands now: its access
     token derived again, with the time that one has left. None when it cannot be
@@ -882,11 +916,13 @@ async def _same_pair(
         access_token=access,
         refresh_token=refresh,
         expires_in=int((utc(found[0].expires_at) - now).total_seconds()),
-        scopes=grant_scopes(grant),
+        scopes=grant_scopes(grant, remote_writes=remote_writes),
     )
 
 
-async def exchange_refresh(session: AsyncSession, client_id: str, plain: str) -> Issued:
+async def exchange_refresh(
+    session: AsyncSession, client_id: str, plain: str, *, remote_writes: bool
+) -> Issued:
     """Answer a refresh request (spec §6.4). Everything is read and decided under the
     write lock, so two requests with one token are served one after the other.
 
@@ -924,18 +960,31 @@ async def exchange_refresh(session: AsyncSession, client_id: str, plain: str) ->
         issued = None
         if token.rotated_at is None:
             if now - utc(token.created_at) < ROTATION_MIN_AGE:
-                issued = await _same_pair(session, grant, plain, salt, now)
+                issued = await _same_pair(
+                    session, grant, plain, salt, now, remote_writes=remote_writes
+                )
             if issued is None and salt:
                 token.rotated_at = now
                 await _tidy(session, grant.id, now)
-                issued = _issue_pair(session, grant, _derive(salt, plain, "refresh"), now)
+                issued = _issue_pair(
+                    session,
+                    grant,
+                    _derive(salt, plain, "refresh"),
+                    now,
+                    remote_writes=remote_writes,
+                )
         elif now - utc(token.rotated_at) <= REFRESH_RETRY_WINDOW:
             if salt:
                 replacement = _derive(salt, plain, "refresh")
                 child = await _find(session, replacement, "refresh", fresh=True)
                 if child is not None:
                     issued = await _same_pair(
-                        session, grant, replacement, child[0].derive_salt, now
+                        session,
+                        grant,
+                        replacement,
+                        child[0].derive_salt,
+                        now,
+                        remote_writes=remote_writes,
                     )
         else:
             await revoke_grant(
@@ -969,7 +1018,9 @@ class AccessInfo:
     scopes: list[str]
 
 
-async def load_access(session: AsyncSession, plain: str) -> AccessInfo | None:
+async def load_access(
+    session: AsyncSession, plain: str, *, remote_writes: bool
+) -> AccessInfo | None:
     """The grant a bearer on `/mcp` acts for, or None when it is not an unexpired
     access token of an unrevoked grant.
 
@@ -989,7 +1040,7 @@ async def load_access(session: AsyncSession, plain: str) -> AccessInfo | None:
         client_id=grant.client_id,
         grant_id=grant.id,
         expires_at=utc(token.expires_at),
-        scopes=grant_scopes(grant),
+        scopes=grant_scopes(grant, remote_writes=remote_writes),
     )
     last = utc(grant.last_used_at)
     if last is None or last <= now - LAST_USED_GRANULARITY:

@@ -323,7 +323,12 @@ async def delete_subnet(
 
 
 async def create_reserved_range(
-    session: AsyncSession, subnet_id: str, payload: ReservedRangeCreate, source: str
+    session: AsyncSession,
+    subnet_id: str,
+    payload: ReservedRangeCreate,
+    source: str,
+    *,
+    actor: str | None = None,
 ) -> ReservedRange:
     subnet = await get_subnet(session, subnet_id)
     net = parse_cidr(subnet.cidr)
@@ -369,6 +374,7 @@ async def create_reserved_range(
             + (", excluded from scanning" if block.scan_excluded else "")
         ),
         source=source,
+        actor=actor,
         after=changes.snapshot(block),
     )
     await session.commit()
@@ -413,7 +419,7 @@ async def update_reserved_range(
 
 
 async def delete_reserved_range(
-    session: AsyncSession, subnet_id: str, range_id: str, source: str
+    session: AsyncSession, subnet_id: str, range_id: str, source: str, *, actor: str | None = None
 ) -> None:
     subnet, block = await _get_reserved_range(session, subnet_id, range_id)
     if block.scan_excluded and source == "mcp":
@@ -433,6 +439,7 @@ async def delete_reserved_range(
         action="update",
         summary=f"reserved range {block.start_ip}-{block.end_ip} removed from {subnet.name}",
         source=source,
+        actor=actor,
         before=changes.snapshot(block),
     )
     await session.delete(block)

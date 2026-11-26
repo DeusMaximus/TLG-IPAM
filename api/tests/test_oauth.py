@@ -1231,11 +1231,11 @@ async def test_the_claim_refuses_a_code_spent_since_it_was_loaded(web, linking):
     client = await register(web)
     code = await link(web, client)
     async with SessionLocal() as session:
-        assert await oauth.load_code(session, client["client_id"], code) is not None
+        assert await oauth.load_code(session, client["client_id"], code, remote_writes=False) is not None
     await set_token(code, used_at=NOW())
     async with SessionLocal() as session:
         with pytest.raises(oauth.Refused) as refused:
-            await oauth.exchange_code(session, client["client_id"], code)
+            await oauth.exchange_code(session, client["client_id"], code, remote_writes=False)
     assert refused.value.error == "invalid_grant"
     assert [t.kind for t in await all_rows(OAuthToken)] == ["code"]
 
@@ -1245,13 +1245,13 @@ async def test_a_code_expires_after_five_minutes(web, linking):
     code = await link(web, client)
     await set_token(code, expires_at=NOW() + timedelta(seconds=30))
     async with SessionLocal() as session:
-        assert await oauth.load_code(session, client["client_id"], code) is not None
+        assert await oauth.load_code(session, client["client_id"], code, remote_writes=False) is not None
     await set_token(code, expires_at=NOW() - timedelta(seconds=1))
     assert invalid_grant(await exchange(web, client, code))
     # and the claim holds the expiry by itself
     async with SessionLocal() as session:
         with pytest.raises(oauth.Refused):
-            await oauth.exchange_code(session, client["client_id"], code)
+            await oauth.exchange_code(session, client["client_id"], code, remote_writes=False)
     assert [t.kind for t in await all_rows(OAuthToken)] == ["code"]
 
 
@@ -1270,7 +1270,7 @@ async def test_a_code_is_only_its_own_clients(web, linking):
     assert invalid_grant(await exchange(web, thief, code))
     async with SessionLocal() as session:
         with pytest.raises(oauth.Refused):
-            await oauth.exchange_code(session, thief["client_id"], code)
+            await oauth.exchange_code(session, thief["client_id"], code, remote_writes=False)
     assert (await token_row(code)).used_at is None
     assert (await exchange(web, client, code)).status_code == 200
 
@@ -1639,7 +1639,9 @@ async def test_an_expired_refresh_token_is_refused_without_revoking(web, linking
     assert invalid_grant(await refresh(web, client, tokens["refresh_token"]))
     async with SessionLocal() as session:
         with pytest.raises(oauth.Refused):
-            await oauth.exchange_refresh(session, client["client_id"], tokens["refresh_token"])
+            await oauth.exchange_refresh(
+                session, client["client_id"], tokens["refresh_token"], remote_writes=False
+            )
     assert (await the_grant()).revoked_at is None
     assert (await token_row(tokens["refresh_token"])).rotated_at is None
 
@@ -1651,7 +1653,9 @@ async def test_a_refresh_token_is_only_its_own_clients(web, linking):
     assert invalid_grant(await refresh(web, thief, tokens["refresh_token"]))
     async with SessionLocal() as session:
         with pytest.raises(oauth.Refused):
-            await oauth.exchange_refresh(session, thief["client_id"], tokens["refresh_token"])
+            await oauth.exchange_refresh(
+                session, thief["client_id"], tokens["refresh_token"], remote_writes=False
+            )
     assert (await token_row(tokens["refresh_token"])).rotated_at is None
     assert (await the_grant()).revoked_at is None
 
@@ -1821,7 +1825,7 @@ async def test_a_failed_token_read_is_a_server_error_not_an_invalid_token(linkin
     """A `401` tells a client its token is no good. A database that cannot be read says
     nothing about the token, and must not be answered that way."""
 
-    async def broken(*_args):
+    async def broken(*_args, **_kwargs):
         raise OperationalError("SELECT", {}, Exception("disk I/O error"))
 
     monkeypatch.setattr(oauth, "load_access", broken)

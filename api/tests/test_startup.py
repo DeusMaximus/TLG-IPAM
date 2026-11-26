@@ -725,3 +725,87 @@ def test_uvicorn_refuses_to_start_with_a_malformed_public_base_url(tmp_path, sta
     assert config.PUBLIC_BASE_URL_REFUSED in done.stderr
     assert PUBLIC_HOST not in done.stderr
     assert "Uvicorn running on" not in done.stderr
+
+
+# --- MCP_REMOTE_WRITES (v0.2 spec §6.5, §6.9, #28) --------------------------------------
+
+REMOTE_WRITES = {
+    "unset": (UNSET, False),
+    "empty": ("", False),
+    "false": ("false", False),
+    "False": ("False", False),
+    "FALSE": ("FALSE", False),
+    "true": ("true", True),
+    "True": ("True", True),
+    "TRUE": ("TRUE", True),
+}
+# A word no message of the server holds, so a test can tell whether a refusal repeats it
+_TOKEN_WORD = "on" + secrets.token_hex(6)
+REFUSED_REMOTE_WRITES = {
+    "1": "1",
+    "0": "0",
+    "yes": "yes",
+    "no": "no",
+    "on": "on",
+    "off": "off",
+    "a typo": "ture",
+    "a leading space": " true",
+    "a trailing space": "true ",
+    "a trailing newline": "false\n",
+    "only whitespace": " ",
+    "a non-ASCII letter that lowers to ASCII": "K",
+    "a word of its own": _TOKEN_WORD,
+}
+
+
+def _set_remote_writes(monkeypatch, value):
+    for name in [n for n in os.environ if n.upper() == "MCP_REMOTE_WRITES"]:
+        monkeypatch.delenv(name)
+    if value is not UNSET:
+        monkeypatch.setenv("MCP_REMOTE_WRITES", value)
+
+
+@pytest.mark.parametrize(("value", "on"), REMOTE_WRITES.values(), ids=REMOTE_WRITES.keys())
+def test_load_settings_reads_mcp_remote_writes(monkeypatch, value, on):
+    _set_remote_writes(monkeypatch, value)
+    assert config.load_settings().remote_writes is on
+
+
+@pytest.mark.parametrize("value", REFUSED_REMOTE_WRITES.values(), ids=REFUSED_REMOTE_WRITES.keys())
+def test_load_settings_refuses_any_other_mcp_remote_writes(monkeypatch, value):
+    """Neither on nor off: a value meant as on is not silently off, and nothing but
+    `true` is on. One fixed message, which repeats nothing of the value."""
+    _set_remote_writes(monkeypatch, value)
+    with pytest.raises(SystemExit) as refused:
+        config.load_settings()
+    assert str(refused.value.code) == f"TLG-IPAM will not start: {config.MCP_REMOTE_WRITES_REFUSED}"
+    assert _TOKEN_WORD not in str(refused.value.code)
+
+
+def test_the_setting_reaches_the_server_the_module_builds():
+    """`mcp_server.mcp` is built from the settings, which the test session leaves unset:
+    off, and no OAuth server either (`PUBLIC_BASE_URL` unset)."""
+    from app.mcp_server import mcp
+    from app.oauth_provider import remote_writes_of
+
+    assert config.settings.remote_writes is False
+    assert remote_writes_of(mcp.auth) is False
+
+
+@pytest.mark.parametrize("start", STARTS.values(), ids=STARTS.keys())
+def test_uvicorn_refuses_to_start_with_a_malformed_mcp_remote_writes(tmp_path, start):
+    env = _child_env(tmp_path, REAL_KEY)
+    env["MCP_REMOTE_WRITES"] = _TOKEN_WORD
+    module = ["uvicorn", "app.main:app"] if start is _uvicorn else ["app.serve"]
+    done = subprocess.run(
+        [sys.executable, "-m", *module, "--host", "127.0.0.1", "--port", "0"],
+        cwd=API_DIR,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=START_DEADLINE,
+    )
+    assert done.returncode == 1, done.stderr
+    assert config.MCP_REMOTE_WRITES_REFUSED in done.stderr
+    assert _TOKEN_WORD not in done.stderr
+    assert "Uvicorn running on" not in done.stderr

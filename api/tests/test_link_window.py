@@ -149,7 +149,8 @@ async def test_the_countdown_is_the_servers_monotonic_clock(web, monkeypatch):
     assert state["expires_in_s"] is None and state["ended_at"].endswith("+00:00")
 
 
-async def test_a_window_allowing_writes_is_refused_until_remote_writes_exist(web):
+async def test_a_window_allowing_writes_is_refused_while_remote_writes_are_off(web):
+    """`web` is the server with `MCP_REMOTE_WRITES` off (`test_remote_writes.py` has it on)."""
     res = await web.post("/api/v1/link-window", json={"can_write": True}, headers=OWNER)
     assert res.status_code == 409
     assert res.json()["error"]["code"] == "REMOTE_WRITES_OFF"
