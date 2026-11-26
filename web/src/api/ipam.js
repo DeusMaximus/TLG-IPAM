@@ -79,6 +79,16 @@ export const createScanTarget = (body) => api('/api/v1/scan-targets', { method: 
 export const updateScanTarget = (id, body) =>
   api(`/api/v1/scan-targets/${id}`, { method: 'PUT', body })
 
+// the link window (spec §6.3): the link code is in openLinkWindow's answer and no other
+export const getLinkWindow = () => api('/api/v1/link-window')
+export const openLinkWindow = (body) => api('/api/v1/link-window', { method: 'POST', body })
+export const cancelLinkWindow = () => api('/api/v1/link-window', { method: 'DELETE' })
+
+// linked clients (spec §6.6): the owner's links, and revoking one
+export const listLinkedClients = () => api('/api/v1/linked-clients')
+export const revokeLinkedClient = (id) =>
+  api(`/api/v1/linked-clients/${encodeURIComponent(id)}/revoke`, { method: 'POST' })
+
 // changes / misc
 export const listChanges = (params) => api(`/api/v1/changes${qs(params)}`)
 export const getHealth = () => api('/health')

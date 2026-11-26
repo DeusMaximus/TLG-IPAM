@@ -1,6 +1,15 @@
 import { useState } from 'react'
 import { NavLink, useNavigate } from 'react-router-dom'
-import { ChevronDown, ChevronRight, LayoutDashboard, Network, Plus, Radar, Settings } from 'lucide-react'
+import {
+  ChevronDown,
+  ChevronRight,
+  LayoutDashboard,
+  Link2,
+  Network,
+  Plus,
+  Radar,
+  Settings,
+} from 'lucide-react'
 import { useTree } from '../context'
 import SectionFormModal from './SectionFormModal'
 import UtilPill from './UtilPill'
@@ -91,6 +100,9 @@ export default function Sidebar() {
         </NavItem>
         <NavItem to="/agents" icon={Radar}>
           Agents
+        </NavItem>
+        <NavItem to="/linked-clients" icon={Link2}>
+          Linked clients
         </NavItem>
       </nav>
 

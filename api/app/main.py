@@ -18,7 +18,7 @@ from .errors import ApiError
 from .mcp_server import mcp
 from .oauth_provider import public_base_url_of, remote_writes_of
 from .routers import agent, agents, changes, device_types, hosts, scan_targets, sections, subnets
-from .routers import findings, link_window
+from .routers import findings, link_window, linked_clients
 from .services import oauth as oauth_svc
 from .services.backups import create_snapshot
 from .services.device_types import seed_defaults
@@ -152,6 +152,7 @@ def create_app(server: FastMCP = mcp) -> FastAPI:
         scan_targets.router,
         findings.router,
         link_window.router,
+        linked_clients.router,
     ):
         app.include_router(router, prefix="/api/v1", dependencies=[Depends(require_api_key)])
 

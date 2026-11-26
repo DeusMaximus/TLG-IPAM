@@ -625,9 +625,35 @@ class LinkWindowOut(BaseModel):
     # that failed unexpectedly, which ends the window
     ended: LinkWindowEnd | None
     ended_at: UtcDatetime | None
+    # the URL a client is given to link: `<PUBLIC_BASE_URL>/mcp`, the resource the OAuth
+    # server publishes; null when `configured` is false (#30)
+    mcp_url: str | None = None
 
 
 class LinkWindowOpened(LinkWindowOut):
     """The answer that opens a window, the only one that carries its link code."""
 
     code: str
+
+
+class LinkedClientOut(BaseModel):
+    """One link on the owner's **Linked clients** list (`services/linked_clients`,
+    v0.2 spec §6.6, #30): a grant, with what its client declared."""
+
+    id: str
+    client_id: str
+    # the client's own claim about itself, as stored; null when no name was kept or the
+    # registration is gone (`client_registered`)
+    client_name: str | None
+    client_registered: bool
+    # the host of the redirect URI the link was authorised through, in ASCII form
+    redirect_host: str
+    # what the owner chose when opening the window, and what its tokens carry now:
+    # read-only while `MCP_REMOTE_WRITES` is off, whatever `can_write` says
+    can_write: bool
+    writes: bool
+    created_at: UtcDatetime
+    # the client's last contact (a request to `/mcp`, a code exchange or a refresh), a
+    # heartbeat and not the owner's last use
+    last_used_at: UtcDatetime | None
+    revoked_at: UtcDatetime | None
