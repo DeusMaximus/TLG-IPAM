@@ -214,7 +214,7 @@ describe('Linked clients list', () => {
     renderPage()
     const t = await table()
     const [note] = t.getAllByText(/^Never completed/)
-    expect(note).toHaveTextContent(/frees no place/)
+    expect(note).toHaveTextContent(/frees no place: its registration holds another link listed here/)
     expect(note).not.toHaveTextContent(/link it again/)
   })
 

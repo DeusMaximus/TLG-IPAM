@@ -94,7 +94,7 @@ describe('neverCompletedNote', () => {
 
   it('states what the list established, not the present', () => {
     expect(NEVER_COMPLETED).toMatch(/as of this list/)
-    expect(NEVER_COMPLETED).toMatch(/next refresh/)
+    expect(NEVER_COMPLETED).toMatch(/Refresh to confirm/)
   })
 })
 
