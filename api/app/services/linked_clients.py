@@ -6,7 +6,7 @@ the client was given tokens for `/mcp`. Every grant needs that, so the number of
 is the number of times the owner linked a client, and the list of unrevoked links is
 answered whole. Revoked links are kept in the database (their audit entries refer to
 them) and the newest `REVOKED_SHOWN` are listed after the unrevoked ones; the change log
-has every revoke.
+has every revoke. Both come from one statement, one snapshot (`list_links`).
 
 What the list says of a link, and why:
 
@@ -34,7 +34,7 @@ refused. Revoking a revoked link is `409` and writes nothing.
 import re
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -84,22 +84,43 @@ def _with_client():
 
 async def list_links(session: AsyncSession, *, remote_writes: bool) -> list[dict]:
     """Every unrevoked link, newest first, then the `REVOKED_SHOWN` most recently
-    revoked. Two statements, whatever the tables hold."""
-    live = await session.execute(
-        _with_client()
-        .where(OAuthGrant.revoked_at.is_(None))
-        .order_by(OAuthGrant.created_at.desc(), OAuthGrant.id)
-    )
-    revoked = await session.execute(
-        _with_client()
+    revoked. **One statement**, whatever the tables hold, so the answer is one snapshot
+    of the database: SQLite gives two statements outside a write transaction no shared
+    read snapshot, and a revoke or a link committed between two would put one grant in
+    the answer twice, or an answer no moment of the database held (round 1 of #195's
+    briefed review). The newest revoked are chosen by a subquery of the same
+    statement; the two groups are put in order here."""
+    newest_revoked = (
+        select(OAuthGrant.id)
         .where(OAuthGrant.revoked_at.is_not(None))
         .order_by(OAuthGrant.revoked_at.desc(), OAuthGrant.id)
         .limit(REVOKED_SHOWN)
     )
+    rows = (
+        await session.execute(
+            _with_client()
+            .where(
+                or_(OAuthGrant.revoked_at.is_(None), OAuthGrant.id.in_(newest_revoked))
+            )
+            .execution_options(populate_existing=True)
+        )
+    ).all()
+    live = sorted(
+        (row for row in rows if row[0].revoked_at is None),
+        key=lambda row: (_desc(row[0].created_at), row[0].id),
+    )
+    revoked = sorted(
+        (row for row in rows if row[0].revoked_at is not None),
+        key=lambda row: (_desc(row[0].revoked_at), row[0].id),
+    )
     return [
-        link_out(grant, client, remote_writes=remote_writes)
-        for grant, client in [*live.all(), *revoked.all()]
+        link_out(grant, client, remote_writes=remote_writes) for grant, client in live + revoked
     ]
+
+
+def _desc(value: datetime) -> float:
+    """A key that sorts newest first."""
+    return -utc(value).timestamp()
 
 
 async def revoke(

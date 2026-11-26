@@ -163,7 +163,7 @@ async def test_unrevoked_links_newest_first_then_the_newest_revoked(web, monkeyp
     assert listed == [grants[4].id, grants[3].id, grants[1].id, grants[2].id]
 
 
-async def test_the_list_is_two_statements_whatever_it_holds(web):
+async def test_the_list_is_one_statement_whatever_it_holds(web):
     from sqlalchemy import event
 
     from app.database import engine
@@ -181,7 +181,43 @@ async def test_the_list_is_two_statements_whatever_it_holds(web):
             assert len(await linked_clients.list_links(session, remote_writes=False)) == 3
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", count)
-    assert len(statements) == 2
+    assert len(statements) == 1
+
+
+async def test_the_list_is_one_snapshot_whatever_commits_while_it_reads(web, monkeypatch):
+    """Round 1 of #195's briefed review, finding 2: a revoke, and a new link, committed
+    in other sessions while the list is being read. The answer is the database as one
+    statement saw it: the grant once, live, and not the link made after. With two
+    statements the revoke landed between them and the grant came back twice, both live."""
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    await linked_through_window(web)
+    grant = await the_grant()
+    real_execute = AsyncSession.execute
+    interleaved = False
+
+    async def execute(self, *args, **kwargs):
+        nonlocal interleaved
+        result = await real_execute(self, *args, **kwargs)
+        if not interleaved:
+            interleaved = True
+            async with SessionLocal() as other:
+                await linked_clients.revoke(other, grant.id, source="api", remote_writes=False)
+            async with SessionLocal() as other:
+                other.add(OAuthGrant(client_id=grant.client_id, redirect_uri="https://client.example.com/cb"))
+                await other.commit()
+        return result
+
+    monkeypatch.setattr(AsyncSession, "execute", execute)
+    async with SessionLocal() as session:
+        listed = await linked_clients.list_links(session, remote_writes=False)
+    monkeypatch.undo()
+    assert interleaved
+    assert [(link["id"], link["revoked_at"]) for link in listed] == [(grant.id, None)]
+    # and the next read sees both commits, the revoked grant once
+    after = await links(web)
+    assert [link["id"] for link in after].count(grant.id) == 1
+    assert len(after) == 2 and after[1]["id"] == grant.id and after[1]["revoked_at"]
 
 
 async def test_without_oauth_the_list_answers_and_there_is_no_mcp_url(client):
