@@ -17,6 +17,7 @@ from app import mcp_server
 from app.auth import OWNER_SCOPES
 from app.mcp_server import mcp
 from app.models import Change, Host, OAuthGrant
+from app.database import SessionLocal
 from app.services import oauth
 
 from .conftest import make_host, make_section, make_subnet
@@ -25,13 +26,16 @@ from .oauth_flow import (  # noqa: F401 (web, linking and no_ambient_token are f
     WRITE_TOOLS,
     all_rows,
     database_dump,
+    age,
     exchange,
     http_client,
+    link,
     linked,
     linking,
     mcp_client,
     no_ambient_token,
     oauth_app,
+    refresh,
     register,
     rotate,
     running,
@@ -108,6 +112,68 @@ async def test_a_read_write_grant_lists_and_calls_the_write_tools_and_is_the_act
     assert entry["summary"] == "host nas created at 10.0.0.20 in lab"
     [stored] = [c for c in await all_rows(Change) if c.source == "mcp"]
     assert stored.actor == "grant:Example" and "Example" not in stored.summary
+
+
+@pytest.mark.parametrize("can_write", [True, False], ids=["read-write", "read-only"])
+async def test_every_answer_with_a_scope_follows_the_setting_and_can_write(
+    web, web_on, linking, can_write
+):
+    """Every path that answers with a token's scopes, read on and off on the same
+    stored tokens: the code as loaded, the code exchange, a young refresh (the pair it
+    was issued in, again), a rotation, and the rotated token presented again within
+    the retry window (the replacement pair, again). With the setting on a read-write
+    grant gets both scopes on each; with it off, or for a read-only grant, `ipam:read`
+    alone. The pairs are the same tokens whichever server answers."""
+    both, read = "ipam:read ipam:write", "ipam:read"
+    on = both if can_write else read
+    client = await register(web_on)
+    code = await link(web_on, client, can_write=can_write)
+    async with SessionLocal() as session:
+        loaded_on = await oauth.load_code(session, client["client_id"], code, remote_writes=True)
+        loaded_off = await oauth.load_code(session, client["client_id"], code, remote_writes=False)
+    assert " ".join(loaded_on.scopes) == on
+    assert " ".join(loaded_off.scopes) == read
+    res = await exchange(web_on, client, code)
+    assert res.status_code == 200, res.text
+    first = res.json()
+    assert first["scope"] == on
+
+    # young: not rotated, the same pair again, its scope as each server judges it now
+    for server, scope in ((web_on, on), (web, read)):
+        res = await refresh(server, client, first["refresh_token"], scope=both)
+        assert res.status_code == 200, res.text
+        again = res.json()
+        assert (again["access_token"], again["refresh_token"]) == (
+            first["access_token"],
+            first["refresh_token"],
+        )
+        assert again["scope"] == scope
+
+    # a rotation on the setting-on server
+    await age(first["refresh_token"])
+    res = await refresh(web_on, client, first["refresh_token"], scope=both)
+    assert res.status_code == 200, res.text
+    second = res.json()
+    assert second["refresh_token"] != first["refresh_token"]
+    assert second["scope"] == on
+
+    # the rotated token again, within the retry window: the replacement pair again
+    for server, scope in ((web_on, on), (web, read)):
+        res = await refresh(server, client, first["refresh_token"], scope=both)
+        assert res.status_code == 200, res.text
+        retried = res.json()
+        assert (retried["access_token"], retried["refresh_token"]) == (
+            second["access_token"],
+            second["refresh_token"],
+        )
+        assert retried["scope"] == scope
+    assert (await the_grant()).revoked_at is None
+
+    # and a rotation on the setting-off server, of the replacement
+    await age(second["refresh_token"])
+    res = await refresh(web, client, second["refresh_token"], scope=both)
+    assert res.status_code == 200, res.text
+    assert res.json()["scope"] == read
 
 
 async def test_turning_the_setting_on_does_not_upgrade_a_read_only_grant(
