@@ -58,6 +58,7 @@ from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOption
 from mcp.shared.auth import InvalidRedirectUriError, OAuthClientInformationFull, OAuthToken
 from pydantic import AnyHttpUrl, AnyUrl
 from sqlalchemy.exc import SQLAlchemyError
+from starlette.datastructures import FormData
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
@@ -101,9 +102,9 @@ def _registered(client: OAuthClient) -> RegisteredClient:
     )
 
 
-def _basic_secret(request: Request, client_id: str) -> str | None:
-    """The secret of an `Authorization: Basic` header that names this client
-    (RFC 6749 §2.3.1: both parts are form-encoded), or None."""
+def _basic_credentials(request: Request) -> tuple[str, str] | None:
+    """The client id and secret of an `Authorization: Basic` header (RFC 6749 §2.3.1:
+    both parts are form-encoded), or None when there is none that can be read."""
     scheme, _, encoded = request.headers.get("Authorization", "").partition(" ")
     if scheme.lower() != "basic":
         return None
@@ -111,9 +112,9 @@ def _basic_secret(request: Request, client_id: str) -> str | None:
         name, separator, secret = base64.b64decode(encoded, validate=True).decode().partition(":")
     except (ValueError, binascii.Error):
         return None
-    if not separator or unquote(name) != client_id:
+    if not separator:
         return None
-    return unquote(secret)
+    return unquote(name), unquote(secret)
 
 
 class HashedSecretAuthenticator(ClientAuthenticator):
@@ -125,24 +126,43 @@ class HashedSecretAuthenticator(ClientAuthenticator):
     way it registered to (`client_secret_post` in the form, `client_secret_basic` in
     the header); a public client presents none. Every failure is one answer: it does
     not say whether the client exists.
+
+    A client registered for `client_secret_basic` may name itself in the header alone
+    (RFC 6749 §2.3.1 asks for no `client_id` in the body of an authenticated request).
+    The SDK's token request models require the form field, so once such a client has
+    authenticated its id is added to the form the handler parses, as FastMCP's own
+    authenticator does for a client that names itself in a JWT assertion. A client id
+    in both places must be the same one.
     """
 
     async def authenticate_request(self, request: Request) -> OAuthClientInformationFull:
         form = await request.form()
-        client_id = form.get("client_id")
-        if not isinstance(client_id, str) or not client_id:
+        in_form = form.get("client_id")
+        basic = _basic_credentials(request)
+        if isinstance(in_form, str) and in_form:
+            client_id = in_form
+        elif in_form is None and basic is not None:
+            client_id = basic[0]
+        else:
             raise AuthenticationError("Missing client_id")
         async with SessionLocal() as session:
             client = await oauth.get_client(session, client_id)
         presented = None
+        named_in_header_only = in_form is None
         if client is not None:
             if client.token_endpoint_auth_method == "client_secret_basic":
-                presented = _basic_secret(request, client_id)
+                if basic is not None and basic[0] == client_id:
+                    presented = basic[1]
+            elif named_in_header_only:
+                # only a client that authenticates in the header is named by it
+                client = None
             elif client.token_endpoint_auth_method == "client_secret_post":
-                in_form = form.get("client_secret")
-                presented = in_form if isinstance(in_form, str) else None
+                secret = form.get("client_secret")
+                presented = secret if isinstance(secret, str) else None
         if client is None or not oauth.secret_matches(client, presented):
             raise AuthenticationError("Client authentication failed")
+        if named_in_header_only:
+            request._form = FormData([*form.multi_items(), ("client_id", client_id)])
         return _registered(client)
 
 

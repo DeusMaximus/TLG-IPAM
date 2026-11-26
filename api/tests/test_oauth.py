@@ -932,6 +932,70 @@ async def test_a_client_registered_for_basic_authenticates_in_the_header(web, li
     assert res.status_code == 200, res.text
 
 
+async def test_a_basic_client_may_name_itself_in_the_header_alone(web, linking):
+    """RFC 6749 §2.3.1 asks for no `client_id` in the body of a request authenticated
+    in the header (Codex on PR #189): the code exchange and the refresh work with the
+    id and the secret in `Authorization: Basic` only."""
+    client = await register(web, token_endpoint_auth_method="client_secret_basic")
+    other = await register(web, token_endpoint_auth_method="client_secret_basic")
+    code = await link(web, client)
+    form = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": CALLBACK,
+        "code_verifier": VERIFIER,
+    }
+    secret = client["client_secret"]
+    for wrong in (
+        {},
+        basic(client["client_id"], "wrong"),
+        basic(client["client_id"], ""),
+        basic("00000000-0000-4000-8000-000000000000", secret),
+        {"Authorization": "Basic " + base64.b64encode(b"no-colon").decode()},
+    ):
+        res = await web.post("/mcp/token", data=form, headers=wrong)
+        assert res.status_code == 401 and res.json()["error"] == "invalid_client"
+    # another client's valid credentials do not make this client's code theirs
+    assert invalid_grant(
+        await web.post("/mcp/token", data=form, headers=basic(other["client_id"], other["client_secret"]))
+    )
+    assert (await token_row(code)).used_at is None
+    # a client id in the form that is not the header's is refused
+    mixed = await web.post(
+        "/mcp/token",
+        data={**form, "client_id": other["client_id"]},
+        headers=basic(client["client_id"], secret),
+    )
+    assert invalid_client(mixed)
+    res = await web.post("/mcp/token", data=form, headers=basic(client["client_id"], secret))
+    assert res.status_code == 200, res.text
+    res = await web.post(
+        "/mcp/token",
+        data={"grant_type": "refresh_token", "refresh_token": res.json()["refresh_token"]},
+        headers=basic(client["client_id"], secret),
+    )
+    assert res.status_code == 200, res.text
+
+
+@pytest.mark.parametrize("method", ["client_secret_post", "none"])
+async def test_only_a_basic_client_is_named_by_the_header(web, linking, method):
+    """A client that registered another method is not found through a Basic header: it
+    names itself in the form, as it registered to."""
+    client = await register(web, token_endpoint_auth_method=method)
+    code = await link(web, client)
+    form = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": CALLBACK,
+        "code_verifier": VERIFIER,
+    }
+    headers = basic(client["client_id"], client.get("client_secret", ""))
+    extra = {"client_secret": client["client_secret"]} if "client_secret" in client else {}
+    assert invalid_client(await web.post("/mcp/token", data={**form, **extra}, headers=headers))
+    assert (await token_row(code)).used_at is None
+    assert (await exchange(web, client, code)).status_code == 200
+
+
 @pytest.mark.parametrize(
     "client_id",
     ["00000000-0000-4000-8000-000000000000", "not-a-client-id", "' OR 1=1 --", "x" * 5000],
