@@ -1568,15 +1568,49 @@ async def test_a_replacement_is_derived_and_only_with_the_servers_salt(web, link
     child = await token_row(second["refresh_token"])
     assert second["access_token"] == oauth._derive(child.derive_salt, second["refresh_token"], "access")
     assert child.derive_salt != row.derive_salt
-    # another salt, another kind or another token: another value
+    # another salt or another token: another value
     assert oauth._derive("x" * 43, first["refresh_token"], "refresh") != second["refresh_token"]
     assert oauth._derive(row.derive_salt, first["refresh_token"], "access") != second["access_token"]
+    # and another kind: from one salt and one token, the access token and the
+    # replacement share nothing but their length. The kind is in what is signed, not
+    # only in the prefix, which anyone can change.
+    as_access = oauth._derive(row.derive_salt, first["refresh_token"], "access")
+    as_refresh = oauth._derive(row.derive_salt, first["refresh_token"], "refresh")
+    assert as_access == first["access_token"] and as_refresh == second["refresh_token"]
+    assert as_access.removeprefix("tlgoa_") != as_refresh.removeprefix("tlgor_")
     # the database holds no plain value, of a drawn token or a derived one
     text = database_text()
     for plain in (*first.values(), *second.values()):
         if isinstance(plain, str) and plain.startswith("tlgo"):
             assert plain not in text and plain.split("_", 1)[1] not in text
     assert "derive_salt" in changes._SNAPSHOT_EXCLUDE
+
+
+async def test_an_access_token_is_never_a_refresh_token_under_another_prefix(web, linking):
+    """Round 2 of PR #189's briefed review (finding 1). An access token and the refresh
+    token that replaces its sibling come from the same salt and the same plain token,
+    so only the kind inside the HMAC keeps them apart: without it, the holder of an
+    hour-long access token would hold, under the other prefix, the 30-day refresh
+    token of the next link. A public client, which needs no secret, presents each of
+    its access tokens as a refresh token: unknown, `invalid_grant`, nothing written,
+    and the grant is not revoked (an unknown value is no reuse of anything)."""
+    client, first = await linked(web, token_endpoint_auth_method="none")
+    second = await rotate(web, client, first["refresh_token"])
+    third = await rotate(web, client, second["refresh_token"])
+    await set_grant(last_used_at=NOW())
+    before = database_dump()
+    for pair in (first, second, third):
+        swapped = "tlgor_" + pair["access_token"].removeprefix("tlgoa_")
+        assert oauth.TOKEN_FORMS["refresh"].fullmatch(swapped)
+        assert invalid_grant(await refresh(web, client, swapped))
+    # nor is a refresh token an access token under the other prefix
+    for pair in (first, second, third):
+        swapped = "tlgoa_" + pair["refresh_token"].removeprefix("tlgor_")
+        assert (await initialise(web, swapped)).status_code == 401
+    assert database_dump() == before
+    assert (await the_grant()).revoked_at is None
+    # the real tokens are untouched by the attempts
+    assert (await refresh(web, client, third["refresh_token"])).status_code == 200
 
 
 async def test_a_salt_is_erased_once_its_token_can_no_longer_be_retried(web, linking):
