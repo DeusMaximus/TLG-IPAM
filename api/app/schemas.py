@@ -597,7 +597,8 @@ LinkWindowEnd = Literal["linked", "expired", "cancelled", "replaced", "failed"]
 class LinkWindowOpen(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    # whether the link may write; refused until remote writes can be allowed (#28)
+    # whether the link may write; refused (`409 REMOTE_WRITES_OFF`) while
+    # `MCP_REMOTE_WRITES` is off (#28)
     can_write: StrictBool = False
 
 
@@ -606,6 +607,9 @@ class LinkWindowOut(BaseModel):
 
     # whether remote MCP is configured (`PUBLIC_BASE_URL`): without it no window opens
     configured: bool
+    # whether a window may be opened for a read-write link: `MCP_REMOTE_WRITES` is on
+    # (#28). False when `configured` is false
+    remote_writes: bool
     open: bool
     # while open: what its link may do, when it opened and runs out, and how long it has
     # left by the server's clock, which a countdown starts from

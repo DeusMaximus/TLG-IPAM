@@ -627,7 +627,9 @@ def _cooldown(subnet: Subnet, asked: datetime) -> ApiError:
     )
 
 
-async def request_scan(session: AsyncSession, subnet_id: str, source: str) -> ScanTarget:
+async def request_scan(
+    session: AsyncSession, subnet_id: str, source: str, *, actor: str | None = None
+) -> ScanTarget:
     """Mark the subnet's scan target due ("Scan now"). The agent picks it up at its
     next check-in (`services/jobs`).
 
@@ -674,6 +676,7 @@ async def request_scan(session: AsyncSession, subnet_id: str, source: str) -> Sc
         action="update",
         summary=f"{_label(subnet)}: scan requested",
         source=source,
+        actor=actor,
         before=before,
         after=changes.snapshot(target),
     )

@@ -43,9 +43,13 @@ it is what proves that the person approving is the owner (spec §7.2, invariant 
   in that window only. A form post whose `Origin` is not the server's own is refused
   (`origin_allowed`). Neither is counted as a wrong code, and neither compares a code.
 - **Writes.** A window records whether the link it makes may write (`can_write`), which
-  is fixed into the grant. Until #28 brings `MCP_REMOTE_WRITES`, no window may allow it
-  (`writes_may_be_allowed`), so no grant is issued with `can_write` the owner could not
-  have chosen with the setting off, whichever of #27 and #28 merges first.
+  is fixed into the grant. A window may allow it only while `MCP_REMOTE_WRITES` is on
+  (`writes_may_be_allowed`, #28); the owner's routes say which (`state_out`'s
+  `remote_writes`), so the UI offers the choice only then. The setting is read at
+  start and a window lives in this process, so a window cannot outlive the setting it
+  was opened under: turning the setting off is a restart, which ends the window. And
+  `can_write` is only half of the rule: a token carries `ipam:write` only while the
+  setting is on as well (`oauth.grant_scopes`).
 
 Audit (`entity_type="link_window"`): opening a window (`source` the owner's, `ui` or
 `api`) and its first wrong code (`source="oauth"`). The summary never holds the code, a
@@ -109,11 +113,10 @@ def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def writes_may_be_allowed() -> bool:
-    """Whether a window may be opened with `can_write`. Never, until #28 makes this
-    `MCP_REMOTE_WRITES`: a grant's `can_write` is then always one the owner could have
-    chosen with the setting off."""
-    return False
+def writes_may_be_allowed(remote_writes: bool) -> bool:
+    """Whether a window may be opened with `can_write`: only while `MCP_REMOTE_WRITES`
+    is on (`remote_writes`, which the routes take from the OAuth provider, #28)."""
+    return remote_writes
 
 
 @dataclass
@@ -182,16 +185,19 @@ def reset() -> None:
     _transitions = asyncio.Lock()
 
 
-def state_out(*, configured: bool) -> dict:
-    """The window as the owner's routes answer with it: whether one is open, what its
-    link may do, how long it has left by the server's clock (`expires_in_s`, which a
-    countdown starts from, so it does not depend on the browser's clock) and how many
-    wrong codes its requests have had, or how the latest one ended. Never the code:
-    that is in the one answer that opened it."""
+def state_out(*, configured: bool, remote_writes: bool) -> dict:
+    """The window as the owner's routes answer with it: whether a window may be opened
+    for a read-write link (`remote_writes`, `writes_may_be_allowed`), whether one is
+    open, what its link may do, how long it has left by the server's clock
+    (`expires_in_s`, which a countdown starts from, so it does not depend on the
+    browser's clock) and how many wrong codes its requests have had, or how the latest
+    one ended. Never the code: that is in the one answer that opened it."""
+    writes = configured and writes_may_be_allowed(remote_writes)
     window = _live() if configured else None
     if window is not None:
         return {
             "configured": True,
+            "remote_writes": writes,
             "open": True,
             "can_write": window.can_write,
             "opened_at": window.opened_at,
@@ -204,6 +210,7 @@ def state_out(*, configured: bool) -> dict:
     ended, ended_at = _last_end if configured and _last_end else (None, None)
     return {
         "configured": configured,
+        "remote_writes": writes,
         "open": False,
         "can_write": None,
         "opened_at": None,
@@ -224,20 +231,20 @@ def _snapshot(window: _Window) -> dict:
 
 
 async def open_window(
-    session: AsyncSession, *, configured: bool, can_write: bool, source: str
+    session: AsyncSession, *, configured: bool, remote_writes: bool, can_write: bool, source: str
 ) -> tuple[dict, str]:
     """Open a link window, replacing any that is open, and return its state and the
     link code in plain: the one time the code is given out.
 
     Refused with nothing opened or logged when remote MCP is not configured (`409
     OAUTH_NOT_CONFIGURED`) and when `can_write` is asked while no window may allow it
-    (`409 REMOTE_WRITES_OFF`, `writes_may_be_allowed`). The audit entry is committed
+    (`409 REMOTE_WRITES_OFF`, `writes_may_be_allowed`: `MCP_REMOTE_WRITES` is off). The audit entry is committed
     before the window opens, so a database that refuses it opens nothing (`503`). An
     approval in flight on the window it replaces finishes first.
     """
     if not configured:
         raise ApiError("OAUTH_NOT_CONFIGURED", NOT_CONFIGURED, 409)
-    if can_write and not writes_may_be_allowed():
+    if can_write and not writes_may_be_allowed(remote_writes):
         raise ApiError("REMOTE_WRITES_OFF", WRITES_OFF, 409)
     code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LENGTH))
     window = _Window(
@@ -270,17 +277,17 @@ async def open_window(
         oauth.pending.reset()
         _wrong.clear()
         _current, _last_end = window, None
-        return state_out(configured=True), code
+        return state_out(configured=True, remote_writes=remote_writes), code
 
 
-async def cancel(*, configured: bool) -> dict:
+async def cancel(*, configured: bool, remote_writes: bool) -> dict:
     """End the open window, if there is one; the state after. An approval in flight on
     it finishes first, so the answer is true of what happened: `linked` if it linked."""
     if configured:
         async with _transitions:
             if _live() is not None:
                 _end(CANCELLED)
-    return state_out(configured=configured)
+    return state_out(configured=configured, remote_writes=remote_writes)
 
 
 # --- The consent page ---

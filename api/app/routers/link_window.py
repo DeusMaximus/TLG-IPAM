@@ -19,9 +19,18 @@ def oauth_configured(request: Request) -> bool:
     return bool(getattr(request.app.state, "public_base_url", ""))
 
 
+def remote_writes(request: Request) -> bool:
+    """Whether the app's OAuth server may give a link write access
+    (`MCP_REMOTE_WRITES`, #28), as `main.create_app` recorded it from the provider."""
+    return bool(getattr(request.app.state, "remote_writes", False))
+
+
 @router.get("")
-async def get_link_window(configured: bool = Depends(oauth_configured)):
-    return {"data": LinkWindowOut.model_validate(svc.state_out(configured=configured)).model_dump()}
+async def get_link_window(
+    configured: bool = Depends(oauth_configured), writes: bool = Depends(remote_writes)
+):
+    state = svc.state_out(configured=configured, remote_writes=writes)
+    return {"data": LinkWindowOut.model_validate(state).model_dump()}
 
 
 @router.post("", status_code=201)
@@ -30,14 +39,21 @@ async def open_link_window(
     session: AsyncSession = Depends(get_session),
     source: str = Depends(request_source),
     configured: bool = Depends(oauth_configured),
+    writes: bool = Depends(remote_writes),
 ):
     state, code = await svc.open_window(
-        session, configured=configured, can_write=payload.can_write, source=source
+        session,
+        configured=configured,
+        remote_writes=writes,
+        can_write=payload.can_write,
+        source=source,
     )
     return {"data": LinkWindowOpened.model_validate({**state, "code": code}).model_dump()}
 
 
 @router.delete("")
-async def cancel_link_window(configured: bool = Depends(oauth_configured)):
-    state = await svc.cancel(configured=configured)
+async def cancel_link_window(
+    configured: bool = Depends(oauth_configured), writes: bool = Depends(remote_writes)
+):
+    state = await svc.cancel(configured=configured, remote_writes=writes)
     return {"data": LinkWindowOut.model_validate(state).model_dump()}

@@ -23,6 +23,12 @@ PUBLIC_BASE_URL_REFUSED = (
     "to keep remote MCP (the built-in OAuth server) off."
 )
 
+# The one refusal of MCP_REMOTE_WRITES; fixed, so it repeats no value
+MCP_REMOTE_WRITES_REFUSED = (
+    "MCP_REMOTE_WRITES must be `true` or `false` (in any case), or unset, which is "
+    "`false`. Nothing else is read as either: not `1`, `yes`, `on`, and no spaces."
+)
+
 # The value `.env.example` ships. Anyone who has read the repository knows it.
 PLACEHOLDER_API_KEY = "change-me"
 
@@ -41,9 +47,18 @@ class Settings(BaseSettings):
     # The server's public origin (v0.2 spec §6.1). Empty, the default, leaves the
     # built-in OAuth server off: `/mcp` takes the owner key alone, as before M3.
     public_base_url: str = ""
+    # Whether a linked client may be given write access (v0.2 spec §6.5, #28): `true` or
+    # `false`, read once here (`remote_writes`) and handed to the OAuth provider, from
+    # which the token rule and the link window both take it. Unset is `false`.
+    mcp_remote_writes: str = ""
     # The release this code is (`app/version.py`, #24): a class attribute, not a field,
     # so no environment variable can make a server report another release than it runs
     version: ClassVar[str] = VERSION
+
+    @property
+    def remote_writes(self) -> bool:
+        """`MCP_REMOTE_WRITES` as `load_settings` has checked it: on only for `true`."""
+        return self.mcp_remote_writes.lower() == "true"
 
 
 def api_key_problem(value: str) -> str | None:
@@ -131,11 +146,24 @@ def public_base_url_problem(value: str) -> str | None:
     return None
 
 
+def mcp_remote_writes_problem(value: str) -> str | None:
+    """Why `value` cannot be `MCP_REMOTE_WRITES`, or None when it can (#28).
+
+    `true` turns remote writes on and `false` or unset leaves them off, in any case. Any
+    other spelling stops the start rather than being read as either: a value meant as
+    on (`yes`, `1`) is not silently off, and one meant as off is never on.
+    """
+    if value.isascii() and value.lower() in ("", "true", "false"):
+        return None
+    return MCP_REMOTE_WRITES_REFUSED
+
+
 def load_settings() -> Settings:
     """Read the settings from the environment, refusing an unusable owner key, a
     `DB_PATH` that is not a filesystem path or `:memory:` (`db_path_problem`), and a
     `PUBLIC_BASE_URL` that is not the public origin in the spelling the server would
-    publish (`public_base_url_problem`).
+    publish (`public_base_url_problem`), and an `MCP_REMOTE_WRITES` that is not `true`
+    or `false` (`mcp_remote_writes_problem`).
 
     Runs when this module is imported, so uvicorn (by hand or as the container's
     CMD) exits before it serves anything. Under `--reload` the reloader stays up and
@@ -154,6 +182,8 @@ def load_settings() -> Settings:
         raise SystemExit(f"TLG-IPAM will not start: {DB_PATH_REFUSED}")
     if public_base_url_problem(loaded.public_base_url) is not None:
         raise SystemExit(f"TLG-IPAM will not start: {PUBLIC_BASE_URL_REFUSED}")
+    if mcp_remote_writes_problem(loaded.mcp_remote_writes) is not None:
+        raise SystemExit(f"TLG-IPAM will not start: {MCP_REMOTE_WRITES_REFUSED}")
     return loaded
 
 

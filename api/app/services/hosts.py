@@ -173,7 +173,12 @@ async def _commit_host(session: AsyncSession, host: Host) -> None:
 
 
 async def create_host(
-    session: AsyncSession, payload: HostCreate, source: str, *, finding: str | None = None
+    session: AsyncSession,
+    payload: HostCreate,
+    source: str,
+    *,
+    finding: str | None = None,
+    actor: str | None = None,
 ) -> Host:
     """Create a host. `finding` is set when the owner accepts a scan finding
     (`services/findings.accept`): a finding type, never an observed value. The summary
@@ -199,6 +204,7 @@ async def create_host(
             else f"host {_label(host)} created at {host.ip} in {subnet.name}"
         ),
         source=source,
+        actor=actor,
         after=changes.snapshot(host),
     )
     await _commit_host(session, host)
@@ -212,6 +218,7 @@ async def update_host(
     source: str,
     *,
     finding: str | None = None,
+    actor: str | None = None,
 ) -> Host:
     """Update a host. `finding` as in `create_host`: the summary names the address and
     the finding, not the hostname, which may be the value the finding wrote."""
@@ -258,6 +265,7 @@ async def update_host(
             else f"host {_label(host)} ({host.ip}) updated"
         ),
         source=source,
+        actor=actor,
         before=before,
         after=changes.snapshot(host),
     )
@@ -265,7 +273,9 @@ async def update_host(
     return host
 
 
-async def delete_host(session: AsyncSession, host_id: str, source: str) -> None:
+async def delete_host(
+    session: AsyncSession, host_id: str, source: str, *, actor: str | None = None
+) -> None:
     host = await get_host(session, host_id)
     before = changes.snapshot(host)
     changes.record(
@@ -275,6 +285,7 @@ async def delete_host(session: AsyncSession, host_id: str, source: str) -> None:
         action="delete",
         summary=f"host {_label(host)} deleted, freeing {host.ip}",
         source=source,
+        actor=actor,
         before=before,
     )
     await session.delete(host)
@@ -282,7 +293,7 @@ async def delete_host(session: AsyncSession, host_id: str, source: str) -> None:
 
 
 async def bulk_create(
-    session: AsyncSession, subnet_id: str, items: list[dict], source: str
+    session: AsyncSession, subnet_id: str, items: list[dict], source: str, *, actor: str | None = None
 ) -> dict:
     """Import many hosts in one transaction. Each record succeeds or fails on its
     own — duplicates are skipped and invalid records error, without aborting the
@@ -348,6 +359,7 @@ async def bulk_create(
         action="update",
         summary=summary,
         source=source,
+        actor=actor,
         after={"results": results},
     )
     await session.commit()
@@ -359,7 +371,9 @@ async def bulk_create(
     }
 
 
-async def bulk_delete(session: AsyncSession, host_ids: list[str], source: str) -> dict:
+async def bulk_delete(
+    session: AsyncSession, host_ids: list[str], source: str, *, actor: str | None = None
+) -> dict:
     """Delete many hosts at once. One audit entry per affected subnet, carrying the
     full before-snapshots of everything removed."""
     ids = list(dict.fromkeys(host_ids))
@@ -381,6 +395,7 @@ async def bulk_delete(session: AsyncSession, host_ids: list[str], source: str) -
             action="update",
             summary=f"bulk delete from {subnet_name}: {len(group)} host(s) removed",
             source=source,
+            actor=actor,
             before={"hosts": [changes.snapshot(h) for h in group]},
         )
         for host in group:
@@ -394,7 +409,12 @@ _ALLOCATE_ATTEMPTS = 5
 
 
 async def allocate_next(
-    session: AsyncSession, subnet_id: str, payload: AllocateRequest, source: str
+    session: AsyncSession,
+    subnet_id: str,
+    payload: AllocateRequest,
+    source: str,
+    *,
+    actor: str | None = None,
 ) -> Host:
     _check_notes(payload.notes)
     data = payload.model_dump()
@@ -426,6 +446,7 @@ async def allocate_next(
             action="create",
             summary=summary,
             source=source,
+            actor=actor,
             after=changes.snapshot(host),
         )
         try:

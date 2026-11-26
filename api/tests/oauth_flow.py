@@ -45,6 +45,11 @@ SPIKE_LOG = Path(__file__).resolve().parents[2] / ".agents" / "spikes" / "25" / 
 
 oauth_mcp = build_mcp(mcp_auth(BASE))
 oauth_app = create_app(oauth_mcp)
+# The same server with `MCP_REMOTE_WRITES` on (#28), on the same database: a token one
+# issued is loaded by the other, which is what turning the setting off or on does to a
+# grant (`test_remote_writes.py`; across a restart, `test_oauth_restart.py`)
+writes_mcp = build_mcp(mcp_auth(BASE, remote_writes=True))
+writes_app = create_app(writes_mcp)
 
 # The tools by what they do. Every tool is in exactly one list (`test_oauth_mcp.py`).
 READ_TOOLS = {
