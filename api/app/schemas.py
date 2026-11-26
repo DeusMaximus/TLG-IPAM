@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, StrictBool, field_validator
 
 from .agent_protocol import ENROL_TOO_NEW, ENROL_TOO_OLD, ScanRange
 from .ipnet import normalise_domain, normalise_mac, parse_ip
@@ -587,3 +587,41 @@ class FindingOut(FindingKey):
     proposed: dict
     # digest of the key, `host_id` and `proposed`: accept is refused once it changes
     fingerprint: str
+
+
+# --- The link window (v0.2 spec §6.3, #27) ---
+
+LinkWindowEnd = Literal["linked", "burned", "expired", "cancelled", "replaced"]
+
+
+class LinkWindowOpen(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # whether the link may write; refused until remote writes can be allowed (#28)
+    can_write: StrictBool = False
+
+
+class LinkWindowOut(BaseModel):
+    """The link window as `services/link_window.state_out` gives it. Never the code."""
+
+    # whether remote MCP is configured (`PUBLIC_BASE_URL`): without it no window opens
+    configured: bool
+    open: bool
+    # while open: what its link may do, when it opened and runs out, and how long it has
+    # left by the server's clock, which a countdown starts from
+    can_write: bool | None
+    opened_at: UtcDatetime | None
+    expires_at: UtcDatetime | None
+    expires_in_s: int | None
+    # how many more wrong link codes it takes; the last of them burns it
+    attempts_left: int | None
+    # while none is open: how the latest window ended, and when (process memory: null
+    # after a restart until one has been opened and has ended)
+    ended: LinkWindowEnd | None
+    ended_at: UtcDatetime | None
+
+
+class LinkWindowOpened(LinkWindowOut):
+    """The answer that opens a window, the only one that carries its link code."""
+
+    code: str

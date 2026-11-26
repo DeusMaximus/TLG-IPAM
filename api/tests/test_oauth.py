@@ -249,16 +249,17 @@ async def test_what_the_spike_clients_asked_for_and_is_not_served_is_a_404(web, 
 
 
 def test_the_oauth_server_serves_exactly_these_routes():
-    """Under the `/mcp` mount: the MCP endpoint, the three OAuth endpoints and the two
-    discovery documents (which FastMCP's app carries too). No consent route, no
-    revocation endpoint, nothing that approves a link: `oauth.approve` has no caller
-    over HTTP until #27 adds one."""
+    """Under the `/mcp` mount: the MCP endpoint, the three OAuth endpoints, the consent
+    page (#27) and the two discovery documents (which FastMCP's app carries too). No
+    revocation endpoint: the consent page is the one route that approves a link
+    (`test_link_window.py`)."""
     provider = oauth_mcp.auth.server
     served = sorted((route.path, tuple(sorted(route.methods))) for route in provider.get_routes("/"))
     assert served == [
         ("/.well-known/oauth-authorization-server", ("GET", "HEAD", "OPTIONS")),
         ("/.well-known/oauth-protected-resource/mcp", ("GET", "HEAD", "OPTIONS")),
         ("/authorize", ("GET", "HEAD", "POST")),
+        ("/consent", ("GET", "HEAD", "POST")),
         ("/register", ("OPTIONS", "POST")),
         ("/token", ("OPTIONS", "POST")),
     ]
@@ -284,7 +285,7 @@ def test_the_body_cap_wraps_the_oauth_app_too():
     assert oauth_app.user_middleware[0].cls is BodyLimitMiddleware
 
 
-@pytest.mark.parametrize("path", OAUTH_ROUTES)
+@pytest.mark.parametrize("path", OAUTH_ROUTES + ("/mcp/consent",))
 async def test_a_body_over_the_cap_is_refused_on_the_oauth_routes(web, linking, path):
     res = await web.post(
         path, content=b"x" * (BODY_MAX + 1), headers={"Content-Type": "application/json"}
@@ -294,12 +295,12 @@ async def test_a_body_over_the_cap_is_refused_on_the_oauth_routes(web, linking, 
     assert await all_rows(OAuthClient) == []
 
 
-# --- Linking is closed until the link window exists (#27) ---
+# --- Linking is closed outside a link window (#27, `test_link_window.py`) ---
 
 
-def test_linking_is_closed():
-    """No test opens it but through the `linking` fixture: as the server ships, it
-    registers no client and authorises nothing, so no grant can be issued."""
+def test_linking_is_closed_without_a_link_window():
+    """The `linking` fixture opens it in place of a window; without one, as a server
+    starts, it registers no client and authorises nothing, so no grant can be issued."""
     assert oauth.linking_open() is False
 
 

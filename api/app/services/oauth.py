@@ -8,20 +8,21 @@ and the life of every code and token.
 
 Nothing here reads the settings: the provider passes the public base URL in.
 
-**The seam the link window and consent page are built on (#27).** Until they exist no
-grant can be issued over HTTP:
+**The link window and the consent page (#27)** are built on three things here:
 
-- `linking_open()` says whether registration and authorisation are taken now. Here it
-  is always False, so `/register` and `/authorize` refuse every request and no row is
-  written by a caller without a credential. #27 makes it the link window.
+- `linking_open()` says whether registration and authorisation are taken now: while a
+  link window is open (`services/link_window`). Outside one `/register` and
+  `/authorize` refuse every request and no row is written by a caller without a
+  credential.
 - `begin_authorisation` checks an authorise request the SDK has validated (client,
   redirect URI, scope) and keeps it in `pending`, in process memory, under an opaque
   transaction id. The provider sends the browser to `CONSENT_PATH` with that id.
-- `approve` is what the consent handler calls once the owner's link code is accepted:
-  it takes the transaction, records the grant with the redirect URI it was authorised
-  for, issues the single-use code, writes the audit entry, and returns the URL to send
-  the browser back to the client with. `pending.get` reads a transaction without taking
-  it (for the page), `pending.discard` drops one (a refused consent).
+- `approve` is what the consent handler calls once the owner's link code is accepted
+  (`link_window.submit`): it takes the transaction, records the grant with the redirect
+  URI it was authorised for, issues the single-use code, writes the audit entry, and
+  returns the URL to send the browser back to the client with. `pending.get` reads a
+  transaction without taking it (for the page), `pending.discard` drops one (a refused
+  consent), and every way a window ends drops them all.
 
 **Scopes (#28).** A token's scopes are never stored: `grant_scopes` is asked each time
 one is loaded. Here it answers `ipam:read` alone, whatever `can_write` says, so no grant
@@ -49,7 +50,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..errors import database_unavailable
 from ..models import OAuthClient, OAuthGrant, OAuthToken
 from ..times import utc
-from . import changes, scans
+from . import changes, link_window, scans
 
 log = logging.getLogger(__name__)
 
@@ -146,17 +147,15 @@ def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-# --- The link window's seam (#27) ---
+# --- The link window (#27) ---
 
 
 def linking_open() -> bool:
-    """Whether the server registers clients and takes authorise requests now.
-
-    Never, until the link window exists (#27): the routes refuse, nothing is stored for
-    a caller without a credential, and no grant can be issued. Discovery and the token
-    endpoint do not ask.
-    """
-    return False
+    """Whether the server registers clients and takes authorise requests now: while the
+    owner has a link window open (`link_window.is_open`, spec §6.3). Outside one the
+    routes refuse and nothing is stored for a caller without a credential. Discovery and
+    the token endpoint do not ask."""
+    return link_window.is_open()
 
 
 LINKING_CLOSED = (

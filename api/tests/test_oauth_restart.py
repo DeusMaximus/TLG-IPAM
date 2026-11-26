@@ -1,12 +1,17 @@
-"""Grants survive a restart (#26): three processes, one database file.
+"""Grants survive a restart (#26), and a link in progress does not (#27): three
+processes, one database file.
 
 The first is a script that links a client: it registers, authorises, approves (in the
-consent handler's place, #27) and exchanges the code, all against the app as a server
-with `PUBLIC_BASE_URL` set imports it, then exits. The second and third are the server
+consent handler's place) and exchanges the code, all against the app as a server with
+`PUBLIC_BASE_URL` set imports it, then exits. The second and third are the server
 itself, started the way the image starts it (`python -m app.serve`), one after the
-other on the same file. Nothing the tokens need is in a process's memory.
+other on the same file. Nothing the tokens need is in a process's memory; the link
+window and the requests pending in it are, so the second server's window and the
+request a client sent in it are gone on the third.
 """
 
+import base64
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -46,7 +51,7 @@ from app.database import SessionLocal, init_models
 from app.main import app
 from app.services import oauth
 
-oauth.linking_open = lambda: True   # the link window, which #27 adds
+oauth.linking_open = lambda: True   # open, in a link window's place
 BASE, VERIFIER, CALLBACK = settings.public_base_url, "v" * 64, "https://client.example.com/cb"
 challenge = base64.urlsafe_b64encode(hashlib.sha256(VERIFIER.encode()).digest()).decode().rstrip("=")
 
@@ -70,6 +75,21 @@ async def main():
 
 asyncio.run(main())
 """
+
+
+CALLBACK = "https://client.example.com/cb"
+
+
+def _authorise(client):
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(b"v" * 64).digest()).decode().rstrip("=")
+    return {
+        "client_id": client["client_id"],
+        "response_type": "code",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "redirect_uri": CALLBACK,
+        "state": "s",
+    }
 
 
 def _five_minutes_pass(tmp_path):
@@ -136,8 +156,17 @@ def test_a_grant_outlives_the_process_that_issued_it_and_a_server_restart(tmp_pa
             assert res.status_code == 200, res.text
             second = res.json()
             assert second["refresh_token"] != first["refresh_token"]
-            # no link can be started on a server as it ships: the window is #27's
-            assert http.post(f"{base}/mcp/register", json={"redirect_uris": ["https://x.example/cb"]}).status_code == 403
+            # no link can be started without a window; one is opened, and a client
+            # registers and authorises in it
+            assert http.post(f"{base}/mcp/register", json={"redirect_uris": [CALLBACK]}).status_code == 403
+            res = http.post(f"{base}/api/v1/link-window", json={}, headers={"X-API-Key": REAL_KEY})
+            assert res.status_code == 201, res.text
+            other = http.post(f"{base}/mcp/register", json={"redirect_uris": [CALLBACK]})
+            assert other.status_code == 201, other.text
+            res = http.get(f"{base}/mcp/authorize", params=_authorise(other.json()))
+            assert res.headers["location"].startswith(BASE + "/mcp/consent?txn=")
+            txn = httpx.URL(res.headers["location"]).params["txn"]
+            assert http.get(f"{base}/mcp/consent", params={"txn": txn}).status_code == 200
     finally:
         _stop(proc, reader)
 
@@ -156,5 +185,11 @@ def test_a_grant_outlives_the_process_that_issued_it_and_a_server_restart(tmp_pa
             # the wrong secret is still refused, by the hash the database kept
             wrong = {**client, "client_secret": "0" * 64}
             assert _refresh(http, base, wrong, res.json()["refresh_token"]).status_code == 401
+            # the restart cancelled the link in progress, and nothing else: no window,
+            # the request gone with it, the registration kept
+            state = http.get(f"{base}/api/v1/link-window", headers={"X-API-Key": REAL_KEY})
+            assert state.json()["data"]["open"] is False
+            assert http.get(f"{base}/mcp/consent", params={"txn": txn}).status_code == 403
+            assert http.get(f"{base}/mcp/authorize", params=_authorise(other.json())).status_code == 403
     finally:
         _stop(proc, reader)

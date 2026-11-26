@@ -16,8 +16,9 @@ from .config import settings
 from .database import SessionLocal, init_models
 from .errors import ApiError
 from .mcp_server import mcp
+from .oauth_provider import public_base_url_of
 from .routers import agent, agents, changes, device_types, hosts, scan_targets, sections, subnets
-from .routers import findings
+from .routers import findings, link_window
 from .services import oauth as oauth_svc
 from .services.backups import create_snapshot
 from .services.device_types import seed_defaults
@@ -119,6 +120,9 @@ def create_app(server: FastMCP = mcp) -> FastAPI:
         openapi_url="/api/v1/openapi.json",
     )
 
+    # What the owner's link-window routes ask: whether this app has the OAuth server
+    app.state.public_base_url = public_base_url_of(server.auth)
+
     app.add_middleware(MCPPathRewriteMiddleware)
     # Added last, so it wraps everything above: the body cap runs before routing, before
     # any route dependency (authentication included) and before any body is parsed, on
@@ -142,6 +146,7 @@ def create_app(server: FastMCP = mcp) -> FastAPI:
         agents.router,
         scan_targets.router,
         findings.router,
+        link_window.router,
     ):
         app.include_router(router, prefix="/api/v1", dependencies=[Depends(require_api_key)])
 
