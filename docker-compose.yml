@@ -6,6 +6,11 @@ services:
     environment:
       - API_KEY=${API_KEY:?set API_KEY in .env}
       - DB_PATH=/data/ipam.db
+      # Remote MCP for web assistants: off while empty. Read docs/deployment.md first.
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - MCP_REMOTE_WRITES=${MCP_REMOTE_WRITES:-false}
+      # Passed in only when set: a proxy whose client addresses the log should show
+      - UVICORN_FORWARDED_ALLOW_IPS
     ports:
       - "8080:8080"
     restart: unless-stopped
