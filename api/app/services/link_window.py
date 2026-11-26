@@ -10,17 +10,21 @@ it is what proves that the person approving is the owner (spec §7.2, invariant 
   link in progress and nothing else. Opening a window while one is open replaces it,
   and the old code stops working.
 - It ends on the first successful link, after `LIFETIME_S`, or when the owner cancels
-  or replaces it. **Nothing a caller without the owner key sends ends, shortens or
-  blocks it.**
+  or replaces it. **No wrong code, however many, closes or shortens it.** An open
+  window is not the same as an approval attempt, though: an outsider can still push
+  the owner's pending request out of `oauth.pending`, or reclaim the owner's client's
+  unlinked registration, and so make that attempt start again, as often as it likes
+  while the window is open (spec §6.3; #190).
 - **Wrong codes are counted for the request, not the window**: the
   `WRONG_CODES_MAX`th wrong code typed on one request's consent page ends that request,
   and only that request. The right code links whatever wrong codes other requests have
   had. What bounds guessing is the code itself (`CODE_ALPHABET` ** `CODE_LENGTH`, about
   5.9e14 values) against the posts the server can take in the window's `LIFETIME_S`
-  (spec §6.3 gives the measurement), not a count an outsider could run out for the
-  owner. The owner is told: the window's `wrong_codes` (all its requests together), and
-  one change-log entry for the window's first wrong code, so an outsider can write the
-  log at most once a window.
+  (spec §6.3 gives the measurement), not a count of wrong codes an outsider could run
+  out for the owner. The owner is told: the window's `wrong_codes` (all its requests
+  together), and one change-log entry for the window's first wrong code, written while
+  the window is current (`_log_first_wrong`), so an outsider can write the log at most
+  once a window.
 - **A registration is not a link**: any number of them, in any window, neither closes
   nor uses one up. A client registered in one window can authorise in a later one.
 - **Pending transactions end with the window**: every way a window ends drops them all
@@ -400,15 +404,42 @@ async def show(session: AsyncSession, txn_id: str | None) -> Outcome:
 
 async def _count_wrong(session: AsyncSession, window: _Window, txn_id: str) -> bool:
     """Count a wrong code for the request and the window. True when the request has had
-    its `WRONG_CODES_MAX` and is ended. The window's first wrong code is logged, once: an
-    outsider can write the change log at most once a window."""
+    its `WRONG_CODES_MAX` and is ended.
+
+    Everything is decided before anything is awaited: the count, and at the
+    `WRONG_CODES_MAX`th the request's discard, so a post on it that arrives while this
+    one waits on its audit entry finds it no longer pending and compares nothing. Five
+    guesses a request hold whatever the database does with the entry."""
     window.wrong_codes += 1
     # only pending requests are counted, so the counts are as bounded as `pending`
     for gone in [t for t in _wrong if oauth.pending.get(t) is None]:
         del _wrong[gone]
-    _wrong[txn_id] = _wrong.get(txn_id, 0) + 1
+    count = _wrong.get(txn_id, 0) + 1
+    ended = count >= WRONG_CODES_MAX
+    if ended:
+        _wrong.pop(txn_id, None)
+        oauth.pending.discard(txn_id)
+    else:
+        _wrong[txn_id] = count
     if not window.wrong_logged:
         window.wrong_logged = True
+        await _log_first_wrong(session, window)
+    return ended
+
+
+async def _log_first_wrong(session: AsyncSession, window: _Window) -> None:
+    """The window's one change-log entry about wrong codes, written under the lock that
+    opening, cancelling and an approval hold, and only while the window is still the
+    current one: the entry is committed, its time taken, before any end of the window,
+    and never after one. A first wrong code whose window ended while it waited for the
+    lock is not logged; it changed nothing, and the window is over.
+
+    An outsider can hold the lock for one database write a window at most (another
+    only after a refused write, which leaves the entry to the next wrong code), so the
+    owner's open, cancel or an approval waits at most that long behind it."""
+    async with _transitions:
+        if _live() is not window:
+            return
         changes.record(
             session,
             entity_type=AUDIT_ENTITY,
@@ -426,11 +457,6 @@ async def _count_wrong(session: AsyncSession, window: _Window, txn_id: str) -> b
             log.warning(
                 "link window: a wrong code was not recorded (%s)", type(exc.orig).__name__
             )
-    if _wrong.get(txn_id, 0) >= WRONG_CODES_MAX:
-        _wrong.pop(txn_id, None)
-        oauth.pending.discard(txn_id)
-        return True
-    return False
 
 
 async def submit(

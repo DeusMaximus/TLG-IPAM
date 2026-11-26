@@ -5,11 +5,14 @@ end, through the owner's routes and the page, with no gate opened in the window'
 import asyncio
 import html
 import re
+import sqlite3
 import time
 
 import httpx
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import consent
 from app.database import SessionLocal
@@ -855,4 +858,158 @@ async def test_a_failure_after_the_grant_is_committed_still_links_once(web, monk
         "/mcp/consent", data={**other_form, "code": window["code"], "action": "link"}
     )
     assert res.status_code == 403
+    assert len(await all_rows(OAuthGrant)) == 1
+
+
+# --- The wrong-code entry and the window's ends (round 2 of the briefed review) ---
+
+
+def pause_wrong_code_commits(monkeypatch, *, fail_first: int = 0):
+    """Commits that carry the wrong-code entry: the first `fail_first` refused as
+    SQLite refuses a busy write, the next paused until `go` is set."""
+    paused, go = asyncio.Event(), asyncio.Event()
+    commit = AsyncSession.commit
+    refused = []
+
+    async def held(self):
+        if any(isinstance(row, Change) and row.action == "wrong_code" for row in self.new):
+            if len(refused) < fail_first:
+                refused.append(1)
+                raise OperationalError("COMMIT", {}, sqlite3.OperationalError("database is locked"))
+            paused.set()
+            await go.wait()
+        return await commit(self)
+
+    monkeypatch.setattr(AsyncSession, "commit", held)
+    return paused, go
+
+
+async def _owner_ends(web, action, other_txn=None, code=None):
+    if action == "cancel":
+        return await web.delete("/api/v1/link-window", headers=OWNER)
+    if action == "replace":
+        return await web.post("/api/v1/link-window", json={}, headers=OWNER)
+    return await _post_right_code(web, other_txn, code)
+
+
+ENDS = {"cancel": [], "replace": ["open"], "link": ["create"]}
+
+
+@pytest.mark.parametrize("action", ENDS)
+async def test_a_wrong_code_entry_in_progress_is_logged_before_the_window_ends(
+    web, monkeypatch, action
+):
+    """As round 2 broke it: the first wrong code's entry is paused in its commit, and the
+    owner cancels, replaces or links. The owner's step waits for the one write, so the
+    entry is in the log before the end, as the wrong code was."""
+    window = await open_window(web)
+    client = await register(web)
+    txn = transaction(await authorise(web, client))
+    other = transaction(await authorise(web, client))
+    form = hidden_fields((await consent_page(web, txn)).text)
+    await consent_page(web, other)
+    paused, go = pause_wrong_code_commits(monkeypatch)
+    wrong = asyncio.create_task(
+        web.post("/mcp/consent", data={**form, "code": wrong_code_for(window["code"]), "action": "link"})
+    )
+    await paused.wait()
+    owner = asyncio.create_task(_owner_ends(web, action, other, window["code"]))
+    await asyncio.sleep(0.05)
+    assert not owner.done()  # behind one database write, no more
+    go.set()
+    await wrong, await owner
+    assert [c.action for c in await changes()] == ["open", "wrong_code", *ENDS[action]]
+
+
+@pytest.mark.parametrize("action", ENDS)
+async def test_a_wrong_code_whose_window_ended_first_is_not_logged_after_the_end(web, action):
+    """The other order: the owner's step takes the lock first, and the first wrong code's
+    entry, waiting behind it, finds the window gone and is not written."""
+    window = await open_window(web)
+    client = await register(web)
+    txn = transaction(await authorise(web, client))
+    other = transaction(await authorise(web, client))
+    form = hidden_fields((await consent_page(web, txn)).text)
+    other_form = hidden_fields((await consent_page(web, other)).text)
+    lock = link_window._transitions
+    await lock.acquire()  # only to order the two requests
+    if action == "link":
+        owner = asyncio.create_task(
+            web.post("/mcp/consent", data={**other_form, "code": window["code"], "action": "link"})
+        )
+    else:
+        owner = asyncio.create_task(_owner_ends(web, action))
+    await asyncio.sleep(0.05)
+    wrong = asyncio.create_task(
+        web.post("/mcp/consent", data={**form, "code": wrong_code_for(window["code"]), "action": "link"})
+    )
+    await asyncio.sleep(0.05)
+    lock.release()
+    await owner
+    res = await wrong
+    # a link in flight refuses the wrong code uncounted; an end leaves it no window
+    assert res.status_code == (409 if action == "link" else 403)
+    assert [c.action for c in await changes()] == ["open", *ENDS[action]]
+
+
+async def test_a_request_gets_five_guesses_however_the_database_takes_the_entry(
+    web, monkeypatch
+):
+    """As round 2 broke it: the first four entries refused (each leaves the entry to the
+    next wrong code), the fifth paused, and a sixth posted meanwhile. The fifth ended the
+    request before it waited, so the sixth compares nothing."""
+    window = await open_window(web)
+    client = await register(web)
+    txn = transaction(await authorise(web, client))
+    form = hidden_fields((await consent_page(web, txn)).text)
+    wrong = {**form, "code": wrong_code_for(window["code"]), "action": "link"}
+    paused, go = pause_wrong_code_commits(monkeypatch, fail_first=4)
+    for _ in range(4):
+        assert (await web.post("/mcp/consent", data=wrong)).status_code == 403
+    fifth = asyncio.create_task(web.post("/mcp/consent", data=wrong))
+    await paused.wait()
+    sixth = await asyncio.wait_for(web.post("/mcp/consent", data=wrong), 2)
+    go.set()
+    fifth = await fifth
+    assert fifth.status_code == 403 and "This request was ended" in fifth.text
+    assert sixth.status_code == 410
+    assert (await window_state(web))["wrong_codes"] == 5
+    # nor does the right code, after
+    assert (await web.post("/mcp/consent", data={**wrong, "code": window["code"]})).status_code == 410
+    assert await all_rows(OAuthGrant) == []
+    assert [c.action for c in await changes()] == ["open", "wrong_code"]
+
+
+async def test_while_a_link_is_approved_other_posts_are_refused_and_not_counted(
+    web, monkeypatch
+):
+    """What the claim does besides keeping the window from expiring: while the right code
+    of one request is being approved, a post on another request is answered `409` at
+    once, its code neither compared nor counted. (One grant a window rests on the lock
+    and the recheck after it, `_link`.)"""
+    window = await open_window(web)
+    client = await register(web)
+    first = transaction(await authorise(web, client))
+    second = transaction(await authorise(web, client))
+    second_form = hidden_fields((await consent_page(web, second)).text)
+    paused, go = asyncio.Event(), asyncio.Event()
+    take = scans.take_write_lock
+
+    async def held(session):
+        paused.set()
+        await go.wait()
+        await take(session)
+
+    monkeypatch.setattr(scans, "take_write_lock", held)
+    linking = asyncio.create_task(_post_right_code(web, first, window["code"]))
+    await paused.wait()
+    for code in (wrong_code_for(window["code"]), window["code"]):
+        res = await asyncio.wait_for(
+            web.post("/mcp/consent", data={**second_form, "code": code, "action": "link"}), 2
+        )
+        assert res.status_code == 409 and "A link is being made" in res.text
+    assert (await window_state(web))["wrong_codes"] == 0
+    monkeypatch.setattr(scans, "take_write_lock", take)
+    go.set()
+    assert (await linking).status_code == 303
     assert len(await all_rows(OAuthGrant)) == 1
