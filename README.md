@@ -51,13 +51,21 @@ A bind mount in place of the named volume (`./data:/data`, say) needs its direct
 
 The image starts the server with `python -m app.serve`, which runs uvicorn with one worker whatever the environment says: setting `WEB_CONCURRENCY` (or `UVICORN_WORKERS`) does not change it. The same command sets the limits on request headers, idle connections and clients that stop reading, which keep a client from holding the server's memory without a credential (brief §4.3) and which a plain `uvicorn` command line does not have. It is uvicorn's own command line underneath, so `UVICORN_*` variables you set for the old `CMD` (`UVICORN_FORWARDED_ALLOW_IPS` behind a proxy, `UVICORN_LOG_LEVEL`, …) still apply, except the six it pins: `UVICORN_WORKERS`, `UVICORN_RELOAD`, `UVICORN_HTTP`, `UVICORN_HTTP2`, `UVICORN_WS` and `UVICORN_TIMEOUT_KEEP_ALIVE` are ignored. It should stay that way, so do not change the `CMD`, override it with a different command, or run several replicas behind a load balancer. MCP sessions are held in the memory of the process that opened them, and SQLite allows one writer at a time, so a second process would not share them, and adds no capacity a homelab needs.
 
+## Deployment and remote access
+
+[docs/deployment.md](docs/deployment.md) says how to run the server on your network (isolation, where the scan agents go, what to scan) and, if you want a web AI assistant to reach it, how to publish `/mcp` through a Cloudflare Tunnel or nginx while the web UI and the REST API stay private, with optional SSO or MFA in front of linking.
+
+Remote MCP is off unless `PUBLIC_BASE_URL` is set. Do not forward port 8080 from the internet.
+
 ## Connect an AI assistant
 
-The MCP server at `/mcp` speaks Streamable HTTP. It takes the same `API_KEY` as the REST API, sent as a bearer token (`Authorization: Bearer <API_KEY>`), so any MCP-capable client that can send a header can use it. `X-API-Key` works on the REST API only. Claude Desktop setup is documented below; instructions for other clients (ChatGPT, Codex CLI, …) coming soon.
+The MCP server at `/mcp` speaks Streamable HTTP. It takes the same `API_KEY` as the REST API, sent as a bearer token (`Authorization: Bearer <API_KEY>`), so any MCP-capable client that can send a header can use it. `X-API-Key` works on the REST API only. Claude Desktop setup is documented below; instructions for other local clients (Codex CLI, …) coming soon.
+
+A web client, which signs in with OAuth and cannot send your key, is linked instead: set `PUBLIC_BASE_URL`, publish the paths it needs, and approve it with a one-time link code ([docs/deployment.md](docs/deployment.md#remote-mcp)).
 
 ### Claude Desktop
 
-Claude Desktop's native connectors want OAuth, so the key goes through `mcp-remote`. Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+Claude Desktop's native connectors want OAuth, so on your own network the key goes through `mcp-remote`. Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 "mcpServers": {
@@ -92,6 +100,8 @@ This release does ICMP, ARP and reverse DNS. Reverse DNS asks the subnet's DNS s
 3. Once the agent has checked in, the Agents page offers to scan each subnet one of its interfaces is on that nothing scans yet: **Scan** sets it up with the default methods and asks for a scan. Or assign the subnet to the agent in the subnet's **Scanning** section, and save.
 
 A used, expired or revoked enrolment token is refused (`403`); so, for a minute, is every attempt after ten that failed (`429`). If the answer to the exchange is lost, or the token runs out before it is used, **Re-enrol** on the agent's row issues a new enrolment token for the same agent, which keeps its scan targets, and shows the commands again, with those that remove an old token from the host first. Exchanging it also revokes the agent token the agent held before, which is the way to replace a lost or leaked one. Pending enrolments are listed on the page until they are used or expire.
+
+Where to put agents and what to have them scan is in [docs/deployment.md](docs/deployment.md#scan-agents).
 
 An agent older than the server is flagged "update available", and one refused for speaking another protocol says so; either offers the update command for both ways of running it.
 

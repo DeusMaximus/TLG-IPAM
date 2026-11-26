@@ -29,7 +29,7 @@ TLG-IPAM is a clean, modern IP address manager designed for homelabs. It replace
 | Database | SQLite via SQLAlchemy 2 (async, `aiosqlite`) |
 | MCP server | FastMCP 4.x (locked at 4.1.8, MCP SDK 2.3.0) — curated tools, mounted at `/mcp` in the same process |
 | Container | Docker — **single container**: FastAPI serves the API, MCP, and the built SPA |
-| Reverse proxy | Cloudflare Tunnel / Caddy compatible (`/mcp` path exposed) |
+| Reverse proxy or tunnel | Optional. For remote MCP it publishes the `/mcp` and discovery paths alone (§5.5); `docs/deployment.md` gives Cloudflare Tunnel and nginx configurations |
 
 ### 2.2 Container layout
 
@@ -45,6 +45,9 @@ services:
     environment:
       - API_KEY=${API_KEY:?set API_KEY in .env}
       - DB_PATH=/data/ipam.db
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}          # empty: remote MCP off (§5.5)
+      - MCP_REMOTE_WRITES=${MCP_REMOTE_WRITES:-false} # true: a link may be made read-write (§5.5)
+      - UVICORN_FORWARDED_ALLOW_IPS                    # passed in only when set (§4.3)
     ports: ["8080:8080"]
 volumes:
   ipam-data:
@@ -453,7 +456,7 @@ The image runs with uvicorn's WebSocket support off, since the app serves none, 
 
 Measured at `7063421` against a loopback uvicorn 0.54 (macOS, one run each). Before: httptools took 8 MiB of one unfinished header and the worker grew by 119 MiB (h11 refused it past its 16 KiB with `400`); a connection that sent nothing, and one that sent a header a byte every 2 s, were both still open after 75 s, on both parsers. 1,000 connections that had sent nothing cost the worker 6 to 7 MiB, and 1,000 holding 60 KiB of unfinished head each 71 MiB (h11: 22 MiB, refusing them all). With the limits, the 8 MiB header was refused with `431` once 64 KiB of it had arrived (the worker grew by 0.3 MiB), and the other two were closed at 10 s; 1,000 connections holding 60 KiB each, under the limit, still cost 70 MiB, but for 10 s at most. Twenty connections that each sent 64 KiB of pipelined requests and read nothing grew the worker by 78 MiB on plain httptools and by 8 MiB with one request ahead; a client that asked for a 64 MiB static file and read nothing was still holding it after 75 s on plain httptools, and was dropped at 60.6 s. The UI in a browser, before and after 12 s idle, an agent's check-in and a full result set, a 1,000-row import and an MCP session with its event stream held open for 30 s were served as before (#132's PR has the run). No concurrency limit is set: uvicorn's `--limit-concurrency` counts open connections, idle ones included, and answers `503` to every request past it, so at a limit of 32, 32 connections that had sent nothing turned `/health` into `503`. It would give whoever holds the connections the server, without bounding what they cost.
 
-**Left to the reverse proxy or tunnel** (the deployment guidance, #31; v0.2 spec §8 lists each with how to check it is in force). The server's limits bound what one connection and one body cost and for how long, not how many there are or whose they are. The body budget is shared by every client, so one that keeps it full (16 MiB sent again each minute, from eight connections or more) holds every other body off with `503`, small ones included; the agent retries a `503` on its back-off. Each connection costs the worker about 7 KiB, and up to 64 KiB of head for at most 10 s, or one queued request and a read, or a paused response for at most 60 s, plus the kernel's socket buffers, and nothing in the server bounds their number. A client that reads a response at just over 1 KB/s holds it as long as it keeps reading. The server cannot tell clients apart behind a proxy, whose address is all it sees. A proxy or tunnel in front of the server is expected to:
+**Left to the reverse proxy or tunnel** (`docs/deployment.md`, "What the proxy holds", gives each with how to check it is in force; v0.2 spec §8 holds the detail). The server's limits bound what one connection and one body cost and for how long, not how many there are or whose they are. The body budget is shared by every client, so one that keeps it full (16 MiB sent again each minute, from eight connections or more) holds every other body off with `503`, small ones included; the agent retries a `503` on its back-off. Each connection costs the worker about 7 KiB, and up to 64 KiB of head for at most 10 s, or one queued request and a read, or a paused response for at most 60 s, plus the kernel's socket buffers, and nothing in the server bounds their number. A client that reads a response at just over 1 KB/s holds it as long as it keeps reading. The server cannot tell clients apart behind a proxy, whose address is all it sees. A proxy or tunnel in front of the server is expected to:
 
 - limit each client's request rate and requests in progress (nginx's `limit_req` and `limit_conn`; `limit_conn` counts a connection only once its whole head has been read, so it does not count silent or trickling sockets);
 - read each request's head itself, within a size and a time limit of its own, and send it on whole, so a slow or oversized head ends at the proxy and never takes a connection to the server; nginx has no per-client limit on sockets without a complete head (they are bounded by its header timeout and its worker's connection limit), so a per-client cap on sockets, where one is wanted, is the firewall's, on the host clients connect to directly: it counts by source address, which behind a tunnel or another proxy is that hop's, shared by every client;
@@ -745,6 +748,12 @@ Refusals on these routes are OAuth's own shapes, not the REST envelope (§4.3): 
 
 A grant's token is a credential for `/mcp` and nothing else: the REST API, the backup and the agent routes refuse it.
 
+**What is published** (v0.2 spec §6.7, §8; `docs/deployment.md`). A tunnel or reverse proxy in front of the server publishes `/mcp` (with or without the trailing slash), `/mcp/authorize`, `/mcp/token`, `/mcp/register`, `/mcp/consent`, `/.well-known/oauth-authorization-server` and `/.well-known/oauth-protected-resource/mcp`, each matched exactly. The SPA, every `/api/` route (the link window's among them), the backup and `/health` stay private, and `/api/v1/agent/*` needs to be reachable by agents only. The server does not enforce this split: it serves everything on one port to whoever reaches it, with each route's own credential as the only other guard (the SPA's files, `/health` and the API docs have none), so the proxy is what keeps the private paths private. A proxy that normalises a path before matching it and forwards the original does not: the server resolves no dot segment, so such a path can match a published one and reach an `/api/` route (spec §8).
+
+**SSO or MFA** is the operator's access proxy in front of `/mcp/authorize` and `/mcp/consent`, which only the owner's browser visits; the server has no OIDC support and nothing to set. The other five are requested by clients, which cannot complete an interactive login, and pass through untouched. The login guards the making of a link, not a link already made. Through it, the consent form's post must carry no `Origin` but `PUBLIC_BASE_URL` (above): an access proxy that serves the page under another host, rewrites `Origin`, or adds `Referrer-Policy: no-referrer` (with which a browser sends `Origin: null`) gets the form refused, and the page's Content-Security-Policy blocks what a proxy injects into it.
+
+**Ending links**, until #30's **Linked clients** list. As above, there is no supported way to revoke one link: no route or screen does it, and there is no OAuth revocation endpoint, so removing a connector in the client revokes nothing here. The server revokes a grant itself only when a rotated refresh token is reused (above). Leaving `MCP_REMOTE_WRITES` off stops every link writing and ends none: each still reads. Starting without `PUBLIC_BASE_URL` refuses every grant's token and removes the OAuth routes; the grants stay stored and work again once it is set, a read-write one writing if the setting is on then. Changing `PUBLIC_BASE_URL` or `API_KEY` revokes no grant. With Compose, a change to either setting in `.env` is applied by `docker compose up -d`; `docker compose restart` keeps the old values.
+
 ---
 
 ## 6. Frontend specification
@@ -907,7 +916,7 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 | Single container, FastAPI serves the SPA | One origin (no CORS), no nginx config, one port to tunnel, `docker compose up` is the whole story. |
 | Audit log from day one | Claude writes to this system; you need to be able to review what it did. Also free "recent activity" UI. |
 | React + Vite not Next.js | No SSR needed. Vite builds faster, static output served straight from FastAPI. |
-| Single API key not JWT | Homelab single-user context. Adding OAuth/OIDC later is a one-file change in `auth.py`. |
+| Single API key not JWT | Homelab single-user context. Web MCP clients, which cannot send a static key, are linked through the server's own OAuth for `/mcp` alone (§5.5); the REST API keeps the one key. OIDC is not built in: SSO or MFA is an access proxy in front of the two browser paths. |
 | No discovery/scanning in v1 | Keeps scope sane. Manual + MCP-driven allocation is the primary workflow. Scanning can be added later. |
 
 ---
@@ -953,6 +962,13 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 - No MCP tool configures agents, scan targets or scan scope. `add_reserved_range` creates a scanned range; `delete_reserved_range` on an excluded range fails with a message pointing at the web UI; `get_subnet` shows `scan_excluded` and `scan_dhcp_pool`.
 - `list_scan_findings` and `request_scan` are in `EXPECTED_TOOLS` and the tool table. `request_scan` inside the cooldown returns a tool error that says when it can run again.
 - Natural-language queries resolve to correct tool calls without ambiguity.
+
+### Remote MCP
+- Without `PUBLIC_BASE_URL` the OAuth and discovery paths are 404s and `/mcp` takes the owner key alone; with it, the owner key still works on `/mcp` (`api/tests/test_oauth.py`).
+- Outside a link window, registration and authorisation are refused and existing links keep refreshing. A link needs the window's one-time code, and one window makes one link. A request's fifth wrong code ends that request and never the window (`api/tests/test_link_window.py`).
+- A grant's token works on `/mcp` only, never on the REST API, the backup or the agent routes. A refresh token reused after its 60-second retry window revokes the grant (`api/tests/test_oauth.py`).
+- A link is read-only unless `MCP_REMOTE_WRITES` is `true` **and** its window was opened with `can_write`: otherwise it lists no write tool, and calling one changes nothing. Turning the setting off takes write access from every link at the restart, with no relink, and a link made read-write writes again once it is back on. A linked client's write names it in `actor`. A value other than `true` or `false` stops the start (`api/tests/test_remote_writes.py`, `test_oauth_mcp.py`, `test_oauth_restart.py`, `test_startup.py`).
+- `docs/deployment.md` says which paths a tunnel or reverse proxy publishes, so that the REST API and the SPA stay private; how to put SSO or MFA on the authorise and consent paths alone; and how to deploy the server and agents. Its examples use placeholder domains only.
 
 ### Operations
 - `docker compose up --build` produces a running stack with no manual steps.
