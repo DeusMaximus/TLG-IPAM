@@ -45,8 +45,8 @@ If you only use local clients, you need [Running the server](#running-the-server
 
 With `PUBLIC_BASE_URL` set, the server is its own OAuth authorisation server for `/mcp`, so that web MCP clients, which cannot send a static key, can be linked to it. Read this before turning it on:
 
-- **A linked client can read the whole IPAM**: subnets, VLANs, gateways, hostnames, MAC addresses, notes, scan findings and the change log. That is the cost of remote MCP. A link is read-only unless you [allow writes](#writes).
-- **There is no way yet to revoke one link.** The list of linked clients, with revoke, is [#30](https://github.com/DeusMaximus/TLG-IPAM/issues/30) and has not shipped. See [Ending a link](#ending-a-link) before you make one.
+- **A linked client can read the whole IPAM**: subnets, VLANs, gateways, hostnames, MAC addresses, notes, scan findings and the change log. That is the cost of remote MCP. A link is read-only unless you [allow writes](#writes), which takes both a server setting and a choice made for that link.
+- **There is no supported way yet to revoke one link.** The list of linked clients, with revoke, is [#30](https://github.com/DeusMaximus/TLG-IPAM/issues/30) and has not shipped. A link you allowed to write can write again whenever the setting is on. See [Ending a link](#ending-a-link) before you make one.
 - Linking needs a code that only the holder of the owner key can get. There is no standing password for it.
 
 ### What you publish
@@ -72,9 +72,15 @@ PUBLIC_BASE_URL=https://ipam.example.com
 MCP_REMOTE_WRITES=false
 ```
 
-then `docker compose up -d`. Until this is set, the OAuth and discovery paths answer `404`.
+then `docker compose up -d`. Until `PUBLIC_BASE_URL` is set, the OAuth and discovery paths answer `404`.
+
+**Apply every later change to these with `docker compose up -d` too. `docker compose restart` does not read `.env` again**: it starts the same container with the old values, so a setting you turned off stays on.
+
+`docker-compose.yml` passes both values from `.env` into the container. The server itself reads only its environment, never a `.env` file. If you run it another way (an older copy of the Compose file, `docker run`, by hand), set them in its environment.
 
 `PUBLIC_BASE_URL` is the public origin and nothing else: `https://`, a lowercase host name, and a port only when it is not 443. No path (not `/mcp`), no trailing slash, query, fragment, user name or spaces. The server refuses to start with any other spelling. (Plain `http://` is taken only for `localhost`, `127.0.0.1` and `[::1]`, to test on one machine.) Every URL the server tells a client comes from this value, never from the request's `Host` or `X-Forwarded-*` headers, so set it to exactly the name your tunnel or proxy serves. Choose it once: a client keeps the URL it was linked with, so changing it means linking every client again. Changing it does not revoke anything.
+
+`MCP_REMOTE_WRITES` says whether a link may be allowed to make changes ([Writes](#writes)). It is `true` or `false`, in any case; unset or empty is `false`. With any other value (`1`, `yes`, `on`, a value with a space) the server does not start, and its log says why. It is read when the server starts. Without `PUBLIC_BASE_URL` it changes nothing.
 
 The owner key keeps working on `/mcp` for your local clients. It works on the published `/mcp` too, so whoever has it can use every MCP tool from the internet: use a long random key, as `.env.example` shows.
 
@@ -339,14 +345,28 @@ Five wrong codes on one consent page end that request: start again from the clie
 
 ### Writes
 
-`MCP_REMOTE_WRITES` is `false` by default, and every link is then read-only: the write tools are not listed to a linked client. With it `true`, you may open a window with `{"can_write": true}`, and the link made in it can change hosts and reserved ranges and ask for scans. Otherwise the link is read-only. A link's choice is fixed when its window is opened. It writes only while the setting is also `true`: turning the setting off takes write access from every link at once, and turning it on does not upgrade a read-only link. The owner key is not affected.
+A link is read-only unless you do both of these:
+
+1. Set `MCP_REMOTE_WRITES=true` in `.env` and run `docker compose up -d`.
+2. Open its link window for a read-write link: in the command above, send `-d '{"can_write": true}'` in place of `-d '{}'`. The consent page then shows **Read and write** as the access. If it shows that and you did not mean it, choose **Do not link**.
+
+While the setting is off, that request is refused (`409 REMOTE_WRITES_OFF`) and no window opens. The window's state says whether the setting is on (`remote_writes`) and, while a window is open, what its link may do (`can_write`).
+
+A read-only link is not shown the write tools, and a call to one answers `Unknown tool`. A read-write link can create, change and delete hosts, add and delete reserved ranges, and ask for scans. It cannot configure scanning or widen what is scanned: it cannot delete a range that is excluded from scanning. Whoever holds its tokens can change or delete those records, and text it puts in a hostname or a note is read later by your own assistants, so allow it only for a client you would trust with that, and keep the [backups](backup-and-restore.md) running. The change log names the link as the `actor` of each of its writes: `grant:<client name>`, a name the client chose for itself, or `grant-id:<grant id>` if the server kept no name.
+
+The choice is fixed when the window is opened. Turning the setting on does not upgrade a read-only link.
+
+**To stop links writing**, set `MCP_REMOTE_WRITES=false` (or remove the line) and run `docker compose up -d`, not `restart`. Every link loses write access at once, without being linked again, and goes on reading and refreshing. This ends no link. **A link made read-write writes again whenever the setting is turned back on.** Until [#30](https://github.com/DeusMaximus/TLG-IPAM/issues/30) there is no supported way to revoke one link, so leaving the setting off is the way to stop it writing, and that stops every link.
+
+The owner key reads and writes whatever the setting is.
 
 ### Ending a link
 
 The list of linked clients, with revoke, has not shipped ([#30](https://github.com/DeusMaximus/TLG-IPAM/issues/30)). Until it does:
 
 - **Removing the connector in the client does not revoke anything here.** The server has no revocation endpoint.
-- **To stop every link at once**, remove `PUBLIC_BASE_URL` from `.env` and run `docker compose up -d`. Linked clients' tokens are refused from then on, and the public OAuth paths answer `404`. The links are stored, not deleted: set the value again and they work again.
+- **To stop a link writing**, leave `MCP_REMOTE_WRITES` off ([Writes](#writes)). That ends no link: each can still read everything.
+- **To stop every link at once**, remove `PUBLIC_BASE_URL` from `.env` and run `docker compose up -d` (`restart` would leave it set). Linked clients' tokens are refused from then on, and the public OAuth paths answer `404`. The links are stored, not deleted: set the value again and they work again, and a read-write one can write again if `MCP_REMOTE_WRITES` is `true` then.
 - **To end a link for good** before #30, keep remote MCP off until you can revoke it, or [restore a backup](backup-and-restore.md) taken before the link was made, which also undoes every other change made since.
 - The server revokes a link by itself when one of its old refresh tokens is used again, a sign that two parties hold its tokens, and logs it.
 

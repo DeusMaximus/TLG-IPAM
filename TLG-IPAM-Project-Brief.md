@@ -46,7 +46,7 @@ services:
       - API_KEY=${API_KEY:?set API_KEY in .env}
       - DB_PATH=/data/ipam.db
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}          # empty: remote MCP off (§5.5)
-      - MCP_REMOTE_WRITES=${MCP_REMOTE_WRITES:-false}
+      - MCP_REMOTE_WRITES=${MCP_REMOTE_WRITES:-false} # true: a link may be made read-write (§5.5)
       - UVICORN_FORWARDED_ALLOW_IPS                    # passed in only when set (§4.3)
     ports: ["8080:8080"]
 volumes:
@@ -752,7 +752,7 @@ A grant's token is a credential for `/mcp` and nothing else: the REST API, the b
 
 **SSO or MFA** is the operator's access proxy in front of `/mcp/authorize` and `/mcp/consent`, which only the owner's browser visits; the server has no OIDC support and nothing to set. The other five are requested by clients, which cannot complete an interactive login, and pass through untouched. The login guards the making of a link, not a link already made. Through it, the consent form's post must carry no `Origin` but `PUBLIC_BASE_URL` (above): an access proxy that serves the page under another host, rewrites `Origin`, or adds `Referrer-Policy: no-referrer` (with which a browser sends `Origin: null`) gets the form refused, and the page's Content-Security-Policy blocks what a proxy injects into it.
 
-**Ending links.** No route or screen revokes a grant yet (#30, the **Linked clients** list), and there is no OAuth revocation endpoint, so removing a connector in the client revokes nothing here. A grant is revoked by the server only when a rotated refresh token is reused (above). Starting without `PUBLIC_BASE_URL` refuses every grant's token and removes the OAuth routes; the grants stay stored and work again when it is set again. Changing `PUBLIC_BASE_URL` or `API_KEY` revokes no grant.
+**Ending links**, until #30's **Linked clients** list. As above, there is no supported way to revoke one link: no route or screen does it, and there is no OAuth revocation endpoint, so removing a connector in the client revokes nothing here. The server revokes a grant itself only when a rotated refresh token is reused (above). Leaving `MCP_REMOTE_WRITES` off stops every link writing and ends none: each still reads. Starting without `PUBLIC_BASE_URL` refuses every grant's token and removes the OAuth routes; the grants stay stored and work again once it is set, a read-write one writing if the setting is on then. Changing `PUBLIC_BASE_URL` or `API_KEY` revokes no grant. With Compose, a change to either setting in `.env` is applied by `docker compose up -d`; `docker compose restart` keeps the old values.
 
 ---
 
@@ -966,7 +966,8 @@ Follow this sequence to stay unblocked. Each step is independently runnable and 
 ### Remote MCP
 - Without `PUBLIC_BASE_URL` the OAuth and discovery paths are 404s and `/mcp` takes the owner key alone; with it, the owner key still works on `/mcp` (`api/tests/test_oauth.py`).
 - Outside a link window, registration and authorisation are refused and existing links keep refreshing. A link needs the window's one-time code, and one window makes one link. A request's fifth wrong code ends that request and never the window (`api/tests/test_link_window.py`).
-- A grant's token works on `/mcp` only, never on the REST API, the backup or the agent routes; until remote writes exist it lists no write tool, and calling one changes nothing. A refresh token reused after its 60-second retry window revokes the grant (`api/tests/test_oauth.py`, `api/tests/test_oauth_mcp.py`).
+- A grant's token works on `/mcp` only, never on the REST API, the backup or the agent routes. A refresh token reused after its 60-second retry window revokes the grant (`api/tests/test_oauth.py`).
+- A link is read-only unless `MCP_REMOTE_WRITES` is `true` **and** its window was opened with `can_write`: otherwise it lists no write tool, and calling one changes nothing. Turning the setting off takes write access from every link at the restart, with no relink, and a link made read-write writes again once it is back on. A linked client's write names it in `actor`. A value other than `true` or `false` stops the start (`api/tests/test_remote_writes.py`, `test_oauth_mcp.py`, `test_oauth_restart.py`, `test_startup.py`).
 - `docs/deployment.md` says which paths a tunnel or reverse proxy publishes, so that the REST API and the SPA stay private; how to put SSO or MFA on the authorise and consent paths alone; and how to deploy the server and agents. Its examples use placeholder domains only.
 
 ### Operations
