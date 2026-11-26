@@ -244,6 +244,8 @@ describe('Link a client dialog', () => {
     await user.click(await screen.findByRole('button', { name: /Link a client/ }))
     await user.click(screen.getByRole('button', { name: 'Open link window' }))
     await screen.findByTestId('link-code')
+    // the server reports the dialog's own window, so the cancel is of that one
+    ipam.getLinkWindow.mockResolvedValue({ data: open() })
     await user.click(screen.getByRole('button', { name: 'Close' }))
     expect(ipam.cancelLinkWindow).toHaveBeenCalledTimes(1)
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
@@ -257,6 +259,7 @@ describe('Link a client dialog', () => {
     await user.click(await screen.findByRole('button', { name: /Link a client/ }))
     await user.click(screen.getByRole('button', { name: 'Open link window' }))
     await screen.findByTestId('link-code')
+    ipam.getLinkWindow.mockResolvedValue({ data: open() })
     await user.click(screen.getByRole('button', { name: 'Cancel link' }))
     expect(await screen.findByText(/could not be cancelled/)).toBeInTheDocument()
     expect(screen.getByTestId('link-code')).toHaveTextContent('ABCDE FGHJK')
@@ -270,6 +273,96 @@ describe('Link a client dialog', () => {
     await user.click(screen.getByRole('button', { name: /Link a client/ }))
     expect(screen.getByRole('dialog')).toHaveTextContent('opening a new window replaces it')
     expect(screen.getByRole('button', { name: 'Open a new window' })).toBeInTheDocument()
+  })
+
+  // Codex's P2 on e911edf: no window the dialog opened is left open once the dialog no
+  // longer shows its code, however it went away, and only the dialog's own is cancelled
+  describe('no window is left open that the dialog no longer shows', () => {
+    // an open request the test answers when it chooses
+    function pendingOpen() {
+      let answer, refuse
+      ipam.openLinkWindow.mockImplementation(
+        () =>
+          new Promise((resolve, reject) => {
+            answer = () => resolve({ data: { ...open(), code: CODE } })
+            refuse = () => reject(new Error('server unreachable'))
+          })
+      )
+      return { answer: () => answer(), refuse: () => refuse() }
+    }
+
+    async function startOpening(user) {
+      const view = renderPage()
+      await user.click(await screen.findByRole('button', { name: /Link a client/ }))
+      await user.click(screen.getByRole('button', { name: 'Open link window' }))
+      // from here on the server reports the window the request opens
+      ipam.getLinkWindow.mockResolvedValue({ data: open() })
+      return view
+    }
+
+    for (const [how, dismiss] of [
+      ['its close button', () => userEvent.click(screen.getByRole('button', { name: 'Close' }))],
+      ['its Cancel button', () => userEvent.click(screen.getByRole('button', { name: 'Cancel' }))],
+    ]) {
+      it(`cancels the window a request in flight opens, after a dismissal by ${how}`, async () => {
+        const user = userEvent.setup()
+        const request = pendingOpen()
+        await startOpening(user)
+        await dismiss()
+        expect(screen.queryByRole('dialog')).toBeNull()
+        await act(async () => request.answer())
+        await waitFor(() => expect(ipam.cancelLinkWindow).toHaveBeenCalledTimes(1))
+        expect(document.body.textContent).not.toContain('ABCDE')
+      })
+    }
+
+    it('cancels the window a request in flight opens when the page goes away', async () => {
+      const user = userEvent.setup()
+      const request = pendingOpen()
+      const view = await startOpening(user)
+      view.unmount()
+      await act(async () => request.answer())
+      await waitFor(() => expect(ipam.cancelLinkWindow).toHaveBeenCalledTimes(1))
+    })
+
+    it('cancels its open window when the page goes away while the code is shown', async () => {
+      const user = userEvent.setup()
+      const view = await startOpening(user)
+      await screen.findByTestId('link-code')
+      view.unmount()
+      await waitFor(() => expect(ipam.cancelLinkWindow).toHaveBeenCalledTimes(1))
+    })
+
+    it('cancels nothing, and says nothing, when the request fails after a dismissal', async () => {
+      const user = userEvent.setup()
+      const request = pendingOpen()
+      await startOpening(user)
+      await user.click(screen.getByRole('button', { name: 'Close' }))
+      await act(async () => request.refuse())
+      expect(ipam.cancelLinkWindow).not.toHaveBeenCalled()
+      expect(screen.queryByText(/server unreachable/)).toBeNull()
+    })
+
+    it('leaves alone a window that replaced its own before the request answered', async () => {
+      const user = userEvent.setup()
+      const request = pendingOpen()
+      await startOpening(user)
+      await user.click(screen.getByRole('button', { name: 'Close' }))
+      ipam.getLinkWindow.mockResolvedValue({ data: open({ opened_at: '2026-11-26T12:05:00+00:00' }) })
+      await act(async () => request.answer())
+      await waitFor(() => expect(ipam.getLinkWindow).toHaveBeenCalled())
+      expect(ipam.cancelLinkWindow).not.toHaveBeenCalled()
+    })
+
+    it('closes without cancelling a window another tab opened in place of its own', async () => {
+      const user = userEvent.setup()
+      await startOpening(user)
+      await screen.findByTestId('link-code')
+      ipam.getLinkWindow.mockResolvedValue({ data: open({ opened_at: '2026-11-26T12:05:00+00:00' }) })
+      await user.click(screen.getByRole('button', { name: 'Close' }))
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+      expect(ipam.cancelLinkWindow).not.toHaveBeenCalled()
+    })
   })
 
   describe('while the window is open', () => {

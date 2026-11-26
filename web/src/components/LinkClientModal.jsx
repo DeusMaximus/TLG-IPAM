@@ -6,10 +6,23 @@ import { countdown, ENDED_TEXT, groupedCode, POLL_MS, sameWindow, windowLeft } f
 import CopyBlock from './CopyBlock'
 import Modal, { primaryBtn, secondaryBtn } from './Modal'
 
+// Cancel the window opened at `openedAt`, and no other: `DELETE /link-window` ends
+// whatever window is open, so the state is asked first, and a window that has ended or
+// been replaced since is left alone. True when it was cancelled.
+export async function cancelOwn(openedAt) {
+  const now = (await getLinkWindow()).data
+  if (!now.open || now.opened_at !== openedAt) return false
+  await cancelLinkWindow()
+  return true
+}
+
 // "Link a client" (v0.2 spec §6.3). Opening the window gives the link code, in that one
 // answer: the code is kept in this dialog's state alone, never in storage, the URL or
-// anything that outlives the dialog, so a reload loses it. Closing the dialog while its
-// window is open therefore cancels the window, since nothing could show its code again.
+// anything that outlives the dialog, so a reload loses it. So no window this dialog
+// opened is left open once the dialog no longer shows its code: closing the dialog while
+// its window is open cancels the window, and so does unmounting it (navigating away);
+// a dialog dismissed while its open request is in flight cancels that window as soon as
+// the answer arrives. Each cancel is of this dialog's own window only (`cancelOwn`).
 // While open, the dialog asks the server how the window stands every POLL_MS and stops
 // once it has ended (a link, its expiry, a cancel or a replacement from elsewhere), or
 // when the dialog closes.
@@ -29,31 +42,76 @@ export default function LinkClientModal({ state, onClose, onChanged }) {
   useEffect(() => {
     openedRef.current = opened
   }, [opened])
+  // the `opened_at` of the window this dialog holds open and shows the code of, if any
+  const held = useRef(null)
+  // set once the dialog is dismissed: an open request still in flight then cancels its
+  // window when it answers, since no dialog is left to show the code
+  const dismissed = useRef(false)
+  // the page's callbacks as they are now, for the unmount below
+  const latest = useRef({ toast, onChanged })
+  useEffect(() => {
+    latest.current = { toast, onChanged }
+  })
+
+  // Unmounting (navigating away, or the page closing the dialog) cancels a window the
+  // dialog still holds. Set again on mount, since StrictMode mounts twice in development.
+  useEffect(() => {
+    const flags = { dismissed, held, latest }
+    flags.dismissed.current = false
+    return () => {
+      flags.dismissed.current = true
+      const openedAt = flags.held.current
+      if (!openedAt) return
+      flags.held.current = null
+      cancelOwn(openedAt)
+        .catch((err) =>
+          flags.latest.current.toast.error(`The link window could not be cancelled: ${err.message}`)
+        )
+        .finally(() => flags.latest.current.onChanged?.())
+    }
+  }, [])
 
   const offerWrites = Boolean(state?.remote_writes)
   const isOpen = Boolean(opened) && !ended
 
   const open = async () => {
     setBusy(true)
+    const askedAt = monotonicNow()
+    let res
     try {
-      const askedAt = monotonicNow()
-      const res = await openLinkWindow({ can_write: offerWrites && canWrite })
-      const { code: given, ...window } = res.data
-      setOpened(received(window, askedAt))
-      setCode(given)
-      setEnded(null)
-      setPollError(null)
-      setMono(monotonicNow())
-      onChanged?.()
+      res = await openLinkWindow({ can_write: offerWrites && canWrite })
     } catch (err) {
-      toast.error(err.message)
-    } finally {
-      setBusy(false)
+      // nothing was opened; after a dismissal there is no one to tell
+      if (!dismissed.current) {
+        toast.error(err.message)
+        setBusy(false)
+      }
+      return
     }
+    const { code: given, ...window } = res.data
+    if (dismissed.current) {
+      // dismissed while the request was in flight: nothing can show this code
+      try {
+        await cancelOwn(window.opened_at)
+      } catch (err) {
+        toast.error(`A link window opened after the dialog closed, and could not be cancelled: ${err.message}`)
+      }
+      onChanged?.()
+      return
+    }
+    held.current = window.opened_at
+    setOpened(received(window, askedAt))
+    setCode(given)
+    setEnded(null)
+    setPollError(null)
+    setMono(monotonicNow())
+    setBusy(false)
+    onChanged?.()
   }
 
   // the end of the window: the code goes with it
   const finish = (how) => {
+    held.current = null
     setEnded(how)
     setCode(null)
     onChanged?.()
@@ -90,20 +148,24 @@ export default function LinkClientModal({ state, onClose, onChanged }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen])
 
-  // Closing cancels a window this dialog still holds open: its code exists only here
+  // Closing cancels a window this dialog still holds open: its code exists only here.
+  // Closed while the open request is in flight, the request cancels its window when it
+  // answers (`open`).
   const close = async () => {
     if (isOpen) {
       setBusy(true)
       try {
-        await cancelLinkWindow()
+        await cancelOwn(opened.opened_at)
       } catch (err) {
         toast.error(`The window could not be cancelled: ${err.message}`)
         setBusy(false)
         return
       }
+      held.current = null
       setCode(null)
       onChanged?.()
     }
+    dismissed.current = true
     onClose()
   }
 
@@ -149,7 +211,7 @@ export default function LinkClientModal({ state, onClose, onChanged }) {
             </p>
           )}
           <div className="mt-4 flex justify-end gap-2">
-            <button onClick={onClose} className={secondaryBtn}>
+            <button onClick={close} className={secondaryBtn}>
               Cancel
             </button>
             <button onClick={open} disabled={busy} className={primaryBtn}>
