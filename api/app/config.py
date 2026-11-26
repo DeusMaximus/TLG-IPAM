@@ -113,6 +113,9 @@ def public_base_url_problem(value: str) -> str | None:
     # which rules out a path (a lone `/` included), `?`, `#` and surrounding whitespace
     if value != f"{parts.scheme}://{parts.netloc}" or not host or "@" in parts.netloc:
         return PUBLIC_BASE_URL_REFUSED
+    if port == 0:
+        # no server listens on it: a typo, not an origin
+        return PUBLIC_BASE_URL_REFUSED
     if parts.scheme not in ("https", "http") or (parts.scheme == "http" and host not in _HTTP_HOSTS):
         return PUBLIC_BASE_URL_REFUSED
     # What the URL type FastMCP and the MCP SDK publish it through makes of it: only a

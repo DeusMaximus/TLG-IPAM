@@ -28,6 +28,7 @@ one is loaded. Here it answers `ipam:read` alone, whatever `can_write` says, so 
 can write through `/mcp` before #28 adds the `MCP_REMOTE_WRITES` rule to that function.
 """
 
+import base64
 import hashlib
 import hmac
 import ipaddress
@@ -45,7 +46,7 @@ from sqlalchemy import delete, exists, func, or_, select, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..errors import ApiError, database_unavailable
+from ..errors import database_unavailable
 from ..models import OAuthClient, OAuthGrant, OAuthToken
 from ..times import utc
 from . import changes, scans
@@ -69,23 +70,34 @@ CODE_LIFETIME = timedelta(minutes=5)
 ACCESS_LIFETIME = timedelta(hours=1)
 REFRESH_LIFETIME = timedelta(days=30)
 # A refresh token presented again this soon after it was rotated is a retry (a lost
-# answer, or two requests at once) and gets a new pair. Later, it is taken for theft.
+# answer, or two requests at once) and gets the same pair again. Later, it is taken
+# for theft.
 REFRESH_RETRY_WINDOW = timedelta(seconds=60)
 # A grant's `last_used_at` is written at most this often, as an agent token's is
 LAST_USED_GRANULARITY = timedelta(seconds=10)
 
-# How often one grant is issued tokens: at most this many pairs in any `ISSUE_WINDOW`,
-# the code exchange included. It is what bounds the rows a grant holds in
-# `oauth_tokens`, and it bounds them by time: a rotated refresh token is kept until it
-# expires, because presenting it again is how a stolen one is noticed, so no row that
-# has not expired is ever deleted to make room (a cap on the row count was, and whoever
-# held a stolen token could refresh past it and erase the evidence, PR #189). At most
-# `ISSUES_PER_WINDOW` x 720 hours = 8,640 unexpired refresh tokens, and as many access
-# tokens as one window issues. A client that refreshes once an hour, or every ten
-# minutes, never meets the limit; one refused by it holds an access token issued
-# within the hour, which still works, and its refresh token is not rotated.
-ISSUES_PER_WINDOW = 12
-ISSUE_WINDOW = ACCESS_LIFETIME
+# A refresh token is not rotated in its first five minutes: presented that young, it
+# is answered with the pair it was issued in, again, and nothing is written. That is
+# what bounds the rows a grant holds in `oauth_tokens`, without an error any client
+# could meet. A grant has one chain of refresh tokens (a retry is answered with the
+# same pair, never a second one), each link at least this old before the next exists,
+# so at most 720 hours / 5 minutes = 8,640 unexpired refresh tokens and 13 unexpired
+# access tokens, whatever a client does. A rotated refresh token is kept until it
+# expires, because presenting it again is how a stolen one is noticed, and no row
+# that has not expired is ever deleted to make room: an earlier cap on the row count
+# let the holder of a stolen token refresh past it and erase the evidence (PR #189).
+# A client that refreshes when its hour is up never notices the rule; one that
+# refreshes on every request is handed the access token it already holds.
+ROTATION_MIN_AGE = timedelta(minutes=5)
+
+# How many registrations the server keeps (spec §6.6). At the cap a new one takes the
+# place of the oldest that holds no unrevoked grant; when every one holds an unrevoked
+# grant, it is refused until the owner revokes a link.
+CLIENTS_MAX = 50
+REGISTRY_FULL = (
+    f"This server already holds {CLIENTS_MAX} linked clients; a link must be revoked in "
+    "the IPAM's own web interface before another client can register."
+)
 
 # What a registration may hold. Gemini registers six redirect URIs (§6.8).
 REDIRECT_URIS_MAX = 16
@@ -306,11 +318,19 @@ async def register_client(
     of the secret is stored. Of the rest, only what the server uses: the name when
     `kept_name` keeps it, and the grant types and scopes among the server's own.
 
-    Not audit-logged: a registration is not a link (§6.3), it comes from a caller with
-    no credential, and it grants nothing. The grant that may follow is logged.
+    At most `CLIENTS_MAX` registrations exist, counted under the write lock, so that
+    requests at once cannot pass it. At the cap the oldest registration that holds no
+    unrevoked grant (never linked, or its links revoked, alike) is deleted to make
+    room; its grants and their audit entries stay, and its tokens were deleted when
+    its grants were revoked. When every registration holds an unrevoked grant the new
+    one is refused (`access_denied`) and nothing changes.
+
+    Not audit-logged, storing or reclaiming: a registration is not a link (§6.3), it
+    comes from a caller with no credential, and it grants nothing. The grant that may
+    follow is logged.
     """
     if not linking_open():
-        raise Refused("invalid_client_metadata", LINKING_CLOSED)
+        raise Refused("access_denied", LINKING_CLOSED)
     if not redirect_uris or len(redirect_uris) > REDIRECT_URIS_MAX:
         raise Refused(
             "invalid_redirect_uri", f"redirect_uris must hold 1 to {REDIRECT_URIS_MAX} URIs"
@@ -332,6 +352,10 @@ async def register_client(
         scope=" ".join(s for s in VALID_SCOPES if s in asked),
     )
     try:
+        await scans.take_write_lock(session)
+        if not await _make_room(session):
+            await session.rollback()
+            raise Refused("access_denied", REGISTRY_FULL)
         session.add(
             OAuthClient(
                 client_id=client_id,
@@ -349,6 +373,35 @@ async def register_client(
         await session.rollback()
         raise database_unavailable("oauth registration", exc) from exc
     return stored
+
+
+async def _make_room(session: AsyncSession) -> bool:
+    """Leave room for one more registration, deleting the oldest reclaimable ones when
+    `CLIENTS_MAX` are held. False when there are not enough to reclaim. The caller
+    holds the write lock."""
+    held = await session.scalar(select(func.count()).select_from(OAuthClient))
+    excess = held - CLIENTS_MAX + 1
+    if excess <= 0:
+        return True
+    linked = exists().where(
+        OAuthGrant.client_id == OAuthClient.client_id, OAuthGrant.revoked_at.is_(None)
+    )
+    reclaimable = list(
+        await session.scalars(
+            select(OAuthClient.client_id)
+            .where(~linked)
+            .order_by(OAuthClient.created_at, OAuthClient.client_id)
+            .limit(excess)
+        )
+    )
+    if len(reclaimable) < excess:
+        return False
+    await session.execute(
+        delete(OAuthClient)
+        .where(OAuthClient.client_id.in_(reclaimable))
+        .execution_options(synchronize_session=False)
+    )
+    return True
 
 
 async def get_client(session: AsyncSession, client_id: str) -> OAuthClient | None:
@@ -498,27 +551,41 @@ def grant_scopes(grant: OAuthGrant) -> list[str]:
     return [SCOPE_READ]
 
 
-def _issue(session: AsyncSession, grant_id: str, kind: str, now: datetime, **fields) -> str:
-    """A new code or token of the grant, added to the session. Returns the plain value,
-    which goes into one answer and is never stored."""
-    lifetime = {"code": CODE_LIFETIME, "access": ACCESS_LIFETIME, "refresh": REFRESH_LIFETIME}
-    plain = _PREFIXES[kind] + secrets.token_urlsafe(_SECRET_BYTES)
+_LIFETIMES = {"code": CODE_LIFETIME, "access": ACCESS_LIFETIME, "refresh": REFRESH_LIFETIME}
+
+
+def _random(kind: str) -> str:
+    return _PREFIXES[kind] + secrets.token_urlsafe(_SECRET_BYTES)
+
+
+def _derive(salt: str, plain: str, kind: str) -> str:
+    """The token of `kind` that belongs to the refresh token `plain`: the access token
+    issued with it, or the refresh token that replaces it. An HMAC-SHA256 keyed with
+    the salt on that token's row, so it is the same value each time the server is
+    shown `plain`, which is what lets a retry be answered with the first answer again
+    while the database holds only hashes. It cannot be computed from the database
+    alone (that needs `plain`) nor by the holder of `plain` alone (that needs the
+    salt, which never leaves the server), and it is in the form of a drawn token."""
+    digest = hmac.new(salt.encode(), f"{kind}:{plain}".encode(), hashlib.sha256).digest()
+    return _PREFIXES[kind] + base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+
+def _store(session: AsyncSession, grant_id: str, kind: str, plain: str, now: datetime, **fields):
     session.add(
         OAuthToken(
             token_hash=_sha256(plain),
             grant_id=grant_id,
             kind=kind,
             created_at=now,
-            expires_at=now + lifetime[kind],
+            expires_at=now + _LIFETIMES[kind],
             **fields,
         )
     )
-    return plain
 
 
 @dataclass(frozen=True)
 class Issued:
-    """A token answer: the plain values, shown once."""
+    """A token answer: the plain values, which are never stored."""
 
     access_token: str
     refresh_token: str | None
@@ -526,49 +593,47 @@ class Issued:
     scopes: list[str]
 
 
-async def _issued_lately(session: AsyncSession, grant_id: str, now: datetime) -> int:
-    """How many pairs the grant was issued in the last `ISSUE_WINDOW`: its access
-    tokens made since then, one to an issue."""
-    return await session.scalar(
-        select(func.count())
-        .select_from(OAuthToken)
-        .where(
-            OAuthToken.grant_id == grant_id,
-            OAuthToken.kind == "access",
-            OAuthToken.created_at > now - ISSUE_WINDOW,
-        )
-    )
-
-
-def _issued_too_often() -> ApiError:
-    return ApiError(
-        "RATE_LIMITED",
-        "This link has been issued tokens too often; use the access token it holds and "
-        "refresh later",
-        429,
-    )
-
-
-async def _issue_pair(
-    session: AsyncSession, grant: OAuthGrant, client: OAuthClient, now: datetime
+def _issue_pair(
+    session: AsyncSession, grant: OAuthGrant, refresh: str | None, now: datetime
 ) -> Issued:
-    """A new access token for the grant, and a refresh token when the client registered
-    for one. The caller holds the write lock and has checked `_issued_lately`. Before
-    it adds them, the grant's expired rows are deleted; nothing unexpired ever is."""
-    await session.execute(
-        delete(OAuthToken)
-        .where(OAuthToken.grant_id == grant.id, OAuthToken.expires_at <= now)
-        .execution_options(synchronize_session=False)
-    )
-    access = _issue(session, grant.id, "access", now)
-    refresh = None
-    if "refresh_token" in client.grant_types:
-        refresh = _issue(session, grant.id, "refresh", now)
+    """Store a new refresh token `refresh`, with a salt of its own, and the access
+    token derived from the two; or, for a client that registered for no refresh token
+    (`refresh` None), a drawn access token alone. Does not flush."""
+    if refresh is None:
+        access = _random("access")
+    else:
+        salt = secrets.token_urlsafe(_SECRET_BYTES)
+        _store(session, grant.id, "refresh", refresh, now, derive_salt=salt)
+        access = _derive(salt, refresh, "access")
+    _store(session, grant.id, "access", access, now)
     return Issued(
         access_token=access,
         refresh_token=refresh,
         expires_in=int(ACCESS_LIFETIME.total_seconds()),
         scopes=grant_scopes(grant),
+    )
+
+
+async def _tidy(session: AsyncSession, grant_id: str, now: datetime) -> None:
+    """At each rotation: delete the grant's expired rows, and nothing that has not
+    expired; and erase the salt of each refresh token rotated longer ago than the
+    retry window, which no answer needs again. A copy of the database then holds the
+    salts of the chain's newest tokens only, so an old refresh token that leaked
+    cannot be walked forward to the current one with it."""
+    await session.execute(
+        delete(OAuthToken)
+        .where(OAuthToken.grant_id == grant_id, OAuthToken.expires_at <= now)
+        .execution_options(synchronize_session=False)
+    )
+    await session.execute(
+        update(OAuthToken)
+        .where(
+            OAuthToken.grant_id == grant_id,
+            OAuthToken.derive_salt.is_not(None),
+            OAuthToken.rotated_at <= now - REFRESH_RETRY_WINDOW,
+        )
+        .values(derive_salt=None)
+        .execution_options(synchronize_session=False)
     )
 
 
@@ -637,10 +702,12 @@ async def approve(session: AsyncSession, txn_id: str, *, can_write: bool) -> str
         )
         session.add(grant)
         await session.flush()
-        code = _issue(
+        code = _random("code")
+        _store(
             session,
             grant.id,
             "code",
+            code,
             now,
             code_challenge=txn.code_challenge,
             redirect_uri_explicit=txn.redirect_uri_explicit,
@@ -734,7 +801,9 @@ async def exchange_code(session: AsyncSession, client_id: str, plain: str) -> Is
             await session.rollback()
             raise Refused("invalid_grant", "authorization code does not exist")
         grant = found[1]
-        issued = await _issue_pair(session, grant, client, now)
+        # the grant's one chain of refresh tokens starts here, with a drawn one
+        first = _random("refresh") if "refresh_token" in client.grant_types else None
+        issued = _issue_pair(session, grant, first, now)
         await _touch(session, grant.id, now)
         await session.commit()
     except OperationalError as exc:
@@ -798,22 +867,44 @@ async def revoke_grant(
     )
 
 
-async def exchange_refresh(session: AsyncSession, client_id: str, plain: str) -> Issued:
-    """Exchange a refresh token for a new access and refresh token (spec §6.4).
+async def _same_pair(
+    session: AsyncSession, grant: OAuthGrant, refresh: str, salt: str | None, now: datetime
+) -> Issued | None:
+    """The pair the refresh token `refresh` was issued in, as it stands now: its access
+    token derived again, with the time that one has left. None when it cannot be
+    given again (no salt, or the access token is gone or has run out)."""
+    if not salt:
+        return None
+    access = _derive(salt, refresh, "access")
+    found = await _find(session, access, "access", fresh=True)
+    if found is None or utc(found[0].expires_at) <= now:
+        return None
+    return Issued(
+        access_token=access,
+        refresh_token=refresh,
+        expires_in=int((utc(found[0].expires_at) - now).total_seconds()),
+        scopes=grant_scopes(grant),
+    )
 
-    Everything is read and decided under the write lock, so two requests with one
-    token are served one after the other. A token used for the first time is rotated
-    and answered with a new pair. One presented again within `REFRESH_RETRY_WINDOW` of
-    its rotation is a retry and is answered with another new pair. One presented later
-    than that revokes the whole grant, which is committed and audit-logged
-    (`entity_type="grant"`, `source="oauth"`) before the request is refused.
+
+async def exchange_refresh(session: AsyncSession, client_id: str, plain: str) -> Issued:
+    """Answer a refresh request (spec §6.4). Everything is read and decided under the
+    write lock, so two requests with one token are served one after the other.
+
+    - A token younger than `ROTATION_MIN_AGE` is not rotated: the answer is the pair it
+      was issued in, again, and no token row is written.
+    - Otherwise a token used for the first time is rotated: its replacement and the
+      access token that goes with it are derived (`_derive`) and stored.
+    - A token presented again within `REFRESH_RETRY_WINDOW` of its rotation is a retry
+      (a lost answer, or two requests at once) and gets the same pair the rotation
+      gave, again; nothing is written. So a grant has one chain of refresh tokens: two
+      holders of one token cannot each walk off with a chain of their own.
+    - Presented later than that, it revokes the whole grant, which is committed and
+      audit-logged (`entity_type="grant"`, `source="oauth"`) before the request is
+      refused.
+
     `Refused` (`invalid_grant`) for a token that is unknown, expired, another client's
     or of a revoked grant, with nothing written.
-
-    A grant that has been issued `ISSUES_PER_WINDOW` pairs in the last `ISSUE_WINDOW`
-    is refused `429 RATE_LIMITED` with nothing written and the token not rotated. The
-    reuse rule is judged first: a rotated token presented late revokes the grant
-    however often the grant has been refreshed.
     """
     try:
         await scans.take_write_lock(session)
@@ -830,16 +921,24 @@ async def exchange_refresh(session: AsyncSession, client_id: str, plain: str) ->
             await session.rollback()
             raise Refused("invalid_grant", "refresh token does not exist")
         token, grant = found
-        reused = (
-            token.rotated_at is not None
-            and now - utc(token.rotated_at) > REFRESH_RETRY_WINDOW
-        )
-        if not reused and await _issued_lately(session, grant.id, now) >= ISSUES_PER_WINDOW:
-            await session.rollback()
-            raise _issued_too_often()
+        salt = token.derive_salt
+        issued = None
         if token.rotated_at is None:
-            token.rotated_at = now
-        elif reused:
+            if now - utc(token.created_at) < ROTATION_MIN_AGE:
+                issued = await _same_pair(session, grant, plain, salt, now)
+            if issued is None and salt:
+                token.rotated_at = now
+                await _tidy(session, grant.id, now)
+                issued = _issue_pair(session, grant, _derive(salt, plain, "refresh"), now)
+        elif now - utc(token.rotated_at) <= REFRESH_RETRY_WINDOW:
+            if salt:
+                replacement = _derive(salt, plain, "refresh")
+                child = await _find(session, replacement, "refresh", fresh=True)
+                if child is not None:
+                    issued = await _same_pair(
+                        session, grant, replacement, child[0].derive_salt, now
+                    )
+        else:
             await revoke_grant(
                 session,
                 grant,
@@ -850,7 +949,11 @@ async def exchange_refresh(session: AsyncSession, client_id: str, plain: str) ->
             )
             await session.commit()
             raise Refused("invalid_grant", "refresh token does not exist")
-        issued = await _issue_pair(session, grant, client, now)
+        if issued is None:
+            # a token that can be neither rotated nor answered for again: no row the
+            # server writes is in that state
+            await session.rollback()
+            raise Refused("invalid_grant", "refresh token does not exist")
         await _touch(session, grant.id, now)
         await session.commit()
     except OperationalError as exc:

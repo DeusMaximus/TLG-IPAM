@@ -659,6 +659,8 @@ REFUSED_PUBLIC_BASE_URLS = {
     "the default port written out": f"https://{PUBLIC_HOST}:443",
     "an empty port": f"https://{PUBLIC_HOST}:",
     "a port out of range": f"https://{PUBLIC_HOST}:99999",
+    "port 0": f"https://{PUBLIC_HOST}:0",
+    "port 0 on this machine": "http://localhost:0",
     "credentials": f"https://owner:secret@{PUBLIC_HOST}",
     "a leading space": f" https://{PUBLIC_HOST}",
     "a trailing space": f"https://{PUBLIC_HOST} ",

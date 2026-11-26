@@ -30,6 +30,7 @@ from .oauth_flow import (  # noqa: F401 (web, linking and no_ambient_token are f
     RESOURCE,
     STATE,
     VERIFIER,
+    age,
     all_rows,
     approve,
     authorise,
@@ -46,6 +47,7 @@ from .oauth_flow import (  # noqa: F401 (web, linking and no_ambient_token are f
     oauth_mcp,
     refresh,
     register,
+    rotate,
     set_grant,
     set_token,
     sha256,
@@ -552,6 +554,150 @@ async def test_each_client_of_the_spike_registers_and_reaches_consent(web, linki
     assert held.client_id == client["client_id"]
 
 
+# --- The registry is bounded (spec §6.6) ---
+
+
+async def client_ids() -> set[str]:
+    return {c.client_id for c in await all_rows(OAuthClient)}
+
+
+async def give_grant(client: dict, *, revoked: bool = False) -> OAuthGrant:
+    """A grant for the client, as a link leaves one; revoked, as the reuse rule or the
+    owner leaves it."""
+    async with SessionLocal() as session:
+        grant = OAuthGrant(
+            client_id=client["client_id"],
+            redirect_uri=CALLBACK,
+            revoked_at=NOW() if revoked else None,
+        )
+        session.add(grant)
+        await session.commit()
+        return grant
+
+
+async def set_registered(client: dict, when: datetime) -> None:
+    async with SessionLocal() as session:
+        (await session.get(OAuthClient, client["client_id"])).created_at = when
+        await session.commit()
+
+
+async def fill_registry(web) -> list[dict]:
+    """`CLIENTS_MAX` registrations, the first the oldest."""
+    clients = [await register(web) for _ in range(oauth.CLIENTS_MAX)]
+    start = NOW() - timedelta(hours=2)
+    for position, client in enumerate(clients):
+        await set_registered(client, start + timedelta(seconds=position))
+    return clients
+
+
+async def test_the_fifty_first_registration_takes_the_place_of_the_oldest_unlinked(web, linking):
+    assert oauth.CLIENTS_MAX == 50
+    clients = await fill_registry(web)
+    newcomer = await register(web)
+    held = await client_ids()
+    assert len(held) == 50
+    assert clients[0]["client_id"] not in held and newcomer["client_id"] in held
+    assert {c["client_id"] for c in clients[1:]} <= held
+    # the one reclaimed is gone for good: its secret authenticates nothing
+    res = await refresh(web, clients[0], "tlgor_" + "a" * 43)
+    assert res.status_code == 401 and res.json()["error"] == "invalid_client"
+    assert await change_rows() == []
+
+
+async def test_a_flood_of_registrations_never_holds_more_than_fifty(web, linking):
+    """Round 1 of PR #189's briefed review (finding 2): 55 registrations were 55 rows."""
+    for _ in range(55):
+        await register(web)
+    assert len(await client_ids()) == 50
+    answers = await asyncio.gather(
+        *(web.post("/mcp/register", json={"redirect_uris": [CALLBACK]}) for _ in range(12))
+    )
+    assert [res.status_code for res in answers] == [201] * 12
+    assert len(await client_ids()) == 50
+
+
+async def test_requests_at_once_cannot_pass_the_cap(web, linking):
+    for _ in range(oauth.CLIENTS_MAX - 1):
+        await register(web)
+    answers = await asyncio.gather(
+        *(web.post("/mcp/register", json={"redirect_uris": [CALLBACK]}) for _ in range(8))
+    )
+    assert [res.status_code for res in answers] == [201] * 8
+    assert len(await client_ids()) == 50
+
+
+async def test_a_linked_registration_is_never_reclaimed_and_a_revoked_one_is(web, linking):
+    """The oldest registration holds a live link, the second a revoked one, the third
+    was never linked. A newcomer takes the second's place, the next the third's: no
+    unrevoked grant, never linked or revoked alike, oldest first."""
+    clients = await fill_registry(web)
+    await give_grant(clients[0])
+    await give_grant(clients[1], revoked=True)
+    first = await register(web)
+    held = await client_ids()
+    assert clients[0]["client_id"] in held and clients[1]["client_id"] not in held
+    assert clients[2]["client_id"] in held and first["client_id"] in held
+    await register(web)
+    held = await client_ids()
+    assert clients[0]["client_id"] in held and clients[2]["client_id"] not in held
+    assert len(held) == 50
+
+
+async def test_a_reclaimed_registrations_grant_and_audit_entries_remain(web, linking):
+    """A client that was linked, then revoked by the reuse rule, then reclaimed: its
+    grant and both audit entries are still there, and its tokens are still refused."""
+    client, first = await linked(web, client_name="Example")
+    second = await rotate(web, client, first["refresh_token"])
+    await set_token(first["refresh_token"], rotated_at=NOW() - timedelta(seconds=61))
+    assert invalid_grant(await refresh(web, client, first["refresh_token"]))
+    await set_registered(client, NOW() - timedelta(days=1))
+    for _ in range(oauth.CLIENTS_MAX):
+        await register(web)
+    assert client["client_id"] not in await client_ids()
+    grant = await the_grant()
+    assert grant.client_id == client["client_id"] and grant.revoked_at is not None
+    assert [(e.entity_id, e.action, e.actor) for e in await change_rows()] == [
+        (grant.id, "create", "grant:Example"),
+        (grant.id, "revoke", "grant:Example"),
+    ]
+    for token in (first["access_token"], second["access_token"]):
+        assert (await initialise(web, token)).status_code == 401
+    res = await refresh(web, client, second["refresh_token"])
+    assert res.status_code == 401 and res.json()["error"] == "invalid_client"
+
+
+async def test_when_every_registration_is_linked_a_new_one_is_refused(web, linking):
+    clients = await fill_registry(web)
+    for client in clients:
+        await give_grant(client)
+    before = database_dump()
+    res = await web.post("/mcp/register", json={"redirect_uris": [CALLBACK]})
+    assert res.status_code == 403
+    assert res.json() == {"error": "access_denied", "error_description": oauth.REGISTRY_FULL}
+    assert res.headers["cache-control"] == "no-store"
+    assert database_dump() == before
+    # the owner revokes a link, and there is room for one
+    await set_grant(revoked_at=NOW())
+    assert (await web.post("/mcp/register", json={"redirect_uris": [CALLBACK]})).status_code == 201
+    assert len(await client_ids()) == 50
+
+
+async def test_a_pending_request_of_a_reclaimed_registration_approves_nothing(web, linking):
+    """What a flood inside a window can do to the client the owner meant to link: its
+    registration is reclaimed before the owner approves. The approval then issues
+    nothing, and the client registers again."""
+    client = await register(web)
+    await set_registered(client, NOW() - timedelta(hours=1))
+    txn = transaction(await authorise(web, client))
+    for _ in range(oauth.CLIENTS_MAX):
+        await register(web)
+    with pytest.raises(oauth.Refused):
+        await approve(txn)
+    assert await all_rows(OAuthGrant) == []
+    res = await authorise(web, client)
+    assert res.status_code == 400 and "location" not in res.headers
+
+
 # --- Authorise: the redirect URI ---
 
 
@@ -890,9 +1036,7 @@ async def test_a_confidential_clients_refresh_needs_its_secret_and_survives_a_wr
     assert invalid_client(await refresh(web, client, tokens["refresh_token"], secret="wrong"))
     # not rotated, nothing issued, and no step towards revoking the grant
     assert database_dump() == before
-    res = await refresh(web, client, tokens["refresh_token"])
-    assert res.status_code == 200, res.text
-    assert res.json()["refresh_token"] != tokens["refresh_token"]
+    await rotate(web, client, tokens["refresh_token"])
 
 
 async def test_a_public_client_links_and_refreshes_with_no_secret(web, linking):
@@ -1150,50 +1294,74 @@ async def test_a_client_registered_without_refresh_gets_no_refresh_token(web, li
 # --- The token endpoint: refresh, the retry window, reuse ---
 
 
+async def refresh_rows() -> list[OAuthToken]:
+    return [t for t in await all_rows(OAuthToken) if t.kind == "refresh"]
+
+
 async def test_a_refresh_rotates_the_token(web, linking):
     client, first = await linked(web)
-    res = await refresh(web, client, first["refresh_token"])
-    assert res.status_code == 200, res.text
-    second = res.json()
-    assert second["refresh_token"] != first["refresh_token"]
+    second = await rotate(web, client, first["refresh_token"])
     assert second["access_token"] != first["access_token"]
     assert second["scope"] == "ipam:read" and second["expires_in"] == 3600
+    assert oauth.TOKEN_FORMS["refresh"].fullmatch(second["refresh_token"])
+    assert oauth.TOKEN_FORMS["access"].fullmatch(second["access_token"])
     assert (await token_row(first["refresh_token"])).rotated_at is not None
     assert (await token_row(second["refresh_token"])).rotated_at is None
     assert (await the_grant()).revoked_at is None
+    # the first access token runs out by itself; it is not revoked by the rotation
+    assert (await initialise(web, first["access_token"])).status_code == 200
+    assert (await initialise(web, second["access_token"])).status_code == 200
 
 
-async def test_a_refresh_token_reused_within_60_seconds_gets_a_new_pair(web, linking):
+async def test_a_refresh_token_reused_within_60_seconds_gets_the_same_pair_again(web, linking):
+    """A retry: a lost answer, or two requests at once. It is answered with the pair
+    the rotation gave, not another one, so there is one chain of refresh tokens."""
     client, first = await linked(web)
-    second = (await refresh(web, client, first["refresh_token"])).json()
+    second = await rotate(web, client, first["refresh_token"])
     rotated = utc((await token_row(first["refresh_token"])).rotated_at)
-    # a retry: a lost answer, or two requests at once
-    res = await refresh(web, client, first["refresh_token"])
-    assert res.status_code == 200, res.text
-    third = res.json()
-    assert len({first["refresh_token"], second["refresh_token"], third["refresh_token"]}) == 3
-    assert len({first["access_token"], second["access_token"], third["access_token"]}) == 3
-    # the window runs from the first rotation: a retry does not extend it
+    await set_grant(last_used_at=NOW())  # so the heartbeat has nothing to write
+    before = database_dump()
+    for _ in range(3):
+        res = await refresh(web, client, first["refresh_token"])
+        assert res.status_code == 200, res.text
+        again = res.json()
+        assert again["refresh_token"] == second["refresh_token"]
+        assert again["access_token"] == second["access_token"]
+        assert again["scope"] == "ipam:read"
+        # the access token's own remaining time, not a new hour
+        assert 3590 <= again["expires_in"] <= 3600
+    # nothing was written: no row, no rotation time moved
+    assert database_dump() == before
     assert utc((await token_row(first["refresh_token"])).rotated_at) == rotated
+    assert len(await refresh_rows()) == 2
     assert (await the_grant()).revoked_at is None
-    # both pairs work
-    for pair in (second, third):
-        assert (await refresh(web, client, pair["refresh_token"])).status_code == 200
+
+
+async def test_a_retry_says_how_long_the_access_token_has_left(web, linking):
+    client, first = await linked(web)
+    second = await rotate(web, client, first["refresh_token"])
+    row = await token_row(second["access_token"])
+    await set_token(second["access_token"], expires_at=utc(row.expires_at) - timedelta(minutes=20))
+    again = (await refresh(web, client, first["refresh_token"])).json()
+    assert again["access_token"] == second["access_token"]
+    assert 2390 <= again["expires_in"] <= 2400
 
 
 @pytest.mark.parametrize(("seconds_ago", "retry"), [(55, True), (65, False), (3600, False)])
 async def test_the_retry_window_is_60_seconds(web, linking, seconds_ago, retry):
     client, first = await linked(web)
-    await refresh(web, client, first["refresh_token"])
+    second = await rotate(web, client, first["refresh_token"])
     await set_token(first["refresh_token"], rotated_at=NOW() - timedelta(seconds=seconds_ago))
     res = await refresh(web, client, first["refresh_token"])
     assert (res.status_code == 200) is retry
     assert ((await the_grant()).revoked_at is None) is retry
+    if retry:
+        assert res.json()["refresh_token"] == second["refresh_token"]
 
 
 async def test_a_refresh_token_reused_later_revokes_the_grant(web, linking):
     client, first = await linked(web, client_name="Example")
-    second = (await refresh(web, client, first["refresh_token"])).json()
+    second = await rotate(web, client, first["refresh_token"])
     await set_token(first["refresh_token"], rotated_at=NOW() - timedelta(seconds=61))
     entries_before = len(await change_rows())
     assert invalid_grant(await refresh(web, client, first["refresh_token"]))
@@ -1217,16 +1385,217 @@ async def test_a_refresh_token_reused_later_revokes_the_grant(web, linking):
     assert len(await change_rows()) == entries_before + 1
 
 
-async def test_two_refreshes_at_once_with_one_token_both_get_a_pair(web, linking):
+async def test_two_refreshes_at_once_with_one_token_get_the_same_pair(web, linking):
     """The case the retry window exists for: the write lock serves them one after the
-    other, and the second finds the token rotated a moment ago."""
+    other, the first rotates, and the rest find the token rotated a moment ago."""
     client, first = await linked(web)
+    await age(first["refresh_token"])
     answers = await asyncio.gather(*(refresh(web, client, first["refresh_token"]) for _ in range(4)))
     assert [res.status_code for res in answers] == [200] * 4
-    assert len({res.json()["refresh_token"] for res in answers}) == 4
-    assert len({res.json()["access_token"] for res in answers}) == 4
+    assert len({res.json()["refresh_token"] for res in answers}) == 1
+    assert len({res.json()["access_token"] for res in answers}) == 1
+    assert answers[0].json()["refresh_token"] != first["refresh_token"]
+    assert len(await refresh_rows()) == 2
     assert (await the_grant()).revoked_at is None
     assert not [e for e in await change_rows() if e.action == "revoke"]
+
+
+async def test_a_client_whose_answer_was_lost_carries_on(web, linking):
+    """The first ordering a retry has to serve: the rotation's answer never arrived, the
+    client asks again with the token it still holds, and goes on from the pair it is
+    given, link after link, with nothing revoked."""
+    client, first = await linked(web)
+    lost = await rotate(web, client, first["refresh_token"])
+    got = (await refresh(web, client, first["refresh_token"])).json()
+    assert got == {**lost, "expires_in": got["expires_in"]}
+    third = await rotate(web, client, got["refresh_token"])
+    fourth = await rotate(web, client, third["refresh_token"])
+    assert (await initialise(web, fourth["access_token"])).status_code == 200
+    assert (await the_grant()).revoked_at is None
+    assert len(await refresh_rows()) == 4
+
+
+async def test_two_holders_of_one_token_cannot_each_keep_a_chain(web, linking):
+    """The second ordering, and round 1 of PR #189's briefed review (finding 1): two
+    presenters of one refresh token inside the retry window, a thief and the real
+    client, say. Both get the same replacement, so there is one chain, and when the
+    two do not refresh it within a minute of each other the second to come is a late
+    reuse: the grant is revoked. (Each used to get a pair of its own, and both chains
+    refreshed for ever with the parent never presented again.)"""
+    client, first = await linked(web)
+    one = await rotate(web, client, first["refresh_token"])
+    other = (await refresh(web, client, first["refresh_token"])).json()
+    assert other["refresh_token"] == one["refresh_token"]
+    # one of them refreshes on; the other still holds the token it was given
+    newer = await rotate(web, client, one["refresh_token"])
+    assert len(await refresh_rows()) == 3
+    # inside a minute the other is given the same pair again, and they stay on one chain
+    same = (await refresh(web, client, other["refresh_token"])).json()
+    assert same["refresh_token"] == newer["refresh_token"]
+    assert (await the_grant()).revoked_at is None
+    # later than that, it is the reuse the rule is for
+    await set_token(one["refresh_token"], rotated_at=NOW() - timedelta(seconds=61))
+    assert invalid_grant(await refresh(web, client, other["refresh_token"]))
+    assert (await the_grant()).revoked_at is not None
+    assert invalid_grant(await refresh(web, client, newer["refresh_token"]))
+
+
+async def test_a_young_refresh_token_is_answered_with_its_own_pair(web, linking):
+    """A refresh token is not rotated in its first five minutes: the answer is the pair
+    it was issued in. No error, no new row, however often a client asks."""
+    client, tokens = await linked(web)
+    await set_grant(last_used_at=NOW())
+    before = database_dump()
+    for _ in range(50):
+        res = await refresh(web, client, tokens["refresh_token"])
+        assert res.status_code == 200, res.text
+        again = res.json()
+        assert again["refresh_token"] == tokens["refresh_token"]
+        assert again["access_token"] == tokens["access_token"]
+        assert 3590 <= again["expires_in"] <= 3600 and again["scope"] == "ipam:read"
+    assert database_dump() == before
+    assert (await token_row(tokens["refresh_token"])).rotated_at is None
+    # four minutes old: still its own pair. Five: rotated.
+    await age(tokens["refresh_token"], timedelta(minutes=4))
+    assert (await refresh(web, client, tokens["refresh_token"])).json()["refresh_token"] == tokens["refresh_token"]
+    await age(tokens["refresh_token"], timedelta(minutes=1))
+    rotated = (await refresh(web, client, tokens["refresh_token"])).json()
+    assert rotated["refresh_token"] != tokens["refresh_token"]
+    # and the new token is young in its turn
+    again = (await refresh(web, client, rotated["refresh_token"])).json()
+    assert again["refresh_token"] == rotated["refresh_token"]
+    assert len(await refresh_rows()) == 2
+
+
+async def test_no_run_of_refreshes_hides_a_later_reuse(web, linking):
+    """A thief with the client's refresh token uses it, then refreshes as often as the
+    server lets it. When the real client presents the token it still holds, the grant
+    is revoked: the rotated token is still known. (A cap on the rows a grant held once
+    deleted it after 511 refreshes, PR #189.)"""
+    client, stolen = await linked(web)
+    chain = await rotate(web, client, stolen["refresh_token"])
+    for _ in range(520):
+        res = await refresh(web, client, chain["refresh_token"])
+        assert res.status_code == 200
+        chain = res.json()
+    # the run wrote nothing: the thief was handed its own pair each time
+    assert len(await all_rows(OAuthToken)) == 5
+    await set_token(stolen["refresh_token"], rotated_at=NOW() - timedelta(seconds=61))
+    assert invalid_grant(await refresh(web, client, stolen["refresh_token"]))
+    assert (await the_grant()).revoked_at is not None
+    assert [e.action for e in await change_rows()] == ["create", "revoke"]
+    assert invalid_grant(await refresh(web, client, chain["refresh_token"]))
+
+
+async def test_a_rotated_token_is_kept_however_many_rotations_follow(web, linking, monkeypatch):
+    """With the five minutes out of the way, as they are for a thief who takes days
+    over it: no number of later rotations deletes a rotated token that has not expired,
+    so its reuse is still seen."""
+    monkeypatch.setattr(oauth, "ROTATION_MIN_AGE", timedelta(0))
+    client, stolen = await linked(web)
+    chain = (await refresh(web, client, stolen["refresh_token"])).json()
+    for _ in range(520):
+        chain = (await refresh(web, client, chain["refresh_token"])).json()
+    assert len(await refresh_rows()) == 522
+    assert (await token_row(stolen["refresh_token"])).rotated_at is not None
+    await set_token(stolen["refresh_token"], rotated_at=NOW() - timedelta(seconds=61))
+    assert invalid_grant(await refresh(web, client, stolen["refresh_token"]))
+    assert (await the_grant()).revoked_at is not None
+
+
+async def age_grant(grant_id: str, by: timedelta) -> None:
+    """Let `by` pass for every row of a grant: issue times, rotation times and the
+    access tokens' expiry."""
+    async with SessionLocal() as session:
+        rows = await session.scalars(select(OAuthToken).where(OAuthToken.grant_id == grant_id))
+        for row in rows.all():
+            row.created_at = utc(row.created_at) - by
+            if row.rotated_at is not None:
+                row.rotated_at = utc(row.rotated_at) - by
+            if row.kind == "access":
+                row.expires_at = utc(row.expires_at) - by
+        await session.commit()
+
+
+@pytest.mark.parametrize("minutes", [60, 40, 10, 5])
+async def test_a_client_that_refreshes_on_time_is_rotated_every_time(web, linking, minutes):
+    """Thirty refreshes of a client that asks once an hour, every forty minutes, every
+    ten or every five: each is a rotation, none is refused, and every rotated token is
+    still there afterwards."""
+    client, tokens = await linked(web)
+    grant = await the_grant()
+    seen = {tokens["refresh_token"]}
+    for _ in range(30):
+        await age_grant(grant.id, timedelta(minutes=minutes))
+        res = await refresh(web, client, tokens["refresh_token"])
+        assert res.status_code == 200, res.text
+        tokens = res.json()
+        assert tokens["refresh_token"] not in seen and tokens["expires_in"] == 3600
+        seen.add(tokens["refresh_token"])
+    assert len(await refresh_rows()) == 31
+    assert (await the_grant()).revoked_at is None
+
+
+async def test_a_client_that_refreshes_on_every_request_is_rotated_every_five_minutes(web, linking):
+    """A refresh a minute for an hour: sixty answers, none an error, twelve rotations."""
+    client, tokens = await linked(web)
+    grant = await the_grant()
+    answers = set()
+    for _ in range(60):
+        await age_grant(grant.id, timedelta(minutes=1))
+        res = await refresh(web, client, tokens["refresh_token"])
+        assert res.status_code == 200, res.text
+        tokens = res.json()
+        answers.add(tokens["refresh_token"])
+        assert (await initialise(web, tokens["access_token"])).status_code == 200
+    # the token it started with, for its first four minutes, and twelve replacements
+    assert len(answers) == 13
+    assert len(await refresh_rows()) == 13
+    assert len([t for t in await all_rows(OAuthToken) if t.kind == "access"]) <= 13
+
+
+async def test_a_replacement_is_derived_and_only_with_the_servers_salt(web, linking):
+    """What lets a retry be answered again with hashes alone in the database: the
+    replacement is an HMAC of the presented token under a salt on its row. The same
+    token and salt give the same value; without the salt, or from the database alone,
+    it cannot be computed."""
+    client, first = await linked(web)
+    row = await token_row(first["refresh_token"])
+    assert re.fullmatch("[A-Za-z0-9_-]{43}", row.derive_salt)
+    assert (await token_row(first["access_token"])).derive_salt is None
+    second = await rotate(web, client, first["refresh_token"])
+    assert second["refresh_token"] == oauth._derive(row.derive_salt, first["refresh_token"], "refresh")
+    child = await token_row(second["refresh_token"])
+    assert second["access_token"] == oauth._derive(child.derive_salt, second["refresh_token"], "access")
+    assert child.derive_salt != row.derive_salt
+    # another salt, another kind or another token: another value
+    assert oauth._derive("x" * 43, first["refresh_token"], "refresh") != second["refresh_token"]
+    assert oauth._derive(row.derive_salt, first["refresh_token"], "access") != second["access_token"]
+    # the database holds no plain value, of a drawn token or a derived one
+    text = database_text()
+    for plain in (*first.values(), *second.values()):
+        if isinstance(plain, str) and plain.startswith("tlgo"):
+            assert plain not in text and plain.split("_", 1)[1] not in text
+    assert "derive_salt" in changes._SNAPSHOT_EXCLUDE
+
+
+async def test_a_salt_is_erased_once_its_token_can_no_longer_be_retried(web, linking):
+    """A copy of the database holds the salts of the chain's newest tokens only: an old
+    refresh token that leaked cannot be walked forward to the current one with it."""
+    client, first = await linked(web)
+    second = await rotate(web, client, first["refresh_token"])
+    # inside the retry window the rotated token keeps its salt: a retry needs it
+    assert (await token_row(first["refresh_token"])).derive_salt is not None
+    await set_token(first["refresh_token"], rotated_at=NOW() - timedelta(minutes=10))
+    third = await rotate(web, client, second["refresh_token"])
+    assert (await token_row(first["refresh_token"])).derive_salt is None
+    assert (await token_row(second["refresh_token"])).derive_salt is not None
+    assert (await token_row(third["refresh_token"])).derive_salt is not None
+    # the retry of the token just rotated still works, and the old one is still a reuse
+    again = (await refresh(web, client, second["refresh_token"])).json()
+    assert again["refresh_token"] == third["refresh_token"]
+    assert invalid_grant(await refresh(web, client, first["refresh_token"]))
+    assert (await the_grant()).revoked_at is not None
 
 
 async def test_an_expired_refresh_token_is_refused_without_revoking(web, linking):
@@ -1243,6 +1612,7 @@ async def test_an_expired_refresh_token_is_refused_without_revoking(web, linking
 async def test_a_refresh_token_is_only_its_own_clients(web, linking):
     client, tokens = await linked(web)
     thief = await register(web)
+    await age(tokens["refresh_token"])
     assert invalid_grant(await refresh(web, thief, tokens["refresh_token"]))
     async with SessionLocal() as session:
         with pytest.raises(oauth.Refused):
@@ -1255,7 +1625,7 @@ async def test_a_rotated_token_of_another_client_does_not_revoke_the_grant(web, 
     """Only the client the token was issued to can set off the reuse rule."""
     client, first = await linked(web)
     thief = await register(web)
-    await refresh(web, client, first["refresh_token"])
+    await rotate(web, client, first["refresh_token"])
     await set_token(first["refresh_token"], rotated_at=NOW() - timedelta(hours=1))
     assert invalid_grant(await refresh(web, thief, first["refresh_token"]))
     assert (await the_grant()).revoked_at is None
@@ -1271,8 +1641,11 @@ async def test_an_access_token_or_a_code_is_no_refresh_token(web, linking):
 
 
 @pytest.mark.parametrize("scope", ["ipam:read", "ipam:read ipam:write", "ipam:write"])
-async def test_a_refresh_gets_what_the_grant_allows_whatever_it_asks(web, linking, scope):
+@pytest.mark.parametrize("old_enough", [False, True], ids=["young", "rotated"])
+async def test_a_refresh_gets_what_the_grant_allows_whatever_it_asks(web, linking, scope, old_enough):
     client, tokens = await linked(web, can_write=True)
+    if old_enough:
+        await age(tokens["refresh_token"])
     res = await refresh(web, client, tokens["refresh_token"], scope=scope)
     assert res.status_code == 200, res.text
     assert res.json()["scope"] == "ipam:read"
@@ -1280,6 +1653,7 @@ async def test_a_refresh_gets_what_the_grant_allows_whatever_it_asks(web, linkin
 
 async def test_a_refresh_for_a_scope_the_server_has_not_is_refused(web, linking):
     client, tokens = await linked(web)
+    await age(tokens["refresh_token"])
     res = await refresh(web, client, tokens["refresh_token"], scope="ipam:admin")
     assert res.status_code == 400 and res.json()["error"] == "invalid_scope"
     assert (await token_row(tokens["refresh_token"])).rotated_at is None
@@ -1294,21 +1668,22 @@ async def test_a_client_registered_without_refresh_cannot_use_the_grant_type(web
 
 async def test_exchanges_and_refreshes_write_no_change_entry(web, linking):
     client, tokens = await linked(web)
-    await refresh(web, client, tokens["refresh_token"])
+    again = (await refresh(web, client, tokens["refresh_token"])).json()
+    await rotate(web, client, again["refresh_token"])
     assert [(e.entity_type, e.action) for e in await change_rows()] == [("grant", "create")]
 
 
 # --- The rows a grant holds ---
 
 
-async def test_issuing_deletes_the_grants_expired_rows(web, linking):
+async def test_a_rotation_deletes_the_grants_expired_rows_and_nothing_else(web, linking):
     client = await register(web)
     code = await link(web, client)
     first = (await exchange(web, client, code)).json()
     past = NOW() - timedelta(seconds=1)
     await set_token(code, expires_at=past)
     await set_token(first["access_token"], expires_at=past)
-    second = (await refresh(web, client, first["refresh_token"])).json()
+    second = await rotate(web, client, first["refresh_token"])
     kept = {t.token_hash for t in await all_rows(OAuthToken)}
     assert kept == {
         sha256(first["refresh_token"]),
@@ -1317,133 +1692,17 @@ async def test_issuing_deletes_the_grants_expired_rows(web, linking):
     }
 
 
-async def test_no_run_of_refreshes_hides_a_later_reuse(web, linking):
-    """A thief with the client's refresh token uses it, then refreshes the newer chain
-    as often as the server lets it. When the real client presents the token it still
-    holds, the grant must be revoked: either the rotated token is still known, or the
-    run was stopped before it could be forgotten."""
-    client, stolen = await linked(web)
-    chain = (await refresh(web, client, stolen["refresh_token"])).json()
-    for _ in range(520):
-        res = await refresh(web, client, chain["refresh_token"])
-        if res.status_code != 200:
-            break
-        chain = res.json()
-    await set_token(stolen["refresh_token"], rotated_at=NOW() - timedelta(seconds=61))
-    assert invalid_grant(await refresh(web, client, stolen["refresh_token"]))
-    assert (await the_grant()).revoked_at is not None
-    assert [e.action for e in await change_rows()] == ["create", "revoke"]
-    assert invalid_grant(await refresh(web, client, chain["refresh_token"]))
-
-
-async def test_a_rotated_token_is_kept_however_many_refreshes_follow(web, linking, monkeypatch):
-    """With the rate limit out of the way, as it is for a thief who takes days over it:
-    no number of later refreshes deletes a rotated token that has not expired, so its
-    reuse is still seen. (A cap on the rows a grant holds deleted it after 511.)"""
-    monkeypatch.setattr(oauth, "ISSUES_PER_WINDOW", 10_000)
-    client, stolen = await linked(web)
-    chain = (await refresh(web, client, stolen["refresh_token"])).json()
-    for _ in range(520):
-        chain = (await refresh(web, client, chain["refresh_token"])).json()
-    rows = await all_rows(OAuthToken)
-    assert len([t for t in rows if t.kind == "refresh"]) == 522
-    assert (await token_row(stolen["refresh_token"])).rotated_at is not None
-    await set_token(stolen["refresh_token"], rotated_at=NOW() - timedelta(seconds=61))
-    assert invalid_grant(await refresh(web, client, stolen["refresh_token"]))
-    assert (await the_grant()).revoked_at is not None
-
-
-def rate_limited(res: httpx.Response) -> bool:
-    assert res.status_code == 429, res.text
-    assert res.json()["error"]["code"] == "RATE_LIMITED"
-    return True
-
-
-async def issue_up_to_the_limit(web, client, tokens) -> list[dict]:
-    """Refresh until the grant has been issued `ISSUES_PER_WINDOW` pairs; returns them
-    all, the first (from the code exchange) included."""
-    pairs = [tokens]
-    while len(pairs) < oauth.ISSUES_PER_WINDOW:
-        res = await refresh(web, client, pairs[-1]["refresh_token"])
-        assert res.status_code == 200, res.text
-        pairs.append(res.json())
-    return pairs
-
-
-async def test_a_grant_is_issued_at_most_twelve_pairs_an_hour(web, linking):
-    assert (oauth.ISSUES_PER_WINDOW, oauth.ISSUE_WINDOW) == (12, timedelta(hours=1))
+async def test_the_first_tokens_of_a_grant(web, linking):
+    """The chain starts at the code exchange with a drawn refresh token and the access
+    token derived from it. A client that registered for no refresh token gets a drawn
+    access token, and has no chain."""
     client, tokens = await linked(web)
-    other_client, other = await linked(web)
-    pairs = await issue_up_to_the_limit(web, client, tokens)
-    before = database_dump()
-    newest = pairs[-1]
-    for _ in range(3):
-        assert rate_limited(await refresh(web, client, newest["refresh_token"]))
-    # a retry of a token rotated a moment ago is an issue too
-    assert rate_limited(await refresh(web, client, pairs[-2]["refresh_token"]))
-    # nothing written: the refused token is not rotated, and nothing was deleted
-    assert database_dump() == before
-    assert (await token_row(newest["refresh_token"])).rotated_at is None
-    assert (await the_grant_of(client)).revoked_at is None
-    # the client is not cut off: the access token it holds works, and so does another grant
-    assert (await initialise(web, newest["access_token"])).status_code == 200
-    assert (await refresh(web, other_client, other["refresh_token"])).status_code == 200
-    # the window moves on: once an issue is an hour old, there is room for one more
-    await set_token(pairs[0]["access_token"], created_at=NOW() - timedelta(minutes=61))
-    assert (await refresh(web, client, newest["refresh_token"])).status_code == 200
-    assert rate_limited(await refresh(web, client, pairs[-2]["refresh_token"]))
-
-
-async def the_grant_of(client: dict) -> OAuthGrant:
-    [grant] = [g for g in await all_rows(OAuthGrant) if g.client_id == client["client_id"]]
-    return grant
-
-
-async def test_a_reuse_revokes_the_grant_even_when_the_limit_is_reached(web, linking):
-    """The reuse rule is judged before the limit, so a thief who spends the grant's
-    budget does not buy the real client's reuse an hour of going unnoticed."""
-    client, tokens = await linked(web)
-    pairs = await issue_up_to_the_limit(web, client, tokens)
-    assert rate_limited(await refresh(web, client, pairs[-1]["refresh_token"]))
-    await set_token(tokens["refresh_token"], rotated_at=NOW() - timedelta(seconds=61))
-    assert invalid_grant(await refresh(web, client, tokens["refresh_token"]))
-    assert (await the_grant()).revoked_at is not None
-    assert await all_rows(OAuthToken) == []
-
-
-async def test_requests_at_once_cannot_pass_the_limit(web, linking):
-    client, tokens = await linked(web)
-    pairs = await issue_up_to_the_limit(web, client, tokens)
-    # one place left once the oldest issue leaves the window; eight requests want it
-    await set_token(pairs[0]["access_token"], created_at=NOW() - timedelta(minutes=61))
-    answers = await asyncio.gather(
-        *(refresh(web, client, pairs[-1]["refresh_token"]) for _ in range(8))
-    )
-    assert sorted(res.status_code for res in answers) == [200] + [429] * 7
-
-
-async def test_an_hourly_client_and_a_faster_one_never_meet_the_limit(web, linking):
-    """What 30 days of a legitimate client hold, at the rate it refreshes: every rotated
-    token kept, none refused. Each refresh here is made an hour (or forty or ten
-    minutes) after the last by ageing the rows already there."""
-    for minutes in (60, 40, 10):
-        client, tokens = await linked(web)
-        grant = await the_grant_of(client)
-        for _ in range(30):
-            async with SessionLocal() as session:
-                for row in (await session.scalars(
-                    select(OAuthToken).where(OAuthToken.grant_id == grant.id)
-                )).all():
-                    row.created_at = utc(row.created_at) - timedelta(minutes=minutes)
-                    if row.kind == "access":
-                        row.expires_at = utc(row.expires_at) - timedelta(minutes=minutes)
-                await session.commit()
-            res = await refresh(web, client, tokens["refresh_token"])
-            assert res.status_code == 200, (minutes, res.text)
-            tokens = res.json()
-        rows = [t for t in await all_rows(OAuthToken) if t.grant_id == grant.id]
-        # all 31 refresh tokens are there, the first still known after 30 rotations
-        assert len([t for t in rows if t.kind == "refresh"]) == 31
+    row = await token_row(tokens["refresh_token"])
+    assert tokens["access_token"] == oauth._derive(row.derive_salt, tokens["refresh_token"], "access")
+    other = await register(web, grant_types=["authorization_code"])
+    alone = (await exchange(web, other, await link(web, other))).json()
+    assert oauth.TOKEN_FORMS["access"].fullmatch(alone["access_token"])
+    assert (await token_row(alone["access_token"])).derive_salt is None
 
 
 # --- Access tokens on /mcp, and the grant's last contact ---

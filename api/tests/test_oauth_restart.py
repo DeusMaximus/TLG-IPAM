@@ -8,6 +8,7 @@ other on the same file. Nothing the tokens need is in a process's memory.
 """
 
 import json
+import sqlite3
 import subprocess
 import sys
 import time
@@ -71,6 +72,17 @@ asyncio.run(main())
 """
 
 
+def _five_minutes_pass(tmp_path):
+    """Make every refresh token old enough to be rotated (`oauth.ROTATION_MIN_AGE`),
+    while no server runs on the file."""
+    con = sqlite3.connect(tmp_path / "ipam.db")
+    try:
+        con.execute("UPDATE oauth_tokens SET created_at = '2026-01-01 00:00:00.000000'")
+        con.commit()
+    finally:
+        con.close()
+
+
 def _serve(tmp_path):
     proc = _image(tmp_path, REAL_KEY, env={"PUBLIC_BASE_URL": BASE})
     lines, reader = _read_stderr(proc)
@@ -109,6 +121,7 @@ def test_a_grant_outlives_the_process_that_issued_it_and_a_server_restart(tmp_pa
     assert first["scope"] == "ipam:read" and first["refresh_token"].startswith("tlgor_")
 
     # A server on the same file: the linking process is gone, and its tokens work
+    _five_minutes_pass(tmp_path)
     deadline = time.monotonic() + START_DEADLINE
     proc, lines, reader = _serve(tmp_path)
     try:
@@ -122,12 +135,14 @@ def test_a_grant_outlives_the_process_that_issued_it_and_a_server_restart(tmp_pa
             res = _refresh(http, base, client, first["refresh_token"])
             assert res.status_code == 200, res.text
             second = res.json()
+            assert second["refresh_token"] != first["refresh_token"]
             # no link can be started on a server as it ships: the window is #27's
             assert http.post(f"{base}/mcp/register", json={"redirect_uris": ["https://x.example/cb"]}).status_code == 403
     finally:
         _stop(proc, reader)
 
     # Restarted: the pair that server issued works on the next one
+    _five_minutes_pass(tmp_path)
     deadline = time.monotonic() + START_DEADLINE
     proc, lines, reader = _serve(tmp_path)
     try:

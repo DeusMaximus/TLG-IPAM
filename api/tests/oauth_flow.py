@@ -15,6 +15,7 @@ import base64
 import hashlib
 import json
 import sqlite3
+from datetime import timedelta
 from pathlib import Path
 
 import httpx
@@ -32,6 +33,7 @@ from app.mcp_server import build_mcp
 from app.models import OAuthClient, OAuthGrant, OAuthToken
 from app.oauth_provider import mcp_auth
 from app.services import oauth
+from app.times import utc
 
 BASE = "https://ipam.example.com"
 RESOURCE = BASE + "/mcp"
@@ -198,6 +200,26 @@ async def refresh(web, client: dict, token: str, *, secret=..., **extra) -> http
         **extra,
     }
     return await web.post("/mcp/token", data=_with_secret(client, form, secret))
+
+
+async def age(plain: str, by: timedelta = timedelta(minutes=6)) -> None:
+    """Make a token older, as time passing does. A refresh token is not rotated in its
+    first five minutes (`oauth.ROTATION_MIN_AGE`)."""
+    async with SessionLocal() as session:
+        row = await session.scalar(
+            select(OAuthToken).where(OAuthToken.token_hash == sha256(plain))
+        )
+        row.created_at = utc(row.created_at) - by
+        await session.commit()
+
+
+async def rotate(web, client: dict, token: str, **extra) -> dict:
+    """Refresh with a token old enough to be rotated; returns the new pair."""
+    await age(token)
+    res = await refresh(web, client, token, **extra)
+    assert res.status_code == 200, res.text
+    assert res.json()["refresh_token"] != token
+    return res.json()
 
 
 async def linked(web, *, can_write: bool = False, **metadata) -> tuple[dict, dict]:

@@ -417,6 +417,12 @@ class OAuthToken(Base):
     A code is single-use (`used_at`). A refresh token is rotated on use (`rotated_at`)
     and its row is kept until it expires, because presenting it again is how a stolen
     one is noticed (§6.4, the retry window).
+
+    A grant has one chain of refresh tokens. The access token issued with a refresh
+    token, and the refresh token that replaces it, are derived from its plain value
+    and `derive_salt` (`services/oauth._derive`), so that the server can give the same
+    answer again to a retry without ever storing a plain value. The salt is useless
+    without the plain token, and is erased once the token can no longer be retried.
     """
 
     __tablename__ = "oauth_tokens"
@@ -433,5 +439,7 @@ class OAuthToken(Base):
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     code_challenge: Mapped[str | None] = mapped_column(String(64))
     redirect_uri_explicit: Mapped[bool | None] = mapped_column(Boolean)
-    # refresh tokens only: when it was first exchanged for a new pair
+    # refresh tokens only: when it was first exchanged for a new pair, and the salt
+    # its pair and its replacement are derived with
     rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    derive_salt: Mapped[str | None] = mapped_column(String(64))

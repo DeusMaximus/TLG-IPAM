@@ -76,6 +76,9 @@ AUTHORIZE_PATH = "/authorize"
 TOKEN_PATH = "/token"
 REGISTER_PATH = "/register"
 _NO_STORE = {"Cache-Control": "no-store"}
+# The codes a registration error answer may carry (RFC 7591 §3.2.2), which the SDK's
+# handler turns into a `400`
+_REGISTRATION_ERRORS = ("invalid_redirect_uri", "invalid_client_metadata")
 
 
 class RegisteredClient(OAuthClientInformationFull):
@@ -175,17 +178,22 @@ def _while_linking_is_open(handle, *, page: bool):
     the handler's, marked not to be stored."""
 
     async def gated(request: Request) -> Response:
+        refusal = oauth.LINKING_CLOSED
         if oauth.linking_open():
-            response = await handle(request)
-            # a registration answer holds the client secret in plain (RFC 7591 §3.2.1)
-            response.headers.setdefault("Cache-Control", "no-store")
-            return response
+            try:
+                response = await handle(request)
+            except oauth.Refused as refused:
+                # a refusal that is none of the handler's own error codes: the
+                # registry is full of linked clients
+                refusal = refused.description
+            else:
+                # a registration answer holds the client secret in plain (RFC 7591 §3.2.1)
+                response.headers.setdefault("Cache-Control", "no-store")
+                return response
         if page:
-            return PlainTextResponse(oauth.LINKING_CLOSED + "\n", 403, headers=_NO_STORE)
+            return PlainTextResponse(refusal + "\n", 403, headers=_NO_STORE)
         return JSONResponse(
-            {"error": "access_denied", "error_description": oauth.LINKING_CLOSED},
-            403,
-            headers=_NO_STORE,
+            {"error": "access_denied", "error_description": refusal}, 403, headers=_NO_STORE
         )
 
     return gated
@@ -301,6 +309,9 @@ class IpamOAuthProvider(OAuthProvider):
                     scope=client_info.scope,
                 )
         except oauth.Refused as refusal:
+            if refusal.error not in _REGISTRATION_ERRORS:
+                # not one of RFC 7591's codes (the registry is full): the route answers
+                raise
             raise RegistrationError(refusal.error, refusal.description) from None
         # the handler answers with this object: it says what was registered
         client_info.client_name = stored.client_name
