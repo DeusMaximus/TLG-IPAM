@@ -1,0 +1,874 @@
+"""The built-in OAuth server's rules and storage (v0.2 spec §6.2 to §6.4, #26).
+
+`oauth_provider.IpamOAuthProvider` is the thin layer FastMCP and the MCP SDK call;
+everything it decides, it decides here. The SDK supplies the protocol endpoints, PKCE
+verification and the parsing of each request. This module supplies what a client may
+register, how an authorise request's redirect URI and `resource` are judged, the grant,
+and the life of every code and token.
+
+Nothing here reads the settings: the provider passes the public base URL in.
+
+**The seam the link window and consent page are built on (#27).** Until they exist no
+grant can be issued over HTTP:
+
+- `linking_open()` says whether registration and authorisation are taken now. Here it
+  is always False, so `/register` and `/authorize` refuse every request and no row is
+  written by a caller without a credential. #27 makes it the link window.
+- `begin_authorisation` checks an authorise request the SDK has validated (client,
+  redirect URI, scope) and keeps it in `pending`, in process memory, under an opaque
+  transaction id. The provider sends the browser to `CONSENT_PATH` with that id.
+- `approve` is what the consent handler calls once the owner's link code is accepted:
+  it takes the transaction, records the grant with the redirect URI it was authorised
+  for, issues the single-use code, writes the audit entry, and returns the URL to send
+  the browser back to the client with. `pending.get` reads a transaction without taking
+  it (for the page), `pending.discard` drops one (a refused consent).
+
+**Scopes (#28).** A token's scopes are never stored: `grant_scopes` is asked each time
+one is loaded. Here it answers `ipam:read` alone, whatever `can_write` says, so no grant
+can write through `/mcp` before #28 adds the `MCP_REMOTE_WRITES` rule to that function.
+"""
+
+import hashlib
+import hmac
+import ipaddress
+import logging
+import re
+import secrets
+import time
+from collections import OrderedDict
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from pydantic import AnyUrl
+from sqlalchemy import delete, exists, or_, select, update
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..errors import database_unavailable
+from ..models import OAuthClient, OAuthGrant, OAuthToken
+from ..times import utc
+from . import changes, scans
+
+log = logging.getLogger(__name__)
+
+SCOPE_READ = "ipam:read"
+SCOPE_WRITE = "ipam:write"
+# every scope the server has, in the order it writes them
+VALID_SCOPES = (SCOPE_READ, SCOPE_WRITE)
+# the grant types the token endpoint serves, in the order a registration is stored with
+GRANT_TYPES = ("authorization_code", "refresh_token")
+
+# Where `/mcp` is mounted, and so where the OAuth routes and the resource are (§6.7)
+MCP_MOUNT = "/mcp"
+# Under the mount: where the authorise step sends the browser, with `?txn=<id>` (#27)
+CONSENT_PATH = "/consent"
+
+# Lifetimes (spec §6.4)
+CODE_LIFETIME = timedelta(minutes=5)
+ACCESS_LIFETIME = timedelta(hours=1)
+REFRESH_LIFETIME = timedelta(days=30)
+# A refresh token presented again this soon after it was rotated is a retry (a lost
+# answer, or two requests at once) and gets a new pair. Later, it is taken for theft.
+REFRESH_RETRY_WINDOW = timedelta(seconds=60)
+# A grant's `last_used_at` is written at most this often, as an agent token's is
+LAST_USED_GRANULARITY = timedelta(seconds=10)
+
+# The rows one grant may hold in `oauth_tokens`. A client that refreshes once an hour
+# holds about 720 rotated refresh tokens after 30 days, each kept until it expires so
+# that its reuse is noticed, and one or two access tokens. Issuing past the cap deletes
+# the grant's oldest rows first, so a client that refreshes in a loop, or replays one
+# token throughout its retry window, cannot grow the table without bound; what it
+# loses is the reuse detection of its own oldest tokens, which are then unknown and
+# refused.
+GRANT_TOKENS_MAX = 1024
+
+# What a registration may hold. Gemini registers six redirect URIs (§6.8).
+REDIRECT_URIS_MAX = 16
+REDIRECT_URI_MAX = 2048
+# A declared name is kept only when it is already at most this long and printable
+# (`kept_name`); #29 replaces the rule with the sanitising of spec §4.3
+CLIENT_NAME_MAX = 60
+# An authorise request's `state` is the client's, returned to it unread
+STATE_MAX = 4096
+
+# Authorise requests waiting for the owner's decision, in process memory (one worker).
+# A transaction lasts as long as a link window does (§6.3).
+PENDING_MAX = 32
+PENDING_LIFETIME_S = 600
+
+_SECRET_BYTES = 32
+_SECRET = "[A-Za-z0-9_-]{43}"
+_PREFIXES = {"code": "tlgoc_", "access": "tlgoa_", "refresh": "tlgor_"}
+# The exact form of each value the server issues. A presented value in any other form
+# is refused without a statement being run: the owner key, an agent token and anything
+# an outsider makes up never reach the database through these routes.
+TOKEN_FORMS = {kind: re.compile(prefix + _SECRET) for kind, prefix in _PREFIXES.items()}
+# A client id as the MCP SDK's registration handler draws it (`uuid4`)
+CLIENT_ID_FORM = re.compile(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+# An S256 PKCE challenge: the base64url of a SHA-256, unpadded (RFC 7636 §4.2)
+_CHALLENGE_FORM = re.compile("[A-Za-z0-9_-]{43}")
+
+AUDIT_SOURCE = "oauth"
+
+
+class Refused(Exception):
+    """A request the OAuth server refuses, by the protocol's own error code. The
+    provider turns it into the SDK's error type for the route it came through."""
+
+    def __init__(self, error: str, description: str):
+        super().__init__(description)
+        self.error = error
+        self.description = description
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _sha256(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+# --- The link window's seam (#27) ---
+
+
+def linking_open() -> bool:
+    """Whether the server registers clients and takes authorise requests now.
+
+    Never, until the link window exists (#27): the routes refuse, nothing is stored for
+    a caller without a credential, and no grant can be issued. Discovery and the token
+    endpoint do not ask.
+    """
+    return False
+
+
+LINKING_CLOSED = (
+    "Linking a client is started from the IPAM's own web interface, and is not open now."
+)
+
+
+# --- Redirect URIs (spec §6.3) ---
+
+
+def _loopback_ip(host: str | None) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """The address `host` is, when it is a loopback IP literal: one in 127.0.0.0/8, or
+    `::1`. A name, `localhost` included, is none, and so is an IPv4-mapped IPv6
+    address."""
+    try:
+        address = ipaddress.ip_address((host or "").strip("[]"))
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv4Address):
+        return address if address in ipaddress.ip_network("127.0.0.0/8") else None
+    return address if address == ipaddress.IPv6Address("::1") else None
+
+
+def redirect_problem(uri: AnyUrl) -> str | None:
+    """Why a client may not register `uri` as a redirect URI, or None when it may.
+
+    The SDK registers any URI it can parse, `javascript:alert(1)` and
+    `http://client.example.com/cb` included. Taken here: `https` with a host, and `http`
+    to `localhost` or a loopback address, for a client on the owner's own machine.
+    Refused as well, in either scheme: credentials in the URI, whose host a reader takes
+    for the wrong one, and a fragment (RFC 6749 §3.1.2). The reasons name the rule,
+    never the URI.
+    """
+    if len(str(uri)) > REDIRECT_URI_MAX:
+        return f"is longer than {REDIRECT_URI_MAX} characters"
+    if uri.scheme not in ("https", "http"):
+        return "must be an https URI, or http to localhost or a loopback address"
+    if not uri.host:
+        return "has no host"
+    if uri.username is not None or uri.password is not None:
+        return "must not hold a user name or password"
+    if uri.fragment is not None:
+        return "must not hold a fragment"
+    if uri.scheme == "http" and uri.host != "localhost" and _loopback_ip(uri.host) is None:
+        return "is plain http to a host other than localhost or a loopback address"
+    return None
+
+
+def match_redirect(registered: list[AnyUrl], requested: AnyUrl | None) -> AnyUrl:
+    """The redirect URI an authorise request is answered at, or `Refused`.
+
+    A request that names none gets the client's one registered URI. One that names a
+    URI gets it when it is registered, compared whole, as the SDK compares. The one
+    exception is OAuth 2.1's for a client on the owner's machine, which listens on a
+    port it is given when it starts: a registered `http` URI on a loopback IP literal
+    matches a request for the same address, path and query on any port. `localhost` by
+    name keeps exact matching, and so does every `https` URI. The URI returned is the
+    request's own, port included: it is what the code, the grant and the code exchange
+    are held to.
+    """
+    if requested is None:
+        if len(registered) == 1:
+            return registered[0]
+        raise Refused(
+            "invalid_request",
+            "redirect_uri must be specified unless the client has exactly one registered URI",
+        )
+    if requested in registered:
+        return requested
+    address = _loopback_ip(requested.host)
+    if (
+        requested.scheme == "http"
+        and address is not None
+        and requested.port
+        and requested.username is None
+        and requested.password is None
+        and requested.fragment is None
+    ):
+        for candidate in registered:
+            if (
+                candidate.scheme == "http"
+                and _loopback_ip(candidate.host) == address
+                and candidate.path == requested.path
+                and candidate.query == requested.query
+            ):
+                return requested
+    raise Refused("invalid_request", "redirect_uri is not registered for this client")
+
+
+# --- The resource indicator (spec §6.3) ---
+
+
+def names_this_server(resource: str | None, public_base_url: str) -> bool:
+    """Whether an authorise request's RFC 8707 `resource` names this server:
+    `<public base URL>/mcp`, the scheme and the authority compared without regard to
+    case and one trailing slash ignored. An absent `resource` names it."""
+    if resource is None:
+        return True
+    if "?" in resource or "#" in resource:
+        return False
+    try:
+        given = urlsplit(resource)
+        expected = urlsplit(public_base_url + MCP_MOUNT)
+    except ValueError:
+        return False
+    path = given.path[:-1] if given.path.endswith("/") else given.path
+    return (
+        given.scheme.lower() == expected.scheme
+        and given.netloc.lower() == expected.netloc
+        and path == expected.path
+    )
+
+
+# --- Registration ---
+
+
+def kept_name(declared: str | None) -> str | None:
+    """A client's declared name as this server keeps it: unchanged when it is 1 to
+    `CLIENT_NAME_MAX` printable characters with none of them whitespace at either end,
+    else nothing. It is never cut or cleaned here (#29 owns that rule); a name that
+    would need either is not stored at all."""
+    if not declared or len(declared) > CLIENT_NAME_MAX:
+        return None
+    if not declared.isprintable() or declared != declared.strip():
+        return None
+    return declared
+
+
+def actor_for(client: OAuthClient | None) -> str | None:
+    """The `actor` of an audit entry about this client's grant (spec §4.3). The name is
+    the client's own claim, which is why it goes here and never into a summary."""
+    return f"grant:{client.client_name}" if client is not None and client.client_name else None
+
+
+@dataclass(frozen=True)
+class Registered:
+    """What a registration was stored as, where that is narrower than what was sent."""
+
+    client_name: str | None
+    grant_types: list[str]
+    scope: str
+
+
+async def register_client(
+    session: AsyncSession,
+    *,
+    client_id: str,
+    client_name: str | None,
+    redirect_uris: list[AnyUrl],
+    auth_method: str,
+    client_secret: str | None,
+    grant_types: list[str],
+    scope: str | None,
+) -> Registered:
+    """Store a registration the SDK's handler has parsed and drawn credentials for.
+
+    Refused whole (`invalid_redirect_uri`) when any redirect URI is outside the policy
+    of `redirect_problem`, or there are more than `REDIRECT_URIS_MAX`. Only the SHA-256
+    of the secret is stored. Of the rest, only what the server uses: the name when
+    `kept_name` keeps it, and the grant types and scopes among the server's own.
+
+    Not audit-logged: a registration is not a link (§6.3), it comes from a caller with
+    no credential, and it grants nothing. The grant that may follow is logged.
+    """
+    if not linking_open():
+        raise Refused("invalid_client_metadata", LINKING_CLOSED)
+    if not redirect_uris or len(redirect_uris) > REDIRECT_URIS_MAX:
+        raise Refused(
+            "invalid_redirect_uri", f"redirect_uris must hold 1 to {REDIRECT_URIS_MAX} URIs"
+        )
+    for position, uri in enumerate(redirect_uris):
+        problem = redirect_problem(uri)
+        if problem is not None:
+            raise Refused("invalid_redirect_uri", f"redirect_uris[{position}] {problem}")
+    if auth_method not in ("none", "client_secret_post", "client_secret_basic"):
+        raise Refused("invalid_client_metadata", "token_endpoint_auth_method is not supported")
+    if (auth_method == "none") != (client_secret is None):
+        # the SDK draws a secret exactly when the method needs one; anything else is
+        # a client this server could not authenticate
+        raise Refused("invalid_client_metadata", "token_endpoint_auth_method is not supported")
+    asked = set((scope or "").split())
+    stored = Registered(
+        client_name=kept_name(client_name),
+        grant_types=[g for g in GRANT_TYPES if g in grant_types],
+        scope=" ".join(s for s in VALID_SCOPES if s in asked),
+    )
+    try:
+        session.add(
+            OAuthClient(
+                client_id=client_id,
+                client_name=stored.client_name,
+                redirect_uris=[str(uri) for uri in redirect_uris],
+                token_endpoint_auth_method=auth_method,
+                client_secret_hash=_sha256(client_secret) if client_secret is not None else None,
+                grant_types=stored.grant_types,
+                scope=stored.scope,
+                created_at=_now(),
+            )
+        )
+        await session.commit()
+    except OperationalError as exc:
+        await session.rollback()
+        raise database_unavailable("oauth registration", exc) from exc
+    return stored
+
+
+async def get_client(session: AsyncSession, client_id: str) -> OAuthClient | None:
+    """The registration with this id. An id that is not in the form the server issues
+    is not looked up."""
+    if not CLIENT_ID_FORM.fullmatch(client_id):
+        return None
+    return await session.get(OAuthClient, client_id)
+
+
+def secret_matches(client: OAuthClient, presented: str | None) -> bool:
+    """Whether a token request has authenticated as this client (spec §6.4).
+
+    A public client (`none`) has no secret and needs none. A confidential one needs the
+    secret it was issued: the presented value is hashed and compared in constant time
+    with the stored hash. A confidential registration with no stored hash authenticates
+    nobody.
+    """
+    if client.token_endpoint_auth_method == "none":
+        return client.client_secret_hash is None
+    if not client.client_secret_hash or not presented:
+        return False
+    return hmac.compare_digest(_sha256(presented), client.client_secret_hash)
+
+
+# --- Authorise: the pending transaction ---
+
+
+@dataclass(frozen=True)
+class Pending:
+    """An authorise request that passed every check and waits for the owner."""
+
+    id: str
+    client_id: str
+    # as the request gave it and `match_redirect` returned it, port included
+    redirect_uri: str
+    redirect_uri_explicit: bool
+    state: str | None
+    code_challenge: str
+    expires: float
+
+
+class PendingStore:
+    """Pending authorise transactions, in this process's memory: a restart drops them,
+    which cancels a link in progress and nothing else (§6.3). At most `PENDING_MAX`,
+    the oldest dropped first, each for `PENDING_LIFETIME_S` by the monotonic clock."""
+
+    def __init__(self) -> None:
+        self._held: OrderedDict[str, Pending] = OrderedDict()
+
+    def _expire(self) -> None:
+        now = time.monotonic()
+        for txn_id in [t for t, p in self._held.items() if p.expires <= now]:
+            del self._held[txn_id]
+
+    def add(self, **fields) -> Pending:
+        self._expire()
+        while len(self._held) >= PENDING_MAX:
+            self._held.popitem(last=False)
+        txn = Pending(
+            id=secrets.token_urlsafe(_SECRET_BYTES),
+            expires=time.monotonic() + PENDING_LIFETIME_S,
+            **fields,
+        )
+        self._held[txn.id] = txn
+        return txn
+
+    def get(self, txn_id: str) -> Pending | None:
+        """The transaction, left in place: for showing the consent page."""
+        self._expire()
+        return self._held.get(txn_id)
+
+    def take(self, txn_id: str) -> Pending | None:
+        """The transaction, removed: it can be approved once."""
+        self._expire()
+        return self._held.pop(txn_id, None)
+
+    def discard(self, txn_id: str) -> None:
+        self._held.pop(txn_id, None)
+
+    def reset(self) -> None:
+        self._held.clear()
+
+    def __len__(self) -> int:
+        self._expire()
+        return len(self._held)
+
+
+pending = PendingStore()
+
+
+def begin_authorisation(
+    *,
+    client_id: str,
+    redirect_uri: str,
+    redirect_uri_explicit: bool,
+    state: str | None,
+    code_challenge: str,
+    resource: str | None,
+    public_base_url: str,
+) -> Pending:
+    """Keep an authorise request for the owner's decision, or refuse it.
+
+    The SDK's handler has already found the client, matched the redirect URI
+    (`match_redirect`, through the client it was handed) and checked the scopes asked
+    against the registration. Checked here: that linking is open, that `resource`, when
+    present, names this server (`invalid_target`, so no consent page is shown for a
+    client that reached the server under another name), and that the PKCE challenge
+    and `state` are of a size worth holding. The scopes asked are not kept: what a
+    grant may do is the owner's choice when the link is opened (§6.5).
+    """
+    if not linking_open():
+        raise Refused("access_denied", LINKING_CLOSED)
+    if not names_this_server(resource, public_base_url):
+        raise Refused("invalid_target", "resource does not name this server")
+    if not _CHALLENGE_FORM.fullmatch(code_challenge):
+        raise Refused("invalid_request", "code_challenge is not an S256 challenge")
+    if state is not None and len(state) > STATE_MAX:
+        raise Refused("invalid_request", f"state is longer than {STATE_MAX} characters")
+    return pending.add(
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        redirect_uri_explicit=redirect_uri_explicit,
+        state=state,
+        code_challenge=code_challenge,
+    )
+
+
+def _with_query(uri: str, **params: str | None) -> str:
+    """`uri` with the parameters that are set added to its query."""
+    parts = urlsplit(uri)
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    query += [(name, value) for name, value in params.items() if value is not None]
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
+
+# --- Tokens ---
+
+
+def grant_scopes(grant: OAuthGrant) -> list[str]:
+    """The scopes a token of this grant carries now, asked each time one is loaded.
+
+    `ipam:read` alone, for every grant: until #28 adds its rule here (`ipam:write` only
+    while the grant has `can_write` and `MCP_REMOTE_WRITES` is on), no grant writes
+    through `/mcp`, whichever of #27 and #28 merges first.
+    """
+    return [SCOPE_READ]
+
+
+def _issue(session: AsyncSession, grant_id: str, kind: str, now: datetime, **fields) -> str:
+    """A new code or token of the grant, added to the session. Returns the plain value,
+    which goes into one answer and is never stored."""
+    lifetime = {"code": CODE_LIFETIME, "access": ACCESS_LIFETIME, "refresh": REFRESH_LIFETIME}
+    plain = _PREFIXES[kind] + secrets.token_urlsafe(_SECRET_BYTES)
+    session.add(
+        OAuthToken(
+            token_hash=_sha256(plain),
+            grant_id=grant_id,
+            kind=kind,
+            created_at=now,
+            expires_at=now + lifetime[kind],
+            **fields,
+        )
+    )
+    return plain
+
+
+@dataclass(frozen=True)
+class Issued:
+    """A token answer: the plain values, shown once."""
+
+    access_token: str
+    refresh_token: str | None
+    expires_in: int
+    scopes: list[str]
+
+
+async def _issue_pair(
+    session: AsyncSession, grant: OAuthGrant, client: OAuthClient, now: datetime
+) -> Issued:
+    """A new access token for the grant, and a refresh token when the client registered
+    for one. The caller holds the write lock. Before it adds them, the grant's expired
+    rows are deleted, and its oldest past `GRANT_TOKENS_MAX`."""
+    await session.execute(
+        delete(OAuthToken)
+        .where(OAuthToken.grant_id == grant.id, OAuthToken.expires_at <= now)
+        .execution_options(synchronize_session=False)
+    )
+    past_cap = (
+        select(OAuthToken.id)
+        .where(OAuthToken.grant_id == grant.id)
+        .order_by(OAuthToken.created_at.desc(), OAuthToken.id)
+        .offset(GRANT_TOKENS_MAX - 2)
+    )
+    await session.execute(
+        delete(OAuthToken)
+        .where(OAuthToken.id.in_(past_cap))
+        .execution_options(synchronize_session=False)
+    )
+    access = _issue(session, grant.id, "access", now)
+    refresh = None
+    if "refresh_token" in client.grant_types:
+        refresh = _issue(session, grant.id, "refresh", now)
+    return Issued(
+        access_token=access,
+        refresh_token=refresh,
+        expires_in=int(ACCESS_LIFETIME.total_seconds()),
+        scopes=grant_scopes(grant),
+    )
+
+
+async def _find(
+    session: AsyncSession, plain: str, kind: str, *, fresh: bool = False
+) -> tuple[OAuthToken, OAuthGrant] | None:
+    """The stored row for a presented value of `kind`, with its grant. A value not in
+    the form the server issues for that kind is not looked up."""
+    if not TOKEN_FORMS[kind].fullmatch(plain):
+        return None
+    query = (
+        select(OAuthToken, OAuthGrant)
+        .join(OAuthGrant, OAuthGrant.id == OAuthToken.grant_id)
+        .where(OAuthToken.token_hash == _sha256(plain), OAuthToken.kind == kind)
+    )
+    if fresh:
+        query = query.execution_options(populate_existing=True)
+    row = (await session.execute(query)).first()
+    return (row[0], row[1]) if row is not None else None
+
+
+async def _touch(session: AsyncSession, grant_id: str, now: datetime) -> None:
+    """Move the grant's `last_used_at`, at most once per `LAST_USED_GRANULARITY`: the
+    condition is in the statement, so requests that race write it once."""
+    stale = now - LAST_USED_GRANULARITY
+    await session.execute(
+        update(OAuthGrant)
+        .where(
+            OAuthGrant.id == grant_id,
+            or_(OAuthGrant.last_used_at.is_(None), OAuthGrant.last_used_at <= stale),
+        )
+        .values(last_used_at=now)
+        .execution_options(synchronize_session=False)
+    )
+
+
+async def approve(session: AsyncSession, txn_id: str, *, can_write: bool) -> str:
+    """Record the grant for a pending authorise transaction and issue its code: the
+    step the consent handler takes once the owner's link code is accepted (#27).
+
+    The caller is the authority for the approval; this function asks nobody. It takes
+    the transaction, so one approval is all it gets, and in one transaction under the
+    write lock stores the grant with the redirect URI the request was authorised for,
+    the single-use code bound to the request's PKCE challenge, the client's
+    `linked_at` when this is its first link, and the audit entry. Returns the URL that
+    sends the browser back to the client, with the code and the client's `state`.
+
+    `Refused` (`access_denied`) when the transaction is unknown, already taken or
+    expired, or its registration is gone; nothing is written then.
+    """
+    txn = pending.take(txn_id)
+    if txn is None:
+        raise Refused("access_denied", "this authorisation request is no longer pending")
+    try:
+        await scans.take_write_lock(session)
+        client = await session.get(OAuthClient, txn.client_id, populate_existing=True)
+        if client is None:
+            await session.rollback()
+            raise Refused("access_denied", "the client's registration no longer exists")
+        now = _now()
+        grant = OAuthGrant(
+            client_id=client.client_id,
+            redirect_uri=txn.redirect_uri,
+            can_write=can_write,
+            created_at=now,
+        )
+        session.add(grant)
+        await session.flush()
+        code = _issue(
+            session,
+            grant.id,
+            "code",
+            now,
+            code_challenge=txn.code_challenge,
+            redirect_uri_explicit=txn.redirect_uri_explicit,
+        )
+        if client.linked_at is None:
+            client.linked_at = now
+        changes.record(
+            session,
+            entity_type="grant",
+            entity_id=grant.id,
+            action="create",
+            summary=f"{'read-write' if can_write else 'read-only'} grant issued to a linked client",
+            source=AUDIT_SOURCE,
+            actor=actor_for(client),
+            after=changes.snapshot(grant),
+        )
+        await session.commit()
+    except OperationalError as exc:
+        await session.rollback()
+        raise database_unavailable("oauth grant", exc) from exc
+    return _with_query(txn.redirect_uri, code=code, state=txn.state)
+
+
+@dataclass(frozen=True)
+class CodeInfo:
+    """An authorisation code as the SDK's token handler needs it, to check the client,
+    the expiry, the redirect URI and PKCE before it asks for the exchange."""
+
+    client_id: str
+    expires_at: datetime
+    code_challenge: str
+    redirect_uri: str
+    redirect_uri_explicit: bool
+    scopes: list[str]
+
+
+async def load_code(session: AsyncSession, client_id: str, plain: str) -> CodeInfo | None:
+    """The unused code of an unrevoked grant of this client, or None. Only reads: the
+    code is spent by `exchange_code`, which checks all of this again as it claims it."""
+    found = await _find(session, plain, "code")
+    if found is None:
+        return None
+    token, grant = found
+    if grant.client_id != client_id or grant.revoked_at is not None or token.used_at is not None:
+        return None
+    return CodeInfo(
+        client_id=grant.client_id,
+        expires_at=utc(token.expires_at),
+        code_challenge=token.code_challenge or "",
+        redirect_uri=grant.redirect_uri,
+        redirect_uri_explicit=bool(token.redirect_uri_explicit),
+        scopes=grant_scopes(grant),
+    )
+
+
+async def exchange_code(session: AsyncSession, client_id: str, plain: str) -> Issued:
+    """Spend an authorisation code for the grant's first tokens.
+
+    The SDK's handler has authenticated the client and verified the redirect URI and
+    PKCE against `load_code`'s answer. Here, under the write lock, the code is claimed
+    with a compare-and-set that requires it unused, unexpired, and its grant this
+    client's and unrevoked, at the claim's own time: two exchanges of one code cannot
+    both pass. `Refused` (`invalid_grant`) otherwise, with nothing written.
+    """
+    try:
+        await scans.take_write_lock(session)
+        now = _now()
+        found = await _find(session, plain, "code", fresh=True)
+        usable_grant = exists().where(
+            OAuthGrant.id == OAuthToken.grant_id,
+            OAuthGrant.client_id == client_id,
+            OAuthGrant.revoked_at.is_(None),
+        )
+        claimed = False
+        if found is not None:
+            result = await session.execute(
+                update(OAuthToken)
+                .where(
+                    OAuthToken.id == found[0].id,
+                    OAuthToken.kind == "code",
+                    OAuthToken.used_at.is_(None),
+                    OAuthToken.expires_at > now,
+                    usable_grant,
+                )
+                .values(used_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            claimed = result.rowcount == 1
+        client = await session.get(OAuthClient, client_id, populate_existing=True)
+        if not claimed or client is None:
+            await session.rollback()
+            raise Refused("invalid_grant", "authorization code does not exist")
+        grant = found[1]
+        issued = await _issue_pair(session, grant, client, now)
+        await _touch(session, grant.id, now)
+        await session.commit()
+    except OperationalError as exc:
+        await session.rollback()
+        raise database_unavailable("oauth code exchange", exc) from exc
+    return issued
+
+
+@dataclass(frozen=True)
+class RefreshInfo:
+    client_id: str
+    expires_at: datetime
+    # the most a refresh request may ask for; what it gets is `grant_scopes`
+    scopes: list[str]
+
+
+async def load_refresh(session: AsyncSession, client_id: str, plain: str) -> RefreshInfo | None:
+    """A refresh token of an unrevoked grant of this client, or None. Only reads, and
+    answers for a token that has been rotated too: `exchange_refresh` is where a retry
+    is told from a reuse, and it must be reached to revoke the grant."""
+    found = await _find(session, plain, "refresh")
+    if found is None:
+        return None
+    token, grant = found
+    if grant.client_id != client_id or grant.revoked_at is not None:
+        return None
+    return RefreshInfo(
+        client_id=grant.client_id, expires_at=utc(token.expires_at), scopes=list(VALID_SCOPES)
+    )
+
+
+async def revoke_grant(
+    session: AsyncSession,
+    grant: OAuthGrant,
+    client: OAuthClient | None,
+    now: datetime,
+    *,
+    summary: str,
+    source: str,
+) -> None:
+    """Revoke a grant and delete its codes and tokens, which are refused from the
+    commit on, with the audit entry; does not commit. The caller holds the write lock
+    and has read the grant under it."""
+    before = changes.snapshot(grant)
+    grant.revoked_at = now
+    await session.execute(
+        delete(OAuthToken)
+        .where(OAuthToken.grant_id == grant.id)
+        .execution_options(synchronize_session=False)
+    )
+    changes.record(
+        session,
+        entity_type="grant",
+        entity_id=grant.id,
+        action="revoke",
+        summary=summary,
+        source=source,
+        actor=actor_for(client),
+        before=before,
+        after=changes.snapshot(grant),
+    )
+
+
+async def exchange_refresh(session: AsyncSession, client_id: str, plain: str) -> Issued:
+    """Exchange a refresh token for a new access and refresh token (spec §6.4).
+
+    Everything is read and decided under the write lock, so two requests with one
+    token are served one after the other. A token used for the first time is rotated
+    and answered with a new pair. One presented again within `REFRESH_RETRY_WINDOW` of
+    its rotation is a retry and is answered with another new pair. One presented later
+    than that revokes the whole grant, which is committed and audit-logged
+    (`entity_type="grant"`, `source="oauth"`) before the request is refused.
+    `Refused` (`invalid_grant`) for a token that is unknown, expired, another client's
+    or of a revoked grant, with nothing written.
+    """
+    try:
+        await scans.take_write_lock(session)
+        now = _now()
+        found = await _find(session, plain, "refresh", fresh=True)
+        client = await session.get(OAuthClient, client_id, populate_existing=True)
+        if (
+            found is None
+            or client is None
+            or found[1].client_id != client_id
+            or found[1].revoked_at is not None
+            or utc(found[0].expires_at) <= now
+        ):
+            await session.rollback()
+            raise Refused("invalid_grant", "refresh token does not exist")
+        token, grant = found
+        if token.rotated_at is None:
+            token.rotated_at = now
+        elif now - utc(token.rotated_at) > REFRESH_RETRY_WINDOW:
+            await revoke_grant(
+                session,
+                grant,
+                client,
+                now,
+                summary="grant revoked: a refresh token was used again after it had been replaced",
+                source=AUDIT_SOURCE,
+            )
+            await session.commit()
+            raise Refused("invalid_grant", "refresh token does not exist")
+        issued = await _issue_pair(session, grant, client, now)
+        await _touch(session, grant.id, now)
+        await session.commit()
+    except OperationalError as exc:
+        await session.rollback()
+        raise database_unavailable("oauth refresh", exc) from exc
+    return issued
+
+
+@dataclass(frozen=True)
+class AccessInfo:
+    client_id: str
+    grant_id: str
+    expires_at: datetime
+    scopes: list[str]
+
+
+async def load_access(session: AsyncSession, plain: str) -> AccessInfo | None:
+    """The grant a bearer on `/mcp` acts for, or None when it is not an unexpired
+    access token of an unrevoked grant.
+
+    The lookup only reads. The grant's `last_used_at` is then written when the value
+    read is unset or `LAST_USED_GRANULARITY` old, so a token used at request rate
+    drives no write statement; it is a heartbeat, in a transaction of its own, and a
+    database that refuses it does not refuse the request.
+    """
+    found = await _find(session, plain, "access")
+    if found is None:
+        return None
+    token, grant = found
+    now = _now()
+    if grant.revoked_at is not None or utc(token.expires_at) <= now:
+        return None
+    info = AccessInfo(
+        client_id=grant.client_id,
+        grant_id=grant.id,
+        expires_at=utc(token.expires_at),
+        scopes=grant_scopes(grant),
+    )
+    last = utc(grant.last_used_at)
+    if last is None or last <= now - LAST_USED_GRANULARITY:
+        try:
+            await _touch(session, grant.id, now)
+            await session.commit()
+        except OperationalError as exc:
+            await session.rollback()
+            log.warning(
+                "oauth: last contact of a grant not recorded (%s)", type(exc.orig).__name__
+            )
+    return info

@@ -628,3 +628,98 @@ def test_the_image_refuses_a_db_path_that_is_not_a_path_before_serving(tmp_path,
     assert "Uvicorn running on" not in stderr and "Application startup complete" not in stderr
     assert db_path not in stderr and str(data) not in stderr
     assert list(workdir.iterdir()) == []
+
+
+# --- PUBLIC_BASE_URL (v0.2 spec §6.7, #26) ---------------------------------------------
+
+# A host no test file and no message of the server holds, so a test can tell whether a
+# refusal repeats the value
+PUBLIC_HOST = "ipam-" + secrets.token_hex(8) + ".example.com"
+PUBLIC_BASE_URLS = {
+    "an https origin": f"https://{PUBLIC_HOST}",
+    "with a port": f"https://{PUBLIC_HOST}:8443",
+    "an IP address": "https://192.0.2.10",
+    "http to localhost": "http://localhost:8080",
+    "http to 127.0.0.1": "http://127.0.0.1:8080",
+    "http to [::1]": "http://[::1]:8080",
+}
+REFUSED_PUBLIC_BASE_URLS = {
+    "a trailing slash": f"https://{PUBLIC_HOST}/",
+    "a path": f"https://{PUBLIC_HOST}/ipam",
+    "the mount itself": f"https://{PUBLIC_HOST}/mcp",
+    "a query": f"https://{PUBLIC_HOST}?x=1",
+    "an empty query": f"https://{PUBLIC_HOST}?",
+    "a fragment": f"https://{PUBLIC_HOST}#top",
+    "plain http": f"http://{PUBLIC_HOST}",
+    "plain http to a private address": "http://192.168.1.10:8080",
+    "no scheme": PUBLIC_HOST,
+    "another scheme": f"ftp://{PUBLIC_HOST}",
+    "an upper-case host": f"https://{PUBLIC_HOST.upper()}",
+    "an upper-case scheme": f"HTTPS://{PUBLIC_HOST}",
+    "the default port written out": f"https://{PUBLIC_HOST}:443",
+    "an empty port": f"https://{PUBLIC_HOST}:",
+    "a port out of range": f"https://{PUBLIC_HOST}:99999",
+    "credentials": f"https://owner:secret@{PUBLIC_HOST}",
+    "a leading space": f" https://{PUBLIC_HOST}",
+    "a trailing space": f"https://{PUBLIC_HOST} ",
+    "a trailing newline": f"https://{PUBLIC_HOST}\n",
+    "only whitespace": "  ",
+    "a name not in its ASCII form": f"https://bücher.{PUBLIC_HOST}",
+    "an address in another spelling": "http://127.1:8080",
+    "no host": "https://",
+    "an unclosed bracket": "https://[::1",
+}
+
+
+@pytest.mark.parametrize("value", PUBLIC_BASE_URLS.values(), ids=PUBLIC_BASE_URLS.keys())
+def test_load_settings_accepts_a_public_origin(monkeypatch, value):
+    monkeypatch.setenv("PUBLIC_BASE_URL", value)
+    assert config.load_settings().public_base_url == value
+    # and it is the spelling the server publishes: nothing is normalised on the way
+    from pydantic import AnyHttpUrl
+
+    assert str(AnyHttpUrl(value)) == value + "/"
+
+
+@pytest.mark.parametrize("value", [UNSET, ""], ids=["unset", "empty"])
+def test_no_public_base_url_leaves_oauth_off(monkeypatch, value):
+    for name in [n for n in os.environ if n.upper() == "PUBLIC_BASE_URL"]:
+        monkeypatch.delenv(name)
+    if value is not UNSET:
+        monkeypatch.setenv("PUBLIC_BASE_URL", value)
+    assert config.load_settings().public_base_url == ""
+
+
+@pytest.mark.parametrize(
+    "value", REFUSED_PUBLIC_BASE_URLS.values(), ids=REFUSED_PUBLIC_BASE_URLS.keys()
+)
+def test_load_settings_refuses_a_public_base_url_that_is_not_the_origin_as_published(
+    monkeypatch, value
+):
+    """Refused, never trimmed or normalised: the value is the installation's identity,
+    which clients compare as a string. One fixed message, which repeats nothing of it."""
+    monkeypatch.setenv("PUBLIC_BASE_URL", value)
+    with pytest.raises(SystemExit) as refused:
+        config.load_settings()
+    assert str(refused.value.code) == f"TLG-IPAM will not start: {config.PUBLIC_BASE_URL_REFUSED}"
+    assert PUBLIC_HOST not in str(refused.value.code).lower()
+    assert "secret" not in str(refused.value.code)
+
+
+@pytest.mark.parametrize("start", STARTS.values(), ids=STARTS.keys())
+def test_uvicorn_refuses_to_start_with_a_malformed_public_base_url(tmp_path, start):
+    env = _child_env(tmp_path, REAL_KEY)
+    env["PUBLIC_BASE_URL"] = f"https://{PUBLIC_HOST}/"
+    module = ["uvicorn", "app.main:app"] if start is _uvicorn else ["app.serve"]
+    done = subprocess.run(
+        [sys.executable, "-m", *module, "--host", "127.0.0.1", "--port", "0"],
+        cwd=API_DIR,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=START_DEADLINE,
+    )
+    assert done.returncode == 1, done.stderr
+    assert config.PUBLIC_BASE_URL_REFUSED in done.stderr
+    assert PUBLIC_HOST not in done.stderr
+    assert "Uvicorn running on" not in done.stderr

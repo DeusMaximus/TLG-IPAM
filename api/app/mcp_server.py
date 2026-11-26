@@ -9,11 +9,13 @@ import functools
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.server.auth import AuthProvider, require_scopes
 from pydantic import ValidationError
 
-from .auth import OwnerKeyVerifier
+from .config import settings
 from .database import SessionLocal
 from .errors import ApiError
+from .oauth_provider import mcp_auth
 from .schemas import (
     AllocateRequest,
     ChangeOut,
@@ -29,29 +31,27 @@ from .services import changes as changes_svc
 from .services import device_types as device_types_svc
 from .services import findings as findings_svc
 from .services import hosts as hosts_svc
+from .services import oauth as oauth_svc
 from .services import scans as scans_svc
 from .services import sections as sections_svc
 from .services import subnets as subnets_svc
 
-mcp = FastMCP(
-    "TLG-IPAM",
-    instructions=(
-        "TLG-IPAM is the user's standalone homelab IP address manager — the "
-        "authoritative record of their sections (network segments), subnets, and "
-        "host/IP assignments. It is not phpIPAM, NetBox, or a UniFi controller; use "
-        "these tools directly for any query or change involving the user's IP "
-        "addresses, subnets, VLANs, hostnames, or MAC addresses. Writes are audited; "
-        "use list_changes to review what was done."
-    ),
-    # Bearer auth on the HTTP app (`/mcp`). In-process clients, as in the tests,
-    # skip it: FastMCP applies it only at the HTTP layer.
-    auth=OwnerKeyVerifier(),
+INSTRUCTIONS = (
+    "TLG-IPAM is the user's standalone homelab IP address manager — the "
+    "authoritative record of their sections (network segments), subnets, and "
+    "host/IP assignments. It is not phpIPAM, NetBox, or a UniFi controller; use "
+    "these tools directly for any query or change involving the user's IP "
+    "addresses, subnets, VLANs, hostnames, or MAC addresses. Writes are audited; "
+    "use list_changes to review what was done."
 )
 
+# Every tool, in the order defined, with whether it writes. `build_mcp` registers them.
+_TOOLS: list[tuple] = []
 
-def ipam_tool(fn):
-    """Register an MCP tool, translating domain/validation errors into ToolErrors
-    so Claude sees the actual message instead of a masked internal error."""
+
+def _translating(fn):
+    """`fn` with domain and validation errors turned into ToolErrors, so Claude sees
+    the actual message instead of a masked internal error."""
 
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs):
@@ -64,7 +64,34 @@ def ipam_tool(fn):
             field = ".".join(str(p) for p in first["loc"])
             raise ToolError(f"{field}: {first['msg']}") from None
 
-    return mcp.tool(wrapper)
+    return wrapper
+
+
+def ipam_tool(fn):
+    """An MCP tool that only reads. Any caller `/mcp` lets in may use it."""
+    wrapper = _translating(fn)
+    _TOOLS.append((wrapper, False))
+    return wrapper
+
+
+def ipam_write_tool(fn):
+    """An MCP tool that changes something, a request for a scan included. It requires
+    the `ipam:write` scope through FastMCP's own check (spec §6.5): the owner key
+    carries it, and a grant's token carries what `services/oauth.grant_scopes` says.
+    To a caller without it the tool is not listed, and a call answers `Unknown tool`.
+    Every tool is registered through this or `ipam_tool`, so each is one or the other.
+    """
+    wrapper = _translating(fn)
+    _TOOLS.append((wrapper, True))
+    return wrapper
+
+
+def build_mcp(auth: AuthProvider) -> FastMCP:
+    """The MCP server with every tool, guarded on its HTTP app (`/mcp`) by `auth`."""
+    server = FastMCP("TLG-IPAM", instructions=INSTRUCTIONS, auth=auth)
+    for fn, writes in _TOOLS:
+        server.tool(fn, auth=require_scopes(oauth_svc.SCOPE_WRITE) if writes else None)
+    return server
 
 
 # shared serialisers: same shapes as the REST API
@@ -102,7 +129,7 @@ async def list_device_types() -> dict:
         }
 
 
-@ipam_tool
+@ipam_write_tool
 async def add_reserved_range(
     subnet_id: str, start_ip: str, end_ip: str, description: str | None = None
 ) -> dict:
@@ -118,7 +145,7 @@ async def add_reserved_range(
         return {"reserved_range": ReservedRangeOut.model_validate(block).model_dump()}
 
 
-@ipam_tool
+@ipam_write_tool
 async def delete_reserved_range(subnet_id: str, range_id: str) -> dict:
     """Remove a reserved range from a subnet, returning its addresses to the automatic
     allocation pool. Find range IDs via get_subnet (reserved_ranges field). A range with
@@ -188,7 +215,7 @@ async def get_host(host_id: str) -> dict:
         return {"host": await _host(session, await hosts_svc.get_host(session, host_id))}
 
 
-@ipam_tool
+@ipam_write_tool
 async def create_host(
     subnet_id: str,
     ip: str,
@@ -229,7 +256,7 @@ async def create_host(
         return {"host": await _host(session, host)}
 
 
-@ipam_tool
+@ipam_write_tool
 async def allocate_next_ip(
     subnet_id: str,
     hostname: str,
@@ -258,7 +285,7 @@ async def allocate_next_ip(
         return {"host": await _host(session, host)}
 
 
-@ipam_tool
+@ipam_write_tool
 async def bulk_create_hosts(subnet_id: str, hosts: list[dict]) -> dict:
     """Create many host records in one subnet in a single call — use this instead of
     repeated create_host calls when importing or registering several devices at once
@@ -293,7 +320,7 @@ async def bulk_create_hosts(subnet_id: str, hosts: list[dict]) -> dict:
         return await hosts_svc.bulk_create(session, subnet_id, hosts, source="mcp")
 
 
-@ipam_tool
+@ipam_write_tool
 async def bulk_delete_hosts(host_ids: list[str]) -> dict:
     """Delete many host records in one call, freeing their IPs — use instead of
     repeated delete_host calls when cleaning up several hosts at once (max 1000).
@@ -307,7 +334,7 @@ async def bulk_delete_hosts(host_ids: list[str]) -> dict:
         return await hosts_svc.bulk_delete(session, host_ids, source="mcp")
 
 
-@ipam_tool
+@ipam_write_tool
 async def update_host(
     host_id: str,
     ip: str | None = None,
@@ -357,7 +384,7 @@ async def update_host(
         return {"host": await _host(session, host)}
 
 
-@ipam_tool
+@ipam_write_tool
 async def delete_host(host_id: str) -> dict:
     """Remove a host record, freeing its IP address for future allocation."""
     async with SessionLocal() as session:
@@ -371,16 +398,20 @@ async def delete_host(host_id: str) -> dict:
 async def list_changes(entity_type: str | None = None, limit: int = 20) -> dict:
     """Recent changes to the IPAM (audit log), newest first. Each entry records what
     changed, before/after snapshots, and where it came from (source): the UI, the REST
-    API, MCP, or a scan agent's own check-in (agent). actor names who acted when that
-    is narrower than source: null for the owner's own writes, agent:<name> for an
-    agent. Use to answer "what changed recently?" or to review earlier MCP-driven
-    edits. entity_type filters to:
-    section|subnet|host|device_type|agent|token|scan_target. Reserved-range writes,
-    including a range's scan exclusion, are logged under subnet. In agent snapshots,
-    the values an agent reports about itself (version, platform, hostname,
-    interfaces) are withheld; the summary still names the fields that changed.
-    Heartbeats (check-in and token-use times) and job scheduling are not logged, and
-    an agent keeps only its newest 100 entries of its own."""
+    API, MCP, a scan agent's own check-in (agent), or the server's own OAuth server
+    (oauth: a remote client's link granted, or revoked because one of its refresh
+    tokens was used twice). actor names who acted when that is narrower than source:
+    null for the owner's own writes, agent:<name> for an agent, grant:<client name>
+    for a linked client, a name the client chose for itself. Use to answer "what
+    changed recently?" or to review earlier MCP-driven edits. entity_type filters to:
+    section|subnet|host|device_type|agent|token|scan_target|grant. Reserved-range
+    writes, including a range's scan exclusion, are logged under subnet. In agent
+    snapshots, the values an agent reports about itself (version, platform, hostname,
+    interfaces) are withheld, and in grant snapshots the redirect URI the client
+    chose; the summary still names the fields that changed. Heartbeats (check-in,
+    token-use and last-contact times), job scheduling, and an OAuth client's
+    registration and token refreshes are not logged, and an agent keeps only its
+    newest 100 entries of its own."""
     async with SessionLocal() as session:
         rows = await changes_svc.list_changes(session, entity_type=entity_type, limit=limit)
         return {
@@ -439,7 +470,7 @@ async def list_scan_findings(
         }
 
 
-@ipam_tool
+@ipam_write_tool
 async def request_scan(subnet_id: str) -> dict:
     """Ask for a network scan of one subnet now instead of at its next scheduled time.
     Only for a subnet already set up for scanning in the TLG-IPAM web UI (a scan target
@@ -454,3 +485,9 @@ async def request_scan(subnet_id: str) -> dict:
     async with SessionLocal() as session:
         target = await scans_svc.request_scan(session, subnet_id, source="mcp")
         return {"scan_request": scans_svc.scan_request_out(target)}
+
+
+# Bearer auth on the HTTP app (`/mcp`): the owner key, and with `PUBLIC_BASE_URL` set
+# the built-in OAuth server beside it. A tool's scope check applies to every caller
+# but one on stdio, an in-process client included: one with no token sees no write tool.
+mcp = build_mcp(mcp_auth(settings.public_base_url))

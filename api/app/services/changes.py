@@ -7,14 +7,16 @@ from ..models import Change
 from ..times import utc
 
 # internal columns kept out of audit snapshots; the audit log is readable over MCP,
-# so a token's hash never goes in it, nor the error text an agent reported with its
-# last result set (`scan_targets.last_scan_error`, spec §7.2 invariant 8)
+# so a token's hash never goes in it (an agent's, an OAuth code's or token's, or an
+# OAuth client secret's), nor the error text an agent reported with its last result
+# set (`scan_targets.last_scan_error`, spec §7.2 invariant 8)
 _SNAPSHOT_EXCLUDE = {
     "ip_int",
     "start_int",
     "end_int",
     "name_key",
     "token_hash",
+    "client_secret_hash",
     "last_scan_error",
     # the names a leased job was sent (`scan_targets.job_fdns`): up to a job's worth of
     # FQDNs, scheduling state that is cleared with the lease
@@ -27,6 +29,15 @@ _SNAPSHOT_EXCLUDE = {
 # there (spec §7.2, invariant 8). Owner REST shows them.
 AGENT_REPORTED_FIELDS = ("version", "platform", "hostname", "interfaces")
 WITHHELD = "(reported by the agent; withheld over MCP, shown in the web UI)"
+# What an OAuth client chose and a `grant` snapshot keeps: the redirect URI its link
+# was approved through, whose path and query are the client's own text (#26). Withheld
+# over MCP by the same rule.
+CLIENT_SUPPLIED_FIELDS = ("redirect_uri",)
+CLIENT_WITHHELD = "(supplied by the client; withheld over MCP, shown in the web UI)"
+_WITHHELD_OVER_MCP = {
+    "agent": (AGENT_REPORTED_FIELDS, WITHHELD),
+    "grant": (CLIENT_SUPPLIED_FIELDS, CLIENT_WITHHELD),
+}
 
 
 def snapshot(obj) -> dict:
@@ -78,16 +89,18 @@ async def list_changes(
 
 def assistant_view(change: dict) -> dict:
     """A serialised change as MCP returns it: in `agent` snapshots, whoever wrote the
-    entry, each agent-reported value that is set is replaced by WITHHELD. The field
-    names stay, so an assistant can still say what changed."""
-    if change.get("entity_type") != "agent":
+    entry, each agent-reported value that is set is replaced by WITHHELD, and in
+    `grant` snapshots the client's redirect URI by CLIENT_WITHHELD. The field names
+    stay, so an assistant can still say what changed."""
+    withheld = _WITHHELD_OVER_MCP.get(change.get("entity_type"))
+    if withheld is None:
         return change
+    fields, marker = withheld
     out = dict(change)
     for side in ("before", "after"):
         snap = out.get(side)
         if isinstance(snap, dict):
             out[side] = {
-                k: WITHHELD if k in AGENT_REPORTED_FIELDS and v is not None else v
-                for k, v in snap.items()
+                k: marker if k in fields and v is not None else v for k, v in snap.items()
             }
     return out
