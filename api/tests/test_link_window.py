@@ -805,6 +805,89 @@ async def test_a_request_whose_registration_was_reclaimed_shows_the_start_again_
     assert (await exchange(web, again, url.params["code"])).status_code == 200
 
 
+async def registered_at(web, when) -> dict:
+    client = await register(web)
+    async with SessionLocal() as session:
+        (await session.get(OAuthClient, client["client_id"])).created_at = when
+        await session.commit()
+    return client
+
+
+async def held_ids() -> set[str]:
+    return {c.client_id for c in await all_rows(OAuthClient)}
+
+
+@pytest.mark.parametrize("oldest", [True, False])
+async def test_at_the_cap_a_pending_request_does_not_change_what_is_reclaimed(web, oldest):
+    """#190, part 2: the registry at the cap, one registration holding the owner's
+    pending request. A new registration reclaims the oldest registration with no
+    unrevoked grant, by `created_at` alone, whether or not it has a request pending.
+    When that is the owner's client, the right code shows the start-again page, nothing
+    is written, the window stays open, and the client registers again and links with
+    the same code. When it is another, the owner's request links."""
+    from datetime import datetime, timedelta, timezone
+
+    window = await open_window(web)
+    start = datetime.now(timezone.utc) - timedelta(hours=2)
+    owners = await registered_at(web, start + timedelta(seconds=0 if oldest else 30))
+    txn = transaction(await authorise(web, owners))
+    page = await consent_page(web, txn)
+    assert page.status_code == 200
+    others = [
+        await registered_at(web, start + timedelta(seconds=1 + i))
+        for i in range(oauth.CLIENTS_MAX - 1)
+    ]
+    assert len(await held_ids()) == oauth.CLIENTS_MAX
+    newcomer = await register(web)
+    held = await held_ids()
+    assert len(held) == oauth.CLIENTS_MAX and newcomer["client_id"] in held
+    reclaimed = owners if oldest else others[0]
+    assert reclaimed["client_id"] not in held
+    assert oauth.pending.get(txn) is not None
+    res = await web.post(
+        "/mcp/consent", data={**hidden_fields(page.text), "code": window["code"], "action": "link"}
+    )
+    if not oldest:
+        assert res.status_code == 303
+        assert [g.client_id for g in await all_rows(OAuthGrant)] == [owners["client_id"]]
+        return
+    assert res.status_code == 409 and "Start again from the client" in res.text
+    assert await all_rows(OAuthGrant) == [] and await all_rows(OAuthToken) == []
+    # the change log holds the window's opening and nothing about a grant
+    assert [c.entity_type for c in await changes()] == ["link_window"]
+    state = await window_state(web)
+    assert state["open"] is True and state["wrong_codes"] == 0
+    again = await register(web)
+    url = await consent_with_code(web, again, window["code"])
+    assert (await exchange(web, again, url.params["code"])).status_code == 200
+
+
+async def test_an_outsider_ends_a_pending_request_without_touching_the_registry(web):
+    """Why #190 spares no registration for its pending request: the owner's request is
+    ended as surely, and more cheaply, through the pending store alone. One registration
+    of the outsider's and `PENDING_MAX` authorise requests push the owner's out of the
+    32 held, with no registration reclaimed; the right code then finds nothing pending,
+    and the window stays open for the owner to start again."""
+    window = await open_window(web)
+    owners = await register(web)
+    txn = transaction(await authorise(web, owners))
+    page = await consent_page(web, txn)
+    outsider = await register(web)
+    held = await held_ids()
+    for _ in range(oauth.PENDING_MAX):
+        transaction(await authorise(web, outsider))
+    assert await held_ids() == held and oauth.pending.get(txn) is None
+    res = await web.post(
+        "/mcp/consent", data={**hidden_fields(page.text), "code": window["code"], "action": "link"}
+    )
+    assert res.status_code == 410 and "no longer pending" in res.text
+    assert await all_rows(OAuthGrant) == []
+    state = await window_state(web)
+    assert state["open"] is True and state["wrong_codes"] == 0
+    url = await consent_with_code(web, owners, window["code"])
+    assert (await exchange(web, owners, url.params["code"])).status_code == 200
+
+
 async def test_the_page_of_a_request_whose_registration_was_reclaimed_says_start_again(web):
     await open_window(web)
     client = await register(web)

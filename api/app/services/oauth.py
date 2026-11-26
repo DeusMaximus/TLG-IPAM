@@ -48,7 +48,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import AnyUrl
-from sqlalchemy import delete, exists, func, or_, select, update
+from sqlalchemy import and_, delete, exists, func, or_, select, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -430,7 +430,16 @@ async def register_client(
 async def _make_room(session: AsyncSession) -> bool:
     """Leave room for one more registration, deleting the oldest reclaimable ones when
     `CLIENTS_MAX` are held. False when there are not enough to reclaim. The caller
-    holds the write lock."""
+    holds the write lock.
+
+    The order is `created_at` alone, and `pending` is never read (#190, spec §6.3): a
+    registration with an authorise request waiting for the owner is reclaimed like any
+    other, and a request added or dropped while this runs changes nothing it decides.
+    Sparing one would not protect the owner, who loses the request as surely to
+    `PENDING_MAX` authorise requests on any registration, and as a rule would let an
+    outsider's pending requests make this refuse while registrations are reclaimable.
+    A link never completed (`never_completed`) is unrevoked, so its registration is
+    not reclaimable until the owner revokes it."""
     held = await session.scalar(select(func.count()).select_from(OAuthClient))
     excess = held - CLIENTS_MAX + 1
     if excess <= 0:
@@ -655,6 +664,48 @@ def grant_scopes(grant: OAuthGrant, *, remote_writes: bool) -> list[str]:
     if grant.can_write and remote_writes:
         return [SCOPE_READ, SCOPE_WRITE]
     return [SCOPE_READ]
+
+
+def never_completed(now: datetime):
+    """SQL, over `OAuthGrant`: whether a grant is a link **never completed** at `now`
+    (spec §6.6, #190). The owner approved it, the server issued its code, and the code
+    expired with no exchange, so the grant holds no token and can never get one. It is
+    left for the owner: listed as a link, marked, until the owner revokes it, and its
+    registration holds its place in the registry until then.
+
+    True exactly when all three hold:
+
+    - the grant is unrevoked (`revoked_at` null);
+    - it has never been used (`last_used_at` null). The code exchange sets it in the
+      transaction that claims the code and stores the first tokens (`exchange_code`),
+      and nothing ever clears it;
+    - it has no row in `oauth_tokens` but codes, and none of those has time left: no
+      access or refresh token, expired or not, and no code with `expires_at` after
+      `now`, used or not.
+
+    Either of the last two alone excludes every grant that holds a token today: a grant
+    whose code was exchanged has its tokens' rows and `last_used_at`, from one commit.
+    Both are asked so that each guards the other: a later change that pruned expired
+    rows could not make a grant that lapsed after use (its tokens all expired, 30 days
+    unused) read as never completed, and a grant written with a token but no
+    `last_used_at` would not either. A grant that lapsed after use is not this case: it
+    was completed, and stays a link with its last contact, for the owner to judge.
+
+    The clock is the server's (`_now`), and the comparison with a code's `expires_at`
+    is the exact complement of the one `exchange_code` claims a code by (`expires_at >
+    now`): at any instant a code is claimable or the grant can be flagged, never both.
+    The rule only reads, and is judged here alone; `linked_clients.list_links` asks it
+    in its one statement. It revokes nothing, so a wrong answer could never take a
+    token from anyone: see that function for how fresh its answer is."""
+    holds_more_than_a_spent_code = exists().where(
+        OAuthToken.grant_id == OAuthGrant.id,
+        or_(OAuthToken.kind != "code", OAuthToken.expires_at > now),
+    )
+    return and_(
+        OAuthGrant.revoked_at.is_(None),
+        OAuthGrant.last_used_at.is_(None),
+        ~holds_more_than_a_spent_code,
+    )
 
 
 _LIFETIMES = {"code": CODE_LIFETIME, "access": ACCESS_LIFETIME, "refresh": REFRESH_LIFETIME}

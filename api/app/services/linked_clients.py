@@ -21,6 +21,10 @@ What the list says of a link, and why:
   read-only for every grant while `MCP_REMOTE_WRITES` is off (#28).
 - **Last contact** is the grant's `last_used_at`, moved by a request to `/mcp`, a code
   exchange or a refresh. A client moves it with nobody using it, so it is not use.
+- **Never completed** (`never_completed`, #190): the owner approved the link but the
+  client never exchanged its code, which has expired (`oauth.never_completed`). The
+  grant holds no token and can get none; it is left for the owner to revoke, and holds
+  its registration's place in the registry until then (spec §6.6).
 
 **Revoke** is the owner's act: `source` `ui` or `api`, `actor` null (spec §4.3), on the
 grant's entity (`entity_type="grant"`, `action="revoke"`), with a fixed summary that
@@ -57,9 +61,15 @@ def _now() -> datetime:
 
 
 def link_out(
-    grant: OAuthGrant, client: OAuthClient | None, *, remote_writes: bool
+    grant: OAuthGrant,
+    client: OAuthClient | None,
+    *,
+    remote_writes: bool,
+    never_completed: bool = False,
 ) -> dict:
-    """One link as the owner's routes answer with it."""
+    """One link as the owner's routes answer with it. `never_completed` is
+    `oauth.never_completed` as the list's statement read it; a revoked link is never
+    one (the rule is about links that still hold a place)."""
     revoked = grant.revoked_at is not None
     return {
         "id": grant.id,
@@ -73,11 +83,12 @@ def link_out(
         "created_at": utc(grant.created_at),
         "last_used_at": utc(grant.last_used_at),
         "revoked_at": utc(grant.revoked_at),
+        "never_completed": bool(never_completed) and not revoked,
     }
 
 
-def _with_client():
-    return select(OAuthGrant, OAuthClient).outerjoin(
+def _with_client(*columns):
+    return select(OAuthGrant, OAuthClient, *columns).outerjoin(
         OAuthClient, OAuthClient.client_id == OAuthGrant.client_id
     )
 
@@ -89,7 +100,18 @@ async def list_links(session: AsyncSession, *, remote_writes: bool) -> list[dict
     read snapshot, and a revoke or a link committed between two would put one grant in
     the answer twice, or an answer no moment of the database held (round 1 of #195's
     briefed review). The newest revoked are chosen by a subquery of the same
-    statement; the two groups are put in order here."""
+    statement, and whether each link was never completed (`oauth.never_completed`) is a
+    column of it; the two groups are put in order here.
+
+    The never-completed column is read by the server's clock just before the
+    statement, without the write lock, as the rest of the list is: one snapshot, in
+    which an exchange is either wholly committed (its claim, its tokens and
+    `last_used_at`, one transaction) or absent. It can therefore be stale only for an
+    exchange whose claim had passed, under the lock, by a clock reading earlier than
+    this one and had not committed when the statement read: that answer marks it never
+    completed, and the next marks it completed. It never removes a link from the
+    answer, and nothing acts on it but the owner."""
+    now = _now()
     newest_revoked = (
         select(OAuthGrant.id)
         .where(OAuthGrant.revoked_at.is_not(None))
@@ -98,7 +120,7 @@ async def list_links(session: AsyncSession, *, remote_writes: bool) -> list[dict
     )
     rows = (
         await session.execute(
-            _with_client()
+            _with_client(oauth.never_completed(now).label("never_completed"))
             .where(
                 or_(OAuthGrant.revoked_at.is_(None), OAuthGrant.id.in_(newest_revoked))
             )
@@ -114,7 +136,8 @@ async def list_links(session: AsyncSession, *, remote_writes: bool) -> list[dict
         key=lambda row: (_desc(row[0].revoked_at), row[0].id),
     )
     return [
-        link_out(grant, client, remote_writes=remote_writes) for grant, client in live + revoked
+        link_out(grant, client, remote_writes=remote_writes, never_completed=flag)
+        for grant, client, flag in live + revoked
     ]
 
 

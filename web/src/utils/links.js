@@ -97,6 +97,16 @@ export function nameText(link) {
   return link.client_registered ? 'no name this server keeps' : 'registration deleted'
 }
 
+// What the list says of a link the owner approved whose client never collected its
+// tokens: the code the approval issued expired unexchanged (`never_completed`, from the
+// server, #190). It holds no token and can get none, and it holds its registration's
+// place among the 50 until it is revoked. Null for any other link: the page never works
+// this out from the times it is given
+export function neverCompletedNote(link) {
+  if (!link || !link.never_completed || link.revoked_at) return null
+  return 'Never completed: the client did not collect its tokens before the code from your approval expired. It holds no token and cannot get one. Revoke it to free its place; link the client again if you still want it.'
+}
+
 export const liveLinks = (links) => (links || []).filter((l) => !l.revoked_at)
 export const revokedLinks = (links) => (links || []).filter((l) => l.revoked_at)
 

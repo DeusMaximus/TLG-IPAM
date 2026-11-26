@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest'
-import { access, countdown, endedOutcome, groupedCode, nameText, sameWindow, windowLeft } from './links'
+import {
+  access,
+  countdown,
+  endedOutcome,
+  groupedCode,
+  nameText,
+  neverCompletedNote,
+  sameWindow,
+  windowLeft,
+} from './links'
 
 describe('windowLeft', () => {
   const state = { open: true, expires_in_s: 600, askedAt: 1000, arrivedAt: 1200 }
@@ -47,6 +56,19 @@ describe('access', () => {
     expect(off.label).toBe('Read-only now')
     expect(off.note).toMatch(/MCP_REMOTE_WRITES/)
     expect(access({ can_write: true, writes: false, revoked_at: 'x' }).note).toBeNull()
+  })
+})
+
+describe('neverCompletedNote', () => {
+  it('speaks only when the server says the link was never completed', () => {
+    expect(neverCompletedNote({ never_completed: true, revoked_at: null })).toMatch(
+      /^Never completed: the client did not collect its tokens/
+    )
+    expect(neverCompletedNote({ never_completed: true, revoked_at: null })).toMatch(/free its place/)
+    expect(neverCompletedNote({ never_completed: false, revoked_at: null })).toBeNull()
+    // never worked out from the times: no flag, no note, whatever last_used_at says
+    expect(neverCompletedNote({ last_used_at: null, revoked_at: null })).toBeNull()
+    expect(neverCompletedNote({ never_completed: true, revoked_at: 'x' })).toBeNull()
   })
 })
 
