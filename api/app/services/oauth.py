@@ -41,11 +41,11 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import AnyUrl
-from sqlalchemy import delete, exists, or_, select, update
+from sqlalchemy import delete, exists, func, or_, select, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..errors import database_unavailable
+from ..errors import ApiError, database_unavailable
 from ..models import OAuthClient, OAuthGrant, OAuthToken
 from ..times import utc
 from . import changes, scans
@@ -74,14 +74,18 @@ REFRESH_RETRY_WINDOW = timedelta(seconds=60)
 # A grant's `last_used_at` is written at most this often, as an agent token's is
 LAST_USED_GRANULARITY = timedelta(seconds=10)
 
-# The rows one grant may hold in `oauth_tokens`. A client that refreshes once an hour
-# holds about 720 rotated refresh tokens after 30 days, each kept until it expires so
-# that its reuse is noticed, and one or two access tokens. Issuing past the cap deletes
-# the grant's oldest rows first, so a client that refreshes in a loop, or replays one
-# token throughout its retry window, cannot grow the table without bound; what it
-# loses is the reuse detection of its own oldest tokens, which are then unknown and
-# refused.
-GRANT_TOKENS_MAX = 1024
+# How often one grant is issued tokens: at most this many pairs in any `ISSUE_WINDOW`,
+# the code exchange included. It is what bounds the rows a grant holds in
+# `oauth_tokens`, and it bounds them by time: a rotated refresh token is kept until it
+# expires, because presenting it again is how a stolen one is noticed, so no row that
+# has not expired is ever deleted to make room (a cap on the row count was, and whoever
+# held a stolen token could refresh past it and erase the evidence, PR #189). At most
+# `ISSUES_PER_WINDOW` x 720 hours = 8,640 unexpired refresh tokens, and as many access
+# tokens as one window issues. A client that refreshes once an hour, or every ten
+# minutes, never meets the limit; one refused by it holds an access token issued
+# within the hour, which still works, and its refresh token is not rotated.
+ISSUES_PER_WINDOW = 12
+ISSUE_WINDOW = ACCESS_LIFETIME
 
 # What a registration may hold. Gemini registers six redirect URIs (§6.8).
 REDIRECT_URIS_MAX = 16
@@ -522,26 +526,38 @@ class Issued:
     scopes: list[str]
 
 
+async def _issued_lately(session: AsyncSession, grant_id: str, now: datetime) -> int:
+    """How many pairs the grant was issued in the last `ISSUE_WINDOW`: its access
+    tokens made since then, one to an issue."""
+    return await session.scalar(
+        select(func.count())
+        .select_from(OAuthToken)
+        .where(
+            OAuthToken.grant_id == grant_id,
+            OAuthToken.kind == "access",
+            OAuthToken.created_at > now - ISSUE_WINDOW,
+        )
+    )
+
+
+def _issued_too_often() -> ApiError:
+    return ApiError(
+        "RATE_LIMITED",
+        "This link has been issued tokens too often; use the access token it holds and "
+        "refresh later",
+        429,
+    )
+
+
 async def _issue_pair(
     session: AsyncSession, grant: OAuthGrant, client: OAuthClient, now: datetime
 ) -> Issued:
     """A new access token for the grant, and a refresh token when the client registered
-    for one. The caller holds the write lock. Before it adds them, the grant's expired
-    rows are deleted, and its oldest past `GRANT_TOKENS_MAX`."""
+    for one. The caller holds the write lock and has checked `_issued_lately`. Before
+    it adds them, the grant's expired rows are deleted; nothing unexpired ever is."""
     await session.execute(
         delete(OAuthToken)
         .where(OAuthToken.grant_id == grant.id, OAuthToken.expires_at <= now)
-        .execution_options(synchronize_session=False)
-    )
-    past_cap = (
-        select(OAuthToken.id)
-        .where(OAuthToken.grant_id == grant.id)
-        .order_by(OAuthToken.created_at.desc(), OAuthToken.id)
-        .offset(GRANT_TOKENS_MAX - 2)
-    )
-    await session.execute(
-        delete(OAuthToken)
-        .where(OAuthToken.id.in_(past_cap))
         .execution_options(synchronize_session=False)
     )
     access = _issue(session, grant.id, "access", now)
@@ -793,6 +809,11 @@ async def exchange_refresh(session: AsyncSession, client_id: str, plain: str) ->
     (`entity_type="grant"`, `source="oauth"`) before the request is refused.
     `Refused` (`invalid_grant`) for a token that is unknown, expired, another client's
     or of a revoked grant, with nothing written.
+
+    A grant that has been issued `ISSUES_PER_WINDOW` pairs in the last `ISSUE_WINDOW`
+    is refused `429 RATE_LIMITED` with nothing written and the token not rotated. The
+    reuse rule is judged first: a rotated token presented late revokes the grant
+    however often the grant has been refreshed.
     """
     try:
         await scans.take_write_lock(session)
@@ -809,9 +830,16 @@ async def exchange_refresh(session: AsyncSession, client_id: str, plain: str) ->
             await session.rollback()
             raise Refused("invalid_grant", "refresh token does not exist")
         token, grant = found
+        reused = (
+            token.rotated_at is not None
+            and now - utc(token.rotated_at) > REFRESH_RETRY_WINDOW
+        )
+        if not reused and await _issued_lately(session, grant.id, now) >= ISSUES_PER_WINDOW:
+            await session.rollback()
+            raise _issued_too_often()
         if token.rotated_at is None:
             token.rotated_at = now
-        elif now - utc(token.rotated_at) > REFRESH_RETRY_WINDOW:
+        elif reused:
             await revoke_grant(
                 session,
                 grant,
