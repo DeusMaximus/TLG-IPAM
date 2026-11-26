@@ -13,17 +13,23 @@ _SESSION_DIR = tempfile.mkdtemp(prefix="tlg-ipam-test-")
 os.environ["API_KEY"] = "test-key"
 os.environ["DB_PATH"] = os.path.join(_SESSION_DIR, "ipam.db")
 os.environ["STATIC_DIR"] = os.path.join(_SESSION_DIR, "no-static")
+# OAuth off, whatever the developer's environment holds: the session's app is a server
+# without `PUBLIC_BASE_URL`. `tests/oauth_flow.py` builds the one with it.
+os.environ["PUBLIC_BASE_URL"] = ""
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from mcp.server.auth.middleware.auth_context import auth_context_var
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from sqlalchemy import event, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.auth import OWNER_SCOPES
 from app.config import settings
 from app.database import SessionLocal, _configure_connection, engine, get_session
 from app.main import app
 from app.models import Base, Subnet
-from app.services import agents, enrolment, jobs
+from app.services import agents, enrolment, jobs, oauth
 from app.services.device_types import seed_defaults
 
 
@@ -39,6 +45,21 @@ async def fresh_db():
     async with SessionLocal() as session:
         await seed_defaults(session)
     yield
+
+
+@pytest.fixture(autouse=True)
+def in_process_mcp_is_the_owner():
+    """An in-process MCP client (`Client(mcp)`) passes no HTTP layer, so it carries no
+    token, and since #26 a caller with no token is not shown a write tool. The tests
+    that use one are the owner's: this gives them the token the owner-key verifier
+    returns (`auth.OwnerKeyVerifier`), where the MCP SDK's bearer middleware would put
+    it. A request over HTTP carries its own, which FastMCP reads first."""
+    from fastmcp.server.auth import AccessToken
+
+    owner = AccessToken(token="test-key", client_id="owner", scopes=list(OWNER_SCOPES))
+    token = auth_context_var.set(AuthenticatedUser(owner))
+    yield
+    auth_context_var.reset(token)
 
 
 @pytest.fixture(autouse=True)
@@ -59,6 +80,15 @@ def fresh_enrol_throttle():
     yield
     enrolment.throttle.reset()
     agents.enrol_refusals.reset()
+
+
+@pytest.fixture(autouse=True)
+def fresh_pending_authorisations():
+    """Pending authorise transactions are process memory (`services/oauth.pending`):
+    each test starts with none."""
+    oauth.pending.reset()
+    yield
+    oauth.pending.reset()
 
 
 async def enrol(client, enrol_token: str, **body):

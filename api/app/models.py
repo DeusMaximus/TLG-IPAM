@@ -355,3 +355,91 @@ class FdnsResult(Base):
     checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # when an accepted result set last came back for a job that asked for the name
     asked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OAuthClient(Base):
+    """A client registered with the built-in OAuth server (v0.2 spec §6.4): what its
+    dynamic registration declared, as far as the server uses it. A registration is not
+    a link (§6.3): it grants nothing until the owner approves a grant for it.
+
+    Only the SHA-256 of the client secret is stored, and it is null for a public client
+    (`token_endpoint_auth_method` `none`); the plain secret appears once, in the
+    registration answer. `client_name` is the client's own claim about itself, kept
+    only when it needs no cleaning (`services/oauth.kept_name`), else null.
+    """
+
+    __tablename__ = "oauth_clients"
+
+    # the id the MCP SDK's registration handler draws: a UUID
+    client_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    client_name: Mapped[str | None] = mapped_column(String(60))
+    # absolute URIs as registered, each one the policy of §6.3 allows
+    redirect_uris: Mapped[list] = mapped_column(JSON)
+    # `none`, `client_secret_post` or `client_secret_basic`
+    token_endpoint_auth_method: Mapped[str] = mapped_column(String(32))
+    client_secret_hash: Mapped[str | None] = mapped_column(String(64))
+    # of the grant types and scopes the server has, the ones the client registered for
+    grant_types: Mapped[list] = mapped_column(JSON)
+    scope: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    # when its first grant was approved; null while it has never been linked
+    linked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OAuthGrant(Base):
+    """One approved link (v0.2 spec §6.4): the owner let this client reach `/mcp`.
+    Every token of the link points here, so revoking the grant refuses them all.
+
+    `client_id` is not a foreign key: a grant and its audit entries outlive the
+    registration, which is reclaimed once it holds no unrevoked grant (§6.6).
+    `redirect_uri` is the one the link was approved through, as the authorise request
+    gave it, port included. `last_used_at` is the client's last contact (a request to
+    `/mcp`, a code exchange or a refresh), a heartbeat and not the owner's last use.
+    """
+
+    __tablename__ = "oauth_grants"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    client_id: Mapped[str] = mapped_column(String(36), index=True)
+    redirect_uri: Mapped[str] = mapped_column(Text)
+    can_write: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class OAuthToken(Base):
+    """An authorisation code, access token or refresh token of a grant (v0.2 spec
+    §6.4), by the SHA-256 of its value: the plain value appears once, in the answer
+    that issues it. Scopes are not stored: a token carries what its grant allows at
+    the moment it is loaded (`services/oauth.grant_scopes`).
+
+    A code is single-use (`used_at`). A refresh token is rotated on use (`rotated_at`)
+    and its row is kept until it expires, because presenting it again is how a stolen
+    one is noticed (§6.4, the retry window).
+
+    A grant has one chain of refresh tokens. The access token issued with a refresh
+    token, and the refresh token that replaces it, are derived from its plain value
+    and `derive_salt` (`services/oauth._derive`), so that the server can give the same
+    answer again to a retry without ever storing a plain value. The salt is useless
+    without the plain token, and is erased once the token can no longer be retried.
+    """
+
+    __tablename__ = "oauth_tokens"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    grant_id: Mapped[str] = mapped_column(ForeignKey("oauth_grants.id"), index=True)
+    # `code`, `access` or `refresh`
+    kind: Mapped[str] = mapped_column(String(8))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # codes only: when it was exchanged; the PKCE challenge it is bound to; and whether
+    # the authorise request named its redirect URI, which the token request must repeat
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    code_challenge: Mapped[str | None] = mapped_column(String(64))
+    redirect_uri_explicit: Mapped[bool | None] = mapped_column(Boolean)
+    # refresh tokens only: when it was first exchanged for a new pair, and the salt
+    # its pair and its replacement are derived with
+    rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    derive_salt: Mapped[str | None] = mapped_column(String(64))

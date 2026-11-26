@@ -62,6 +62,8 @@ volumes:
 | `/api/v1/...` | REST API (owner key) |
 | `/api/v1/agent/...` | Agent-facing REST API (agent token; §4.1): check-in (§4.5) and scan results (§4.6) |
 | `/mcp` | Streamable HTTP MCP endpoint |
+| `/mcp/authorize`, `/mcp/token`, `/mcp/register` | The built-in OAuth server's endpoints (§5.5). Served only with `PUBLIC_BASE_URL` set; a 404 without it, and with a trailing slash |
+| `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp` | OAuth discovery (§5.5), with `PUBLIC_BASE_URL` set. Every other path under `/.well-known/` answers 404 in the error shape, with OAuth on or off, and never the SPA's `index.html` |
 | `/api/v1/docs` | OpenAPI / Swagger (FastAPI auto-generated) |
 
 ### 2.4 Releases
@@ -155,13 +157,13 @@ A record of every write, never edited, with one deletion: an agent's own check-i
 |---|---|
 | `id` | UUID, primary key |
 | `ts` | datetime, auto |
-| `entity_type` | enum: `section` \| `subnet` \| `host` \| `device_type` \| `agent` \| `token` \| `scan_target`. Reserved-range writes, a range's scan exclusion included, are logged as `subnet` updates |
+| `entity_type` | enum: `section` \| `subnet` \| `host` \| `device_type` \| `agent` \| `token` \| `scan_target` \| `grant` (an OAuth grant, §3.15). Reserved-range writes, a range's scan exclusion included, are logged as `subnet` updates |
 | `entity_id` | UUID of the affected record |
-| `action` | enum: `create` \| `update` \| `delete` \| `revoke` (`revoke` is for tokens only) |
+| `action` | enum: `create` \| `update` \| `delete` \| `revoke` (`revoke` is for tokens and grants) |
 | `summary` | str — human-readable one-liner, e.g. `host pbs-01 created at 10.10.20.45` |
 | `before` / `after` | JSON snapshots, nullable |
-| `source` | enum: `ui` \| `api` \| `mcp` \| `agent` — MCP and `agent` are server-assigned; REST uses the advisory `X-TLG-Client: ui` hint, so `ui` versus `api` is a UX label rather than trusted provenance. `agent` is the agent's own write: a check-in that changed what the agent reports (§4.5), or its enrolment exchange (§4.8); each agent keeps its newest 100 such entries on its agent record (token entries are not capped), and over MCP the reported values in `agent` snapshots are withheld. Not logged: heartbeats (`tokens.last_used_at`, `agents.last_checkin_at`), job scheduling (the lease columns), and scan results ingest (observations and the target's last-scan columns, §4.6) |
-| `actor` | str(80), nullable — who acted, when that is narrower than `source`. Null is the owner key, whether over REST or MCP. An agent's own write records `agent:<agent name>`; `grant:<client name>` arrives with OAuth (v0.2 spec §4.3). It is a field of its own and never part of `summary`. Databases created before it gain the column, null in existing rows, on startup. |
+| `source` | enum: `ui` \| `api` \| `mcp` \| `agent` \| `oauth` — MCP, `agent` and `oauth` are server-assigned; REST uses the advisory `X-TLG-Client: ui` hint, so `ui` versus `api` is a UX label rather than trusted provenance. `agent` is the agent's own write: a check-in that changed what the agent reports (§4.5), or its enrolment exchange (§4.8); each agent keeps its newest 100 such entries on its agent record (token entries are not capped), and over MCP the reported values in `agent` snapshots are withheld. `oauth` is the built-in OAuth server's own write (§5.5): a grant issued, and a grant revoked because a refresh token was used again after it had been replaced; over MCP a `grant` snapshot's `redirect_uri`, which the client chose, is withheld. Not logged: heartbeats (`tokens.last_used_at`, `agents.last_checkin_at`, `oauth_grants.last_used_at`), job scheduling (the lease columns), scan results ingest (observations and the target's last-scan columns, §4.6), and of the OAuth server a client's registration (not a link: it comes from a caller with no credential and grants nothing) and the issue, rotation and pruning of codes and tokens |
+| `actor` | str(80), nullable — who acted, when that is narrower than `source`. Null is the owner key, whether over REST or MCP. An agent's own write records `agent:<agent name>`; an OAuth grant's entries record `grant:<client name>`, or null when the client's declared name was not kept (§3.14). It is a field of its own and never part of `summary`. Databases created before it gain the column, null in existing rows, on startup. |
 
 ### 3.7 Validation constraints
 
@@ -294,6 +296,55 @@ The latest forward-DNS answer for one host (v0.2 spec §5.4, #20), upserted by r
 | `asked_at` | datetime, nullable — when an accepted result set last came back for a job that sent the host's name, answered or not. The next job's names are chosen by it (§4.5), so names that never get a usable answer still rotate |
 
 Rules: a row exists only for a host whose address is inside its subnet's scan scope: ingest stores none for a host that has left it, and a write that narrows the scope deletes those outside it (§3.10). Nothing in ingest writes `hosts` or the change log. Databases created before #20 gain the table on startup.
+
+### 3.14 OAuthClient
+
+A client registered with the built-in OAuth server (v0.2 spec §6.4, #26), by dynamic registration (§5.5). A registration is not a link: it grants nothing until the owner approves a grant for it. Table `oauth_clients`.
+
+| Field | Type / notes |
+|---|---|
+| `client_id` | str(36), primary key — the UUID the registration handler draws |
+| `client_name` | str(60), nullable — the client's own claim about itself. Kept only when it is 1 to 60 printable characters with no whitespace at either end, as declared; any other name is not stored (v0.2 #29 replaces this with sanitising). It appears in `actor` (§3.6), never in a summary |
+| `redirect_uris` | JSON list of 1 to 16 URIs, each at most 2,048 characters: `https` with a host, or `http` to `localhost` or a loopback address (§5.5) |
+| `token_endpoint_auth_method` | `client_secret_post`, `client_secret_basic` or `none` (a public client) |
+| `client_secret_hash` | str(64), nullable — the SHA-256 of the client secret; null for a public client. The plain secret appears once, in the registration answer. Never in an audit snapshot or a response |
+| `grant_types`, `scope` | of the server's grant types (`authorization_code`, `refresh_token`) and scopes (`ipam:read`, `ipam:write`), the ones the client registered for |
+| `created_at`, `linked_at` | datetimes; `linked_at` is when its first grant was approved, null while it has never been linked |
+
+Nothing else a client declares (`client_uri`, `logo_uri`, `software_id`, …) is stored. **At most 50 registrations exist** (v0.2 spec §6.6), counted under the write lock: at the cap a new one takes the place of the oldest that holds no unrevoked grant, never linked or its links revoked alike, and when all 50 hold an unrevoked grant it is refused (§5.5). A reclaimed registration's grants and audit entries stay (§3.15). Registrations are not audit-logged, stored or reclaimed (§3.6).
+
+### 3.15 OAuthGrant
+
+One approved link: the owner let a client reach `/mcp` (v0.2 spec §6.4). Every code and token of the link points at it, so revoking the grant refuses them all. Table `oauth_grants`.
+
+| Field | Type / notes |
+|---|---|
+| `id` | UUID, primary key |
+| `client_id` | str(36), indexed — the client. Not a foreign key: a grant and its audit entries outlive the registration |
+| `redirect_uri` | text — the redirect URI the link was approved through, as the authorise request gave it, port included (§5.5) |
+| `can_write` | bool — whether the owner allowed changes when the link was opened. It grants nothing yet: every grant's token carries `ipam:read` alone until the remote-writes setting exists (§5.5) |
+| `created_at` | datetime |
+| `last_used_at` | datetime, nullable — the client's last contact: a request to `/mcp`, a code exchange or a refresh with one of the grant's tokens, written at most once in 10 seconds. A heartbeat, not the owner's last use |
+| `revoked_at` | datetime, nullable |
+
+Issuing a grant and revoking one are audit-logged (`entity_type="grant"`, §3.6).
+
+### 3.16 OAuthToken
+
+An authorisation code, access token or refresh token of a grant (v0.2 spec §6.4), by the SHA-256 of its value: the plain value appears once, in the answer that issues it. Table `oauth_tokens`. Scopes are not stored (§5.5).
+
+| Field | Type / notes |
+|---|---|
+| `id` | UUID, primary key |
+| `token_hash` | str(64), unique. Never in an audit snapshot or a response |
+| `grant_id` | FK → OAuthGrant, indexed |
+| `kind` | `code` (5 minutes, single use), `access` (1 hour) or `refresh` (30 days, rotated on every use) |
+| `created_at`, `expires_at` | datetimes |
+| `used_at`, `code_challenge`, `redirect_uri_explicit` | codes only: when it was exchanged; the PKCE S256 challenge it is bound to; whether the authorise request named its redirect URI, which the token request must then repeat |
+| `rotated_at` | refresh tokens only: when it was first exchanged for a new pair |
+| `derive_salt` | str(64), nullable — refresh tokens only: the random salt the token's own access token and its replacement are derived with (§5.5). Useless without the plain token; erased once the token has been rotated for more than 60 seconds; never in an audit snapshot or a response |
+
+Rules: a plain value is `tlgoc_` (code), `tlgoa_` (access) or `tlgor_` (refresh) and 43 URL-safe base64 characters, and a presented value in any other form is refused without a database read. A rotated refresh token keeps its row until it expires, because presenting it again is how a stolen one is noticed (§5.5), and no unexpired row is ever deleted to make room: each rotation deletes only the grant's expired rows. What bounds a grant's rows is that it has one chain of refresh tokens, each not rotated in its first five minutes (§5.5): at most 8,640 unexpired refresh tokens and 13 unexpired access tokens. Revoking a grant deletes its rows. None of these writes is audit-logged (§3.6). Databases created before #26 gain the three tables on startup, whether or not `PUBLIC_BASE_URL` is set.
 
 ---
 
@@ -566,14 +617,16 @@ app = FastAPI(lifespan=mcp_app.lifespan, ...)
 app.mount("/mcp", mcp_app)
 ```
 
-Auth for `/mcp` is the same owner key (`API_KEY`), sent as a bearer token: `Authorization: Bearer <API_KEY>`. FastMCP enforces it through its own `auth=`: `OwnerKeyVerifier` in `auth.py` compares the token in constant time and grants the scopes `ipam:read` and `ipam:write`. No tool checks the scopes yet. `X-API-Key` is not accepted on `/mcp`, and an empty bearer is never the owner key (§4.1).
+Auth for `/mcp` is the same owner key (`API_KEY`), sent as a bearer token: `Authorization: Bearer <API_KEY>`. FastMCP enforces it through its own `auth=`: `OwnerKeyVerifier` in `auth.py` compares the token in constant time and grants the scopes `ipam:read` and `ipam:write`. `X-API-Key` is not accepted on `/mcp`, and an empty bearer is never the owner key (§4.1). With `PUBLIC_BASE_URL` set, an access token of an OAuth grant is accepted beside the owner key, which keeps working unchanged (§5.5).
+
+**Write tools require the `ipam:write` scope** (#26), through FastMCP's own check (`require_scopes`): `add_reserved_range`, `delete_reserved_range`, `create_host`, `allocate_next_ip`, `bulk_create_hosts`, `bulk_delete_hosts`, `update_host`, `delete_host` and `request_scan`. Every tool is registered as a read tool or a write tool (`mcp_server.ipam_tool`, `ipam_write_tool`), with OAuth on or off. The owner key carries both scopes. To a caller whose token lacks the scope a write tool is not listed by `tools/list`, and calling it answers `Unknown tool: '<name>'` (an MCP tool error over HTTP 200): FastMCP's behaviour, held by a test. An OAuth grant's token carries `ipam:read` alone (§5.5).
 
 A request refused for its credentials gets FastMCP's RFC 6750 response, not the REST error envelope; one refused for its size gets the REST envelope, before its credentials are looked at:
 
 | Request | Status | Response |
 |---|---|---|
-| No `Authorization: Bearer` header (none, `X-API-Key` only, or another scheme) | `401` | Empty body; `WWW-Authenticate: Bearer` |
-| A bearer that is not the owner key | `401` | `WWW-Authenticate: Bearer error="invalid_token", error_description="…"`; JSON body `{"error": "invalid_token", "error_description": "…"}` |
+| No `Authorization: Bearer` header (none, `X-API-Key` only, or another scheme) | `401` | Empty body; `WWW-Authenticate: Bearer`. With `PUBLIC_BASE_URL` set the header also names the protected-resource metadata, which is what starts a client's discovery: `Bearer resource_metadata="<PUBLIC_BASE_URL>/.well-known/oauth-protected-resource/mcp"`. `HEAD` is answered as `GET` is |
+| A bearer that is not the owner key (nor, with `PUBLIC_BASE_URL` set, an unexpired access token of an unrevoked grant) | `401` | `WWW-Authenticate: Bearer error="invalid_token", error_description="…"` (and `resource_metadata` as above); JSON body `{"error": "invalid_token", "error_description": "…"}` |
 | A body over 2 MiB, with or without a bearer | `413` | `{"error": {"code": "PAYLOAD_TOO_LARGE", "message": "…"}}`; `Connection: close` (§4.3) |
 | A body that would take the bodies being received past 16 MiB, with or without a bearer | `503` | `{"error": {"code": "UNAVAILABLE", "message": "…"}}`; `Connection: close` (§4.3) |
 | A body not received whole within 60 s (a chunked one before the bearer is looked at; one with a declared length once it is accepted) | `408` | `{"error": {"code": "REQUEST_TIMEOUT", "message": "…"}}`; `Connection: close` (§4.3) |
@@ -606,11 +659,11 @@ Tool descriptions are the documentation Claude reads at runtime — write them w
 | `bulk_delete_hosts` | Delete many hosts by ID in one call (cleanup workflows). Returns deleted count + not-found IDs. |
 | `add_reserved_range` | Reserve a block of IPs in a subnet so automatic allocation skips it (manual creation inside it stays allowed). Always creates a scanned range: the tool has no `scan_excluded` argument. Refused once the subnet holds 100 reserved ranges (§3, validation). |
 | `delete_reserved_range` | Remove a reserved range, returning its addresses to the allocation pool. Refuses a range with `scan_excluded`, because removing it would widen what is scanned; the error says to remove it in the web UI. |
-| `list_changes` | Recent changes to the IPAM (audit log), newest first, each with its `source` (`ui`, `api`, `mcp` or `agent`) and `actor` (null for the owner's own writes, `agent:<name>` for an agent). In `agent` snapshots the values the agent reports about itself are withheld (§4.5). Use to answer "what changed recently?" or to review previous MCP-driven edits. |
+| `list_changes` | Recent changes to the IPAM (audit log), newest first, each with its `source` (`ui`, `api`, `mcp`, `agent` or `oauth`) and `actor` (null for the owner's own writes, `agent:<name>` for an agent, `grant:<client name>` for a linked client). In `agent` snapshots the values the agent reports about itself are withheld (§4.5), and in `grant` snapshots the redirect URI the client chose (§3.6). Use to answer "what changed recently?" or to review previous MCP-driven edits. |
 | `list_scan_findings` | Scan findings (§4.7), for one subnet or, with `subnet_id` omitted, every subnet (by subnet name, then address), optionally of one `type`, a page at a time: `list_scan_findings(subnet_id?, type?, cursor?)` returns `{next_cursor, returned, note, findings}`: at most 25 findings (`findings.PAGE_SIZE`), each at most 5,000 bytes as compact UTF-8 JSON (`findings.FINDING_MAX`), and a `findings` array of at most 45,000 bytes, brackets and commas included (`findings.PAGE_BUDGET`). Every value a finding carries has a length bound (subnet name 120, hostname 253, PTR name 253, domain 253, an `fdns_mismatch`'s observed value 214), and the largest finding they allow, with the names in control characters that JSON writes in 6 bytes each and the address at IPv4's widest (`192.168.255.254`), is 4,880 bytes; a host whose effective domain was stored longer before the domain limit is listed with `host_fqdn` null, never with a cut value, and its record keeps the domain. The work of one call is bounded too: at most 100 SQL statements (`findings.CALL_STATEMENTS`), each reading at most 250 hosts (with each one's forward-DNS answer, joined by its unique `host_id`) and 250 observations (`findings.SCAN_CHUNK`) and the dismissals at those addresses along an index on `(subnet_id, ip_int)` (created on start-up in an existing database), passing over no row it does not return (inside a scanned DHCP pool, observations are read only at its hosts' addresses); the scope each visited subnet needs reads only that subnet's excluded reserved ranges, along their own index, at most 100 of them (a subnet stored with more before that limit is read whole: the one read besides the subnet list whose cost follows what is stored, about 6 SQLite instructions a range), but the one that lists the subnets, which reads the order key of each subnet that can hold a finding (one with an observation, or with a scan target and a host); a subnet with neither costs nothing. That work is SQLite's, counted as the rows a statement reads or passes over, not the bytes it returns or Python's processing of them, so every read returns only the columns a finding uses, never a whole row: with `subnet_id`, the check that the subnet exists reads its id alone, since a subnet's notes have no length bound (#133). `next_cursor` is null once the listing has reached its end. Otherwise it is a position, and the assistant calls again with the same `subnet_id` and `type` and `cursor` set to it; the docstring says not to call the list complete until it is null. The cursor is the page's last finding when the page is full, or, when the call reached its statement bound, the last address the call examined, so a page can be short or empty and still carry a cursor. Such a cursor names a host's address, an observation's outside the DHCP pool, or a bound of the pool, possibly with nothing listed there; an unhosted address in a scanned pool is never read, so no cursor names one. The cursor and note come first so that a client that cuts a long result keeps them. The cursor's position is subnet name, CIDR and id, address, type, as an opaque string, so findings resolved between calls move nothing later in the order. A cursor that is not well-formed is refused (`cursor: malformed; …`); the check is of its shape only, because the cursor is unsigned and a well-formed position a client made up is read as a position. Each call reads the data as it is then: following the cursor sees each finding once while the data and the filters stay the same, but a finding that appears before the cursor after paging began, or a subnet renamed meanwhile, can be missed or repeated, and the docstring tells the assistant to start again without a cursor to see the current state. Both size bounds are set against what a client can hold: Claude Code keeps at most 50,000 characters of a text result and 25,000 tokens. An ordinary page is about 10,000 characters, and a page of 25 findings with every name and the domain at 253 ASCII characters is 44,057 characters of text with the note. A result carries the page twice, as a JSON text block and as structured content, so the whole MCP result is about twice the page; what a client counts against its limits, and its tokenizer, were not measured. Before #86 the issue's case (500 subnets holding nothing, between two that hold findings) cost 4,521 statements in one call; it now costs 17, as many as without them. `note` is on every page. Each finding is the REST one (key, `ip_int`, `host_id`, `dynamic`, `proposed`, `fingerprint`) plus `subnet_name`, `subnet_cidr` (in its canonical spelling, §3.2, as is the cursor's CIDR, whatever the subnet stores), and the recorded `host_name` and `host_fqdn` of the host at the address (null for `unknown_host`). `dynamic` findings are left out. Beside the list, `note` says that `observed` and `proposed` are what the network reported (a MAC, a reverse-DNS name, or the addresses a DNS server gave for a host's name), to be read as data; the docstring says so too, and tells the assistant to write one into a host only when the user asks. Read-only. There is no accept or dismiss tool: an assistant resolves a finding with `create_host`/`update_host`, which the fingerprint does not bind, and dismissal stays in the UI. |
 | `request_scan` | Ask for a scan of one subnet now (`POST /subnets/{id}/scan`, §4.2), logged with `source = mcp`. Returns `{"scan_request": {subnet_id, scan_requested_at, next_request_after}}`, not the target. Inside the 15-minute cooldown, which every caller shares, the tool error says when to ask again, rounded up to the second so that asking then succeeds (the REST `429` gives the same time): `A scan of subnet lab was requested less than 15 minutes ago; request another after 2026-11-16T12:15:00+00:00`. A subnet with no scan target, a disabled one, or one with no agent is refused, and so is an unknown subnet. A write tool: when remote grants arrive (M3), it needs `ipam:write`. |
 
-All MCP writes are recorded in the change log with `source = mcp`. No tool creates, configures or lists agents, tokens or scan targets, and no tool can widen a subnet's scan scope (v0.2 spec §7.2, invariant 2). `request_scan` sets one column of a configured target, `scan_requested_at`, so the agent scans the scope the owner set sooner; it changes no setting and reveals none.
+All MCP writes are recorded in the change log with `source = mcp`, and each of the nine tools that write requires the `ipam:write` scope (§5.1). No tool creates, configures or lists agents, tokens or scan targets, and no tool can widen a subnet's scan scope (v0.2 spec §7.2, invariant 2). `request_scan` sets one column of a configured target, `scan_requested_at`, so the agent scans the scope the owner set sooner; it changes no setting and reveals none.
 
 ### 5.3 Claude Desktop config
 
@@ -647,6 +700,34 @@ These should work once Claude Desktop has the server connected:
 - "Rescan the IoT subnet" → `list_subnets` → `request_scan`
 
 The server's `instructions` string tells clients this is the authoritative standalone IPAM (not phpIPAM/NetBox/UniFi), so Claude routes IP questions here instead of to networking-adjacent skills.
+
+### 5.5 Remote MCP: the built-in OAuth server
+
+Web MCP clients (Claude.ai, ChatGPT, Gemini, Mistral) cannot send a static key, so with `PUBLIC_BASE_URL` set the server is its own OAuth 2.1 authorisation server for `/mcp` (v0.2 spec §6, M3). Without the setting none of this exists: the routes below answer 404 and `/mcp` takes the owner key alone. **This section describes what has shipped (#26): storage, tokens and discovery. The link window and consent page have not (#27), so no client can be linked yet:** registration and authorisation are refused, and the token endpoint serves only grants that tests create.
+
+**`PUBLIC_BASE_URL`** is the server's public origin, `https://ipam.example.com`. Every URL the server publishes is built from it and never from `Host` or `X-Forwarded-*`. It is taken only in the one spelling the server would publish: `https://`, a lowercase host in its ASCII form, a port only when it is not the default. The server refuses to start (`config.load_settings`, as for `API_KEY`) with a path, a trailing slash, a query, a fragment, credentials, whitespace, an upper-case letter, `:443` or port 0, in one fixed message that repeats nothing of the value. Plain `http://` is taken only for `localhost`, `127.0.0.1` and `[::1]`, to test on one machine. Empty is unset.
+
+| Route | Purpose |
+|---|---|
+| `GET /.well-known/oauth-protected-resource/mcp` | RFC 9728: the resource is `<PUBLIC_BASE_URL>/mcp`, its authorisation server `<PUBLIC_BASE_URL>/` |
+| `GET /.well-known/oauth-authorization-server` | RFC 8414: issuer `<PUBLIC_BASE_URL>/`, the three endpoints below, PKCE `S256`, scopes `ipam:read` and `ipam:write` |
+| `POST /mcp/register` | Dynamic client registration (RFC 7591). Only while linking is open |
+| `GET`/`POST /mcp/authorize` | The authorise endpoint the owner's browser is sent to. Only while linking is open |
+| `POST /mcp/token` | Code exchange and refresh. Always answers |
+
+Authentication is FastMCP's `MultiAuth`: the OAuth provider (`oauth_provider.IpamOAuthProvider`, over `services/oauth`) with the owner-key verifier beside it. A bearer is tried as an access token first, and only a value in the form the server issues is looked up (§3.16), so the owner key costs no database read.
+
+**Linking is closed.** `services/oauth.linking_open` is what the link window will answer; until it exists it is always false. Register and authorise then answer `403` before anything of the request is read, the first with `{"error": "access_denied", "error_description": "…"}` and the second with one plain sentence for the browser, and nothing is stored. No route approves a link.
+
+**Registration** (while open) takes only redirect URIs that are `https` with a host, or `http` to `localhost` or a loopback address (an IP literal in `127.0.0.0/8`, or `[::1]`). Any other URI (plain `http` to another host, `javascript:`, a custom scheme, one with credentials or a fragment, one over 2,048 characters), or more than 16 of them, refuses the whole registration: `400` `invalid_redirect_uri`, naming the URI by its place in the list. The 51st registration takes the place of the oldest with no unrevoked grant (§3.14); when all 50 are linked it is refused, `403` `access_denied`, until the owner revokes a link. A confidential client's secret is stored as its SHA-256 only (§3.14); the answer gives it once, with `client_secret_expires_at` 0 and `Cache-Control: no-store`, and says what was registered where that is less than what was sent.
+
+**Authorise** (while open). The request's `redirect_uri` must be one the client registered, compared whole, with one exception: a registered `http` URI on a loopback IP literal matches the same address, path and query on any port, since a local client listens on a port it is given when it starts. `localhost` by name and every `https` URI match only as registered. An RFC 8707 `resource` that is present and is not `<PUBLIC_BASE_URL>/mcp` (scheme and host compared without regard to case, one trailing slash ignored, nothing else) is answered `invalid_target` at the client's redirect URI, and nothing is held; absent, it is accepted. A request that passes is held in memory (at most 32, each for 10 minutes; a restart drops them) and the browser is sent to `<PUBLIC_BASE_URL>/mcp/consent?txn=…`, which #27 serves. Approving it (`services/oauth.approve`, the consent handler's call) records the grant with the redirect URI as authorised, port included, and issues the code.
+
+**Tokens.** A code lasts 5 minutes and is single-use; an access token 1 hour; a refresh token 30 days and is rotated on use (not in its first five minutes, below). A token request is authenticated first (`oauth_provider.HashedSecretAuthenticator`): a confidential client must present its secret the way it registered to (in the form for `client_secret_post`; in `Authorization: Basic` for `client_secret_basic`, where the client id may be in the header alone), which is hashed and compared in constant time; a public client presents none. A missing or wrong secret, or an unknown client, is `401` `invalid_client` before the code or refresh token is looked at, so both stay usable by the right secret. Each exchange is decided under SQLite's write lock, and a code is claimed with a compare-and-set. **A refresh token presented again within 60 seconds of its rotation** is a retry (a lost answer, two requests at once) and gets the same pair the rotation gave, again, with the access token's remaining time; **presented later, it revokes the whole grant**, which deletes its tokens and is audit-logged (§3.6). A retry can be answered again, with only hashes stored, because a replacement is derived and not drawn: `HMAC-SHA256` of the presented token under a random salt on its row (§3.16), which neither the database alone nor the token's holder alone can compute. So a grant has one chain of refresh tokens, and two holders of one token cannot each keep a chain of their own: the second to refresh, more than a minute after the first, revokes the grant. **A refresh token is not rotated in its first five minutes**: presented younger, it is answered `200` with the pair it was issued in and nothing is written, which is what bounds the table (§3.16). No client meets an error for refreshing often. A grant's token carries `ipam:read` alone, whatever was asked and whatever `can_write` says; the answer's `scope` says so. `resource` is not checked at the token endpoint.
+
+Refusals on these routes are OAuth's own shapes, not the REST envelope (§4.3): `{"error": "<code>", "error_description": "…"}` from the token (`400`; `401` for `invalid_client` and `invalid_grant`), register (`400`, `403`) and authorise endpoints, or a redirect to the client's validated redirect URI carrying `error` and `state`. Three answers there are in the REST shape: a body over the cap, budget or deadline (§4.3), which is refused before the route; a write the database refuses on the register or token endpoint, `503 UNAVAILABLE` with nothing spent; and the 404 of an unserved `/.well-known/` path.
+
+A grant's token is a credential for `/mcp` and nothing else: the REST API, the backup and the agent routes refuse it.
 
 ---
 
@@ -704,10 +785,11 @@ tlg-ipam/
 │       ├── config.py         # env vars (pydantic-settings)
 │       ├── version.py        # the release version, which the agent's __version__ matches (#24)
 │       ├── database.py       # SQLAlchemy async engine + session
-│       ├── models.py         # ORM models (Section, Subnet, ReservedRange, Host, DeviceType, Change, Agent, Token, ScanTarget, Observation, FindingDismissal)
+│       ├── models.py         # ORM models (Section, Subnet, ReservedRange, Host, DeviceType, Change, Agent, Token, ScanTarget, Observation, FindingDismissal, FdnsResult, OAuthClient, OAuthGrant, OAuthToken)
 │       ├── schemas.py        # Pydantic request/response schemas
 │       ├── agent_protocol.py # the agent wire contract: enrolment, check-in, job and result-set shapes, token prefixes, PROTOCOL_VERSION, sanitising agent text
 │       ├── auth.py           # owner-key check (REST dependency + /mcp bearer verifier); agent-token dependency
+│       ├── oauth_provider.py # the OAuth provider FastMCP calls (routes, client authentication), over services/oauth; mcp_auth
 │       ├── body_limit.py     # the request-body limits (cap, budget, deadline), outermost middleware, every route and /mcp
 │       ├── mcp_server.py     # FastMCP tools (thin wrappers over services)
 │       ├── services/         # business logic — single source of truth
@@ -722,6 +804,7 @@ tlg-ipam/
 │       │   ├── jobs.py       # agent check-in, due targets, job leases
 │       │   ├── results.py    # scan results ingest: observations, clearing the lease
 │       │   ├── findings.py   # scan findings computed on read; accept (through hosts) and dismiss
+│       │   ├── oauth.py      # the built-in OAuth server: registrations, grants, codes and tokens, redirect and resource rules
 │       │   └── changes.py    # audit log writes + reads
 │       └── routers/
 │           ├── sections.py

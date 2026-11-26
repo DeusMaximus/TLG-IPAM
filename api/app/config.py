@@ -1,5 +1,7 @@
 from typing import ClassVar
+from urllib.parse import urlsplit
 
+from pydantic import AnyHttpUrl, ValidationError
 from pydantic_settings import BaseSettings
 from sqlalchemy.engine import make_url
 
@@ -10,6 +12,16 @@ SQLITE_URL_PREFIX = "sqlite+aiosqlite:///"
 
 # The one refusal of DB_PATH; fixed, so it repeats no value
 DB_PATH_REFUSED = "DB_PATH must be a filesystem path or :memory:."
+
+# The one refusal of PUBLIC_BASE_URL; fixed, so it repeats no value
+PUBLIC_BASE_URL_REFUSED = (
+    "PUBLIC_BASE_URL must be the server's public origin and nothing else, written as "
+    "clients will use it: `https://` and a lowercase host name, with a port only when "
+    "it is not 443 (https://ipam.example.com). No path, no trailing slash, no query, "
+    "no fragment, no user name and no spaces. Plain `http://` is taken only for "
+    "`localhost`, `127.0.0.1` or `[::1]`, for testing on one machine. Leave it unset "
+    "to keep remote MCP (the built-in OAuth server) off."
+)
 
 # The value `.env.example` ships. Anyone who has read the repository knows it.
 PLACEHOLDER_API_KEY = "change-me"
@@ -26,6 +38,9 @@ class Settings(BaseSettings):
     api_key: str = ""
     db_path: str = "./ipam.db"
     static_dir: str = "./static"
+    # The server's public origin (v0.2 spec §6.1). Empty, the default, leaves the
+    # built-in OAuth server off: `/mcp` takes the owner key alone, as before M3.
+    public_base_url: str = ""
     # The release this code is (`app/version.py`, #24): a class attribute, not a field,
     # so no environment variable can make a server report another release than it runs
     version: ClassVar[str] = VERSION
@@ -67,9 +82,60 @@ def db_path_problem(value: str) -> str | None:
     return None
 
 
+# The hosts plain `http` is taken for: the MCP SDK's own list (`validate_issuer_url`),
+# which refuses any other issuer that is not `https`
+_HTTP_HOSTS = ("localhost", "127.0.0.1", "[::1]")
+
+
+def public_base_url_problem(value: str) -> str | None:
+    """Why `value` cannot be `PUBLIC_BASE_URL`, or None when it can (spec §6.7, #26).
+
+    The empty string is "unset": OAuth off. Any other value is the installation's
+    identity: the issuer, the resource (`<value>/mcp`) and every endpoint URL a client is
+    told come from it, and clients compare those as strings. So it is taken only in the
+    one spelling the server publishes it in, and never trimmed or normalised here: an
+    origin, `https://host[:port]`, lowercase, the host in its ASCII form, the port absent
+    when it is the scheme's default. A path, a trailing slash, a query, a fragment,
+    credentials or whitespace is refused, as is plain `http` to anything but this
+    machine (the MCP SDK refuses to build routes for such an issuer, and a link over
+    plain HTTP would send tokens in the clear). One fixed message, which repeats nothing
+    of the value.
+    """
+    if value == "":
+        return None
+    try:
+        parts = urlsplit(value)
+        port = parts.port
+    except ValueError:
+        return PUBLIC_BASE_URL_REFUSED
+    host = parts.netloc.rpartition(":")[0] if port is not None else parts.netloc
+    # The exact text an origin has: nothing before the scheme or after the authority,
+    # which rules out a path (a lone `/` included), `?`, `#` and surrounding whitespace
+    if value != f"{parts.scheme}://{parts.netloc}" or not host or "@" in parts.netloc:
+        return PUBLIC_BASE_URL_REFUSED
+    if port == 0:
+        # no server listens on it: a typo, not an origin
+        return PUBLIC_BASE_URL_REFUSED
+    if parts.scheme not in ("https", "http") or (parts.scheme == "http" and host not in _HTTP_HOSTS):
+        return PUBLIC_BASE_URL_REFUSED
+    # What the URL type FastMCP and the MCP SDK publish it through makes of it: only a
+    # value that comes back unchanged is the one clients will be told (an upper-case
+    # host, `:443`, an internationalised name and `127.1` all come back in another
+    # spelling)
+    try:
+        published = str(AnyHttpUrl(value))
+    except ValidationError:
+        return PUBLIC_BASE_URL_REFUSED
+    if published != value + "/":
+        return PUBLIC_BASE_URL_REFUSED
+    return None
+
+
 def load_settings() -> Settings:
-    """Read the settings from the environment, refusing an unusable owner key, and a
-    `DB_PATH` that is not a filesystem path or `:memory:` (`db_path_problem`).
+    """Read the settings from the environment, refusing an unusable owner key, a
+    `DB_PATH` that is not a filesystem path or `:memory:` (`db_path_problem`), and a
+    `PUBLIC_BASE_URL` that is not the public origin in the spelling the server would
+    publish (`public_base_url_problem`).
 
     Runs when this module is imported, so uvicorn (by hand or as the container's
     CMD) exits before it serves anything. Under `--reload` the reloader stays up and
@@ -86,6 +152,8 @@ def load_settings() -> Settings:
         )
     if db_path_problem(loaded.db_path) is not None:
         raise SystemExit(f"TLG-IPAM will not start: {DB_PATH_REFUSED}")
+    if public_base_url_problem(loaded.public_base_url) is not None:
+        raise SystemExit(f"TLG-IPAM will not start: {PUBLIC_BASE_URL_REFUSED}")
     return loaded
 
 
