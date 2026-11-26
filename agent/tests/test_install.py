@@ -1410,6 +1410,7 @@ def test_an_agent_env_at_the_limit_with_all_three_settings_is_kept_whole_by_an_u
             1000, None, paths_in(root).token,
         )
         if len(rendered) > store.READ_MAX:
+            refused = f"10.{i // 256}.{i % 256}.0/24"
             break
         networks.append(f"10.{i // 256}.{i % 256}.0/24")
     options = Options(
@@ -1420,7 +1421,8 @@ def test_an_agent_env_at_the_limit_with_all_three_settings_is_kept_whole_by_an_u
     assert code == 0, said
     env = root / "etc/tlg-ipam-agent/agent.env"
     written = env.read_bytes()
-    assert store.READ_MAX - len(written) < len(",10.0.0.0/24")
+    # the largest: one network more would not have fitted
+    assert len(written) <= store.READ_MAX < len(written) + len("," + refused)
     code, said = update(root)
     assert code == 0, said
     assert env.read_bytes() == written
