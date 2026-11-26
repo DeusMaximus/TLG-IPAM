@@ -591,7 +591,7 @@ class FindingOut(FindingKey):
 
 # --- The link window (v0.2 spec §6.3, #27) ---
 
-LinkWindowEnd = Literal["linked", "burned", "expired", "cancelled", "replaced"]
+LinkWindowEnd = Literal["linked", "expired", "cancelled", "replaced", "failed"]
 
 
 class LinkWindowOpen(BaseModel):
@@ -613,10 +613,12 @@ class LinkWindowOut(BaseModel):
     opened_at: UtcDatetime | None
     expires_at: UtcDatetime | None
     expires_in_s: int | None
-    # how many more wrong link codes it takes; the last of them burns it
-    attempts_left: int | None
+    # wrong link codes typed on its consent pages, all its requests together: what the
+    # owner is told. They end requests (five each), never the window
+    wrong_codes: int | None
     # while none is open: how the latest window ended, and when (process memory: null
-    # after a restart until one has been opened and has ended)
+    # after a restart until one has been opened and has ended); `failed` is an approval
+    # that failed unexpectedly, which ends the window
     ended: LinkWindowEnd | None
     ended_at: UtcDatetime | None
 

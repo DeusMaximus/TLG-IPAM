@@ -15,7 +15,7 @@ from app import consent
 from app.database import SessionLocal
 from app.errors import ApiError
 from app.models import Change, OAuthClient, OAuthGrant, OAuthToken
-from app.services import link_window, oauth
+from app.services import link_window, oauth, scans
 
 from .oauth_flow import (  # noqa: F401 (web and no_ambient_token are fixtures)
     BASE,
@@ -106,7 +106,7 @@ async def test_opening_a_window_gives_the_code_once(web):
     assert set(code) <= set(link_window.CODE_ALPHABET)
     assert not set("01ILOU") & set(link_window.CODE_ALPHABET)
     assert opened["configured"] is True and opened["open"] is True
-    assert opened["can_write"] is False and opened["attempts_left"] == 5
+    assert opened["can_write"] is False and opened["wrong_codes"] == 0
     assert 598 <= opened["expires_in_s"] <= 600
     assert opened["opened_at"].endswith("+00:00") and opened["expires_at"].endswith("+00:00")
     assert opened["ended"] is None
@@ -187,7 +187,7 @@ async def test_opening_another_window_replaces_the_first(web):
     txn = transaction(await authorise(web, client))
     res = await post_code(web, txn, first["code"])
     assert res.status_code == 403 and consent.WRONG_CODE in res.text
-    assert (await window_state(web))["attempts_left"] == 4
+    assert (await window_state(web))["wrong_codes"] == 1
     assert (await post_code(web, txn, second["code"])).status_code == 303
 
 
@@ -247,52 +247,99 @@ async def test_the_consent_page_with_no_window_is_a_page_and_no_redirect(web):
     assert "No link window is open" in res.text
 
 
-# --- Acceptance: wrong codes burn the window ---
+# --- Wrong codes end a request, never the window ---
 
 
-async def test_the_fifth_wrong_code_burns_the_window_and_is_logged(web):
+async def test_the_fifth_wrong_code_ends_the_request_and_not_the_window(web):
     window = await open_window(web)
     client = await register(web)
     txn = transaction(await authorise(web, client))
     wrong = wrong_code_for(window["code"])
-    for left in (4, 3, 2, 1):
+    for count in (1, 2, 3, 4):
         res = await post_code(web, txn, wrong)
         assert res.status_code == 403 and consent.WRONG_CODE in res.text
-        assert (await window_state(web))["attempts_left"] == left
         assert "location" not in res.headers
-    res = await post_code(web, txn, wrong)
-    assert res.status_code == 403 and "five wrong link codes" in res.text
-    assert "location" not in res.headers
-    state = await window_state(web)
-    assert state["open"] is False and state["ended"] == "burned"
-    assert len(oauth.pending) == 0
-    opened, burned = await changes()
-    assert (burned.entity_type, burned.entity_id, burned.action) == (
-        "link_window", opened.entity_id, "burn",
+        assert (await window_state(web))["wrong_codes"] == count
+    page = (await consent_page(web, txn)).text
+    res = await web.post(
+        "/mcp/consent", data={**hidden_fields(page), "code": wrong, "action": "link"}
     )
-    assert (burned.source, burned.actor) == ("oauth", None)
-    assert burned.summary == "link window closed after 5 wrong link codes"
-    assert burned.after["wrong_codes"] == 5
-    assert window["code"] not in repr((burned.summary, burned.after))
-    # nothing was linked, and the right code does nothing now
+    assert res.status_code == 403 and "This request was ended" in res.text
+    assert "location" not in res.headers
+    # a sixth guess on that request, the right code included, is no guess at all
+    assert oauth.pending.get(txn) is None
+    res = await web.post(
+        "/mcp/consent", data={**hidden_fields(page), "code": window["code"], "action": "link"}
+    )
+    assert res.status_code == 410
     assert await all_rows(OAuthGrant) == []
-    res = await web.post("/mcp/consent", data={"txn": txn, "code": window["code"]})
-    assert res.status_code == 403 and "five wrong link codes" in res.text
-    assert (await web.post("/mcp/register", json={"redirect_uris": [CALLBACK]})).status_code == 403
+    # the window is open, and the client links in it with the right code
+    state = await window_state(web)
+    assert state["open"] is True and state["wrong_codes"] == 5
+    url = await consent_with_code(web, client, window["code"])
+    assert (await exchange(web, client, url.params["code"])).status_code == 200
 
 
-async def test_wrong_codes_are_counted_for_the_window_not_the_request(web):
-    """An outsider who sends its own authorise requests gets five guesses in all."""
+async def test_the_change_log_has_one_entry_a_window_for_its_wrong_codes(web):
     window = await open_window(web)
-    wrong = wrong_code_for(window["code"])
     client = await register(web)
-    for _ in range(4):
+    for _ in range(3):
         txn = transaction(await authorise(web, client))
-        assert (await post_code(web, txn, wrong)).status_code == 403
+        for _ in range(link_window.WRONG_CODES_MAX):
+            await post_code(web, txn, wrong_code_for(window["code"]))
+    opened, wrong = await changes()
+    assert (wrong.entity_type, wrong.entity_id, wrong.action) == (
+        "link_window", opened.entity_id, "wrong_code",
+    )
+    assert (wrong.source, wrong.actor) == ("oauth", None)
+    assert wrong.summary == "a wrong link code was typed on a consent page of this link window"
+    assert set(wrong.after) == {"can_write", "opened_at", "expires_at"}
+    assert window["code"] not in repr((wrong.summary, wrong.after))
+    assert (await window_state(web))["wrong_codes"] == 15
+    # the next window has an entry of its own
+    second = await open_window(web)
     txn = transaction(await authorise(web, client))
-    res = await post_code(web, txn, wrong)
-    assert "five wrong link codes" in res.text
-    assert (await window_state(web))["ended"] == "burned"
+    await post_code(web, txn, wrong_code_for(second["code"]))
+    await post_code(web, txn, wrong_code_for(second["code"]))
+    assert [c.action for c in await changes()] == ["open", "wrong_code", "open", "wrong_code"]
+
+
+async def test_an_outsider_guessing_on_its_own_requests_never_closes_the_owners_window(web):
+    """As round 1 of the briefed review broke it: one registration an outsider made in
+    an earlier window, kept, tells it when a window is open (its authorise is a redirect
+    and no longer a 403) and gets it consent forms of its own. It can type any number of
+    wrong codes on them; the owner still links in every window with the right code."""
+    await open_window(web)
+    outsider = await register(web, client_name="Outsider")
+    await web.delete("/api/v1/link-window", headers=OWNER)
+    assert (await authorise(web, outsider)).status_code == 403
+    for _ in range(3):
+        window = await open_window(web)
+        for _ in range(4):
+            txn = transaction(await authorise(web, outsider))
+            for _ in range(link_window.WRONG_CODES_MAX):
+                await post_code(web, txn, wrong_code_for(window["code"]))
+        state = await window_state(web)
+        assert state["open"] is True and state["wrong_codes"] == 20
+        owners = await register(web, client_name="Example Assistant")
+        url = await consent_with_code(web, owners, window["code"])
+        assert (await exchange(web, owners, url.params["code"])).status_code == 200
+        assert (await window_state(web))["ended"] == "linked"
+    grants = await all_rows(OAuthGrant)
+    assert len(grants) == 3 and outsider["client_id"] not in {g.client_id for g in grants}
+
+
+async def test_wrong_codes_on_other_requests_do_not_count_against_this_one(web):
+    window = await open_window(web)
+    client = await register(web)
+    mine = transaction(await authorise(web, client))
+    for _ in range(4):
+        other = transaction(await authorise(web, client))
+        for _ in range(4):
+            await post_code(web, other, wrong_code_for(window["code"]))
+    page = (await consent_page(web, mine)).text
+    assert "5 more wrong codes end this request" in page
+    assert (await post_code(web, mine, window["code"])).status_code == 303
 
 
 async def test_what_cannot_be_a_code_is_not_counted(web):
@@ -302,7 +349,29 @@ async def test_what_cannot_be_a_code_is_not_counted(web):
     for typed in ("", "ABC", window["code"] + "2", "0" * 10, "I" * 10, "x" * 5000):
         res = await post_code(web, txn, typed)
         assert res.status_code == 400 and consent.NOT_A_CODE in res.text
-    assert (await window_state(web))["attempts_left"] == 5
+    assert (await window_state(web))["wrong_codes"] == 0
+    assert [c.action for c in await changes()] == ["open"]
+
+
+@pytest.mark.parametrize(
+    "typed",
+    [
+        "ſ23456789A",  # long s: upper-cases to S
+        "ß2345678A",  # sharp s: upper-cases to SS
+        "２３４５６７８９AB",  # fullwidth digits
+        "23456\t789AB",
+        "23456\n789AB",
+        "23456\u00a0789AB",  # no-break space
+        "23456_789AB",
+    ],
+)
+def test_only_ascii_code_characters_spaces_and_hyphens_make_a_code(typed):
+    assert link_window.typed_code(typed) is None
+
+
+def test_a_code_may_be_typed_with_spaces_hyphens_and_in_either_case():
+    assert link_window.typed_code(" 23456-789ab ") == "23456789AB"
+    assert link_window.typed_code("2 3 4 5 6 7 8 9 a b") == "23456789AB"
 
 
 async def test_a_code_is_taken_in_either_case_with_spaces_or_hyphens(web):
@@ -473,7 +542,7 @@ async def test_a_client_that_registers_twice_links_with_its_second_registration(
     unused, used = await register(web), await register(web)
     # neither registration closed the window or used it up
     assert (await window_state(web))["open"] is True
-    assert (await window_state(web))["attempts_left"] == 5
+    assert (await window_state(web))["wrong_codes"] == 0
     url = await consent_with_code(web, used, window["code"])
     assert (await exchange(web, used, url.params["code"])).status_code == 200
     [grant] = await all_rows(OAuthGrant)
@@ -527,7 +596,7 @@ async def test_a_request_whose_registration_was_reclaimed_shows_the_start_again_
     assert await all_rows(OAuthGrant) == [] and await all_rows(OAuthToken) == []
     # the window stays open, its count unchanged: the client registers again and links
     state = await window_state(web)
-    assert state["open"] is True and state["attempts_left"] == 5
+    assert state["open"] is True and state["wrong_codes"] == 0
     again = await register(web)
     url = await consent_with_code(web, again, window["code"])
     assert (await exchange(web, again, url.params["code"])).status_code == 200
@@ -561,7 +630,7 @@ async def test_a_grant_the_database_refuses_leaves_the_window_open(web, monkeypa
     )
     assert res.status_code == 503 and "could not be recorded" in res.text
     state = await window_state(web)
-    assert state["open"] is True and state["attempts_left"] == 5
+    assert state["open"] is True and state["wrong_codes"] == 0
 
 
 # --- The form ---
@@ -591,7 +660,7 @@ async def test_a_form_for_another_request_or_without_its_token_is_refused_uncoun
     for csrf in (other_form["csrf"], None, "", "x" * 43):
         res = await post_code(web, txn, window["code"], csrf=csrf)
         assert res.status_code == 403 and "was not accepted" in res.text
-    assert (await window_state(web))["attempts_left"] == 5
+    assert (await window_state(web))["wrong_codes"] == 0
     assert await all_rows(OAuthGrant) == []
 
 
@@ -602,7 +671,7 @@ async def test_a_post_from_another_origin_is_refused_uncounted(web):
     for origin in ("https://attacker.example", "null", "http://ipam.example.com"):
         res = await post_code(web, txn, window["code"], headers={"Origin": origin})
         assert res.status_code == 403 and "was not accepted" in res.text
-    assert (await window_state(web))["attempts_left"] == 5
+    assert (await window_state(web))["wrong_codes"] == 0
     res = await post_code(web, txn, window["code"], headers={"Origin": BASE})
     assert res.status_code == 303
 
@@ -615,7 +684,7 @@ async def test_an_unknown_request_is_no_form(web):
     assert (await web.get("/mcp/consent")).status_code == 410
     res = await web.post("/mcp/consent", data={"txn": "x", "code": "ABCDEFGHJK"})
     assert res.status_code == 410
-    assert (await window_state(web))["attempts_left"] == 5
+    assert (await window_state(web))["wrong_codes"] == 0
 
 
 async def test_do_not_link_drops_the_request_and_keeps_the_window(web):
@@ -634,7 +703,156 @@ async def test_the_page_says_how_many_codes_and_minutes_are_left(web):
     client = await register(web)
     txn = transaction(await authorise(web, client))
     page = (await consent_page(web, txn)).text
-    assert "5 more wrong codes close it." in page and "closes in 10 minutes" in page
+    assert "5 more wrong codes end this request; the window stays open." in page
+    assert "closes in 10 minutes" in page
     for _ in range(4):
         await post_code(web, txn, wrong_code_for(window["code"]))
-    assert "1 more wrong code closes it." in (await consent_page(web, txn)).text
+    assert "1 more wrong code ends this request" in (await consent_page(web, txn)).text
+
+
+# --- Ending a window and an approval in flight ---
+
+
+async def _post_right_code(web, txn, code):
+    form = hidden_fields((await consent_page(web, txn)).text)
+    return await web.post("/mcp/consent", data={**form, "code": code, "action": "link"})
+
+
+@pytest.mark.parametrize("owner_action", ["cancel", "replace"])
+async def test_an_approval_in_flight_finishes_before_the_owner_ends_its_window(
+    web, monkeypatch, owner_action
+):
+    """As round 1 of the briefed review broke it: the approval is paused at the write
+    lock, having taken its transaction, and the owner cancels or replaces the window.
+    The owner's answer waits for the approval, and says what happened."""
+    window = await open_window(web)
+    client = await register(web)
+    txn = transaction(await authorise(web, client))
+    paused, go = asyncio.Event(), asyncio.Event()
+    take = scans.take_write_lock
+
+    async def held(session):
+        paused.set()
+        await go.wait()
+        await take(session)
+
+    monkeypatch.setattr(scans, "take_write_lock", held)
+    linking = asyncio.create_task(_post_right_code(web, txn, window["code"]))
+    await paused.wait()
+    if owner_action == "cancel":
+        owner = asyncio.create_task(web.delete("/api/v1/link-window", headers=OWNER))
+    else:
+        owner = asyncio.create_task(web.post("/api/v1/link-window", json={}, headers=OWNER))
+    await asyncio.sleep(0.05)
+    assert not owner.done()  # the owner is not answered while the approval is out
+    monkeypatch.setattr(scans, "take_write_lock", take)
+    go.set()
+    res, answer = await linking, await owner
+    assert res.status_code == 303
+    assert len(await all_rows(OAuthGrant)) == 1
+    if owner_action == "cancel":
+        # nothing left to cancel: the answer says the window linked
+        assert answer.json()["data"]["ended"] == "linked"
+    else:
+        assert answer.status_code == 201 and answer.json()["data"]["open"] is True
+        assert [c.action for c in await changes()] == ["open", "create", "open"]
+
+
+@pytest.mark.parametrize("owner_action", ["cancel", "replace"])
+async def test_an_approval_that_waits_behind_the_owner_ending_its_window_links_nothing(
+    web, owner_action
+):
+    """The other order: the owner's cancel or replace takes the lock first, and the
+    approval of the right code, waiting behind it, finds its window gone."""
+    window = await open_window(web)
+    client = await register(web)
+    txn = transaction(await authorise(web, client))
+    form = hidden_fields((await consent_page(web, txn)).text)
+    lock = link_window._transitions
+    await lock.acquire()  # only to order the two requests
+    if owner_action == "cancel":
+        owner = asyncio.create_task(web.delete("/api/v1/link-window", headers=OWNER))
+    else:
+        owner = asyncio.create_task(web.post("/api/v1/link-window", json={}, headers=OWNER))
+    await asyncio.sleep(0.05)
+    linking = asyncio.create_task(
+        web.post("/mcp/consent", data={**form, "code": window["code"], "action": "link"})
+    )
+    await asyncio.sleep(0.05)
+    lock.release()
+    answer, res = await owner, await linking
+    if owner_action == "cancel":
+        assert answer.json()["data"]["ended"] == "cancelled"
+    else:
+        assert answer.status_code == 201
+    assert res.status_code == 403 and "No link window is open" in res.text
+    assert await all_rows(OAuthGrant) == [] and await all_rows(OAuthToken) == []
+
+
+async def test_a_window_does_not_expire_under_an_approval_in_flight(web, monkeypatch):
+    window = await open_window(web)
+    client = await register(web)
+    txn = transaction(await authorise(web, client))
+    paused, go = asyncio.Event(), asyncio.Event()
+    take = scans.take_write_lock
+
+    async def held(session):
+        paused.set()
+        await go.wait()
+        await take(session)
+
+    monkeypatch.setattr(scans, "take_write_lock", held)
+    linking = asyncio.create_task(_post_right_code(web, txn, window["code"]))
+    await paused.wait()
+    start = time.monotonic()
+    monkeypatch.setattr(link_window.time, "monotonic", lambda: start + 601)
+    assert (await window_state(web))["open"] is True
+    monkeypatch.setattr(scans, "take_write_lock", take)
+    go.set()
+    assert (await linking).status_code == 303
+    assert (await window_state(web))["ended"] == "linked"
+
+
+async def test_an_unexpected_failure_of_the_approval_ends_the_window(web, monkeypatch):
+    window = await open_window(web)
+    client = await register(web)
+    txn = transaction(await authorise(web, client))
+    form = hidden_fields((await consent_page(web, txn)).text)
+    approve = oauth.approve
+
+    async def broken(session, txn_id, *, can_write):
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(oauth, "approve", broken)
+    res = await web.post("/mcp/consent", data={**form, "code": window["code"], "action": "link"})
+    assert res.status_code == 500 and "The link failed" in res.text
+    state = await window_state(web)
+    assert state["open"] is False and state["ended"] == "failed"
+    # not left claimed: the retry is told there is no window, and a new one links
+    res = await web.post("/mcp/consent", data={**form, "code": window["code"], "action": "link"})
+    assert res.status_code == 403 and "No link window is open" in res.text
+    monkeypatch.setattr(oauth, "approve", approve)
+    url = await consent_with_code(web, client, (await open_window(web))["code"])
+    assert (await exchange(web, client, url.params["code"])).status_code == 200
+
+
+async def test_a_failure_after_the_grant_is_committed_still_links_once(web, monkeypatch):
+    window = await open_window(web)
+    first, second = await register(web), await register(web)
+    txn = transaction(await authorise(web, first))
+    other = transaction(await authorise(web, second))
+    other_form = hidden_fields((await consent_page(web, other)).text)
+    approve = oauth.approve
+
+    async def fails_after_commit(session, txn_id, *, can_write):
+        await approve(session, txn_id, can_write=can_write)
+        raise RuntimeError("injected after the commit")
+
+    monkeypatch.setattr(oauth, "approve", fails_after_commit)
+    assert (await _post_right_code(web, txn, window["code"])).status_code == 500
+    monkeypatch.setattr(oauth, "approve", approve)
+    res = await web.post(
+        "/mcp/consent", data={**other_form, "code": window["code"], "action": "link"}
+    )
+    assert res.status_code == 403
+    assert len(await all_rows(OAuthGrant)) == 1

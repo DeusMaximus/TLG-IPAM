@@ -175,11 +175,12 @@ NOTICES = {
         "Linking a client is started from the IPAM's own web interface: open a link "
         "window there, then start again from the client.",
     ),
-    window.WINDOW_BURNED: (
+    window.REQUEST_ENDED: (
         403,
-        "This link window is closed",
-        "It was closed after five wrong link codes, and nothing was linked. Open a new "
-        "link window in the IPAM's web interface, then start again from the client.",
+        "This request was ended",
+        "Five wrong link codes were typed for it, and nothing was linked. The link "
+        "window is still open and its code has not changed: start again from the "
+        "client.",
     ),
     window.NOT_PENDING: (
         410,
@@ -213,6 +214,13 @@ NOTICES = {
         "Nothing was linked. The link window is still open: cancel it in the IPAM's "
         "web interface if you are not linking another client now.",
     ),
+    window.FAILED_NOW: (
+        500,
+        "The link failed",
+        "Something went wrong while the link was recorded, and the link window was "
+        "closed. Check the IPAM's web interface for a linked client; to link one, open "
+        "a new link window there and start again from the client.",
+    ),
     window.UNAVAILABLE: (
         503,
         "The link could not be recorded",
@@ -238,7 +246,8 @@ def _minutes(seconds: int) -> str:
 
 
 def _attempts(left: int) -> str:
-    return f"{left} more wrong code{'s' if left != 1 else ''} close{'s' if left == 1 else ''} it."
+    codes = f"{left} more wrong code{'s' if left != 1 else ''}"
+    return f"{codes} end{'s' if left == 1 else ''} this request; the window stays open."
 
 
 def consent_page(consent: window.Consent, message: str | None = None, status: int = 200) -> HTMLResponse:

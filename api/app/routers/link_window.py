@@ -39,4 +39,5 @@ async def open_link_window(
 
 @router.delete("")
 async def cancel_link_window(configured: bool = Depends(oauth_configured)):
-    return {"data": LinkWindowOut.model_validate(svc.cancel(configured=configured)).model_dump()}
+    state = await svc.cancel(configured=configured)
+    return {"data": LinkWindowOut.model_validate(state).model_dump()}
