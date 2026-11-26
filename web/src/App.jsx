@@ -4,6 +4,7 @@ import { getApiKey, setApiKey } from './api/client'
 import Layout from './components/Layout'
 import Agents from './pages/Agents'
 import Dashboard from './pages/Dashboard'
+import LinkedClients from './pages/LinkedClients'
 import SectionView from './pages/SectionView'
 import Settings from './pages/Settings'
 import SubnetView from './pages/SubnetView'
@@ -71,6 +72,7 @@ export default function App() {
             <Route path="/sections/:sectionId" element={<SectionView />} />
             <Route path="/subnets/:subnetId" element={<SubnetView />} />
             <Route path="/agents" element={<Agents />} />
+            <Route path="/linked-clients" element={<LinkedClients />} />
             <Route path="/settings" element={<Settings />} />
           </Route>
         </Routes>

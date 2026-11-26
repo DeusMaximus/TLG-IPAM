@@ -46,7 +46,7 @@ If you only use local clients, you need [Running the server](#running-the-server
 With `PUBLIC_BASE_URL` set, the server is its own OAuth authorisation server for `/mcp`, so that web MCP clients, which cannot send a static key, can be linked to it. Read this before turning it on:
 
 - **A linked client can read the whole IPAM**: subnets, VLANs, gateways, hostnames, MAC addresses, notes, scan findings and the change log. That is the cost of remote MCP. A link is read-only unless you [allow writes](#writes), which takes both a server setting and a choice made for that link.
-- **There is no supported way yet to revoke one link.** The list of linked clients, with revoke, is [#30](https://github.com/DeusMaximus/TLG-IPAM/issues/30) and has not shipped. A link you allowed to write can write again whenever the setting is on. See [Ending a link](#ending-a-link) before you make one.
+- **You can revoke any link** on the web UI's **Linked clients** page. Its tokens are refused from the client's next request. See [Ending a link](#ending-a-link).
 - Linking needs a code that only the holder of the owner key can get. There is no standing password for it.
 
 ### What you publish
@@ -317,7 +317,9 @@ None of the last four may be a redirect or your login page. Then link a client, 
 
 ## Linking a client
 
-A client can register and ask to be authorised only while a **link window** is open. You open it with the owner key, from your private network. The web UI for this is [#30](https://github.com/DeusMaximus/TLG-IPAM/issues/30), not shipped yet, so use the API:
+A client can register and ask to be authorised only while a **link window** is open. You open it from your private network, on the web UI's **Linked clients** page: choose **Link a client**, then **Open link window**. The dialog shows the one-time 10-character **link code**, the URL to give the client, and how long the window has left. The code is shown only in that dialog, so closing the dialog, or leaving the page, cancels the window. The dialog follows the window: it says when the client is linked or the window runs out, and how many wrong codes have been typed.
+
+Without the web UI, open it with the API and the owner key:
 
 ```sh
 read -rs API_KEY                      # paste the owner key; it is not echoed
@@ -326,14 +328,14 @@ printf 'X-API-Key: %s\n' "$API_KEY" |
     -H @- -H 'Content-Type: application/json' -d '{}'
 ```
 
-The answer holds `code`, the one-time 10-character **link code**, and `expires_in_s`. It is shown this once.
+The answer holds `code`, the link code, `expires_in_s`, and `window_id`. The code is shown this once.
 
 1. **Open the window first**, then add `https://ipam.example.com/mcp` to the client. Some clients register as soon as you enter the URL, and a registration with no window open is refused.
 2. Connect in the client. Your browser is sent to the consent page (through your access proxy's login, if you set one up).
 3. **Check the host in large type.** That is where the access goes. It must be the one you expect for the assistant you are linking. The client's name is whatever the client chose to call itself, and is marked unverified. If the host is wrong, choose **Do not link**.
 4. Type the link code and choose **Link this client**. The window closes: one window makes one link. To link another client, open another window.
 
-The window lasts 10 minutes, and there is one at a time: opening another replaces it, with a new code. To see it, or cancel it, send the same request with `GET` or `DELETE` in place of `-X POST …`:
+The window lasts 10 minutes, and there is one at a time: opening another replaces it, with a new code. With the API, to see it or cancel it, send the same request with `GET` or `DELETE` in place of `-X POST …`. `DELETE` with `?window_id=<the window_id you were given>` cancels that window only, and leaves alone one opened since, from the web UI or another script. Without it, `DELETE` cancels whatever window is open:
 
 ```sh
 printf 'X-API-Key: %s\n' "$API_KEY" | curl -sS -X DELETE http://ipam.home.arpa:8080/api/v1/link-window -H @-
@@ -348,29 +350,31 @@ Five wrong codes on one consent page end that request: start again from the clie
 A link is read-only unless you do both of these:
 
 1. Set `MCP_REMOTE_WRITES=true` in `.env` and run `docker compose up -d`.
-2. Open its link window for a read-write link: in the command above, send `-d '{"can_write": true}'` in place of `-d '{}'`. The consent page then shows **Read and write** as the access. If it shows that and you did not mean it, choose **Do not link**.
+2. Open its link window for a read-write link: in the **Link a client** dialog, tick **Allow this client to make changes**, which is offered only while the setting is on. With the API, send `-d '{"can_write": true}'` in place of `-d '{}'`. The consent page then shows **Read and write** as the access. If it shows that and you did not mean it, choose **Do not link**.
 
-While the setting is off, that request is refused (`409 REMOTE_WRITES_OFF`) and no window opens. The window's state says whether the setting is on (`remote_writes`) and, while a window is open, what its link may do (`can_write`).
+While the setting is off, an API request for a read-write window is refused (`409 REMOTE_WRITES_OFF`) and no window opens. The window's state says whether the setting is on (`remote_writes`) and, while a window is open, what its link may do (`can_write`).
 
 A read-only link is not shown the write tools, and a call to one answers `Unknown tool`. A read-write link can create, change and delete hosts, add and delete reserved ranges, and ask for scans. It cannot configure scanning or widen what is scanned: it cannot delete a range that is excluded from scanning. Whoever holds its tokens can change or delete those records, and text it puts in a hostname or a note is read later by your own assistants, so allow it only for a client you would trust with that, and keep the [backups](backup-and-restore.md) running. The change log names the link as the `actor` of each of its writes: `grant:<client name>`, a name the client chose for itself, or `grant-id:<grant id>` if the server kept no name.
 
 The choice is fixed when the window is opened. Turning the setting on does not upgrade a read-only link.
 
-**To stop links writing**, set `MCP_REMOTE_WRITES=false` (or remove the line) and run `docker compose up -d`, not `restart`. Every link loses write access at once, without being linked again, and goes on reading and refreshing. This ends no link. **A link made read-write writes again whenever the setting is turned back on.** Until [#30](https://github.com/DeusMaximus/TLG-IPAM/issues/30) there is no supported way to revoke one link, so leaving the setting off is the way to stop it writing, and that stops every link.
+**To stop links writing**, set `MCP_REMOTE_WRITES=false` (or remove the line) and run `docker compose up -d`, not `restart`. Every link loses write access at once, without being linked again, and goes on reading and refreshing. This ends no link. **A link made read-write writes again whenever the setting is turned back on.** While it is off, **Linked clients** shows such a link as **Read-only now**. To stop one link for good, [revoke it](#ending-a-link).
 
 The owner key reads and writes whatever the setting is.
 
 ### Ending a link
 
-The list of linked clients, with revoke, has not shipped ([#30](https://github.com/DeusMaximus/TLG-IPAM/issues/30)). Until it does:
+**Revoke it** on the web UI's **Linked clients** page. The page lists each link by the host its codes were sent to when you approved it, with the name the client gave itself, what it may do, when it was linked and its **Last contact**. **Revoke** asks first, then ends the link: its tokens are deleted, so the client's next request is refused, and the change log records the revoke as yours. A revoked link stays listed under **Recently revoked**, and cannot be restored: to use that client again, link it again with a new code. With the API, `GET /api/v1/linked-clients` lists the links and `POST /api/v1/linked-clients/<id>/revoke` revokes one, with the owner key.
 
-- **Removing the connector in the client does not revoke anything here.** The server has no revocation endpoint.
-- **To stop a link writing**, leave `MCP_REMOTE_WRITES` off ([Writes](#writes)). That ends no link: each can still read everything.
-- **To stop every link at once**, remove `PUBLIC_BASE_URL` from `.env` and run `docker compose up -d` (`restart` would leave it set). Linked clients' tokens are refused from then on, and the public OAuth paths answer `404`. The links are stored, not deleted: set the value again and they work again, and a read-write one can write again if `MCP_REMOTE_WRITES` is `true` then.
-- **To end a link for good** before #30, keep remote MCP off until you can revoke it, or [restore a backup](backup-and-restore.md) taken before the link was made, which also undoes every other change made since.
-- The server revokes a link by itself when one of its old refresh tokens is used again, a sign that two parties hold its tokens, and logs it.
+- **Removing the connector in the client does not revoke anything here.** The server has no revocation endpoint. Revoke the link on this server too.
+- The server revokes a link by itself when one of its old refresh tokens is used again, a sign that two parties hold its tokens, and logs it. The link then shows under **Recently revoked**.
 
-If you think the owner key itself has leaked, change `API_KEY`. Links that somebody made with the old key stay: end them as above.
+Two ways stop every link at once, and end none:
+
+- **To stop every link writing**, leave `MCP_REMOTE_WRITES` off ([Writes](#writes)). Each can still read everything.
+- **To stop every link**, remove `PUBLIC_BASE_URL` from `.env` and run `docker compose up -d` (`restart` would leave it set). Linked clients' tokens are refused from then on, and the public OAuth paths answer `404`. The links are stored, not deleted: set the value again and those not revoked work again, and a read-write one can write again if `MCP_REMOTE_WRITES` is `true` then. **Linked clients** still lists them, and revokes them, while the setting is unset.
+
+If you think the owner key itself has leaked, change `API_KEY`. Links that somebody made with the old key stay: revoke them as above.
 
 ## What the proxy holds
 

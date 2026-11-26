@@ -4,7 +4,7 @@ A clean, modern, homelab-first IP address manager — faster than phpIPAM, simpl
 
 - **Web UI** — dark-mode-first React SPA: section/subnet sidebar tree, host tables, slide-over editing, one-click "allocate next free IP"
 - **REST API** — FastAPI with API-key auth, OpenAPI docs at `/api/v1/docs`
-- **MCP server** — 16 hand-curated tools at `/mcp` (Streamable HTTP) so your AI assistant can query and update your IPAM
+- **MCP server** — 18 hand-curated tools at `/mcp` (Streamable HTTP) so your AI assistant can query and update your IPAM
 - **Custom device types** — define your own types with icons in Settings (seeded with sensible defaults); renames cascade to hosts
 - **Bulk operations** — CSV import in the UI and `bulk_create_hosts`/`bulk_delete_hosts` MCP tools (paste a UniFi export at your assistant); per-record results, partial failures never abort the batch. Multi-select delete in the host table, and force-delete for a whole subnet with confirmation.
 - **Audit log** — every write (UI, API, or MCP) is recorded with before/after snapshots, so you can always review what your assistant changed
@@ -61,7 +61,7 @@ Remote MCP is off unless `PUBLIC_BASE_URL` is set. Do not forward port 8080 from
 
 The MCP server at `/mcp` speaks Streamable HTTP. It takes the same `API_KEY` as the REST API, sent as a bearer token (`Authorization: Bearer <API_KEY>`), so any MCP-capable client that can send a header can use it. `X-API-Key` works on the REST API only. Claude Desktop setup is documented below; instructions for other local clients (Codex CLI, …) coming soon.
 
-A web client, which signs in with OAuth and cannot send your key, is linked instead: set `PUBLIC_BASE_URL`, publish the paths it needs, and approve it with a one-time link code ([docs/deployment.md](docs/deployment.md#remote-mcp)).
+A web client, which signs in with OAuth and cannot send your key, is linked instead: set `PUBLIC_BASE_URL`, publish the paths it needs, and approve it with a one-time link code from the web UI's **Linked clients** page, where you can also revoke it ([docs/deployment.md](docs/deployment.md#remote-mcp)).
 
 ### Claude Desktop
 

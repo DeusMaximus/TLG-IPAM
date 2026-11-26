@@ -30,6 +30,9 @@ it is what proves that the person approving is the owner (spec §7.2, invariant 
 - **Pending transactions end with the window**: every way a window ends drops them all
   (`oauth.pending.reset`), and so does opening one, so no request a client sent in an
   earlier window can be approved in a later one.
+- **A cancel can name its window** (`cancel`'s `window_id`, the window's own `id`):
+  compared under `_transitions`, so it ends that window or nothing, never a window that
+  replaced it (#30).
 - **Ending a window and approving a link are serialised** (`_transitions`): opening,
   cancelling and an approval through its commit each hold the one lock. So a cancel or
   a replacement the owner has been answered for is never followed by a grant from the
@@ -144,8 +147,8 @@ class _Window:
 
 
 _current: _Window | None = None
-# how the latest window ended, and when: (reason, at)
-_last_end: tuple[str, datetime] | None = None
+# how the latest window ended, when, and which window it was: (reason, at, window id)
+_last_end: tuple[str, datetime, str | None] | None = None
 # wrong codes by pending transaction, in the open window; only pending ones are kept
 _wrong: dict[str, int] = {}
 # held by every change of which window is current and by an approval through its commit
@@ -155,8 +158,9 @@ _transitions = asyncio.Lock()
 def _end(reason: str, at: datetime | None = None) -> None:
     """End the open window, and every transaction pending in it."""
     global _current, _last_end
+    ended = _current.id if _current is not None else None
     _current = None
-    _last_end = (reason, at or _now())
+    _last_end = (reason, at or _now(), ended)
     _wrong.clear()
     oauth.pending.reset()
 
@@ -191,7 +195,12 @@ def state_out(*, configured: bool, remote_writes: bool) -> dict:
     open, what its link may do, how long it has left by the server's clock
     (`expires_in_s`, which a countdown starts from, so it does not depend on the
     browser's clock) and how many wrong codes its requests have had, or how the latest
-    one ended. Never the code: that is in the one answer that opened it."""
+    one ended. Never the code: that is in the one answer that opened it.
+
+    `ended`, `ended_at` and `ended_window_id` are the latest end of any window, and
+    `ended_window_id` says which window that was (#30): a page that opened a window
+    takes `ended` for its own only when that id is its window's, since another window
+    may have opened and ended since, and a restart forgets every end."""
     writes = configured and writes_may_be_allowed(remote_writes)
     window = _live() if configured else None
     if window is not None:
@@ -199,6 +208,7 @@ def state_out(*, configured: bool, remote_writes: bool) -> dict:
             "configured": True,
             "remote_writes": writes,
             "open": True,
+            "window_id": window.id,
             "can_write": window.can_write,
             "opened_at": window.opened_at,
             "expires_at": window.expires_at,
@@ -206,12 +216,16 @@ def state_out(*, configured: bool, remote_writes: bool) -> dict:
             "wrong_codes": window.wrong_codes,
             "ended": None,
             "ended_at": None,
+            "ended_window_id": None,
         }
-    ended, ended_at = _last_end if configured and _last_end else (None, None)
+    ended, ended_at, ended_window_id = (
+        _last_end if configured and _last_end else (None, None, None)
+    )
     return {
         "configured": configured,
         "remote_writes": writes,
         "open": False,
+        "window_id": None,
         "can_write": None,
         "opened_at": None,
         "expires_at": None,
@@ -219,6 +233,7 @@ def state_out(*, configured: bool, remote_writes: bool) -> dict:
         "wrong_codes": None,
         "ended": ended,
         "ended_at": ended_at,
+        "ended_window_id": ended_window_id,
     }
 
 
@@ -280,14 +295,28 @@ async def open_window(
         return state_out(configured=True, remote_writes=remote_writes), code
 
 
-async def cancel(*, configured: bool, remote_writes: bool) -> dict:
-    """End the open window, if there is one; the state after. An approval in flight on
-    it finishes first, so the answer is true of what happened: `linked` if it linked."""
+async def cancel(
+    *, configured: bool, remote_writes: bool, window_id: str | None = None
+) -> tuple[dict, bool]:
+    """End the open window, if there is one; the state after, and whether this call
+    ended a window. An approval in flight on it finishes first, so the answer is true of
+    what happened: `linked` if it linked.
+
+    With `window_id` (the window's own `id`, which the state gives as `window_id`) it
+    ends that window only: the id is compared with the current window's under
+    `_transitions`, before anything is ended, so a window that has since ended or been
+    replaced is never taken for it. A cancel naming a window that is not current ends
+    nothing and changes nothing (#30: the owner's page cancels only the window it
+    opened, and a replacement from another tab, with its pending requests, stays).
+    Without `window_id` it ends whatever window is open, for the owner's own scripts."""
+    cancelled = False
     if configured:
         async with _transitions:
-            if _live() is not None:
+            window = _live()
+            if window is not None and (window_id is None or window.id == window_id):
                 _end(CANCELLED)
-    return state_out(configured=configured, remote_writes=remote_writes)
+                cancelled = True
+    return state_out(configured=configured, remote_writes=remote_writes), cancelled
 
 
 # --- The consent page ---

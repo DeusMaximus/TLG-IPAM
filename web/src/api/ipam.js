@@ -79,6 +79,19 @@ export const createScanTarget = (body) => api('/api/v1/scan-targets', { method: 
 export const updateScanTarget = (id, body) =>
   api(`/api/v1/scan-targets/${id}`, { method: 'PUT', body })
 
+// the link window (spec §6.3): the link code is in openLinkWindow's answer and no other
+export const getLinkWindow = () => api('/api/v1/link-window')
+export const openLinkWindow = (body) => api('/api/v1/link-window', { method: 'POST', body })
+// cancels the named window only (its `window_id`), and answers `cancelled: false` when
+// that window has ended or been replaced; the page never cancels a window it did not see
+export const cancelLinkWindow = (windowId) =>
+  api(`/api/v1/link-window?window_id=${encodeURIComponent(windowId)}`, { method: 'DELETE' })
+
+// linked clients (spec §6.6): the owner's links, and revoking one
+export const listLinkedClients = () => api('/api/v1/linked-clients')
+export const revokeLinkedClient = (id) =>
+  api(`/api/v1/linked-clients/${encodeURIComponent(id)}/revoke`, { method: 'POST' })
+
 // changes / misc
 export const listChanges = (params) => api(`/api/v1/changes${qs(params)}`)
 export const getHealth = () => api('/health')
