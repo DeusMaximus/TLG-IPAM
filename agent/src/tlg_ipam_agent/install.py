@@ -28,10 +28,10 @@ is taken back.
 
 Run again without `--enrol-token`, `install` keeps the stored token and rewrites the
 settings and the unit (an update: install the new release into the same environment,
-then run it). Every setting is the run's own options but `ALLOWED_DNS_SERVERS`, which a
-run without `--allowed-dns-servers` keeps as agent.env holds it (`kept_allowed_dns`,
-#179). With a token already stored, `--enrol-token` is refused: `uninstall`
-first, then enrol again.
+then run it). `ALLOWED_CIDRS`, `ALLOWED_DNS_SERVERS` and `MAX_PPS` are kept as agent.env
+holds them by a run without their option (`kept_settings`, #179, #183); `IPAM_URL` and
+the trust settings are the run's own. With a token already stored, `--enrol-token` is
+refused: `uninstall` first, then enrol again.
 
 `uninstall` stops and disables the unit and removes everything `install` created: the
 unit, both directories and the files in them, and the service user and its group when
@@ -126,8 +126,8 @@ class Options:
     url: str | None
     # as given: "-" for standard input, or None; any other value is refused
     enrol_token: str | None = None
+    # these three: None keeps the value agent.env holds (`kept_settings`, #179, #183)
     allowed_cidrs: str | None = None
-    # None keeps the value agent.env holds (`kept_allowed_dns`, #179)
     allowed_dns_servers: str | None = None
     max_pps: str | None = None
     ca_file: str | None = None
@@ -404,14 +404,35 @@ def inherited_trust(environ, ca_file: str | None) -> str | None:
     return None
 
 
-# a line of agent.env `kept_allowed_dns` reads as an assignment: an unquoted name, `=`,
+# the settings a run without their option keeps as agent.env holds them (#179, #183):
+# each one's name in agent.env, its option, and the agent's own rule for reading it.
+# Every one widens what the agent may send when it is dropped: ALLOWED_CIDRS's absence
+# is every private range, ALLOWED_DNS_SERVERS's any server, MAX_PPS's the default rate
+KEPT_SETTINGS = (
+    ("ALLOWED_CIDRS", "--allowed-cidrs", config.parse_allowed),
+    ("ALLOWED_DNS_SERVERS", "--allowed-dns-servers", config.parse_allowed_dns),
+    ("MAX_PPS", "--max-pps", config.parse_max_pps),
+)
+_OPTION_OF = {name: option for name, option, _ in KEPT_SETTINGS}
+# a line of agent.env `kept_settings` reads as an assignment: an unquoted name, `=`,
 # and a value of `_PLAIN` characters
 _ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(" + _PLAIN.pattern + r")")
 # what any line may hold: printable ASCII, no backslash
 _PRINTABLE = re.compile(r"[\x20-\x5b\x5d-\x7e]*")
 
 
-def env_assignments(text: str, env_path: str) -> list[tuple[str, str]]:
+def _listed(words) -> str:
+    words = list(words)
+    return words[0] if len(words) == 1 else ", ".join(words[:-1]) + " and " + words[-1]
+
+
+def _not_kept(names) -> str:
+    """The end of a refusal to read agent.env back: what could not be kept, and the
+    options that would be used in its place."""
+    return f"so the {_listed(names)} in it could not be kept; give {_listed(_OPTION_OF[n] for n in names)}"
+
+
+def env_assignments(text: str, env_path: str, names=tuple(_OPTION_OF)) -> list[tuple[str, str]]:
     """The assignments of an agent.env, in order, when the whole file is in the grammar
     `install` writes; otherwise InstallError, before any assignment is read (round 1
     of the briefed review of #179). systemd's `EnvironmentFile=` grammar is wider:
@@ -422,7 +443,8 @@ def env_assignments(text: str, env_path: str) -> list[tuple[str, str]]:
     alone, may end in one `\r` (a CRLF file), and must be printable ASCII with no
     backslash, and then either empty, a comment (`#` or `;` first), or
     `NAME=<plain value>` (`_PLAIN`, as `install` writes values). Everything `install`
-    writes is in it. The refusal names the line by its number, never its content."""
+    writes is in it. The refusal names the line by its number, never its content, and
+    the settings `names` the run meant to keep."""
     assignments = []
     for number, line in enumerate(text.split("\n"), 1):
         line = line.removesuffix("\r")
@@ -435,41 +457,52 @@ def env_assignments(text: str, env_path: str) -> list[tuple[str, str]]:
         raise InstallError(
             f"line {number} of {env_path} is in a form install does not read back (it reads "
             "only unquoted NAME=value lines of plain characters, comments and empty lines), "
-            "so the ALLOWED_DNS_SERVERS in it could not be kept; give --allowed-dns-servers, "
-            "or rewrite or remove that line"
+            f"{_not_kept(names)}, or rewrite or remove that line"
         )
     return assignments
 
 
-def kept_allowed_dns(env_path: str):
-    """The `ALLOWED_DNS_SERVERS` agent.env holds, for a run without
-    `--allowed-dns-servers` (#179), as `config.parse_allowed_dns` reads it: None when
-    there is no agent.env or it sets none.
+def kept_settings(env_path: str, names) -> dict:
+    """The settings of `names` (from `KEPT_SETTINGS`) that agent.env holds, for a run
+    without their options (#179, #183), each as the agent's own rule reads it
+    (`config.parse_allowed`, `parse_allowed_dns`, `parse_max_pps`); a name agent.env
+    sets none of, or every name when there is no agent.env, is left out, so its line
+    is not written and the agent's default applies, as on a first install. With no
+    names, nothing is read.
 
-    Kept, unlike `--allowed-cidrs`, which a run without it drops back to the default:
-    that default is the private ranges, while this setting's absence is "any server",
-    so dropping it on an update copied from the Agents page would widen what the agent
-    may ask without a word. To remove it, delete its line from agent.env.
+    Kept because dropping any of them widens what the agent may send on an update that
+    changed nothing the operator meant to change: an update run as the Agents page
+    renders it takes none of the options. To remove one, delete its line from
+    agent.env.
 
-    The file is read by `store.read_small`, and only when the whole of it is in the
-    grammar `install` writes (`env_assignments`); then the last assignment of the name
-    decides, as in systemd. A file outside that grammar, or one that cannot be read,
-    is refused rather than guessed at; giving the option skips the read. A bad item
-    is named by its place, never by its value (#140)."""
-    name = "ALLOWED_DNS_SERVERS"
-    where = f"the {name} in {env_path}"
+    The file is read by `store.read_small`, once, and only when the whole of it is in
+    the grammar `install` writes (`env_assignments`); then the last assignment of a
+    name decides, as in systemd. A file outside that grammar, one that cannot be read,
+    or a kept value the rule refuses, stops the run before anything changes, naming the
+    setting and never its value (#140: a bad item by its place); giving the option
+    skips the read of that setting."""
+    names = tuple(names)
+    if not names:
+        return {}
     try:
         data = store.read_small(env_path)
     except store.StoreError as exc:
-        raise InstallError(f"{exc}, so {where} could not be kept; give --allowed-dns-servers") from None
+        raise InstallError(f"{exc}, {_not_kept(names)}") from None
     if data is None:
-        return None
+        return {}
     try:
         text = data.decode("ascii")
     except UnicodeDecodeError:
-        raise InstallError(f"{env_path} is not ASCII, so {where} could not be kept; give --allowed-dns-servers") from None
-    values = [value for key, value in env_assignments(text, env_path) if key == name]
-    return config.parse_allowed_dns(values[-1], where) if values else None
+        raise InstallError(f"{env_path} is not ASCII, {_not_kept(names)}") from None
+    last = dict(env_assignments(text, env_path, names))
+    kept = {}
+    for name, option, parse in KEPT_SETTINGS:
+        if name in names and name in last:
+            try:
+                kept[name] = parse(last[name], f"the {name} in {env_path}")
+            except config.ConfigError as exc:
+                raise InstallError(f"{exc}; give {option} to replace it, or correct that line") from None
+    return kept
 
 
 def render_env(url: str, allowed, allowed_dns, max_pps: int | None, ca_file: str | None, token_path: str) -> str:
@@ -652,14 +685,18 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out, envir
     # module (`trust.check`)
     _preflight(host)
     url = config.parse_url(options.url, "--url")
-    allowed = None if options.allowed_cidrs is None else config.parse_allowed(options.allowed_cidrs, "--allowed-cidrs")
-    if options.allowed_dns_servers is None:
-        allowed_dns = kept_allowed_dns(paths.env)
-        kept = allowed_dns is not None
-    else:
-        kept = False
-        allowed_dns = config.parse_allowed_dns(options.allowed_dns_servers, "--allowed-dns-servers")
-    max_pps = None if options.max_pps is None else config.parse_max_pps(options.max_pps, "--max-pps")
+    given = {
+        "ALLOWED_CIDRS": options.allowed_cidrs,
+        "ALLOWED_DNS_SERVERS": options.allowed_dns_servers,
+        "MAX_PPS": options.max_pps,
+    }
+    settings = {name: parse(given[name], option) for name, option, parse in KEPT_SETTINGS if given[name] is not None}
+    # #179, #183: a setting whose option is left out is kept as agent.env holds it
+    kept = kept_settings(paths.env, (name for name, value in given.items() if value is None))
+    settings.update(kept)
+    allowed = settings.get("ALLOWED_CIDRS")
+    allowed_dns = settings.get("ALLOWED_DNS_SERVERS")
+    max_pps = settings.get("MAX_PPS")
     ca_file = _ca_file(options.ca_file)
     inherited = inherited_trust(environ, ca_file)
     if inherited is not None:
@@ -687,10 +724,10 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out, envir
         secret(token)
     env = render_env(url, allowed, allowed_dns, max_pps, ca_file, paths.token)
     if len(env) > store.READ_MAX:
-        # a later run reads it back (`kept_allowed_dns`), through `store.read_small`
+        # a later run reads it back (`kept_settings`), through `store.read_small`
         raise InstallError(
-            f"the settings given would make {paths.env} longer than {store.READ_MAX} bytes, "
-            "which a later install could not read back; give shorter lists"
+            f"the settings given and kept would make {paths.env} longer than {store.READ_MAX} "
+            "bytes, which a later install could not read back; give shorter lists"
         )
     unit = render_unit(paths.env, interpreter, ca_file)
 
@@ -707,11 +744,9 @@ def _install(options, host, paths, exchange, read_stdin, interpreter, out, envir
             "(--enrol-token - reads it from standard input)"
         )
 
-    if kept:
-        out(
-            f"ALLOWED_DNS_SERVERS: kept the {len(allowed_dns)} network(s) {paths.env} holds "
-            "(--allowed-dns-servers replaces them)"
-        )
+    for name, value in kept.items():
+        held = f"{value}, the rate" if name == "MAX_PPS" else f"the {len(value)} network(s)"
+        out(f"{name}: kept {held} {paths.env} holds ({_OPTION_OF[name]} replaces it)")
     undo: list[Callable[[], object]] = []
     try:
         user = host.service_user()

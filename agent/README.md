@@ -41,8 +41,8 @@ say which interface's link-local resolver it means. A link-local server written 
 a scope is compared by its address alone, and its query goes out on the link the host's
 routing picks. For the systemd unit, `install
 --allowed-dns-servers …` sets it (#179), and an update run without the option keeps the
-value `agent.env` holds, since its absence would mean any server; delete the line there
-to remove it. A drop-in's `Environment=ALLOWED_DNS_SERVERS=…`, which these docs used to
+value `agent.env` holds, since its absence would mean any server, as it keeps
+`ALLOWED_CIDRS` and `MAX_PPS` (#183); delete the line there to remove it. A drop-in's `Environment=ALLOWED_DNS_SERVERS=…`, which these docs used to
 suggest, is overridden by `agent.env`'s once that sets one. The agent reads the setting
 when it starts: after changing it by hand, restart the agent, and its start-up log line
 shows the value it took. A subnet's DNS servers are not checked against anything else, so this is what
@@ -107,7 +107,11 @@ publishes one, `.agents/releases.md`): `.venv/bin/pip wheel --no-deps . -w dist`
 this directory. Then, on the host,
 `sudo python3 -m venv /opt/tlg-ipam-agent`, `sudo /opt/tlg-ipam-agent/bin/pip install
 tlg_ipam_agent-<version>-py3-none-any.whl`, and `tlg-ipam-agent install` as the
-[project README](../README.md#run-it-as-a-systemd-unit) shows.
+[project README](../README.md#run-it-as-a-systemd-unit) shows. Run again without
+`--enrol-token` (an update), `install` keeps the stored token and the `ALLOWED_CIDRS`,
+`ALLOWED_DNS_SERVERS` and `MAX_PPS` that `agent.env` holds, each replaced only by its
+option (`install.kept_settings`, #183), and stops before changing anything when
+`agent.env` is in a form it does not write or a kept value no longer parses.
 
 Tests, from this directory (one-time setup:
 `python3 -m venv .venv && .venv/bin/pip install --require-hashes -r requirements-dev.txt`):

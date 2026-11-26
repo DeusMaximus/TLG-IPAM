@@ -98,8 +98,9 @@ export function containerUpdate({ url, version }) {
 }
 
 // systemd: install the release into the same environment and run `install` again
-// without `--enrol-token`, which keeps the stored token and rewrites the settings and
-// the unit (so the flags it was installed with must be given again)
+// without `--enrol-token`, which keeps the stored token and the ALLOWED_CIDRS,
+// ALLOWED_DNS_SERVERS and MAX_PPS agent.env holds (#183), and rewrites the rest of the
+// settings and the unit (so a `--ca-file` it was installed with must be given again)
 export function systemdUpdate({ url, version }) {
   return [
     `sudo ${VENV}/bin/pip install ${shellQuote(wheelUrl(version))}`,

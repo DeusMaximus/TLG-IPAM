@@ -15,6 +15,7 @@ PRs of #136 and #169 record."""
 
 import asyncio
 import errno
+import ipaddress
 import os
 import shutil
 import signal
@@ -1063,28 +1064,157 @@ def update(root, **options):
     )
 
 
-def test_an_update_without_the_option_keeps_allowed_dns_servers_and_one_with_it_replaces_it(root):
-    """#179, acceptance 2. Unlike `--allowed-cidrs`, whose absence is the private ranges,
-    this setting's absence is any server, so an update run as the Agents page renders it
-    (no options) keeps what agent.env holds rather than widen it."""
-    code, said = run_install(
-        root, FakeHost(), Options(url=URL, enrol_token="-", allowed_cidrs="10.20.0.0/16", allowed_dns_servers="10.0.0.53")
-    )
+# the three settings an update keeps (#179, #183), each narrowed from its default
+NARROWED = {"allowed_cidrs": "192.0.2.0/24", "allowed_dns_servers": "192.0.2.53", "max_pps": "20"}
+NARROWED_LINES = ["ALLOWED_CIDRS=192.0.2.0/24", "ALLOWED_DNS_SERVERS=192.0.2.53/32", "MAX_PPS=20"]
+EVERY_OPTION = "give --allowed-cidrs, --allowed-dns-servers and --max-pps"
+
+
+def agent_settings(root):
+    """What the agent reads once the unit restarts it: its own `config.load`, given
+    the environment the unit's `EnvironmentFile=` hands it (`unit_environment`)."""
+    unit = (root / "etc/systemd/system/tlg-ipam-agent.service").read_text()
+    return config.load({**unit_environment(unit, {}), "IPAM_AGENT_TOKEN": TOKEN})
+
+
+def test_an_update_with_none_of_the_options_keeps_the_three_settings_and_the_agent_reads_them(root):
+    """#183, acceptance 1: an update run as the Agents page renders it (no options)
+    keeps a narrowed ALLOWED_CIDRS, ALLOWED_DNS_SERVERS and a lowered MAX_PPS exactly,
+    agent.env byte for byte, and the restarted agent reads them, not its defaults."""
+    code, said = run_install(root, FakeHost(), Options(url=URL, enrol_token="-", **NARROWED))
     assert code == 0, said
-    code, said = update(root, max_pps="20")
-    assert code == 0, said
-    assert settings_of(root) == ["IPAM_URL=" + URL, "ALLOWED_DNS_SERVERS=10.0.0.53/32", "MAX_PPS=20"]
-    assert any("kept the 1 network(s)" in line for line in said)
-    code, said = update(root, allowed_dns_servers="10.0.0.54,10.0.0.55")
-    assert code == 0, said
-    assert settings_of(root) == ["IPAM_URL=" + URL, "ALLOWED_DNS_SERVERS=10.0.0.54/32,10.0.0.55/32"]
-    assert not any("kept" in line for line in said)
-    # the way to remove it: delete the line, and the next update has none to keep
     env = root / "etc/tlg-ipam-agent/agent.env"
-    env.write_text("".join(line for line in env.read_text().splitlines(True) if "ALLOWED_DNS" not in line))
-    code, said = update(root)
+    written = env.read_bytes()
+    host = FakeHost(user=True)
+    code, said = run_install(root, host, Options(url=URL), exchange=lambda *a: pytest.fail("no exchange"))
+    assert code == 0, said
+    assert host.commands == SYSTEMD_START
+    assert env.read_bytes() == written
+    assert settings_of(root) == ["IPAM_URL=" + URL, *NARROWED_LINES]
+    for line in (
+        f"ALLOWED_CIDRS: kept the 1 network(s) {env} holds (--allowed-cidrs replaces it)",
+        f"ALLOWED_DNS_SERVERS: kept the 1 network(s) {env} holds (--allowed-dns-servers replaces it)",
+        f"MAX_PPS: kept 20, the rate {env} holds (--max-pps replaces it)",
+    ):
+        assert line in said, said
+    settings = agent_settings(root)
+    assert settings.allowed == (ipaddress.ip_network("192.0.2.0/24"),)
+    assert settings.allowed_dns == (ipaddress.ip_network("192.0.2.53/32"),)
+    assert settings.max_pps == 20
+    assert settings.allowed != config.parse_allowed(None) and settings.max_pps != config.DEFAULT_MAX_PPS
+
+
+@pytest.mark.parametrize(
+    "given, line",
+    [
+        ({"allowed_cidrs": "198.51.100.0/24 203.0.113.0/25"}, "ALLOWED_CIDRS=198.51.100.0/24,203.0.113.0/25"),
+        ({"allowed_dns_servers": "10.0.0.54,10.0.0.55"}, "ALLOWED_DNS_SERVERS=10.0.0.54/32,10.0.0.55/32"),
+        ({"max_pps": "5"}, "MAX_PPS=5"),
+    ],
+)
+def test_an_option_given_on_an_update_replaces_its_setting_and_the_others_are_kept(root, given, line):
+    """#183, acceptance 2: the option replaces the kept value; the two left out are
+    kept, and the agent reads the result."""
+    run_install(root, FakeHost(), Options(url=URL, enrol_token="-", **NARROWED))
+    code, said = update(root, **given)
+    assert code == 0, said
+    name = line.partition("=")[0]
+    assert settings_of(root) == ["IPAM_URL=" + URL, *(line if kept.startswith(name + "=") else kept for kept in NARROWED_LINES)]
+    assert not any(text.startswith(name + ": kept") for text in said), said
+    assert sum(text.startswith(("ALLOWED_CIDRS: kept", "ALLOWED_DNS_SERVERS: kept", "MAX_PPS: kept")) for text in said) == 2
+    settings = agent_settings(root)
+    expected = {
+        "ALLOWED_CIDRS": ("allowed", config.parse_allowed),
+        "ALLOWED_DNS_SERVERS": ("allowed_dns", config.parse_allowed_dns),
+        "MAX_PPS": ("max_pps", config.parse_max_pps),
+    }[name]
+    assert getattr(settings, expected[0]) == expected[1](next(iter(given.values())))
+
+
+@pytest.mark.parametrize(
+    "given, message",
+    [
+        ({"allowed_cidrs": "192.0.2.1/24"}, "--allowed-cidrs: item 1 of 1 is not a network"),
+        ({"allowed_dns_servers": f"192.0.2.53,{ENROL_TOKEN}"}, "--allowed-dns-servers: item 2 of 2 is not a network"),
+        ({"max_pps": "5000"}, "--max-pps must be a whole number"),
+        ({"max_pps": ENROL_TOKEN}, "--max-pps must be a whole number"),
+    ],
+)
+def test_a_bad_option_on_an_update_is_refused_before_anything_changes(root, given, message):
+    run_install(root, FakeHost(), Options(url=URL, enrol_token="-", **NARROWED))
+    before = {p: (root / p).read_bytes() for p in tree(root) if (root / p).is_file()}
+    host = FakeHost(user=True)
+    code, said = run_install(root, host, Options(url=URL, **given), exchange=lambda *a: pytest.fail("no exchange"))
+    assert code == 1 and message in said[-1], said
+    assert ENROL_TOKEN[5:] not in "".join(said) and "192.0.2.1/24" not in "".join(said) and "5000" not in "".join(said)
+    assert host.commands == []
+    assert {p: (root / p).read_bytes() for p in tree(root) if (root / p).is_file()} == before
+
+
+@pytest.mark.parametrize(
+    "line, message",
+    [
+        ("ALLOWED_CIDRS=192.0.2.1/24", "the ALLOWED_CIDRS in {env}: item 1 of 1 is not a network"),
+        (f"ALLOWED_CIDRS=192.0.2.0/24,{ENROL_TOKEN}", "the ALLOWED_CIDRS in {env}: item 2 of 2 is not a network"),
+        (f"ALLOWED_DNS_SERVERS={ENROL_TOKEN}", "the ALLOWED_DNS_SERVERS in {env}: item 1 of 1 is not a network"),
+        ("MAX_PPS=0", "the MAX_PPS in {env} must be a whole number from 1 to 1000"),
+        ("MAX_PPS=5000", "the MAX_PPS in {env} must be a whole number from 1 to 1000"),
+        ("MAX_PPS=2.5", "the MAX_PPS in {env} must be a whole number from 1 to 1000"),
+        (f"MAX_PPS={ENROL_TOKEN}", "the MAX_PPS in {env} must be a whole number from 1 to 1000"),
+        (f"MAX_PPS={TOKEN}", "the MAX_PPS in {env} must be a whole number from 1 to 1000"),
+    ],
+)
+def test_a_kept_value_that_no_longer_parses_refuses_the_update_naming_the_setting_alone(root, line, message):
+    """#183, acceptance 2: a kept value is checked as on install, before anything
+    changes, and the refusal names the setting and never the value (#140), here one
+    a token was pasted into by hand. Giving the option replaces it."""
+    run_install(root, FakeHost(), Options(url=URL, enrol_token="-", **NARROWED))
+    env = root / "etc/tlg-ipam-agent/agent.env"
+    env.write_text(env.read_text() + line + "\n")
+    before = {p: ((root / p).read_bytes(), stat.S_IMODE((root / p).stat().st_mode)) for p in tree(root) if (root / p).is_file()}
+    host = FakeHost(user=True)
+    code, said = run_install(root, host, Options(url=URL), exchange=lambda *a: pytest.fail("no exchange"))
+    name = line.partition("=")[0]
+    option = {"ALLOWED_CIDRS": "--allowed-cidrs", "ALLOWED_DNS_SERVERS": "--allowed-dns-servers", "MAX_PPS": "--max-pps"}[name]
+    assert code == 1 and message.format(env=env) in said[-1], said
+    assert said[-1].endswith(f"give {option} to replace it, or correct that line"), said
+    value = line.partition("=")[2]
+    # the path, and the rule's own bounds, are no value
+    shown = "".join(said).replace(str(root), "").replace("from 1 to 1000", "")
+    assert ENROL_TOKEN[5:] not in shown and TOKEN[5:] not in shown and value not in shown
+    assert host.commands == [] and host.run_checks == [] and host.read_checks == []
+    assert {p: ((root / p).read_bytes(), stat.S_IMODE((root / p).stat().st_mode)) for p in tree(root) if (root / p).is_file()} == before
+    replacement = {"ALLOWED_CIDRS": "192.0.2.0/25", "ALLOWED_DNS_SERVERS": "192.0.2.54", "MAX_PPS": "30"}[name]
+    code, said = update(root, **{option[2:].replace("-", "_"): replacement})
+    assert code == 0, said
+    assert sum(text.startswith(name + "=") for text in settings_of(root)) == 1
+
+
+def test_a_first_install_without_the_options_writes_none_of_their_lines(root):
+    """#183, acceptance 3: with no agent.env to keep from, no line is written for any of
+    the three, and the agent reads its defaults, as before."""
+    code, said = run_install(root, FakeHost())
     assert code == 0, said
     assert settings_of(root) == ["IPAM_URL=" + URL]
+    assert not any(": kept" in line for line in said), said
+    settings = agent_settings(root)
+    assert settings.allowed == config.parse_allowed(None)
+    assert settings.allowed_dns is None and settings.max_pps == config.DEFAULT_MAX_PPS
+
+
+def test_removing_a_line_by_hand_is_how_a_setting_goes_back_to_its_default(root):
+    """No flag removes one (#179, #183): delete its line, and the next update has none
+    to keep."""
+    run_install(root, FakeHost(), Options(url=URL, enrol_token="-", **NARROWED))
+    env = root / "etc/tlg-ipam-agent/agent.env"
+    for name in ("ALLOWED_DNS_SERVERS", "ALLOWED_CIDRS", "MAX_PPS"):
+        env.write_text("".join(line for line in env.read_text().splitlines(True) if not line.startswith(name + "=")))
+        code, said = update(root)
+        assert code == 0, said
+        assert not any(line.startswith(name + "=") for line in settings_of(root))
+    assert settings_of(root) == ["IPAM_URL=" + URL]
+    settings = agent_settings(root)
+    assert (settings.allowed, settings.allowed_dns, settings.max_pps) == (config.parse_allowed(None), None, config.DEFAULT_MAX_PPS)
 
 
 def test_an_update_keeps_a_line_added_by_hand_and_the_last_one_as_systemd_does(root):
@@ -1092,53 +1222,73 @@ def test_an_update_keeps_a_line_added_by_hand_and_the_last_one_as_systemd_does(r
     is the same setting: kept, in the install's spelling, the last line deciding."""
     run_install(root, FakeHost())
     env = root / "etc/tlg-ipam-agent/agent.env"
-    env.write_text(env.read_text() + "; a comment naming ALLOWED_DNS_SERVERS\nALLOWED_DNS_SERVERS=10.0.0.1\nALLOWED_DNS_SERVERS=192.168.1.53,192.168.2.0/24\n")
+    env.write_text(
+        env.read_text()
+        + "; a comment naming ALLOWED_DNS_SERVERS\nALLOWED_DNS_SERVERS=10.0.0.1\nALLOWED_DNS_SERVERS=192.168.1.53,192.168.2.0/24\n"
+        + "MAX_PPS=900\nALLOWED_CIDRS=10.0.0.0/8\nMAX_PPS=050\nALLOWED_CIDRS=192.168.1.0/24,192.168.2.7\n"
+    )
     code, said = update(root)
     assert code == 0, said
-    assert settings_of(root)[-1] == "ALLOWED_DNS_SERVERS=192.168.1.53/32,192.168.2.0/24"
+    assert settings_of(root)[1:] == [
+        "ALLOWED_CIDRS=192.168.1.0/24,192.168.2.7/32",
+        "ALLOWED_DNS_SERVERS=192.168.1.53/32,192.168.2.0/24",
+        "MAX_PPS=50",
+    ]
 
 
 FORM = "in a form install does not read back"
 # agent.env as the first install of these tests writes it holds three lines (two
-# comments and IPAM_URL), so what a test appends starts at line 4
-WIDENED = "ALLOWED_DNS_SERVERS=0.0.0.0/0"
+# comments and IPAM_URL), so what a test appends starts at line 4. `{S}` is the setting,
+# `{V}` a value narrowed from its default and `{W}` one wider, `{BAD}` the setting's
+# own refusal of a value that is plain but not one
+KEPT = {
+    "ALLOWED_CIDRS": ("10.0.0.53", "0.0.0.0/0", "item 2 of 2 is not a network"),
+    "ALLOWED_DNS_SERVERS": ("10.0.0.53", "0.0.0.0/0", "item 2 of 2 is not a network"),
+    "MAX_PPS": ("433", "999", "must be a whole number from 1 to 1000"),
+}
+WIDENED = "{S}={W}"
 
 
+@pytest.mark.parametrize("setting", list(KEPT))
 @pytest.mark.parametrize(
     "lines, message",
     [
-        ('ALLOWED_DNS_SERVERS="10.0.0.53"', FORM),
-        ("ALLOWED_DNS_SERVERS = 10.0.0.53", FORM),
-        (" ALLOWED_DNS_SERVERS=10.0.0.53", FORM),
-        ("export ALLOWED_DNS_SERVERS=10.0.0.53", FORM),
-        ("ALLOWED_DNS_SERVERS=10.0.0.53 10.0.0.54", FORM),
-        ("ALLOWED_DNS_SERVERS=", FORM),
-        ("MAX_PPS=20 \\", FORM),
-        (f"ALLOWED_DNS_SERVERS=10.0.0.53,{ENROL_TOKEN}", "item 2 of 2 is not a network"),
-        (f"ALLOWED_DNS_SERVERS=fe80::53%{ENROL_TOKEN}", FORM),  # `%` is not plain
-        # round 1 of the briefed review: to systemd, the third line is inside OTHER's
-        # value, and ALLOWED_DNS_SERVERS is 10.0.0.53; read line by line it was 0.0.0.0/0
-        (f'ALLOWED_DNS_SERVERS=10.0.0.53\nOTHER="a\n{WIDENED}\nb"', "line 5 of"),
-        (f"ALLOWED_DNS_SERVERS=10.0.0.53\nOTHER='a\n{WIDENED}\nb'", "line 5 of"),
+        ('{S}="{V}"', FORM),
+        ("{S} = {V}", FORM),
+        (" {S}={V}", FORM),
+        ("export {S}={V}", FORM),
+        ("{S}={V} {V}", FORM),
+        ("{S}=", FORM),
+        ("OTHER=20 \\", FORM),
+        (f"{{S}}={{V}},{ENROL_TOKEN}", "{BAD}"),
+        (f"{{S}}=fe80::53%{ENROL_TOKEN}", FORM),  # `%` is not plain
+        # round 1 of the briefed review of #179: to systemd, the third line is inside
+        # OTHER's value, and the setting is {V}; read line by line it was {W}
+        (f'{{S}}={{V}}\nOTHER="a\n{WIDENED}\nb"', "line 5 of"),
+        (f"{{S}}={{V}}\nOTHER='a\n{WIDENED}\nb'", "line 5 of"),
         # the same mismatch by the grammar's other ways: a bare carriage return, which
         # ends a line to systemd, or a vertical tab, at which `splitlines` would cut one
-        (f"ALLOWED_DNS_SERVERS=10.0.0.53\n# a note\r{WIDENED}", "line 5 of"),
-        (f"ALLOWED_DNS_SERVERS=10.0.0.53\nOTHER=a\x0b{WIDENED}", "line 5 of"),
+        (f"{{S}}={{V}}\n# a note\r{WIDENED}", "line 5 of"),
+        (f"{{S}}={{V}}\nOTHER=a\x0b{WIDENED}", "line 5 of"),
         # lines that do not name it are held to the grammar too. A comment ending in a
         # backslash is outside it, though systemd 257 does not continue a comment onto
-        # the next line (round 2 of the briefed review): no backslash, anywhere
-        (f"ALLOWED_DNS_SERVERS=10.0.0.53\n# a note \\\n{WIDENED}", "line 5 of"),
-        ('ALLOWED_DNS_SERVERS=10.0.0.53\nOTHER="a b"', "line 5 of"),
-        ("OTHER=\nALLOWED_DNS_SERVERS=10.0.0.53", "line 4 of"),
-        ("  # an indented comment\nALLOWED_DNS_SERVERS=10.0.0.53", "line 4 of"),
-        ("ALLOWED_DNS_SERVERS=10.0.0.53\n\tOTHER=1", "line 5 of"),
+        # the next line (round 2 of the briefed review of #179): no backslash, anywhere
+        (f"{{S}}={{V}}\n# a note \\\n{WIDENED}", "line 5 of"),
+        ('{S}={V}\nOTHER="a b"', "line 5 of"),
+        ("OTHER=\n{S}={V}", "line 4 of"),
+        ("  # an indented comment\n{S}={V}", "line 4 of"),
+        ("{S}={V}\n\tOTHER=1", "line 5 of"),
     ],
 )
-def test_an_update_refuses_a_file_it_cannot_read_back_before_anything_changes(root, lines, message):
+def test_an_update_refuses_a_file_it_cannot_read_back_before_anything_changes(root, setting, lines, message):
     """Refused, not guessed at nor dropped, whichever line is outside the grammar
-    install writes, and before any line is read as an assignment; no line's content
-    is repeated (#140). Giving the option is the way past it, since then agent.env is
-    not read."""
+    install writes, and before any line is read as an assignment, for each of the three
+    settings an update keeps (#179, #183); no line's content is repeated (#140). The
+    refusal names the settings the run meant to keep and their options: giving all
+    three is the way past it, since then agent.env is not read."""
+    narrowed, wider, bad = KEPT[setting]
+    lines = lines.format(S=setting, V=narrowed, W=wider, BAD=bad)
+    message = message.format(BAD=bad)
     run_install(root, FakeHost())
     env = root / "etc/tlg-ipam-agent/agent.env"
     env.write_bytes(env.read_bytes() + lines.encode("ascii") + b"\n")
@@ -1148,40 +1298,57 @@ def test_an_update_refuses_a_file_it_cannot_read_back_before_anything_changes(ro
     code, said = run_install(root, host, Options(url=URL), exchange=lambda *a: pytest.fail("no exchange"))
     assert code == 1 and message in said[-1] and "agent.env" in said[-1], said
     if message.startswith("line"):
-        assert FORM in said[-1] and "give --allowed-dns-servers" in said[-1]
-    shown = "".join(said)
-    assert ENROL_TOKEN[5:] not in shown and "0.0.0.0" not in shown and "10.0.0.53" not in shown
+        assert FORM in said[-1] and EVERY_OPTION in said[-1]
+        assert "so the ALLOWED_CIDRS, ALLOWED_DNS_SERVERS and MAX_PPS in it could not be kept" in said[-1]
+    shown = "".join(said).replace(str(root), "")
+    assert ENROL_TOKEN[5:] not in shown and wider not in shown and narrowed not in shown
     assert host.commands == [] and host.run_checks == [] and host.read_checks == []
     assert {p: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode)) for p in files} == before
-    code, said = update(root, allowed_dns_servers="10.0.0.53")
+    code, said = update(root, **NARROWED)
     assert code == 0, said
-    assert settings_of(root)[-1] == "ALLOWED_DNS_SERVERS=10.0.0.53/32"
+    assert settings_of(root) == ["IPAM_URL=" + URL, *NARROWED_LINES]
 
 
+def test_a_file_it_cannot_read_back_names_only_the_settings_the_run_would_keep(root):
+    """Given one option, the refusal names the other two and their options, not the one
+    given: that one is not read from agent.env."""
+    run_install(root, FakeHost())
+    env = root / "etc/tlg-ipam-agent/agent.env"
+    env.write_text(env.read_text() + 'OTHER="a b"\n')
+    code, said = update(root, max_pps="20")
+    assert code == 1, said
+    assert said[-1].endswith(
+        "so the ALLOWED_CIDRS and ALLOWED_DNS_SERVERS in it could not be kept; give --allowed-cidrs "
+        "and --allowed-dns-servers, or rewrite or remove that line"
+    ), said
+    code, said = update(root, max_pps="20", allowed_cidrs="192.0.2.0/24")
+    assert code == 1 and "so the ALLOWED_DNS_SERVERS in it could not be kept; give --allowed-dns-servers," in said[-1]
+
+
+@pytest.mark.parametrize("settings", [{}, {"allowed_cidrs": "10.20.0.0/16 192.168.1.0/24 fd00::/8", "max_pps": "1000"}])
 @pytest.mark.parametrize("allowed_dns", [None, "10.0.0.53 192.168.1.0/24,2001:db8::53"])
 @pytest.mark.parametrize("ca", [False, True])
-def test_every_agent_env_install_writes_is_in_the_grammar_it_reads_back(root, allowed_dns, ca):
+def test_every_agent_env_install_writes_is_in_the_grammar_it_reads_back(root, settings, allowed_dns, ca):
     """What `install` writes, with every option it takes, is read back whole by
-    `env_assignments`, as the assignments it wrote."""
+    `env_assignments`, as the assignments it wrote; and an update with the same URL and
+    CA file and none of the three options writes it again unchanged (#183)."""
     bundle = root / "ca.pem"
     bundle.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
-    options = Options(
-        url="https://ipam.home.arpa:8443/a/b",
-        enrol_token="-",
-        allowed_cidrs="10.20.0.0/16 192.168.1.0/24 fd00::/8",
-        allowed_dns_servers=allowed_dns,
-        max_pps="1000",
-        ca_file=str(bundle) if ca else None,
-    )
+    url = "https://ipam.home.arpa:8443/a/b"
+    ca_file = str(bundle) if ca else None
+    options = Options(url=url, enrol_token="-", allowed_dns_servers=allowed_dns, ca_file=ca_file, **settings)
     code, said = run_install(root, FakeHost(), options)
     assert code == 0, said
     path = root / "etc/tlg-ipam-agent/agent.env"
     assignments = install.env_assignments(path.read_text(), str(path))
     assert ["=".join(pair) for pair in assignments] == settings_of(root)
-    assert [key for key, _ in assignments][:2] == ["IPAM_URL", "ALLOWED_CIDRS"]
-    code, said = update(root)
+    assert assignments[0][0] == "IPAM_URL"
+    written = path.read_bytes()
+    code, said = run_install(
+        root, FakeHost(user=True), Options(url=url, ca_file=ca_file), exchange=lambda *a: pytest.fail("no exchange")
+    )
     assert code == 0, said
-    assert any(line.startswith("ALLOWED_DNS_SERVERS") for line in settings_of(root)) == (allowed_dns is not None)
+    assert path.read_bytes() == written
 
 
 def test_a_crlf_agent_env_is_read_as_its_lines(root):
@@ -1210,7 +1377,7 @@ def test_an_agent_env_that_cannot_be_read_back_stops_an_update_without_the_optio
         env.write_bytes(env.read_bytes() + "# caf\u00e9\n".encode())
     host = FakeHost(user=True)
     code, said = run_install(root, host, Options(url=URL), exchange=lambda *a: pytest.fail("no exchange"))
-    assert code == 1 and "could not be kept; give --allowed-dns-servers" in said[-1], said
+    assert code == 1 and f"could not be kept; {EVERY_OPTION}" in said[-1], said
     assert host.commands == []
 
 
@@ -1226,6 +1393,62 @@ def test_settings_a_later_install_could_not_read_back_are_refused_before_anythin
     fits = " ".join(f"10.0.{i}.0/24" for i in range(150))
     code, said = run_install(root, FakeHost(), Options(url=URL, enrol_token="-", allowed_dns_servers=fits))
     assert code == 0, said
+
+
+def test_an_agent_env_at_the_limit_with_all_three_settings_is_kept_whole_by_an_update(root):
+    """#183: the three kept settings at their longest, together, in the largest
+    agent.env install writes, are read back and written again unchanged by an update
+    without the options, so a file install wrote always fits what it reads back."""
+    networks = []
+    for i in range(4096):
+        options = Options(
+            url=URL, enrol_token="-", allowed_cidrs=" ".join(networks + [f"10.{i // 256}.{i % 256}.0/24"]),
+            allowed_dns_servers=" ".join(f"192.0.2.{j}" for j in range(1, 101)), max_pps="1000",
+        )
+        rendered = install.render_env(
+            URL, config.parse_allowed(options.allowed_cidrs), config.parse_allowed_dns(options.allowed_dns_servers),
+            1000, None, paths_in(root).token,
+        )
+        if len(rendered) > store.READ_MAX:
+            refused = f"10.{i // 256}.{i % 256}.0/24"
+            break
+        networks.append(f"10.{i // 256}.{i % 256}.0/24")
+    options = Options(
+        url=URL, enrol_token="-", allowed_cidrs=" ".join(networks),
+        allowed_dns_servers=" ".join(f"192.0.2.{j}" for j in range(1, 101)), max_pps="1000",
+    )
+    code, said = run_install(root, FakeHost(), options)
+    assert code == 0, said
+    env = root / "etc/tlg-ipam-agent/agent.env"
+    written = env.read_bytes()
+    # the largest: one network more would not have fitted
+    assert len(written) <= store.READ_MAX < len(written) + len("," + refused)
+    code, said = update(root)
+    assert code == 0, said
+    assert env.read_bytes() == written
+
+
+def test_kept_values_rewritten_past_the_limit_are_refused_before_anything_changes(root):
+    """A value added by hand in a shorter spelling than install's (an address alone,
+    which install writes with its `/32`) can grow past `store.READ_MAX` when written
+    again: refused, as a list given too long is, with nothing changed."""
+    run_install(root, FakeHost())
+    env = root / "etc/tlg-ipam-agent/agent.env"
+    head = env.read_text()
+    addresses = []
+    for i in range(1, 4096):
+        address = f"10.0.{i // 256}.{i % 256}"
+        if len(head) + len("ALLOWED_CIDRS=") + len(",".join(addresses + [address])) + 1 > store.READ_MAX:
+            break
+        addresses.append(address)
+    env.write_text(head + "ALLOWED_CIDRS=" + ",".join(addresses) + "\n")
+    assert env.stat().st_size <= store.READ_MAX
+    before = {p: (root / p).read_bytes() for p in tree(root) if (root / p).is_file()}
+    host = FakeHost(user=True)
+    code, said = run_install(root, host, Options(url=URL), exchange=lambda *a: pytest.fail("no exchange"))
+    assert code == 1 and f"the settings given and kept would make {env} longer than {store.READ_MAX} bytes" in said[-1], said
+    assert host.commands == []
+    assert {p: (root / p).read_bytes() for p in tree(root) if (root / p).is_file()} == before
 
 
 def test_an_update_gives_the_stored_token_to_the_service_user_again(root, monkeypatch):
