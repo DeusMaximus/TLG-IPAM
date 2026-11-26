@@ -109,6 +109,9 @@ def create_app(server: FastMCP = mcp) -> FastAPI:
         await init_models()
         async with SessionLocal() as session:
             await seed_defaults(session)
+        async with SessionLocal() as session:
+            # registrations past their 24 hours, and names stored under an earlier rule
+            await oauth_svc.tidy_registrations(session)
         async with mcp_app.lifespan(app):
             yield
 

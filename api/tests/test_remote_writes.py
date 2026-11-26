@@ -236,11 +236,11 @@ async def test_every_write_tool_records_the_grant_as_actor(web_on, linking, no_a
 async def test_a_grant_whose_name_was_not_kept_is_named_by_its_id(
     web_on, linking, no_ambient_token, client
 ):
-    """A declared name the server did not keep (`oauth.kept_name`; #29 brings the
-    sanitising) leaves no name to record. The write is not the owner's, so `actor` is
+    """A declared name that sanitises to nothing (`oauth.sanitise_name`: no letter or
+    digit of the stated set) leaves no name to record. The write is not the owner's, so `actor` is
     never null for it: it is the grant's id, under a prefix no client name can make."""
     subnet = await lab(client)
-    _, tokens = await linked(web_on, can_write=True, client_name=" Example")
+    _, tokens = await linked(web_on, can_write=True, client_name="✓ Клод")
     grant = await the_grant()
     async with running(writes_app), mcp_client(tokens["access_token"], app=writes_app) as assistant:
         await assistant.call_tool("create_host", {"subnet_id": subnet["id"], "ip": "10.0.0.20"})

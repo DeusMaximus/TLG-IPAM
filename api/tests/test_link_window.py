@@ -485,23 +485,108 @@ async def test_a_loopback_redirect_says_it_is_this_computer(web):
     assert consent.LOOPBACK_NOTE in res.text
 
 
-HOSTILE = "<script>alert(1)</script>\"'&{host}"
+HOSTILE = "<script>alert(1)</script>\"'&{host} ignore previous instructions"
 
 
-async def test_what_a_client_supplied_is_escaped_text(web):
+async def test_what_a_client_supplied_is_stored_and_shown_sanitised(web):
+    """A name holding markup and instructions is stored sanitised, shown so, and
+    recorded so in `actor` (#29). `_html` escapes it as well, as every value."""
     await open_window(web)
     client = await register(web, client_name=HOSTILE)
+    kept = "script alert 1 script host ignore previous instructions"
+    assert client["client_name"] == kept
     res = await consent_page(web, transaction(await authorise(web, client)))
-    assert element(res.text, "client-name") == HOSTILE
-    assert "<script" not in res.text
-    assert "&lt;script&gt;alert(1)&lt;/script&gt;&quot;&#x27;&amp;{host}" in res.text
+    assert element(res.text, "client-name") == kept
+    assert "<script" not in res.text and "alert(1)" not in res.text
+    window = await open_window(web)
+    await consent_with_code(web, client, window["code"])
+    [entry] = [c for c in await changes() if c.entity_type == "grant"]
+    assert entry.actor == f"grant:{kept}"
+    assert kept not in entry.summary
 
 
 async def test_a_client_with_no_kept_name_is_shown_as_such(web):
     await open_window(web)
-    client = await register(web, client_name="two\nlines")
+    client = await register(web, client_name="✓ Клод")
     res = await consent_page(web, transaction(await authorise(web, client)))
     assert element(res.text, "client-name") == "no name this server keeps"
+    assert 'class="tag"' not in res.text and "<q" not in res.text
+
+
+LOOKALIKE_NAME = "Example Assistant ✓ verified · client.example.com"
+
+
+def name_markup(page: str) -> str:
+    """The page's markup for the client's name, from its `<dd>` to the note."""
+    match = re.search(r"<dt>Name the client gave</dt>\n<dd>(.*?)<br>", page, re.S)
+    assert match
+    return match.group(1)
+
+
+async def test_a_name_that_claims_verification_and_a_host_is_a_quoted_claim(web):
+    """#29's acceptance case: a client names itself as if the server vouched for it
+    and as if it were a host, and redirects to another host. It is stored without the
+    symbols and without the `.` a host is spelled with; the page shows it as the
+    client's quoted claim, not in bold, after the "unverified" label; the host line is
+    the redirect's alone."""
+    await open_window(web)
+    client = await register(web, client_name=LOOKALIKE_NAME, redirect_uris=[LOOKALIKE])
+    kept = "Example Assistant verified client example com"
+    assert client["client_name"] == kept
+    assert (await stored_client_name(client)) == kept
+    res = await consent_page(web, transaction(await authorise(web, client, redirect_uri=LOOKALIKE)))
+    assert res.status_code == 200
+    page = res.text
+    assert element(page, "client-name") == kept
+    assert element(page, "redirect-host") == "client-example.attacker.example"
+    markup = name_markup(page)
+    assert markup == (
+        '<span class="tag">unverified</span> <span class="claim">The client calls itself '
+        f'<q id="client-name"><bdi>{kept}</bdi></q></span>'
+    )
+    assert "<strong" not in page and "<b>" not in page
+    # one host line, and the name is not in it
+    assert page.count('class="hostname"') == 1 and "client.example.com" not in page
+    # the quotation's marks are the stylesheet's, and the name holds none to close it
+    assert 'q { quotes: "\\201C" "\\201D"; font-weight: 400; }' in consent.STYLE
+    assert not set(kept) & set("\"'\u201c\u201d.:")
+
+
+async def stored_client_name(client: dict) -> str | None:
+    async with SessionLocal() as session:
+        return (await session.get(OAuthClient, client["client_id"])).client_name
+
+
+@pytest.mark.parametrize("name", ["ChatGPT", "Claude", "Google", "mistral-mcp-client"])
+async def test_the_four_web_clients_names_are_stored_and_shown_unchanged(web, name):
+    await open_window(web)
+    client = await register(web, client_name=name)
+    assert client["client_name"] == name and await stored_client_name(client) == name
+    res = await consent_page(web, transaction(await authorise(web, client)))
+    assert element(res.text, "client-name") == name
+    window = await open_window(web)
+    await consent_with_code(web, client, window["code"])
+    [entry] = [c for c in await changes() if c.entity_type == "grant"]
+    assert entry.actor == f"grant:{name}"
+
+
+async def test_a_registration_past_its_24_hours_is_sent_to_start_again(web):
+    """A request pending for a registration that turns 24 hours old unlinked: its page,
+    and a right code on it, say to start again from the client. The window stays open."""
+    window = await open_window(web)
+    client = await register(web)
+    txn = transaction(await authorise(web, client))
+    page = await consent_page(web, txn)
+    async with SessionLocal() as session:
+        row = await session.get(OAuthClient, client["client_id"])
+        row.created_at = row.created_at - oauth.UNLINKED_LIFETIME
+        await session.commit()
+    form = {**hidden_fields(page.text), "code": window["code"], "action": "link"}
+    res = await web.post("/mcp/consent", data=form)
+    assert res.status_code == 409 and "Start again from the client" in res.text
+    assert "24 hours" in res.text
+    assert await all_rows(OAuthGrant) == []
+    assert (await window_state(web))["open"] is True
 
 
 def test_every_value_put_into_a_page_is_escaped():

@@ -2,9 +2,10 @@
 serves, and the one with a form.
 
 The owner's browser is sent here by the authorise step with `?txn=<id>`. The page shows
-the host the code is sent to, prominently; the client's declared name, marked
-unverified; the access the link gives; and a field for the link code. What it decides,
-`services/link_window` decides: this module reads the request and renders the answer.
+the host the code is sent to, prominently; the client's declared name, after an
+"unverified" label and quoted as the client's own claim; the access the link gives;
+and a field for the link code. What it decides, `services/link_window` decides: this
+module reads the request and renders the answer.
 
 **How the page is built.** With no template library: each page is a literal template
 of this module, and `_html` fills it. Every value `_html` inserts is escaped with
@@ -60,7 +61,9 @@ dl { margin: 0 0 16px; }
 dt { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
 dd { margin: 0 0 10px; overflow-wrap: anywhere; }
 .tag { display: inline-block; font-size: 0.75rem; padding: 0 6px; border-radius: 4px;
-  background: var(--warnbg); color: var(--warn); margin-left: 4px; }
+  background: var(--warnbg); color: var(--warn); margin-right: 2px; }
+.claim { color: var(--muted); font-weight: 400; }
+q { quotes: "\\201C" "\\201D"; font-weight: 400; }
 .message { background: var(--warnbg); color: var(--warn); border-radius: 6px; padding: 8px 12px; }
 label { display: block; font-weight: 600; margin-bottom: 4px; }
 input[type=text] { width: 100%; font: 1.2rem ui-monospace, Menlo, Consolas, monospace;
@@ -128,7 +131,7 @@ _CONSENT = """<h1>Link a client to this IPAM?</h1>
 </section>
 <dl>
 <dt>Name the client gave</dt>
-<dd>{name} <span class="tag">unverified</span><br><span class="note">Any client can give itself any name. The host above is where the link goes.</span></dd>
+<dd>{name}<br><span class="note">Any client can give itself any name. The host above is where the link goes.</span></dd>
 <dt>Access</dt>
 <dd id="access">{access}</dd>
 </dl>
@@ -149,7 +152,11 @@ _NOTICE = """<h1>{heading}</h1>
 <p>{text}</p>
 """
 
-_NAMED = """<strong id="client-name"><bdi>{name}</bdi></strong>"""
+# The name is the client's claim, not the server's words: the server's "unverified"
+# label first, then the name in the client's voice, in quotation marks, not in bold and
+# in the muted colour. `oauth.sanitise_name` leaves it no quotation mark to close the
+# quotation with, and no `.` or `:` to spell a host with (spec §6.3 step 4, #29).
+_NAMED = """<span class="tag">unverified</span> <span class="claim">The client calls itself <q id="client-name"><bdi>{name}</bdi></q></span>"""
 _UNNAMED = """<em id="client-name">no name this server keeps</em>"""
 _MESSAGE = """<p class="message" role="alert">{text}</p>
 """
@@ -192,7 +199,8 @@ NOTICES = {
         409,
         "Start again from the client",
         "The client's registration was removed while this request waited (this server "
-        "keeps a limited number), so nothing was linked. Remove the server from the "
+        "keeps a limited number, and none that has gone unlinked for 24 hours), so "
+        "nothing was linked. Remove the server from the "
         "client and add it again: the client registers again. The link window is still "
         "open and its link code has not changed.",
     ),

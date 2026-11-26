@@ -364,8 +364,10 @@ class OAuthClient(Base):
 
     Only the SHA-256 of the client secret is stored, and it is null for a public client
     (`token_endpoint_auth_method` `none`); the plain secret appears once, in the
-    registration answer. `client_name` is the client's own claim about itself, kept
-    only when it needs no cleaning (`services/oauth.kept_name`), else null.
+    registration answer. `client_name` is the client's own claim about itself, as
+    `services/oauth.sanitise_name` leaves it (at most 60 of ASCII letters, digits,
+    spaces, hyphens and underscores), else null. A registration never linked
+    (`linked_at` null) is deleted once it is 24 hours old (`oauth.UNLINKED_LIFETIME`).
     """
 
     __tablename__ = "oauth_clients"
