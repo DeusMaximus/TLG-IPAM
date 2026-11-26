@@ -51,9 +51,9 @@ function When({ value, now }) {
   return <span title={formatServerTime(value)}>{relativeTime(value, now)}</span>
 }
 
-function LinkRow({ link, now, onRevoke }) {
+function LinkRow({ link, links, now, onRevoke }) {
   const { label, note } = access(link)
-  const unfinished = neverCompletedNote(link)
+  const unfinished = neverCompletedNote(link, links)
   return (
     <tr className="border-t border-slate-700/60 align-top">
       <td className="px-3 py-2">
@@ -236,7 +236,7 @@ export default function LinkedClients() {
               </thead>
               <tbody className="text-slate-300">
                 {live.map((link) => (
-                  <LinkRow key={link.id} link={link} now={now} onRevoke={setRevoking} />
+                  <LinkRow key={link.id} link={link} links={live} now={now} onRevoke={setRevoking} />
                 ))}
               </tbody>
             </table>

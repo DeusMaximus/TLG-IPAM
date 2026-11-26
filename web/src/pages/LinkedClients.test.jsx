@@ -195,13 +195,27 @@ describe('Linked clients list', () => {
     })
     renderPage()
     const t = await table()
-    const notes = t.getAllByText(/^Never completed: the client did not collect its tokens/)
+    const notes = t.getAllByText(/^Never completed: as of this list/)
     expect(notes).toHaveLength(1)
     const row = notes[0].closest('tr')
     expect(within(row).getByText('client.example.com')).toBeInTheDocument()
     expect(within(row).getByRole('button', { name: /Revoke the link to client.example.com/ })).toBeInTheDocument()
     const young = t.getByText('young.example.com').closest('tr')
     expect(within(young).queryByText(/Never completed/)).toBeNull()
+  })
+
+  it('says a revoke frees no place when the registration holds another live link', async () => {
+    ipam.listLinkedClients.mockResolvedValue({
+      data: [
+        link({ id: 'a', client_id: 'shared', last_used_at: null, never_completed: true }),
+        link({ id: 'b', client_id: 'shared', redirect_host: 'other.example.com' }),
+      ],
+    })
+    renderPage()
+    const t = await table()
+    const [note] = t.getAllByText(/^Never completed/)
+    expect(note).toHaveTextContent(/frees no place/)
+    expect(note).not.toHaveTextContent(/link it again/)
   })
 
   it('says a link made read-write is read-only while remote writes are off', async () => {

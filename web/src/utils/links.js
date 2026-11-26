@@ -99,12 +99,35 @@ export function nameText(link) {
 
 // What the list says of a link the owner approved whose client never collected its
 // tokens: the code the approval issued expired unexchanged (`never_completed`, from the
-// server, #190). It holds no token and can get none, and it holds its registration's
-// place among the 50 until it is revoked. Null for any other link: the page never works
-// this out from the times it is given
-export function neverCompletedNote(link) {
+// server, #190). The page never works this out from the times it is given. The note says
+// what the list establishes, as of when it was read: an exchange that was finishing at
+// that moment is shown at the next refresh.
+//
+// A place among the 50 belongs to the client's registration, not to a link, and the
+// server keeps a registration while any of its links is unrevoked (round 1 of PR #197's
+// briefed review). Every unrevoked link is in the list with its `client_id`, so which
+// case this is comes from the list alone: no other unrevoked link of the registration
+// (revoking this frees the place), another one (it frees none), or the registration
+// already gone (it holds none). Null for any other link.
+export const NEVER_COMPLETED =
+  'Never completed: as of this list, the code from your approval expired without the client exchanging it, so this link has no token and cannot get one. An exchange finishing at that moment shows at the next refresh.'
+export const PLACE_FREED =
+  'Revoking it frees its registration’s place among the 50. If you still want this client and no other link to it here works, link it again.'
+export const PLACE_SHARED =
+  'Its registration also holds another link listed here, so revoking this one removes it but frees no place: a registration’s place is freed only once every link it holds is revoked.'
+export const PLACE_GONE =
+  'Its registration has been deleted, so it holds no place: revoking it only removes it from this list.'
+
+export function neverCompletedNote(link, links = []) {
   if (!link || !link.never_completed || link.revoked_at) return null
-  return 'Never completed: the client did not collect its tokens before the code from your approval expired. It holds no token and cannot get one. Revoke it to free its place; link the client again if you still want it.'
+  let place = PLACE_FREED
+  if (!link.client_registered) place = PLACE_GONE
+  else if (
+    (links || []).some((l) => l.id !== link.id && !l.revoked_at && l.client_id === link.client_id)
+  ) {
+    place = PLACE_SHARED
+  }
+  return `${NEVER_COMPLETED} ${place}`
 }
 
 export const liveLinks = (links) => (links || []).filter((l) => !l.revoked_at)

@@ -874,8 +874,12 @@ async def test_an_outsider_ends_a_pending_request_without_touching_the_registry(
     page = await consent_page(web, txn)
     outsider = await register(web)
     held = await held_ids()
-    for _ in range(oauth.PENDING_MAX):
+    # with the owner's alone held, it outlasts 31 and goes at the 32nd: 32 is the most
+    # it takes (one, when the store is already full and the owner's is the oldest)
+    for _ in range(oauth.PENDING_MAX - 1):
         transaction(await authorise(web, outsider))
+    assert oauth.pending.get(txn) is not None
+    transaction(await authorise(web, outsider))
     assert await held_ids() == held and oauth.pending.get(txn) is None
     res = await web.post(
         "/mcp/consent", data={**hidden_fields(page.text), "code": window["code"], "action": "link"}

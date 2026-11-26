@@ -23,8 +23,12 @@ What the list says of a link, and why:
   exchange or a refresh. A client moves it with nobody using it, so it is not use.
 - **Never completed** (`never_completed`, #190): the owner approved the link but the
   client never exchanged its code, which has expired (`oauth.never_completed`). The
-  grant holds no token and can get none; it is left for the owner to revoke, and holds
-  its registration's place in the registry until then (spec §6.6).
+  grant holds no token and can get none; it is left for the owner to revoke. A place
+  in the registry belongs to a registration, not a link: the registration is kept while
+  any of its links is unrevoked, so revoking this one frees the place only when its
+  registration holds no other unrevoked link (spec §6.6). Every unrevoked link is in
+  the answer with its `client_id`, so the page can tell which case it is from the
+  answer alone.
 
 **Revoke** is the owner's act: `source` `ui` or `api`, `actor` null (spec §4.3), on the
 grant's entity (`entity_type="grant"`, `action="revoke"`), with a fixed summary that
@@ -108,9 +112,10 @@ async def list_links(session: AsyncSession, *, remote_writes: bool) -> list[dict
     which an exchange is either wholly committed (its claim, its tokens and
     `last_used_at`, one transaction) or absent. It can therefore be stale only for an
     exchange whose claim had passed, under the lock, by a clock reading earlier than
-    this one and had not committed when the statement read: that answer marks it never
-    completed, and the next marks it completed. It never removes a link from the
-    answer, and nothing acts on it but the owner."""
+    this one and has not committed yet: every list read before that commit marks the
+    link never completed, however many there are, and every read after it does not
+    (`test_a_list_read_before_an_exchange_commits_may_flag_it_and_none_after`). It
+    never removes a link from the answer, and nothing acts on it but the owner."""
     now = _now()
     newest_revoked = (
         select(OAuthGrant.id)

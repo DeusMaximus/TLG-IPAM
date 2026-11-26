@@ -5,7 +5,11 @@ import {
   endedOutcome,
   groupedCode,
   nameText,
+  NEVER_COMPLETED,
   neverCompletedNote,
+  PLACE_FREED,
+  PLACE_GONE,
+  PLACE_SHARED,
   sameWindow,
   windowLeft,
 } from './links'
@@ -60,15 +64,37 @@ describe('access', () => {
 })
 
 describe('neverCompletedNote', () => {
+  const flagged = { id: 'a', client_id: 'c1', client_registered: true, never_completed: true, revoked_at: null }
+
   it('speaks only when the server says the link was never completed', () => {
-    expect(neverCompletedNote({ never_completed: true, revoked_at: null })).toMatch(
-      /^Never completed: the client did not collect its tokens/
-    )
-    expect(neverCompletedNote({ never_completed: true, revoked_at: null })).toMatch(/free its place/)
-    expect(neverCompletedNote({ never_completed: false, revoked_at: null })).toBeNull()
+    expect(neverCompletedNote(flagged, [flagged])).toMatch(/^Never completed: as of this list/)
+    expect(neverCompletedNote({ ...flagged, never_completed: false }, [])).toBeNull()
     // never worked out from the times: no flag, no note, whatever last_used_at says
-    expect(neverCompletedNote({ last_used_at: null, revoked_at: null })).toBeNull()
-    expect(neverCompletedNote({ never_completed: true, revoked_at: 'x' })).toBeNull()
+    expect(neverCompletedNote({ ...flagged, never_completed: undefined, last_used_at: null }, [])).toBeNull()
+    expect(neverCompletedNote({ ...flagged, revoked_at: 'x' }, [])).toBeNull()
+  })
+
+  it('says revoking frees the place only when the registration holds no other live link', () => {
+    // alone, or beside a link of another registration, or a revoked one of its own
+    for (const others of [[], [{ id: 'b', client_id: 'c2' }], [{ id: 'b', client_id: 'c1', revoked_at: 'x' }]]) {
+      const note = neverCompletedNote(flagged, [flagged, ...others])
+      expect(note).toContain(PLACE_FREED)
+      expect(note).not.toContain(PLACE_SHARED)
+    }
+    // the same registration holds another unrevoked link: no place is freed, and the
+    // note does not tell the owner to link the client again
+    const shared = neverCompletedNote(flagged, [flagged, { id: 'b', client_id: 'c1', revoked_at: null }])
+    expect(shared).toContain(PLACE_SHARED)
+    expect(shared).not.toMatch(/frees its registration|link it again/)
+    // the registration is gone: no place either way
+    const gone = neverCompletedNote({ ...flagged, client_registered: false }, [])
+    expect(gone).toContain(PLACE_GONE)
+    expect(gone).not.toMatch(/frees its registration|link it again/)
+  })
+
+  it('states what the list established, not the present', () => {
+    expect(NEVER_COMPLETED).toMatch(/as of this list/)
+    expect(NEVER_COMPLETED).toMatch(/next refresh/)
   })
 })
 

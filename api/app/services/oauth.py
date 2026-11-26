@@ -104,9 +104,12 @@ CLIENTS_MAX = 50
 # what removes the spare of a client that registers twice for one link. One that was
 # ever linked (`linked_at` set) is never deleted by this rule, revoked or not.
 UNLINKED_LIFETIME = timedelta(hours=24)
+# A registration's place is freed only once every link it holds is revoked (#190,
+# round 1 of PR #197's briefed review): one registration may hold several links
 REGISTRY_FULL = (
-    f"This server already holds {CLIENTS_MAX} linked clients; a link must be revoked in "
-    "the IPAM's own web interface before another client can register."
+    f"This server already holds {CLIENTS_MAX} registered clients, each with a link; "
+    "every link of one of them must be revoked in the IPAM's own web interface before "
+    "another client can register."
 )
 
 # What a registration may hold. Gemini registers six redirect URIs (§6.8).
@@ -432,14 +435,20 @@ async def _make_room(session: AsyncSession) -> bool:
     `CLIENTS_MAX` are held. False when there are not enough to reclaim. The caller
     holds the write lock.
 
-    The order is `created_at` alone, and `pending` is never read (#190, spec §6.3): a
-    registration with an authorise request waiting for the owner is reclaimed like any
-    other, and a request added or dropped while this runs changes nothing it decides.
-    Sparing one would not protect the owner, who loses the request as surely to
-    `PENDING_MAX` authorise requests on any registration, and as a rule would let an
+    The order is `created_at` (then `client_id`) alone, and `pending` is never read
+    (#190, spec §6.3): a registration with an authorise request waiting for the owner
+    is reclaimed like any other, and a request added or dropped while this runs changes
+    nothing it decides. Preferring to keep such a registration would raise an
+    outsider's cost only where its registration is cheaper to reclaim than its request
+    is to push out of `pending`, and only up to that: at most `PENDING_MAX` authorise
+    requests on any registration still end the owner's request, after which the
+    registration is reclaimable again. That constant was judged too little to tie this
+    rule to process memory. Never reclaiming such a registration would let an
     outsider's pending requests make this refuse while registrations are reclaimable.
-    A link never completed (`never_completed`) is unrevoked, so its registration is
-    not reclaimable until the owner revokes it."""
+
+    A registration is kept while **any** of its grants is unrevoked, a link never
+    completed (`never_completed`) included: one registration can hold several links,
+    and its place is freed only once every one of them is revoked."""
     held = await session.scalar(select(func.count()).select_from(OAuthClient))
     excess = held - CLIENTS_MAX + 1
     if excess <= 0:
@@ -669,9 +678,11 @@ def grant_scopes(grant: OAuthGrant, *, remote_writes: bool) -> list[str]:
 def never_completed(now: datetime):
     """SQL, over `OAuthGrant`: whether a grant is a link **never completed** at `now`
     (spec §6.6, #190). The owner approved it, the server issued its code, and the code
-    expired with no exchange, so the grant holds no token and can never get one. It is
-    left for the owner: listed as a link, marked, until the owner revokes it, and its
-    registration holds its place in the registry until then.
+    expired with no exchange committed, so the grant holds no token and can get none
+    from that code. It is left for the owner: listed as a link, marked, until the owner
+    revokes it. While it is unrevoked its registration is not reclaimable; revoking it
+    frees the registration's place only when the registration holds no other
+    unrevoked link (`_make_room`).
 
     True exactly when all three hold:
 
@@ -694,9 +705,11 @@ def never_completed(now: datetime):
     The clock is the server's (`_now`), and the comparison with a code's `expires_at`
     is the exact complement of the one `exchange_code` claims a code by (`expires_at >
     now`): at any instant a code is claimable or the grant can be flagged, never both.
-    The rule only reads, and is judged here alone; `linked_clients.list_links` asks it
-    in its one statement. It revokes nothing, so a wrong answer could never take a
-    token from anyone: see that function for how fresh its answer is."""
+    The rule reads committed rows, so it does not see a claim made before the code
+    expired whose transaction has not committed yet: every read before that commit
+    may flag the grant, and every read after it does not (`list_links`). The rule only
+    reads, and is judged here alone; `linked_clients.list_links` asks it in its one
+    statement. It revokes nothing, so even a stale answer takes no token from anyone."""
     holds_more_than_a_spent_code = exists().where(
         OAuthToken.grant_id == OAuthGrant.id,
         or_(OAuthToken.kind != "code", OAuthToken.expires_at > now),
