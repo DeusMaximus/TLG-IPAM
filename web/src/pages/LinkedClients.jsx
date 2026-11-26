@@ -117,10 +117,12 @@ export default function LinkedClients() {
     }
   }
 
+  // the window the banner was showing, by its id: one that replaced it is left open
   const cancelOpen = async () => {
     try {
-      await cancelLinkWindow()
-      toast.success('Link window cancelled')
+      const res = await cancelLinkWindow(state.window_id)
+      if (res.data?.cancelled) toast.success('Link window cancelled')
+      else toast.error('That window had already ended or been replaced: nothing was cancelled')
     } catch (err) {
       toast.error(err.message)
     } finally {

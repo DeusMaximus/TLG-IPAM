@@ -2,12 +2,12 @@
 as every route `main.create_app` includes with `require_api_key`. The window itself is
 `services/link_window`."""
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..auth import request_source
 from ..database import get_session
-from ..schemas import LinkWindowOpen, LinkWindowOpened, LinkWindowOut
+from ..schemas import LinkWindowCancelled, LinkWindowOpen, LinkWindowOpened, LinkWindowOut
 from ..services import link_window as svc
 from ..services.oauth import MCP_MOUNT
 
@@ -69,9 +69,19 @@ async def open_link_window(
 
 @router.delete("")
 async def cancel_link_window(
+    window_id: str | None = Query(default=None, max_length=64),
     configured: bool = Depends(oauth_configured),
     writes: bool = Depends(remote_writes),
     url: str | None = Depends(mcp_url),
 ):
-    state = await svc.cancel(configured=configured, remote_writes=writes)
-    return {"data": LinkWindowOut.model_validate({**state, "mcp_url": url}).model_dump()}
+    """Cancel the open window. With `?window_id=` (the state's `window_id`), only if
+    that window is still the current one: a window that replaced it is left open, and
+    the answer's `cancelled` is false. Without it, whatever window is open."""
+    state, cancelled = await svc.cancel(
+        configured=configured, remote_writes=writes, window_id=window_id
+    )
+    return {
+        "data": LinkWindowCancelled.model_validate(
+            {**state, "mcp_url": url, "cancelled": cancelled}
+        ).model_dump()
+    }

@@ -611,6 +611,9 @@ class LinkWindowOut(BaseModel):
     # (#28). False when `configured` is false
     remote_writes: bool
     open: bool
+    # while open: the window's own id (the `entity_id` of its audit entries, not a
+    # secret), which a cancel can name so that it ends this window and no other (#30)
+    window_id: str | None = None
     # while open: what its link may do, when it opened and runs out, and how long it has
     # left by the server's clock, which a countdown starts from
     can_write: bool | None
@@ -634,6 +637,14 @@ class LinkWindowOpened(LinkWindowOut):
     """The answer that opens a window, the only one that carries its link code."""
 
     code: str
+
+
+class LinkWindowCancelled(LinkWindowOut):
+    """The answer to a cancel: the state after it, and whether this cancel ended a
+    window. False when none was open, or when the cancel named a window that is no
+    longer the current one, which it then left alone (#30)."""
+
+    cancelled: bool
 
 
 class LinkedClientOut(BaseModel):

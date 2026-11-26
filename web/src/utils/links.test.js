@@ -31,11 +31,12 @@ it('groups a code in fives', () => {
   expect(groupedCode(null)).toBe('')
 })
 
-it('tells a replacement by its opening time', () => {
-  const opened = { opened_at: 'a' }
-  expect(sameWindow(opened, { open: true, opened_at: 'a' })).toBe(true)
-  expect(sameWindow(opened, { open: true, opened_at: 'b' })).toBe(false)
-  expect(sameWindow(opened, { open: false, opened_at: null })).toBe(false)
+it('tells a replacement by its window id', () => {
+  const opened = { window_id: 'a' }
+  expect(sameWindow(opened, { open: true, window_id: 'a' })).toBe(true)
+  expect(sameWindow(opened, { open: true, window_id: 'b' })).toBe(false)
+  expect(sameWindow(opened, { open: false, window_id: null })).toBe(false)
+  expect(sameWindow({}, { open: true, window_id: undefined })).toBe(false)
 })
 
 describe('access', () => {

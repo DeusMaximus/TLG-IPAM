@@ -30,6 +30,9 @@ it is what proves that the person approving is the owner (spec §7.2, invariant 
 - **Pending transactions end with the window**: every way a window ends drops them all
   (`oauth.pending.reset`), and so does opening one, so no request a client sent in an
   earlier window can be approved in a later one.
+- **A cancel can name its window** (`cancel`'s `window_id`, the window's own `id`):
+  compared under `_transitions`, so it ends that window or nothing, never a window that
+  replaced it (#30).
 - **Ending a window and approving a link are serialised** (`_transitions`): opening,
   cancelling and an approval through its commit each hold the one lock. So a cancel or
   a replacement the owner has been answered for is never followed by a grant from the
@@ -199,6 +202,7 @@ def state_out(*, configured: bool, remote_writes: bool) -> dict:
             "configured": True,
             "remote_writes": writes,
             "open": True,
+            "window_id": window.id,
             "can_write": window.can_write,
             "opened_at": window.opened_at,
             "expires_at": window.expires_at,
@@ -212,6 +216,7 @@ def state_out(*, configured: bool, remote_writes: bool) -> dict:
         "configured": configured,
         "remote_writes": writes,
         "open": False,
+        "window_id": None,
         "can_write": None,
         "opened_at": None,
         "expires_at": None,
@@ -280,14 +285,28 @@ async def open_window(
         return state_out(configured=True, remote_writes=remote_writes), code
 
 
-async def cancel(*, configured: bool, remote_writes: bool) -> dict:
-    """End the open window, if there is one; the state after. An approval in flight on
-    it finishes first, so the answer is true of what happened: `linked` if it linked."""
+async def cancel(
+    *, configured: bool, remote_writes: bool, window_id: str | None = None
+) -> tuple[dict, bool]:
+    """End the open window, if there is one; the state after, and whether this call
+    ended a window. An approval in flight on it finishes first, so the answer is true of
+    what happened: `linked` if it linked.
+
+    With `window_id` (the window's own `id`, which the state gives as `window_id`) it
+    ends that window only: the id is compared with the current window's under
+    `_transitions`, before anything is ended, so a window that has since ended or been
+    replaced is never taken for it. A cancel naming a window that is not current ends
+    nothing and changes nothing (#30: the owner's page cancels only the window it
+    opened, and a replacement from another tab, with its pending requests, stays).
+    Without `window_id` it ends whatever window is open, for the owner's own scripts."""
+    cancelled = False
     if configured:
         async with _transitions:
-            if _live() is not None:
+            window = _live()
+            if window is not None and (window_id is None or window.id == window_id):
                 _end(CANCELLED)
-    return state_out(configured=configured, remote_writes=remote_writes)
+                cancelled = True
+    return state_out(configured=configured, remote_writes=remote_writes), cancelled
 
 
 # --- The consent page ---

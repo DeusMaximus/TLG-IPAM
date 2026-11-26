@@ -22,6 +22,7 @@ from app.services import link_window, oauth, scans
 
 from .oauth_flow import (  # noqa: F401 (web and no_ambient_token are fixtures)
     BASE,
+    database_dump,
     CALLBACK,
     STATE,
     all_rows,
@@ -178,6 +179,92 @@ async def test_cancelling_ends_the_window_and_its_requests(web):
     # nothing to cancel is no error
     assert (await web.delete("/api/v1/link-window", headers=OWNER)).status_code == 200
     assert [c.action for c in await changes()] == ["open"] and opened
+
+
+async def test_the_state_names_the_window_by_its_own_id(web):
+    """`window_id` is the window's `id`, the `entity_id` of its audit entry (#30): in the
+    answer that opens it and in every state while it is open; null when none is."""
+    assert (await window_state(web))["window_id"] is None
+    opened = await open_window(web)
+    [entry] = await changes()
+    assert opened["window_id"] == entry.entity_id
+    assert (await window_state(web))["window_id"] == opened["window_id"]
+    res = await web.delete("/api/v1/link-window", headers=OWNER)
+    assert res.json()["data"]["window_id"] is None
+
+
+async def test_a_cancel_naming_its_window_ends_that_window(web):
+    opened = await open_window(web)
+    res = await web.delete(
+        "/api/v1/link-window", params={"window_id": opened["window_id"]}, headers=OWNER
+    )
+    assert res.status_code == 200
+    data = res.json()["data"]
+    assert data["cancelled"] is True and data["open"] is False and data["ended"] == "cancelled"
+
+
+async def test_a_cancel_naming_a_replaced_window_leaves_the_replacement_and_its_requests(web):
+    """The race Codex named on PR #195: a page reads window A, another tab opens window
+    B in its place, and the page then cancels A. B stays open, with its pending request,
+    and nothing is written."""
+    first = await open_window(web)
+    second = await open_window(web)
+    client = await register(web)
+    txn = transaction(await authorise(web, client))
+    before = database_dump()
+    res = await web.delete(
+        "/api/v1/link-window", params={"window_id": first["window_id"]}, headers=OWNER
+    )
+    assert res.status_code == 200
+    data = res.json()["data"]
+    assert data["cancelled"] is False
+    assert data["open"] is True and data["window_id"] == second["window_id"]
+    assert len(oauth.pending) == 1
+    assert (await consent_page(web, txn)).status_code == 200
+    assert database_dump() == before
+    # the replacement still links with its own code
+    assert (await post_code(web, txn, second["code"])).status_code == 303
+
+
+async def test_the_service_compares_the_window_under_the_transition_lock(web):
+    """At the service: the cancel's comparison is made once it holds `_transitions`, so
+    a replacement that lands while the cancel waits for the lock is what it compares
+    with, and is left open."""
+    first = await open_window(web)
+    await link_window._transitions.acquire()
+    try:
+        cancelling = asyncio.create_task(
+            link_window.cancel(configured=True, remote_writes=False, window_id=first["window_id"])
+        )
+        await asyncio.sleep(0)
+        # the replacement lands while the cancel waits: opened as `open_window` does
+        replacement = link_window._Window(
+            id="replacement",
+            code_hash="",
+            can_write=False,
+            opened_at=link_window._now(),
+            deadline=time.monotonic() + link_window.LIFETIME_S,
+            csrf_key=b"k" * 32,
+        )
+        link_window._end(link_window.REPLACED)
+        link_window._current = replacement
+    finally:
+        link_window._transitions.release()
+    state, cancelled = await cancelling
+    assert cancelled is False
+    assert state["open"] is True and state["window_id"] == "replacement"
+
+
+async def test_a_cancel_naming_no_window_still_ends_whatever_is_open(web):
+    """The owner's own scripts may still ask to cancel whatever is open; the page never
+    does (`LinkClientModal.cancelOwn`)."""
+    await open_window(web)
+    res = await web.delete("/api/v1/link-window", headers=OWNER)
+    assert res.json()["data"]["cancelled"] is True
+    res = await web.delete("/api/v1/link-window", headers=OWNER)
+    assert res.json()["data"]["cancelled"] is False
+    res = await web.delete("/api/v1/link-window", params={"window_id": "x" * 65}, headers=OWNER)
+    assert res.status_code == 422
 
 
 async def test_opening_another_window_replaces_the_first(web):

@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -19,6 +19,9 @@ vi.mock('../api/ipam', () => ({
 const CODE = 'ABCDEFGHJK'
 const MCP_URL = 'https://ipam.example.com/mcp'
 const OPENED_AT = '2026-11-26T12:00:00+00:00'
+const WINDOW_ID = 'a1b2c3d4-0000-4000-8000-000000000001'
+// a window another tab or the API opened in place of the dialog's
+const OTHER = { window_id: 'a1b2c3d4-0000-4000-8000-000000000002', opened_at: '2026-11-26T12:05:00+00:00' }
 
 const closed = (over = {}) => ({
   configured: true,
@@ -39,6 +42,7 @@ const open = (over = {}) => ({
   ...closed(),
   open: true,
   can_write: false,
+  window_id: WINDOW_ID,
   opened_at: OPENED_AT,
   // deliberately far from the browser's clock: the countdown never reads it
   expires_at: '2030-01-01T00:00:00+00:00',
@@ -75,10 +79,16 @@ beforeEach(() => {
   ipam.getLinkWindow.mockResolvedValue({ data: closed() })
   ipam.listLinkedClients.mockResolvedValue({ data: [] })
   ipam.openLinkWindow.mockResolvedValue({ data: { ...open(), code: CODE } })
-  ipam.cancelLinkWindow.mockResolvedValue({ data: closed({ ended: 'cancelled' }) })
+  ipam.cancelLinkWindow.mockResolvedValue({ data: { ...closed({ ended: 'cancelled' }), cancelled: true } })
 })
 
-afterEach(() => {
+afterEach(async () => {
+  // unmount here, before the mocks are cleared: a dialog still holding its window
+  // cancels it as it goes, and that call belongs to this test, not the next
+  cleanup()
+  await act(async () => {})
+  // the page never asks to cancel a window it did not name: every cancel names one
+  for (const call of ipam.cancelLinkWindow.mock.calls) expect(call[0]).toMatch(/^a1b2c3d4-/)
   vi.clearAllMocks()
   localStorage.clear()
   sessionStorage.clear()
@@ -197,7 +207,17 @@ describe('Linked clients list', () => {
       'Its code is shown only in the dialog that opened it'
     )
     await user.click(screen.getByRole('button', { name: 'Cancel window' }))
-    expect(ipam.cancelLinkWindow).toHaveBeenCalled()
+    expect(ipam.cancelLinkWindow).toHaveBeenCalledWith(WINDOW_ID)
+  })
+
+  it('says so when the window the banner showed had already been replaced', async () => {
+    const user = userEvent.setup()
+    ipam.getLinkWindow.mockResolvedValue({ data: open() })
+    ipam.cancelLinkWindow.mockResolvedValue({ data: { ...open(OTHER), cancelled: false } })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: 'Cancel window' }))
+    expect(ipam.cancelLinkWindow).toHaveBeenCalledWith(WINDOW_ID)
+    expect(await screen.findByText(/nothing was cancelled/)).toBeInTheDocument()
   })
 })
 
@@ -245,9 +265,9 @@ describe('Link a client dialog', () => {
     await user.click(screen.getByRole('button', { name: 'Open link window' }))
     await screen.findByTestId('link-code')
     // the server reports the dialog's own window, so the cancel is of that one
-    ipam.getLinkWindow.mockResolvedValue({ data: open() })
     await user.click(screen.getByRole('button', { name: 'Close' }))
     expect(ipam.cancelLinkWindow).toHaveBeenCalledTimes(1)
+    expect(ipam.cancelLinkWindow).toHaveBeenCalledWith(WINDOW_ID)
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
     expect(document.body.textContent).not.toContain('ABCDE')
   })
@@ -312,6 +332,7 @@ describe('Link a client dialog', () => {
         expect(screen.queryByRole('dialog')).toBeNull()
         await act(async () => request.answer())
         await waitFor(() => expect(ipam.cancelLinkWindow).toHaveBeenCalledTimes(1))
+        expect(ipam.cancelLinkWindow).toHaveBeenCalledWith(WINDOW_ID)
         expect(document.body.textContent).not.toContain('ABCDE')
       })
     }
@@ -323,6 +344,7 @@ describe('Link a client dialog', () => {
       view.unmount()
       await act(async () => request.answer())
       await waitFor(() => expect(ipam.cancelLinkWindow).toHaveBeenCalledTimes(1))
+      expect(ipam.cancelLinkWindow).toHaveBeenCalledWith(WINDOW_ID)
     })
 
     it('cancels its open window when the page goes away while the code is shown', async () => {
@@ -331,6 +353,7 @@ describe('Link a client dialog', () => {
       await screen.findByTestId('link-code')
       view.unmount()
       await waitFor(() => expect(ipam.cancelLinkWindow).toHaveBeenCalledTimes(1))
+      expect(ipam.cancelLinkWindow).toHaveBeenCalledWith(WINDOW_ID)
     })
 
     it('cancels nothing, and says nothing, when the request fails after a dismissal', async () => {
@@ -343,25 +366,29 @@ describe('Link a client dialog', () => {
       expect(screen.queryByText(/server unreachable/)).toBeNull()
     })
 
-    it('leaves alone a window that replaced its own before the request answered', async () => {
+    // The server compares the id under its lock and leaves a replacement open
+    // (`cancelled: false`, test_link_window.py); the dialog's part is to name its own
+    it('names its own window when another replaced it before the request answered', async () => {
       const user = userEvent.setup()
       const request = pendingOpen()
       await startOpening(user)
       await user.click(screen.getByRole('button', { name: 'Close' }))
-      ipam.getLinkWindow.mockResolvedValue({ data: open({ opened_at: '2026-11-26T12:05:00+00:00' }) })
+      ipam.cancelLinkWindow.mockResolvedValue({ data: { ...open(OTHER), cancelled: false } })
       await act(async () => request.answer())
-      await waitFor(() => expect(ipam.getLinkWindow).toHaveBeenCalled())
-      expect(ipam.cancelLinkWindow).not.toHaveBeenCalled()
+      await waitFor(() => expect(ipam.cancelLinkWindow).toHaveBeenCalledTimes(1))
+      expect(ipam.cancelLinkWindow).toHaveBeenCalledWith(WINDOW_ID)
+      expect(screen.queryByText(/could not be cancelled/)).toBeNull()
     })
 
-    it('closes without cancelling a window another tab opened in place of its own', async () => {
+    it('closes, naming its own window, when another tab opened one in its place', async () => {
       const user = userEvent.setup()
       await startOpening(user)
       await screen.findByTestId('link-code')
-      ipam.getLinkWindow.mockResolvedValue({ data: open({ opened_at: '2026-11-26T12:05:00+00:00' }) })
+      ipam.cancelLinkWindow.mockResolvedValue({ data: { ...open(OTHER), cancelled: false } })
       await user.click(screen.getByRole('button', { name: 'Close' }))
       await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
-      expect(ipam.cancelLinkWindow).not.toHaveBeenCalled()
+      expect(ipam.cancelLinkWindow).toHaveBeenCalledTimes(1)
+      expect(ipam.cancelLinkWindow).toHaveBeenCalledWith(WINDOW_ID)
     })
   })
 
@@ -453,7 +480,7 @@ describe('Link a client dialog', () => {
 
     it('says the window was replaced when another one is open in its place', async () => {
       ipam.getLinkWindow.mockResolvedValueOnce({ data: closed() })
-      ipam.getLinkWindow.mockResolvedValue({ data: open({ opened_at: '2026-11-26T12:05:00+00:00' }) })
+      ipam.getLinkWindow.mockResolvedValue({ data: open(OTHER) })
       await openDialog()
       await advance(POLL_MS)
       expect(screen.getByRole('dialog')).toHaveTextContent('This window was replaced')

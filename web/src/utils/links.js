@@ -35,9 +35,9 @@ export const groupedCode = (code) =>
   code && code.length === 10 ? `${code.slice(0, 5)} ${code.slice(5)}` : code || ''
 
 // Whether a later answer is about the window the dialog opened: one opened elsewhere
-// (another tab, the API) replaces it, and says so only by its own opening time
+// (another tab, the API) replaces it, and has a `window_id` of its own
 export const sameWindow = (opened, state) =>
-  Boolean(opened && state && state.open && state.opened_at === opened.opened_at)
+  Boolean(opened && state && state.open && opened.window_id && state.window_id === opened.window_id)
 
 // How a window that the dialog opened ended, from the state the server gave once it
 // was no longer open (`ended`), or 'replaced' when another window took its place
