@@ -142,4 +142,7 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run test
+      # With Node's Web Storage off, as above on Node 24, the storage tests pass without
+      # the redirect in src/test/setup.js. On, they fail if it is removed (#187).
+      - run: NODE_OPTIONS=--experimental-webstorage npm run test -- src/test/storage.test.js
       - run: npm run build
