@@ -29,7 +29,7 @@ from app.config import settings
 from app.database import SessionLocal, _configure_connection, engine, get_session
 from app.main import app
 from app.models import Base, Subnet
-from app.services import agents, enrolment, jobs, oauth
+from app.services import agents, enrolment, jobs, link_window, oauth
 from app.services.device_types import seed_defaults
 
 
@@ -84,11 +84,13 @@ def fresh_enrol_throttle():
 
 @pytest.fixture(autouse=True)
 def fresh_pending_authorisations():
-    """Pending authorise transactions are process memory (`services/oauth.pending`):
-    each test starts with none."""
+    """Pending authorise transactions and the link window are process memory
+    (`services/oauth.pending`, `services/link_window`): each test starts with none."""
     oauth.pending.reset()
+    link_window.reset()
     yield
     oauth.pending.reset()
+    link_window.reset()
 
 
 async def enrol(client, enrol_token: str, **body):

@@ -6,9 +6,10 @@ test file runs with OAuth off, as a server without the setting does. `oauth_app`
 built by the same factories around a server whose auth is the OAuth provider with the
 owner-key verifier beside it, on the same database.
 
-No HTTP route approves a link before the consent page exists (#27), so `approve` here
-calls `services.oauth.approve` directly, in the consent handler's place, and the
-`linking` fixture opens the gate that #27 will make the link window.
+Most of #26's tests link a client without a link window or the consent page: the
+`linking` fixture opens the gate in the window's place, and `approve` here calls
+`services.oauth.approve` directly, in the consent handler's place. `test_link_window.py`
+links through both.
 """
 
 import base64
@@ -100,8 +101,8 @@ async def web():
 
 @pytest.fixture
 def linking(monkeypatch):
-    """Linking open, as it is inside a link window (#27). Without this fixture it is
-    closed, as it always is in this server until the window exists."""
+    """Linking open, as it is inside a link window (#27), with no window and no link
+    code. Without this fixture or a window it is closed."""
     monkeypatch.setattr(oauth, "linking_open", lambda: True)
 
 
@@ -159,7 +160,8 @@ def transaction(res: httpx.Response) -> str:
 
 
 async def approve(txn: str, *, can_write: bool = False) -> httpx.URL:
-    """The owner's approval, as the consent handler will give it (#27)."""
+    """The owner's approval, as the consent handler gives it once the link code is
+    accepted (`link_window.submit`)."""
     async with SessionLocal() as session:
         return httpx.URL(await oauth.approve(session, txn, can_write=can_write))
 

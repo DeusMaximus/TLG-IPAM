@@ -6,8 +6,9 @@ because the SDK's interface puts the decision there:
 
 - **Routes.** The provider builds its own route list (`get_routes`) from the SDK's
   handlers, where FastMCP would take the SDK's ready-made list: the token endpoint
-  must be given this module's client authenticator, and register and authorise are
-  closed outside a link window before the handler parses anything.
+  must be given this module's client authenticator, register and authorise are
+  closed outside a link window before the handler parses anything, and the consent
+  page (`consent.py`, #27) is served beside them.
 - **Client authentication** (`HashedSecretAuthenticator`). The SDK's authenticator
   compares the presented secret with a plain one from the provider, and no provider
   hook is handed the presented secret, so a secret stored as a hash can only be
@@ -63,6 +64,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
+from . import consent
 from .auth import OwnerKeyVerifier
 from .database import SessionLocal
 from .models import OAuthClient
@@ -252,9 +254,10 @@ class IpamOAuthProvider(OAuthProvider):
         """Every route of the OAuth server, built here and not taken from
         `create_auth_routes`, so that no endpoint is served that this list does not
         name: discovery, authorise and register (each closed outside a link window),
-        and the token endpoint with `HashedSecretAuthenticator`. FastMCP adds them to
-        the app that serves `/mcp`, so the operational ones are at `/mcp/authorize`,
-        `/mcp/token` and `/mcp/register`."""
+        the token endpoint with `HashedSecretAuthenticator`, and the consent page the
+        authorise step sends the browser to (`consent.py`). FastMCP adds them to the
+        app that serves `/mcp`, so the operational ones are at `/mcp/authorize`,
+        `/mcp/token`, `/mcp/register` and `/mcp/consent`."""
         self.set_mcp_path(mcp_path)
         validate_issuer_url(self.base_url)
         authorize = AuthorizationHandler(self)
@@ -279,6 +282,12 @@ class IpamOAuthProvider(OAuthProvider):
                     _while_linking_is_open(register.handle, page=False), ["POST", "OPTIONS"]
                 ),
                 methods=["POST", "OPTIONS"],
+            ),
+            Route(
+                oauth.CONSENT_PATH,
+                # the owner's browser, never a client's fetch: no CORS
+                endpoint=consent.endpoint(self.public_base_url),
+                methods=["GET", "POST"],
             ),
         ]
 
@@ -320,7 +329,7 @@ class IpamOAuthProvider(OAuthProvider):
 
     async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
         """Keep the request for the owner's decision and send the browser to the
-        consent page (#27) with the transaction's id. No code is issued here."""
+        consent page (`consent.py`) with the transaction's id. No code is issued here."""
         try:
             txn = oauth.begin_authorisation(
                 client_id=client.client_id,
@@ -433,6 +442,12 @@ class IpamAuth(MultiAuth):
 
     def _get_resource_url(self, path: str | None = None) -> AnyHttpUrl | None:
         return self.server._get_resource_url(path)
+
+
+def public_base_url_of(auth: AuthProvider | None) -> str:
+    """The public base URL the OAuth server behind `auth` publishes, or "" when `auth`
+    is not the OAuth provider (`PUBLIC_BASE_URL` unset)."""
+    return auth.server.public_base_url if isinstance(auth, IpamAuth) else ""
 
 
 def mcp_auth(public_base_url: str) -> AuthProvider:

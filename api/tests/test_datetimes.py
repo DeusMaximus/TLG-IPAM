@@ -154,6 +154,7 @@ REQUEST_MODELS = {
     "ScanTargetUpdate",
     "FindingKey",
     "FindingKeysRequest",
+    "LinkWindowOpen",
 }
 
 STORED = datetime(2026, 11, 16, 6, 38, 44, 765279)  # as SQLite returns it: no zone
