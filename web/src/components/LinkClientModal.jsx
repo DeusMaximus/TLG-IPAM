@@ -173,8 +173,8 @@ export default function LinkClientModal({ state, onClose, onChanged }) {
           <p>
             Opening a link window gives you a one-time <strong>link code</strong> and lets one
             client link to this server in the next 10 minutes. Open it before you enter the
-            server’s URL in the client: some clients (ChatGPT, Gemini) register the moment the
-            URL is entered, and are refused when no window is open.
+            server’s URL in the client: some clients (ChatGPT, for one) register the moment
+            the URL is entered, and are refused when no window is open.
           </p>
           {state?.open && (
             <p className="mt-2 text-amber-300">
