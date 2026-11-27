@@ -49,6 +49,12 @@ With `PUBLIC_BASE_URL` set, the server is its own OAuth authorisation server for
 - **You can revoke any link** on the web UI's **Linked clients** page. Its tokens are refused from the client's next request. See [Ending a link](#ending-a-link).
 - Linking needs a code that only the holder of the owner key can get. There is no standing password for it.
 
+### Supported web clients
+
+**Claude.ai, ChatGPT and Mistral** are the supported web clients.
+
+**Gemini is not supported and not recommended.** It links, but it is unreliable: in a run on 2026-11-27 it reported failure straight after the first link, and linked a second time its regular chat offered the connector and could not use it. Its Task mode did call tools. The cause was not established. The server does not refuse Gemini or treat it differently. If you have linked it, the link is like any other: [revoke it](#ending-a-link) if you do not want it. The observations, and what is only inferred from them, are in the [v0.2 spec, §6.8](v0.2-spec.md#gemini-is-not-supported-added-2026-11-27-198).
+
 ### What you publish
 
 | Path | Who requests it | An interactive login in front of it |

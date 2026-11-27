@@ -138,6 +138,16 @@ function reactHolds(text) {
 const table = async () => within(await screen.findByRole('table', { name: 'Linked clients' }))
 
 describe('Linked clients list', () => {
+  // #198: Gemini can be linked but is not a supported client
+  it('names the three supported web clients in its intro, and not Gemini', async () => {
+    renderPage()
+    const intro = await screen.findByText(/^Web assistants/)
+    expect(intro).toHaveTextContent(
+      'Web assistants (Claude.ai, ChatGPT, Mistral) linked to this server’s MCP endpoint.'
+    )
+    expect(document.body.textContent).not.toContain('Gemini')
+  })
+
   it('shows the redirect host, the name as the client’s quoted claim, access and Last contact', async () => {
     ipam.listLinkedClients.mockResolvedValue({ data: [link()] })
     renderPage()
@@ -309,6 +319,17 @@ describe('Linked clients list', () => {
 })
 
 describe('Link a client dialog', () => {
+  it('says which client registers the moment the URL is entered, without naming Gemini', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: /Link a client/ }))
+    const dialog = screen.getByRole('dialog')
+    expect(dialog).toHaveTextContent(
+      'some clients (ChatGPT, for one) register the moment the URL is entered, and are refused when no window is open.'
+    )
+    expect(document.body.textContent).not.toContain('Gemini')
+  })
+
   it('offers the write checkbox, off by default, only while remote writes are on', async () => {
     const user = userEvent.setup()
     renderPage()

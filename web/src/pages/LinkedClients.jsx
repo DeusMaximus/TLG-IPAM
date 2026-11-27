@@ -161,7 +161,7 @@ export default function LinkedClients() {
         </button>
       </div>
       <p className="mt-1 text-sm text-slate-400">
-        Web assistants (Claude.ai, ChatGPT, Gemini, Mistral) linked to this server’s MCP
+        Web assistants (Claude.ai, ChatGPT, Mistral) linked to this server’s MCP
         endpoint. Each link is one approval you gave with a link code; revoking it stops the
         client at its next request.
       </p>
