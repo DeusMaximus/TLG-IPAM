@@ -14,4 +14,4 @@ in the agent's `__init__.py` together; `agent/tests/test_release.py` and
 environment, so a server reports the release it runs.
 """
 
-VERSION = "0.2.0"
+VERSION = "0.3.0.dev0"
